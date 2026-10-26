@@ -9,7 +9,6 @@
 // make_dir, and close_dir live in the per-OS test file. The scratch
 // directory is removed afterwards.
 
-import std.list as lists
 import std.mem
 import std.testing
 
@@ -130,6 +129,29 @@ fn listSorted() with (t: testing.Testing) {
         free_names(&miss)
         free_str(gone)
         free_names(&names)
+        close_dir(dir)
+    }
+}
+
+@test
+fn renameAndExists() with (t: testing.Testing) {
+    with (mem.heap()) {
+        val dir = scratch("jog-fs-rename")
+        t.expect(make_dir(dir))
+        t.expect(exists(dir))
+        t.expect(put(dir, "old.txt", "hi"))
+        val from = join(dir, "old.txt")
+        val to = join(dir, "new.txt")
+        t.expect(exists(from))
+        t.expect(rename(from, to))
+        t.expect(!exists(from))
+        t.expect(exists(to))
+        val (here, ok) = cwd()
+        t.expect(ok)
+        t.expect(here.len > 0)
+        free_str(here)
+        free_str(from)
+        free_str(to)
         close_dir(dir)
     }
 }

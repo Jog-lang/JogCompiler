@@ -324,6 +324,10 @@ static JirOperand value_addr(Lower *L, JogNode *node) {
     return addr_local(L, value.as.local, node->pos);
 }
 
+JirOperand jog_lower_lvalue_ptr(Lower *L, JogNode *node) {
+    return value_addr(L, node);
+}
+
 /* Pointer to the indexed element, before the load. */
 static JirOperand index_ptr(Lower *L, JogNode *node) {
     JogNode *base_node;

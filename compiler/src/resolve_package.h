@@ -24,7 +24,7 @@
    in program->packages. A package cannot import itself. Duplicate names
    in the same scope are errors, including a file-private name that
    matches a package-visible name. The same file-private name may be used
-   in another file. Unused imports are not reported here.
+   in another file. The checker reports an import the file never uses.
 
    Returns false if program, its arena, diag, or intern is NULL, a scope
    cannot be built, or a diagnostic was emitted. universe may be NULL. */

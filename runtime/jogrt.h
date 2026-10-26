@@ -65,8 +65,11 @@ int jogrt_panic_call(void *body);
 /* ---- process ---- */
 
 int jogrt_argc(void);
-/* Argument i as bytes without the NUL, or {NULL, 0} when out of range. */
-const char *jogrt_argv(int i, size_t *len);
+/* Argument i as bytes without the NUL, or NULL when out of range.
+   const int8_t * is the C type of Jog *const c.char, so an extern
+   binding can redeclare this function. len receives the byte count
+   when it is not NULL. */
+const int8_t *jogrt_argv(int i, size_t *len);
 _Noreturn void jogrt_exit(int code);
 
 /* ---- default Allocator context (malloc-backed) ----

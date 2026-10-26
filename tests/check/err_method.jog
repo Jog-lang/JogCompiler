@@ -1,0 +1,10 @@
+struct S {
+    n: i64
+}
+
+fn main() {
+    var s = S(n: 0)
+    s.missing()
+}
+
+// error: undefined method 'missing'

@@ -56,9 +56,10 @@ extern {
     fn jogrt_realloc(ptr: *void?, old_size: size_t, new_size: size_t, align: size_t): *void?
     fn jogrt_free(ptr: *void?, size: size_t, align: size_t)
     fn jogrt_argc(): int
-    // Same bytes as jogrt_argv, or NULL when i is out of range. The
-    // pointer belongs to the runtime. jogrt_argv itself returns
-    // const char *, and *c.char is const int8_t *, so a generated
-    // redeclaration of jogrt_argv conflicts with jogrt.h.
+    // Argument i, or null when i is out of range. len receives the
+    // byte count. The pointer belongs to the runtime. jogrt.h spells
+    // the return as const int8_t *, which is *const c.char.
+    fn jogrt_argv(i: int, len: *size_t): *const char?
+    // Same bytes as jogrt_argv, without the length out-parameter.
     fn jogrt_arg_ptr(i: int): *const char?
 }

@@ -2,9 +2,10 @@
 // asks for Testing and no context global has that type. expect and
 // expectEq print nothing when the check holds. fail and a failing check
 // write to stderr and increment failures. fatal writes, then panics.
-// finish is what the test harness calls after every @test: a nonzero
-// count exits the process with status 1, and a zero count returns so
-// the process exits 0. One shared value, not a checking allocator.
+// finish exits the process with status 1 when a check recorded a failure,
+// and returns when the count is zero. The harness calls note before each
+// @test and report after the last one. report writes one summary line to
+// stderr, then calls finish. One shared value, not a checking allocator.
 // expectPanic catches a panic inside the closure. A panic outside it
 // still aborts.
 
@@ -25,14 +26,77 @@ struct Test {
 
 var test_value: Test
 var failures: i32 = 0
+var current: str
 
 fn testing(): Testing {
     return &test_value
 }
 
+fn note(name: str) {
+    current = name
+}
+
+private fn write_str(p: *u8, at: usize, text: str): usize {
+    for i in 0 as usize..text.len {
+        *(p + at + i) = *(text.ptr + i)
+    }
+    return at + text.len
+}
+
+private fn write_i32(p: *u8, at: usize, n: i32): usize {
+    var digits: [16]u8
+    var i: usize = 0
+    var x: i32 = n
+    if x < 0 {
+        x = 0 - x
+    }
+    if x == 0 {
+        *(p + at) = 48
+        return at + 1
+    }
+    for _ in 0..16 {
+        if x == 0 {
+            break
+        }
+        val d = (x % 10) + 48
+        digits[i] = d as u8
+        i = i + 1
+        x = x / 10
+    }
+    for k in 0 as usize..i {
+        *(p + at + k) = digits[i - 1 - k]
+    }
+    return at + i
+}
+
+fn report(ran: i32) {
+    var raw: bytes[80]
+    val p = raw[..].ptr
+    var at: usize = 0
+    at = write_i32(p, at, ran)
+    at = write_str(p, at, " tests, ")
+    if failures == 0 {
+        at = write_i32(p, at, ran)
+        at = write_str(p, at, " passed\n")
+    } else {
+        at = write_i32(p, at, failures)
+        at = write_str(p, at, " failed\n")
+    }
+    io.eprint(raw[0..at])
+    finish()
+}
+
+private fn note_fail() {
+    if current.len != 0 {
+        io.eprint(current)
+        io.eprint(": ")
+    }
+}
+
 fn Test.expect(cond: bool) {
     if !cond {
         failures = failures + 1
+        note_fail()
         io.eprint("fail\n")
     }
 }
@@ -40,12 +104,14 @@ fn Test.expect(cond: bool) {
 fn Test.expectEq(got: str, want: str) {
     if got != want {
         failures = failures + 1
+        note_fail()
         io.eprint("fail\n")
     }
 }
 
 fn Test.fail(msg: str) {
     failures = failures + 1
+    note_fail()
     io.eprint(msg)
 }
 
@@ -60,6 +126,7 @@ fn Test.expectPanic(body: () -> ()) {
     // Nested calls save the previous handler and restore it.
     if c.jogrt_panic_call(&body as *void) == 0 {
         failures = failures + 1
+        note_fail()
         io.eprint("fail\n")
     }
 }

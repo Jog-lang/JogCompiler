@@ -1,4 +1,4 @@
-// Windows run. CreateProcessA. The command line is quoted for
+// Windows run. CreateProcessW. The command line is quoted for
 // CommandLineToArgvW: an empty argument, or one that contains a space,
 // a tab, or a quote, is wrapped in double quotes. Backslashes before a
 // quote, and backslashes at the end of a quoted argument, are doubled,
@@ -6,8 +6,8 @@
 // left bare. Quoting every argument makes cmd.exe treat "/c" as a
 // program name. A command line longer than 32766 bytes is a failed start.
 //
-// stdout and stderr are separate temp files. GetTempFileNameA creates
-// them. NUL is stdin.
+// stdout and stderr are separate temp files. GetTempFileNameW creates
+// them. NUL is stdin. Paths are UTF-16.
 
 import std.c
 import std.mem
@@ -52,20 +52,20 @@ private struct ProcessInfo {
 }
 
 private extern {
-    fn CreateProcessA(
-        app: *const c.char,
-        command: *c.char,
+    fn CreateProcessW(
+        app: *u16,
+        command: *u16,
         process_attr: *void?,
         thread_attr: *void?,
         inherit: c.int,
         flags: c.unsigned_long,
         env: *void?,
-        dir: *const c.char?,
+        dir: *u16?,
         startup: *Startup,
         info: *ProcessInfo,
     ): c.int
-    fn CreateFileA(
-        name: *const c.char,
+    fn CreateFileW(
+        name: *u16,
         access: c.unsigned_long,
         share: c.unsigned_long,
         security: *SecurityAttributes,
@@ -73,7 +73,7 @@ private extern {
         attrs: c.unsigned_long,
         template: c.intptr_t,
     ): c.intptr_t
-    fn GetTempFileNameA(dir: *const c.char, prefix: *const c.char, unique: c.unsigned_int, out: *c.char): c.unsigned_int
+    fn GetTempFileNameW(dir: *u16, prefix: *u16, unique: c.unsigned_int, out: *u16): c.unsigned_int
     fn WaitForSingleObject(handle: c.intptr_t, ms: c.unsigned_long): c.unsigned_long
     fn GetExitCodeProcess(process: c.intptr_t, code: *c.unsigned_long): c.int
     fn CloseHandle(handle: c.intptr_t): c.int
@@ -160,10 +160,31 @@ private fn close_handle(h: c.intptr_t) {
     }
 }
 
-private fn delete_made(path: *u8, made: bool) {
+private fn delete_made(path: *u16, made: bool) {
     if made {
-        c.DeleteFileA(path as *const c.char)
+        c.DeleteFileW(path)
     }
+}
+
+private fn wide_len(p: *u16, cap: usize): usize {
+    var i: usize = 0
+    for i < cap {
+        if p[i] == 0 {
+            return i
+        }
+        i = i + 1
+    }
+    return cap
+}
+
+private fn wide_utf8(src: *u16, dest: *u8, cap: usize): bool {
+    val n = wide_len(src, 260)
+    val nbyte = c.wide_to_utf8(src, n, dest, cap)
+    if (n != 0 && nbyte == 0) || nbyte >= cap {
+        return false
+    }
+    dest[nbyte] = 0
+    return true
 }
 
 // DWORD exit status as the two's complement int CreateProcess reports.
@@ -175,61 +196,79 @@ private fn exit_code(status: c.unsigned_long): i32 {
     return n as i32
 }
 
-// GetTempFileNameA creates the file. false leaves dest unchanged.
-private fn make_temp(prefix: *const c.char, dest: *u8): bool {
-    var dir: [260]u8
-    val n = c.GetTempPathA(260, dir[..].ptr as *c.char)
+// GetTempFileNameW creates the file. false leaves dest unchanged.
+private fn make_temp(prefix: str, dest: *u16): bool {
+    var dir: [260]u16
+    val n = c.GetTempPathW(260, dir[..].ptr)
     if n == 0 || n >= 260 {
         return false
     }
-    return GetTempFileNameA(dir[..].ptr as *const c.char, prefix, 0, dest as *c.char) != 0
-}
-
-private fn open_file(path: *const c.char, access: c.unsigned_long, disposition: c.unsigned_long, sa: *SecurityAttributes): c.intptr_t {
-    return CreateFileA(path, access, 3, sa, disposition, 128, 0)
-}
-
-private fn spawn(app: *const c.char, command: *c.char): Output with (a: mem.Allocator) {
-    var out_path: [260]u8
-    var err_path: [260]u8
-    val out_made = make_temp(c"jpo", out_path[..].ptr)
-    val err_made = make_temp(c"jpe", err_path[..].ptr)
-    if !out_made || !err_made {
-        delete_made(out_path[..].ptr, out_made)
-        delete_made(err_path[..].ptr, err_made)
-        return Output()
+    var wide_prefix: [8]u16
+    if !c.utf8_to_wide(prefix, wide_prefix[..].ptr, 8) {
+        return false
     }
+    return GetTempFileNameW(dir[..].ptr, wide_prefix[..].ptr, 0, dest) != 0
+}
 
-    var sa: SecurityAttributes
-    sa.length = size(SecurityAttributes) as c.unsigned_long
-    sa.inherit = 1
-    val nul_h = open_file(c"NUL", 0x80000000, 3, &sa)
-    val out_h = open_file(out_path[..].ptr as *const c.char, 0x40000000, 2, &sa)
-    val err_h = open_file(err_path[..].ptr as *const c.char, 0x40000000, 2, &sa)
-    if nul_h == -1 || out_h == -1 || err_h == -1 {
+private fn open_file(path: *u16, access: c.unsigned_long, disposition: c.unsigned_long, sa: *SecurityAttributes): c.intptr_t {
+    return CreateFileW(path, access, 3, sa, disposition, 128, 0)
+}
+
+private fn fill_nul(dest: *u16) {
+    dest[0] = 'N' as u16
+    dest[1] = 'U' as u16
+    dest[2] = 'L' as u16
+    dest[3] = 0
+}
+
+private fn spawn(app: *u16, command: *u16, capture: bool): Output with (a: mem.Allocator) {
+    var out_path: [260]u16
+    var err_path: [260]u16
+    var startup: Startup
+    startup.cb = size(Startup) as c.unsigned_long
+    var info: ProcessInfo
+    if capture {
+        val out_made = make_temp("jpo", out_path[..].ptr)
+        val err_made = make_temp("jpe", err_path[..].ptr)
+        if !out_made || !err_made {
+            delete_made(out_path[..].ptr, out_made)
+            delete_made(err_path[..].ptr, err_made)
+            return Output()
+        }
+        var sa: SecurityAttributes
+        sa.length = size(SecurityAttributes) as c.unsigned_long
+        sa.inherit = 1
+        var nul: [4]u16
+        fill_nul(nul[..].ptr)
+        val nul_h = open_file(nul[..].ptr, 0x80000000, 3, &sa)
+        val out_h = open_file(out_path[..].ptr, 0x40000000, 2, &sa)
+        val err_h = open_file(err_path[..].ptr, 0x40000000, 2, &sa)
+        if nul_h == -1 || out_h == -1 || err_h == -1 {
+            close_handle(nul_h)
+            close_handle(out_h)
+            close_handle(err_h)
+            delete_made(out_path[..].ptr, true)
+            delete_made(err_path[..].ptr, true)
+            return Output()
+        }
+        startup.flags = 0x100
+        startup.stdin_h = nul_h
+        startup.stdout_h = out_h
+        startup.stderr_h = err_h
+        val created = CreateProcessW(app, command, null, null, 1, 0, null, null, &startup, &info)
         close_handle(nul_h)
         close_handle(out_h)
         close_handle(err_h)
-        delete_made(out_path[..].ptr, true)
-        delete_made(err_path[..].ptr, true)
-        return Output()
-    }
-
-    var startup: Startup
-    startup.cb = size(Startup) as c.unsigned_long
-    startup.flags = 0x100
-    startup.stdin_h = nul_h
-    startup.stdout_h = out_h
-    startup.stderr_h = err_h
-    var info: ProcessInfo
-    val created = CreateProcessA(app, command, null, null, 1, 0, null, null, &startup, &info)
-    close_handle(nul_h)
-    close_handle(out_h)
-    close_handle(err_h)
-    if created == 0 {
-        delete_made(out_path[..].ptr, true)
-        delete_made(err_path[..].ptr, true)
-        return Output()
+        if created == 0 {
+            delete_made(out_path[..].ptr, true)
+            delete_made(err_path[..].ptr, true)
+            return Output()
+        }
+    } else {
+        val created = CreateProcessW(app, command, null, null, 0, 0, null, null, &startup, &info)
+        if created == 0 {
+            return Output()
+        }
     }
 
     val waited = WaitForSingleObject(info.process, 0xFFFFFFFF)
@@ -238,20 +277,33 @@ private fn spawn(app: *const c.char, command: *c.char): Output with (a: mem.Allo
     close_handle(info.thread)
     close_handle(info.process)
     if waited != 0 || got == 0 {
+        if capture {
+            delete_made(out_path[..].ptr, true)
+            delete_made(err_path[..].ptr, true)
+        }
+        return Output()
+    }
+    if !capture {
+        var out: Output
+        out.code = exit_code(status)
+        out.ok = true
+        return out
+    }
+
+    var out_utf: [1024]u8
+    var err_utf: [1024]u8
+    if !wide_utf8(out_path[..].ptr, out_utf[..].ptr, 1024) || !wide_utf8(err_path[..].ptr, err_utf[..].ptr, 1024) {
         delete_made(out_path[..].ptr, true)
         delete_made(err_path[..].ptr, true)
         return Output()
     }
-
-    val out = read_captures(out_path[..].ptr, err_path[..].ptr, exit_code(status))
+    val out = read_captures(out_utf[..].ptr, err_utf[..].ptr, exit_code(status))
     delete_made(out_path[..].ptr, true)
     delete_made(err_path[..].ptr, true)
     return out
 }
 
-// args[0] is the program. The call waits. ok is false when the program
-// cannot be started or the captures cannot be read.
-fn run(args: []str): Output with (a: mem.Allocator) {
+private fn start(args: []str, capture: bool): Output with (a: mem.Allocator) {
     if args.len == 0 {
         panic("empty argument vector")
     }
@@ -264,10 +316,35 @@ fn run(args: []str): Output with (a: mem.Allocator) {
         command.free()
         return Output()
     }
-    command.append_byte(0)
-    val app = c_string(args[0])
-    val out = spawn(app.ptr as *const c.char, command.ptr!! as *c.char)
+    val text = command.str()
+    val slots = text.len + 1
+    val (wide, err) = a.alloc(slots * 2, align(u16))
+    if err != null {
+        command.free()
+        panic("out of memory")
+    }
+    var wide_app: [4096]u16
+    if !c.utf8_to_wide(text, wide.ptr as *u16, slots) || !c.utf8_to_wide(args[0], wide_app[..].ptr, 4096) {
+        command.free()
+        a.free(wide)
+        return Output()
+    }
+    val out = spawn(wide_app[..].ptr, wide.ptr as *u16, capture)
     command.free()
-    a.free(app)
+    a.free(wide)
     return out
+}
+
+// args[0] is the program. The call waits. ok is false when the program
+// cannot be started or the captures cannot be read.
+fn run(args: []str): Output with (a: mem.Allocator) {
+    return start(args, true)
+}
+
+// Same start and wait as run. The child keeps the parent's stdout and
+// stderr, so its writes show up as it makes them. The result has no
+// captured bytes.
+fn run_inherit(args: []str): (i32, bool) with (a: mem.Allocator) {
+    val out = start(args, false)
+    return out.code, out.ok
 }

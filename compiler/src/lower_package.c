@@ -562,11 +562,14 @@ bool jog_lower_package_tests(Lower *L) {
         if (!jog_lower_context_supply(L, decls[at], &args, &argc)) {
             return false;
         }
+        if (decls[at] && decls[at]->as.fn.name && !jog_lower_testing_note(L, decls[at]->as.fn.name, call_pos)) {
+            return false;
+        }
         if (!emit_call_func(L, ids[at], args, argc, call_pos)) {
             return false;
         }
     }
-    if (L->failed || !jog_lower_testing_finish(L, pos)) {
+    if (L->failed || !jog_lower_testing_finish(L, pos, (int32_t)n)) {
         return false;
     }
     close_unit(L, pos);

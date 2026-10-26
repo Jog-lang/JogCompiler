@@ -3,8 +3,8 @@
 // False means the write failed. A newline is a second write of "\n".
 // read_some and binary_stdio are for a program that speaks a byte
 // protocol over stdin and stdout, such as a language server.
-// read_all and write_all take a str path. fopen needs a trailing NUL, so
-// the path is copied into a temporary buffer. Failure is a bool.
+// read_all and write_all take a str path. The platform file opens it:
+// _wfopen from UTF-16 on Windows, fopen on POSIX. Failure is a bool.
 
 import std.c
 import std.mem
@@ -35,19 +35,9 @@ fn eprintln(text: str): bool {
     return eprint("\n")
 }
 
-// 4095 bytes of path plus one NUL. A longer path does not open.
-// The local is zeroed; the byte after the copy is written 0 anyway.
+// A longer path does not open. The platform file adds the trailing NUL.
 private fn open_file(path: str, mode: *const c.char): *c.FILE? {
-    var buf: bytes[4096]
-    if path.len >= 4096 {
-        return null
-    }
-    val dest = buf[..].ptr
-    if path.len > 0 {
-        c.memcpy(dest as *void, path.ptr as *const void, path.len)
-    }
-    *(dest + path.len) = 0
-    return c.fopen(dest as *const c.char, mode)
+    return open_c_file(path, mode)
 }
 
 // Reads up to buf.len bytes from stdin and returns as soon as at least

@@ -44,3 +44,48 @@ fn list(path: str): (lists.List<str>, bool) with (a: mem.Allocator) {
     sort_names(&names)
     return names, true
 }
+
+fn rename(from: str, to: str): bool {
+    var left: [4096]u8
+    var right: [4096]u8
+    if !fill_path(left[..].ptr, 4096, from) || !fill_path(right[..].ptr, 4096, to) {
+        return false
+    }
+    return c.rename(left[..].ptr as *const c.char, right[..].ptr as *const c.char) == 0
+}
+
+fn exists(path: str): bool {
+    var buf: [4096]u8
+    if !fill_path(buf[..].ptr, 4096, path) {
+        return false
+    }
+    val fd = c.open(buf[..].ptr as *const c.char, 0)
+    if fd < 0 {
+        return false
+    }
+    c.close(fd)
+    return true
+}
+
+fn cwd(): (str, bool) with (a: mem.Allocator) {
+    var buf: [4096]u8
+    val p = c.getcwd(buf[..].ptr as *c.char, 4096)
+    if p == null {
+        return "", false
+    }
+    return copy_str(path_view_local(buf[..].ptr)), true
+}
+
+private fn path_view_local(path: *u8): str {
+    var n: usize = 0
+    for n < 4096 {
+        if path[n] == 0 {
+            break
+        }
+        n = n + 1
+    }
+    var view = bytes()
+    view.ptr = path
+    view.len = n
+    return view
+}

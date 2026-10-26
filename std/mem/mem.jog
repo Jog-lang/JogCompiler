@@ -120,3 +120,34 @@ fn ErrorArena.resize(b: bytes, size: usize): (bytes, error?) {
 // its storage at process exit, not per call.
 fn ErrorArena.free(b: bytes) {
 }
+
+// n elements, zeroed. An empty count allocates nothing. The pointer is
+// *T and the length is n. freeSlice releases that block.
+fn newSlice<T>(n: usize): []T with (a: Allocator) {
+    var s: []T
+    if n == 0 {
+        return s
+    }
+    val bytes_n = size(T) * n
+    val (raw, err) = a.alloc(bytes_n, align(T))
+    if err != null {
+        panic("out of memory")
+    }
+    if bytes_n > 0 {
+        c.memset(raw.ptr as *void, 0, bytes_n)
+    }
+    s.ptr = raw.ptr as *T
+    s.len = n
+    return s
+}
+
+// Releases a slice from newSlice. An empty slice allocates nothing.
+fn freeSlice<T>(s: []T) with (a: Allocator) {
+    if s.len == 0 {
+        return
+    }
+    var block = bytes()
+    block.ptr = s.ptr as *u8
+    block.len = size(T) * s.len
+    a.free(block)
+}

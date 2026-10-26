@@ -96,6 +96,18 @@ static bool push_arg(CtDa *args, const char *arg) {
     return ct_da_push(args, &arg);
 }
 
+/* Clang also warns when an extern fopen/fread/fwrite is missing stdio.h.
+   Generated C does not include that header. */
+static bool push_builtin_flags(CtDa *args, const char *compiler) {
+    if (!push_arg(args, mismatch_flag(compiler))) {
+        return false;
+    }
+    if (base_contains(compiler, "clang") && !push_arg(args, "-Wno-builtin-requires-header")) {
+        return false;
+    }
+    return true;
+}
+
 static bool push_mode_flags(CtDa *args, JogBuildMode mode) {
     switch (mode) {
     case JOG_BUILD_DEBUG:
@@ -661,7 +673,7 @@ static bool jog_cc_build_wasm(const JogCcRequest *request, CtDiag *diag) {
     }
 
     if (!push_arg(&args, compiler) || !push_arg(&args, "--target=wasm32-unknown-unknown") || !push_arg(&args, "-std=gnu17") ||
-        !push_mode_flags(&args, request->mode) || !push_arg(&args, mismatch_flag(compiler)) ||
+        !push_mode_flags(&args, request->mode) || !push_builtin_flags(&args, compiler) ||
         !push_arg(&args, "-ffreestanding") || !push_arg(&args, "-fno-builtin") || !push_arg(&args, "-nostdlib") ||
         !push_arg(&args, "-I") || !push_arg(&args, request->runtime_root) || !push_arg(&args, request->c_path) ||
         !push_arg(&args, wasm_rt) || !push_arg(&args, jogrt_main) || !push_arg(&args, "-Wl,--no-entry") ||
@@ -797,7 +809,7 @@ bool jog_cc_build(const JogCcRequest *request, CtDiag *diag) {
     }
 
     if (!push_arg(&args, compiler) || !push_arg(&args, "-std=gnu17") || !push_mode_flags(&args, request->mode) ||
-        !push_arg(&args, mismatch_flag(compiler)) || !push_arg(&args, "-I") || !push_arg(&args, request->runtime_root) ||
+        !push_builtin_flags(&args, compiler) || !push_arg(&args, "-I") || !push_arg(&args, request->runtime_root) ||
         !push_arg(&args, request->c_path) || !push_arg(&args, jogrt_c) || !push_arg(&args, jogrt_sched) ||
         !push_arg(&args, jogrt_switch) || !push_arg(&args, jogrt_main) ||
         !push_arg(&args, "-o") || !push_arg(&args, request->exe_path)) {

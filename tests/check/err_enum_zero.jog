@@ -1,0 +1,5 @@
+enum Color: u8 { Red = 1, Green, Blue }
+
+var c: Color
+
+// error: variable 'c' must be initialized

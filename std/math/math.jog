@@ -1,0 +1,9 @@
+import std.c
+
+@link("m")
+extern {
+    fn floor(x: f64): f64
+    fn ceil(x: f64): f64
+    fn log2(x: f64): f64
+    fn exp2(x: f64): f64
+}

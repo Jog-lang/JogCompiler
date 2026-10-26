@@ -1,0 +1,23 @@
+// expect: ok
+
+extern {
+    fn puts(s: *const i8): i32
+}
+
+struct Vec2 {
+    op: i32
+}
+
+fn Vec2.op+(o: Vec2): Vec2 = Vec2(op: self.op + o.op)
+
+fn id(op: i32): i32 {
+    return op
+}
+
+fn main() {
+    var op: i32 = 2
+    var a = Vec2(op: 4)
+    if a.op == 4 && id(op) == 2 {
+        puts(c"ok")
+    }
+}

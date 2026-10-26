@@ -128,9 +128,42 @@ static bool same_type(const JogType *a, const JogType *b) {
 }
 
 /* bytes converts to const bytes, which is str. The header is the same
-   pointer and length. The reverse is not implicit. */
+   pointer and length. The reverse is not implicit. []T converts to
+   []const T the same way when the element type matches. []u8 and
+   []const u8 convert to str the same way; bytes and []u8 stay different
+   types. */
 static bool bytes_to_const(const JogType *got, const JogType *want) {
     return got && want && got->kind == JOG_TY_BYTES && want->kind == JOG_TY_BYTES && !got->is_const && want->is_const;
+}
+
+static bool is_u8_type(const JogType *type) {
+    return type && type->kind == JOG_TY_INT && !type->as.integer.is_signed && type->as.integer.bits == 8 &&
+           !type->as.integer.is_size;
+}
+
+static bool u8_slice_to_str(const JogType *got, const JogType *want) {
+    const JogType *elem;
+    if (!got || !want || got->kind != JOG_TY_SLICE || want->kind != JOG_TY_BYTES || !want->is_const) {
+        return false;
+    }
+    elem = got->as.elem.elem;
+    if (elem && elem->kind == JOG_TY_DISTINCT) {
+        elem = jog_type_underlying((JogType *)elem);
+    }
+    return is_u8_type(elem);
+}
+
+static bool slice_to_const(const JogType *got, const JogType *want) {
+    return got && want && got->kind == JOG_TY_SLICE && want->kind == JOG_TY_SLICE && !got->is_const && want->is_const &&
+           got->as.elem.elem && got->as.elem.elem == want->as.elem.elem;
+}
+
+/* bytes[N] as T, and T as bytes[N], when N is size(T). Unchecked reinterpret. */
+static bool bytes_n_reinterpret(const JogType *got, const JogType *want) {
+    if (!got || !want || !got->has_layout || !want->has_layout || got->size == 0 || got->size != want->size) {
+        return false;
+    }
+    return got->kind == JOG_TY_BYTES_N || want->kind == JOG_TY_BYTES_N;
 }
 
 static bool is_arith_op(JogTokenKind op) {
@@ -988,6 +1021,44 @@ static JogType *operand_type(Env *env, JogNode *node) {
     return check_expr(env, node, NULL);
 }
 
+/* == and != on an enum when every payload is bool, an integer, a float,
+   bytes or str, or another comparable enum. A struct, slice, pointer, or
+   option payload is not comparable. Tag 0 is unrelated: it is the zero
+   value, checked by jog_enum_has_zero. */
+static bool enum_eq_ok(const JogType *type, int depth) {
+    size_t i;
+    if (!type || depth > 8 || type->kind != JOG_TY_ENUM) {
+        return false;
+    }
+    for (i = 0; i < type->as.nominal.variant_count; i++) {
+        const JogVariant *variant = type->as.nominal.variants ? &type->as.nominal.variants[i] : NULL;
+        size_t f;
+        if (!variant) {
+            return false;
+        }
+        for (f = 0; f < variant->field_count; f++) {
+            JogType *field = variant->fields ? variant->fields[f].type : NULL;
+            JogType *underlying;
+            if (!field) {
+                return false;
+            }
+            underlying = jog_type_underlying(field);
+            if (!underlying || underlying->kind == JOG_TY_UNIT) {
+                continue;
+            }
+            if (underlying->kind == JOG_TY_BOOL || underlying->kind == JOG_TY_INT || underlying->kind == JOG_TY_FLOAT ||
+                underlying->kind == JOG_TY_BYTES) {
+                continue;
+            }
+            if (underlying->kind == JOG_TY_ENUM && enum_eq_ok(underlying, depth + 1)) {
+                continue;
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
 static JogType *check_binary(Env *env, JogNode *node) {
     JogTokenKind op = node->as.binary.op;
     JogNode *lhs = node->as.binary.lhs;
@@ -1101,6 +1172,22 @@ static JogType *check_binary(Env *env, JogNode *node) {
             return cmp;
         }
     }
+    /* A char literal adapts to the integer it is compared or combined with,
+       the same way an assignment `val x: u8 = 'a'` already does. */
+    if (lhs && lhs->kind == JOG_NODE_CHAR_LIT && rt->kind == JOG_TY_INT && lt->kind == JOG_TY_INT && lt != rt) {
+        lt = type_char(env, lhs, rt);
+    }
+    if (rhs && rhs->kind == JOG_NODE_CHAR_LIT && lt && lt->kind == JOG_TY_INT && rt->kind == JOG_TY_INT && rt != lt) {
+        rt = type_char(env, rhs, lt);
+    }
+    if (!lt || !rt || env->ck->stop) {
+        return NULL;
+    }
+    if (is_error(lt) || is_error(rt)) {
+        error = jog_check_error_type(env->ck);
+        node->type = error;
+        return error;
+    }
     if (!same_type(lt, rt)) {
         fail_types(env->ck, node->pos, "mismatched types", lt, rt);
         error = jog_check_error_type(env->ck);
@@ -1116,6 +1203,14 @@ static JogType *check_binary(Env *env, JogNode *node) {
         }
         node->type = boolean;
         return boolean;
+    }
+    if (is_eq_op(op)) {
+        JogType *lu = jog_type_underlying(lt);
+        JogType *ru = jog_type_underlying(rt);
+        if (lu && ru && lu == ru && lu->kind == JOG_TY_ENUM && enum_eq_ok(lu, 0)) {
+            node->type = boolean;
+            return boolean;
+        }
     }
     if (lt->kind == JOG_TY_INT && (compare || is_arith_op(op))) {
         node->type = compare ? boolean : lt;
@@ -1165,7 +1260,11 @@ static JogType *expect_type(Env *env, JogNode *node, JogType *got, JogType *want
             return replaced;
         }
     }
-    if (bytes_to_const(got, want)) {
+    if (bytes_to_const(got, want) || slice_to_const(got, want) || u8_slice_to_str(got, want)) {
+        node->type = want;
+        return want;
+    }
+    if (want->kind == JOG_TY_OPTION && want->as.elem.elem && same_type(got, want->as.elem.elem)) {
         node->type = want;
         return want;
     }
@@ -1394,9 +1493,118 @@ static JogType *size_type_arg(Env *env, JogNode *node, const char *what) {
             return type;
         }
     }
+    if (node->kind == JOG_NODE_UNARY && node->as.unary.op == JOG_TOK_STAR) {
+        JogType *elem = size_type_arg(env, node->as.unary.operand, what);
+        JogType *built;
+        if (!elem) {
+            return NULL;
+        }
+        if (elem->kind == JOG_TY_ERROR) {
+            node->type = elem;
+            return elem;
+        }
+        built = jog_type_ptr(env->ck->program->types, elem, false);
+        if (!built) {
+            jog_check_oom(env->ck);
+            return NULL;
+        }
+        node->type = built;
+        return built;
+    }
+    if (node->kind == JOG_NODE_TYPE_OPTION) {
+        JogType *elem = size_type_arg(env, node->as.type_elem.elem, what);
+        JogType *built;
+        if (!elem) {
+            return NULL;
+        }
+        if (elem->kind == JOG_TY_ERROR) {
+            node->type = elem;
+            return elem;
+        }
+        built = jog_type_option(env->ck->program->types, elem);
+        if (!built) {
+            jog_check_oom(env->ck);
+            return NULL;
+        }
+        node->type = built;
+        return built;
+    }
+    if (node->kind == JOG_NODE_TYPE_NAME || node->kind == JOG_NODE_TYPE_PTR || node->kind == JOG_NODE_TYPE_SLICE ||
+        node->kind == JOG_NODE_TYPE_ARRAY || node->kind == JOG_NODE_TYPE_BYTES || node->kind == JOG_NODE_TYPE_FN ||
+        node->kind == JOG_NODE_TYPE_TUPLE || node->kind == JOG_NODE_TYPE_UNIT) {
+        JogType *type = jog_check_resolve_type(env->ck, env->job, node);
+        if (!type) {
+            return NULL;
+        }
+        node->type = type;
+        return type;
+    }
     jog_check_fail(env->ck, node->pos, "%s expects a type", what);
     node->type = error;
     return error;
+}
+
+/* wrappingAdd, wrappingSub, and wrappingMul on an integer. Checked
+   arithmetic panics; these wrap modulo 2^n. 1 when this call is one of
+   them, 0 when the name is something else, -1 when the checker stopped. */
+static bool wrapping_name(const char *name) {
+    return name && (strcmp(name, "wrappingAdd") == 0 || strcmp(name, "wrappingSub") == 0 ||
+                    strcmp(name, "wrappingMul") == 0);
+}
+
+static int check_wrapping_call(Env *env, JogNode *call) {
+    JogNode *callee;
+    JogNode *base;
+    JogNode *arg;
+    JogNode *value;
+    JogType *ty;
+    JogType *got;
+    JogType *error;
+    const char *name;
+    if (!env || !call || call->kind != JOG_NODE_CALL) {
+        return 0;
+    }
+    callee = call->as.call.callee;
+    if (!callee || callee->kind != JOG_NODE_MEMBER || callee->as.member.safe) {
+        return 0;
+    }
+    name = callee->as.member.name;
+    if (!wrapping_name(name)) {
+        return 0;
+    }
+    base = callee->as.member.base;
+    ty = base && base->type ? jog_type_underlying(base->type) : NULL;
+    if (!ty || ty->kind != JOG_TY_INT) {
+        return 0;
+    }
+    error = jog_check_error_type(env->ck);
+    if (call->as.call.trailing || call->as.call.contexts.count > 0 || call->as.call.args.count != 1) {
+        jog_check_fail(env->ck, call->pos, "%s expects 1 argument", name);
+        call->type = error;
+        return 1;
+    }
+    arg = list_at(call->as.call.args, 0);
+    if (arg && arg->kind == JOG_NODE_ARG && arg->as.arg.name) {
+        jog_check_fail(env->ck, call->pos, "%s expects 1 argument", name);
+        call->type = error;
+        return 1;
+    }
+    value = arg && arg->kind == JOG_NODE_ARG ? arg->as.arg.value : arg;
+    got = check_expr(env, value, ty);
+    if (env->ck->stop) {
+        return -1;
+    }
+    if (!got || is_error(got)) {
+        call->type = error;
+        return 1;
+    }
+    if (!same_type(got, ty)) {
+        jog_check_fail(env->ck, call->pos, "%s expects 1 argument", name);
+        call->type = error;
+        return 1;
+    }
+    call->type = ty;
+    return 1;
 }
 
 /* 1 when call is the builtin named by which ("size" or "align"). 0 when
@@ -1543,6 +1751,28 @@ static JogType *check_call(Env *env, JogNode *node) {
         }
         if (str_call > 0) {
             return node->type;
+        }
+    }
+    {
+        int wrapped = check_wrapping_call(env, node);
+        if (wrapped < 0) {
+            return NULL;
+        }
+        if (wrapped > 0) {
+            return node->type;
+        }
+    }
+    if (target && target->kind == JOG_NODE_MEMBER && target->as.member.name && target->as.member.base &&
+        target->as.member.base->type) {
+        JogType *outer = jog_type_underlying(target->as.member.base->type);
+        if (outer && outer->kind == JOG_TY_PTR) {
+            outer = jog_type_underlying(outer->as.elem.elem);
+        }
+        if (outer && (outer->kind == JOG_TY_STRUCT || outer->kind == JOG_TY_ENUM || outer->kind == JOG_TY_DISTINCT)) {
+            error = jog_check_error_type(env->ck);
+            jog_check_fail(env->ck, node->pos, "undefined method '%s'", target->as.member.name);
+            node->type = error;
+            return error;
         }
     }
     callee = check_expr(env, target, NULL);
@@ -1818,7 +2048,8 @@ static JogType *check_cast(Env *env, JogNode *node) {
         node->type = dest;
         return dest;
     }
-    if (bytes_to_const(got, dest)) {
+    if (bytes_to_const(got, dest) || slice_to_const(got, dest) || u8_slice_to_str(got, dest) ||
+        bytes_n_reinterpret(got, dest)) {
         node->type = dest;
         return dest;
     }
@@ -2627,46 +2858,80 @@ static void check_stmt_raw(Env *env, JogNode *stmt) {
     }
 }
 
+/* One level only. i32 converts to i32?, and the literal is folded as i32.
+   i32 does not convert to i32??, so an option element is left alone. */
+static JogType *literal_target(JogType *target) {
+    JogType *elem;
+    if (!target || target->kind != JOG_TY_OPTION) {
+        return target;
+    }
+    elem = target->as.elem.elem;
+    if (!elem) {
+        return target;
+    }
+    if (elem->kind == JOG_TY_INT || elem->kind == JOG_TY_FLOAT || elem->kind == JOG_TY_BOOL ||
+        elem->kind == JOG_TY_UNTYPED_INT || elem->kind == JOG_TY_UNTYPED_FLOAT) {
+        return elem;
+    }
+    return target;
+}
+
 static JogType *check_expr_raw(Env *env, JogNode *node, JogType *target) {
     JogType *got = NULL;
     if (!node || env->ck->stop) {
         return NULL;
     }
     if (is_bool_lit_tree(node)) {
-        if (target && !is_error(target) && target->kind != JOG_TY_BOOL) {
-            got = fold_const(env->ck, node, target);
+        JogType *fold = literal_target(target);
+        if (fold && !is_error(fold) && fold->kind != JOG_TY_BOOL) {
+            got = fold_const(env->ck, node, fold);
         } else {
             got = fold_const(env->ck, node, NULL);
         }
-        if (got) {
-            node->type = got;
+        if (!got || env->ck->stop || is_error(got)) {
+            if (got) {
+                node->type = got;
+            }
+            return got;
         }
-        return got;
+        node->type = got;
+        return expect_type(env, node, got, target);
     }
     if (is_int_lit_tree(node)) {
-        if (target && target->kind == JOG_TY_INT) {
-            got = fold_const(env->ck, node, target);
-        } else if (target && !is_error(target) && target->kind != JOG_TY_UNTYPED_INT) {
-            got = fold_const(env->ck, node, target);
+        JogType *fold = literal_target(target);
+        if (fold && fold->kind == JOG_TY_INT) {
+            got = fold_const(env->ck, node, fold);
+        } else if (fold && !is_error(fold) && fold->kind != JOG_TY_UNTYPED_INT) {
+            got = fold_const(env->ck, node, fold);
         } else {
             got = fold_const(env->ck, node, NULL);
         }
-        if (got) {
-            node->type = got;
+        if (!got || env->ck->stop || is_error(got)) {
+            if (got) {
+                node->type = got;
+            }
+            return got;
         }
-        return got;
+        node->type = got;
+        return expect_type(env, node, got, target);
     }
     if (jog_float_lit_tree(node)) {
-        if (target && target->kind == JOG_TY_FLOAT) {
-            got = type_float_tree(env, node, target);
-        } else if (target && !is_error(target) && target->kind != JOG_TY_UNTYPED_FLOAT) {
+        JogType *fold = literal_target(target);
+        if (fold && fold->kind == JOG_TY_FLOAT) {
+            got = type_float_tree(env, node, fold);
+        } else if (fold && !is_error(fold) && fold->kind != JOG_TY_UNTYPED_FLOAT) {
             jog_check_fail(env->ck, node->pos, "constant does not fit");
             got = jog_check_error_type(env->ck);
             node->type = got;
+            return got;
         } else {
             got = type_float_tree(env, node, NULL);
         }
-        return got;
+        if (!got || env->ck->stop || is_error(got)) {
+            return got;
+        }
+        node->type = got;
+        return expect_type(env, node, got, target);
     }
     switch (node->kind) {
     case JOG_NODE_IDENT:
@@ -2702,7 +2967,7 @@ static JogType *check_expr_raw(Env *env, JogNode *node, JogType *target) {
         got = check_binary(env, node);
         break;
     case JOG_NODE_CALL: {
-        int en = jog_check_enum_call(env->ck, env->job, env->scope, node, &got);
+        int en = jog_check_enum_call(env->ck, env->job, env->scope, node, target, &got);
         int panic;
         if (en < 0 || env->ck->stop) {
             return NULL;

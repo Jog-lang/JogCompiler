@@ -237,6 +237,7 @@ static bool wait_for_symbol(Check *ck, CheckJob *self, JogSymbol *symbol, bool u
 
 static JogSymbol *lookup_in_file(const CheckJob *job, const char *name) {
     JogPackageScope *scope;
+    JogSymbol *found;
     if (!job->package || !name) {
         return NULL;
     }
@@ -244,7 +245,11 @@ static JogSymbol *lookup_in_file(const CheckJob *job, const char *name) {
     if (!scope) {
         return NULL;
     }
-    return jog_file_lookup(scope, job->file_index, name);
+    found = jog_file_lookup(scope, job->file_index, name);
+    if (found && found->kind == JOG_SYM_PACKAGE) {
+        found->referenced = true;
+    }
+    return found;
 }
 
 static JogSymbol *lookup_binding(const CheckJob *job, const char *name) {
@@ -468,6 +473,37 @@ static JogType *resolve_type_name(Check *ck, CheckJob *self, JogNode *node) {
         if (param) {
             node->type = param;
             return param;
+        }
+    }
+    if (node->as.type_name.path.count == 1 && node->as.type_name.path.items && node->as.type_name.path.items[0] &&
+        strcmp(node->as.type_name.path.items[0], "Option") == 0) {
+        JogSymbol *existing = self ? lookup_in_file(self, "Option") : NULL;
+        if (!existing || existing->kind != JOG_SYM_TYPE) {
+            JogType *elem;
+            JogType *built;
+            JogNode *arg;
+            error = error_type(ck);
+            if (node->as.type_name.args.count != 1) {
+                jog_check_fail(ck, node->pos, "Option takes one type argument");
+                node->type = error;
+                return error;
+            }
+            arg = node->as.type_name.args.items ? node->as.type_name.args.items[0] : NULL;
+            elem = resolve_type(ck, self, arg);
+            if (!elem || ck->stop) {
+                return NULL;
+            }
+            if (elem->kind == JOG_TY_ERROR) {
+                node->type = error;
+                return error;
+            }
+            built = jog_type_option(ck->program->types, elem);
+            if (!built) {
+                jog_check_fail(ck, node->pos, "out of memory");
+                return NULL;
+            }
+            node->type = built;
+            return built;
         }
     }
     symbol = lookup_type_path(ck, self, node->as.type_name.path, node->pos, label);
@@ -1668,6 +1704,38 @@ JogSymbol *jog_check_lookup_file(const CheckJob *job, const char *name) {
     return lookup_in_file(job, name);
 }
 
+/* An import the file never names. A failed import has no symbol and
+   already reported why. A parameter that hides the name marks it used. */
+static void report_unused_imports(Check *ck) {
+    size_t p;
+    size_t f;
+    size_t i;
+    if (!ck || !ck->program) {
+        return;
+    }
+    for (p = 0; p < ck->program->package_count; p++) {
+        JogPackage *pkg = ck->program->packages ? ck->program->packages[p] : NULL;
+        if (!pkg) {
+            continue;
+        }
+        for (f = 0; f < pkg->file_count; f++) {
+            JogSourceFile *source = pkg->files ? pkg->files[f] : NULL;
+            JogNode *file = source ? source->ast : NULL;
+            if (!file || file->kind != JOG_NODE_FILE) {
+                continue;
+            }
+            for (i = 0; i < file->as.file.imports.count; i++) {
+                JogNode *import = file->as.file.imports.items ? file->as.file.imports.items[i] : NULL;
+                JogSymbol *sym = import ? import->symbol : NULL;
+                if (!sym || sym->kind != JOG_SYM_PACKAGE || sym->referenced) {
+                    continue;
+                }
+                fail(ck, import->pos, "unused import '%s'", sym->name ? sym->name : "?");
+            }
+        }
+    }
+}
+
 bool jog_check(JogProgram *program) {
     JogPackageScope *universe;
     Check ck;
@@ -1701,6 +1769,9 @@ bool jog_check(JogProgram *program) {
     }
     if (!ck.failed && !ck.stop) {
         jog_check_package_tests(&ck);
+    }
+    if (!ck.stop) {
+        report_unused_imports(&ck);
     }
     jog_check_context_cleanup(&ck);
     return !ck.failed;

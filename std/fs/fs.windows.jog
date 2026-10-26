@@ -1,7 +1,7 @@
-// Windows list. WIN32_FIND_DATAA is 320 bytes on this host. cFileName
-// is CHAR[260] at byte 44. FindFirstFileA writes that layout into the
-// buffer. list rejects a path that does not leave room for a separator,
-// '*', and NUL in a 4096-byte buffer.
+// Windows list, rename, exists, and cwd. WIN32_FIND_DATAW is 592 bytes
+// on this host. cFileName is WCHAR[260] at byte 44. Paths are UTF-16.
+// list rejects a path that does not leave room for a separator, '*',
+// and NUL in a 4096-character buffer.
 
 import std.c
 import std.list as lists
@@ -10,45 +10,111 @@ import std.mem
 private val name_offset: usize = 44
 private val name_cap: usize = 260
 
+private fn wide_len(p: *u16, cap: usize): usize {
+    var i: usize = 0
+    for i < cap {
+        if p[i] == 0 {
+            return i
+        }
+        i = i + 1
+    }
+    return cap
+}
+
+private fn is_wide_sep(ch: u16): bool {
+    return ch == '/' as u16 || ch == '\\' as u16
+}
+
 // Writes path, a separator when path does not end with one, '*', and NUL.
-// false means the path is empty or does not fit.
-private fn fill_pattern(dest: *u8, cap: usize, path: str): bool {
-    if path.len == 0 || path.len >= cap || cap - path.len < 3 {
+// false means the path is empty, not UTF-8, or does not fit.
+private fn fill_pattern(dest: *u16, cap: usize, path: str): bool {
+    if path.len == 0 || !c.utf8_to_wide(path, dest, cap) {
         return false
     }
-    c.memcpy(dest as *void, path.ptr as *const void, path.len)
-    var at = path.len
-    if !is_sep(path.ptr[path.len - 1]) {
-        dest[at] = '/' as u8
+    var at = wide_len(dest, cap)
+    if at + 3 > cap {
+        return false
+    }
+    if at == 0 || !is_wide_sep(dest[at - 1]) {
+        dest[at] = '/' as u16
         at = at + 1
     }
-    dest[at] = '*' as u8
+    dest[at] = '*' as u16
     at = at + 1
     dest[at] = 0
     return true
+}
+
+private fn wide_path(path: str, dest: *u16, cap: usize): bool {
+    if path.len == 0 {
+        return false
+    }
+    return c.utf8_to_wide(path, dest, cap)
 }
 
 // false means the directory could not be opened. The list is empty then.
 // Each kept name is its own block. free_names releases them.
 fn list(path: str): (lists.List<str>, bool) with (a: mem.Allocator) {
     var names: lists.List<str>
-    var pattern: [4096]u8
+    var pattern: [4096]u16
     if !fill_pattern(pattern[..].ptr, 4096, path) {
         return names, false
     }
-    var data: [320]u8
-    val handle = c.FindFirstFileA(pattern[..].ptr as *const c.char, data[..].ptr)
+    var data: [592]u8
+    val handle = c.FindFirstFileW(pattern[..].ptr, data[..].ptr)
     if handle == -1 {
         return names, false
     }
     for {
-        val name_ptr = data[..].ptr + name_offset
-        push_copied(&names, name_ptr, cstr_len(name_ptr, name_cap))
-        if c.FindNextFileA(handle, data[..].ptr) == 0 {
+        val name_w = (data[..].ptr + name_offset) as *u16
+        val nchars = wide_len(name_w, name_cap)
+        var utf: [780]u8
+        val nbytes = c.wide_to_utf8(name_w, nchars, utf[..].ptr, 780)
+        if nchars == 0 || nbytes > 0 {
+            push_copied(&names, utf[..].ptr, nbytes)
+        }
+        if c.FindNextFileW(handle, data[..].ptr) == 0 {
             break
         }
     }
     c.FindClose(handle)
     sort_names(&names)
     return names, true
+}
+
+// flags 0: an existing target is left untouched and this returns false.
+fn rename(from: str, to: str): bool {
+    var wide_from: [4096]u16
+    var wide_to: [4096]u16
+    if !wide_path(from, wide_from[..].ptr, 4096) || !wide_path(to, wide_to[..].ptr, 4096) {
+        return false
+    }
+    return c.MoveFileExW(wide_from[..].ptr, wide_to[..].ptr, 0) != 0
+}
+
+// false means the path is missing, not UTF-8, or does not fit.
+fn exists(path: str): bool {
+    var wide: [4096]u16
+    if !wide_path(path, wide[..].ptr, 4096) {
+        return false
+    }
+    return c.GetFileAttributesW(wide[..].ptr) != 4294967295 as c.unsigned_long
+}
+
+// The current directory, as an owned UTF-8 str. false leaves it empty.
+fn cwd(): (str, bool) with (a: mem.Allocator) {
+    var wide: [4096]u16
+    val n = c.GetCurrentDirectoryW(4096, wide[..].ptr)
+    if n == 0 || n >= 4096 {
+        return "", false
+    }
+    var raw: [12288]u8
+    val nbytes = c.wide_to_utf8(wide[..].ptr, n as usize, raw[..].ptr, 12288)
+    if nbytes == 0 {
+        return "", false
+    }
+    var view = bytes()
+    view.ptr = raw[..].ptr
+    view.len = nbytes
+    return copy_str(view), true
 }

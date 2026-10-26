@@ -873,6 +873,22 @@ static int exec_binary(Interp *ip, Frame *fr, const JirInst *inst) {
             panic_msg(ip, inst->pos, "overflow");
             return 0;
         }
+        if (checked && op == JIR_SHL && sh > 0 && sh < width) {
+            int drop = 0;
+            unsigned n = (unsigned)sh;
+            if (!sgn) {
+                drop = (ua >> (width - n)) != 0;
+            } else {
+                uint64_t mask_bits = (n + 1u >= width) ? mask_of(width) : ((1ull << (n + 1u)) - 1ull);
+                uint64_t top = ua >> (width - 1u - n);
+                uint64_t sign = (ua >> (width - 1u)) & 1ull;
+                drop = (top & mask_bits) != (sign ? mask_bits : 0ull);
+            }
+            if (drop) {
+                panic_msg(ip, inst->pos, "overflow");
+                return 0;
+            }
+        }
         if (neg || width == 0 || sh >= 64 || sh >= width) {
             if (op == JIR_SHR && sgn && width > 0 && (ua & ((uint64_t)1 << (width - 1)))) {
                 out = mask_of(width);

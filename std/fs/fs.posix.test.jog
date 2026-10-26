@@ -15,7 +15,7 @@ private fn cstr_ok(path: str, buf: *u8, cap: usize): bool {
     return true
 }
 
-private fn make_dir(path: str): bool {
+fn make_dir(path: str): bool {
     var buf: [4096]u8
     if !cstr_ok(path, buf[..].ptr, 4096) {
         return false
@@ -54,6 +54,8 @@ private fn wipe(dir: str) with (a: mem.Allocator) {
     remove_child(dir, "c")
     remove_child(dir, "m")
     remove_child(dir, "hello.txt")
+    remove_child(dir, "old.txt")
+    remove_child(dir, "new.txt")
     remove_child(dir, "nul.bin")
     val sub = join(dir, "sub")
     remove_child(sub, "f.txt")
@@ -64,18 +66,18 @@ private fn wipe(dir: str) with (a: mem.Allocator) {
     remove_dir(dir)
 }
 
-private fn scratch(name: str): str with (a: mem.Allocator) {
+fn scratch(name: str): str with (a: mem.Allocator) {
     val dir = join("/tmp", name)
     wipe(dir)
     return dir
 }
 
-private fn close_dir(dir: str) with (a: mem.Allocator) {
+fn close_dir(dir: str) with (a: mem.Allocator) {
     wipe(dir)
     free_str(dir)
 }
 
-private fn put(dir: str, name: str, text: str): bool with (a: mem.Allocator) {
+fn put(dir: str, name: str, text: str): bool with (a: mem.Allocator) {
     val path = join(dir, name)
     var data = bytes()
     data.ptr = text.ptr as *u8
@@ -85,7 +87,7 @@ private fn put(dir: str, name: str, text: str): bool with (a: mem.Allocator) {
     return wrote
 }
 
-private fn mkdir_at(dir: str, name: str): bool with (a: mem.Allocator) {
+fn mkdir_at(dir: str, name: str): bool with (a: mem.Allocator) {
     val path = join(dir, name)
     val made = make_dir(path)
     free_str(path)

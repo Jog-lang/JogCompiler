@@ -11,7 +11,7 @@ fn f2 export c_entry "app.entry": () -> i32  ; link.jog:13:1
 b0 entry:
   ret i32 2  ; link.jog:14:5
 
-fn f3 internal jog_app__hidden "app.hidden": () -> i32  ; link.jog:17:9
+fn f3 internal jog_app__hidden__link_jog "app.hidden": () -> i32  ; link.jog:17:9
 b0 entry:
   ret i32 3  ; link.jog:18:5
 

@@ -247,6 +247,20 @@ fn structElements() with (t: testing.Testing) {
 }
 
 @test
+fn atMutates() with (t: testing.Testing) {
+    var xs = empty<Item>()
+    with (mem.heap()) {
+        var item: Item
+        item.n = 1
+        xs.push(item)
+        val p = xs.at(0)
+        p.n = 9
+        t.expect(xs.get(0).n == 9)
+        xs.free()
+    }
+}
+
+@test
 fn panicUse() with (t: testing.Testing) {
     var xs = empty<i32>()
     t.expectPanic(() -> { xs.pop() })

@@ -1,4 +1,4 @@
-private fn answer(): i64 {
+fn answer(): i64 {
     return 4
 }
 

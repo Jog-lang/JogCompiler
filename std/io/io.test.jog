@@ -18,7 +18,7 @@ import std.os
 import std.proc
 import std.testing
 
-private fn child_gate() {
+fn child_gate() {
     if os.argc() < 2 {
         return
     }
@@ -48,7 +48,7 @@ private fn child_gate() {
     }
 }
 
-private fn run_child(flag: str): proc.Output with (a: mem.Allocator) {
+fn run_child(flag: str): proc.Output with (a: mem.Allocator) {
     return proc.run([]str(os.argv(0), flag))
 }
 

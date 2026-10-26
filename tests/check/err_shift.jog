@@ -1,0 +1,7 @@
+fn main() {
+    val bad: u32 = 0xFFFFFFFF << 1
+    val also: i32 = 1 << 31
+}
+
+// error: integer overflow
+// error: integer overflow

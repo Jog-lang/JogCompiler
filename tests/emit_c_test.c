@@ -1606,6 +1606,7 @@ static const char k_harness[] =
     "        return 0;\n"
     "    }\n"
     "    if (strcmp(mode, \"overflow\") == 0) { (void)jog__overflow(); return 2; }\n"
+    "    if (strcmp(mode, \"shldrop\") == 0) { (void)jog__shldrop(); return 2; }\n"
     "    if (strcmp(mode, \"div0\") == 0) { (void)jog__div0(); return 2; }\n"
     "    if (strcmp(mode, \"bounds\") == 0) { printf(\"%d\\n\", (int)jog__bounds_bad()); return 0; }\n"
     "    if (strcmp(mode, \"null\") == 0) { (void)jog__null_bad(); return 2; }\n"
@@ -2314,6 +2315,19 @@ static void test_execute(void) {
         ret_local(f, block, dst);
     }
     {
+        JogType *fn = fn_of(&env, NULL, 0, u32, false);
+        JirFunc *f = add_fn(&env, "jog__shldrop", fn, JIR_LINK_INTERNAL, NULL);
+        uint32_t block = jir_block_add(f, NULL);
+        uint32_t dst = jir_local_add(f, NULL, u32);
+        JirInst *in = jir_emit(f, block, JIR_BINARY, (int32_t)dst);
+        in->aux = JIR_SHL;
+        in->checked = true;
+        in->a = jir_int(u32, 0xffffffffu);
+        in->b = jir_int(u32, 1);
+        in->pos = pos_at("sh.jog", 4);
+        ret_local(f, block, dst);
+    }
+    {
         JogType *fn = fn_of(&env, NULL, 0, i32, false);
         JirFunc *f = add_fn(&env, "jog__div0", fn, JIR_LINK_INTERNAL, NULL);
         uint32_t block = jir_block_add(f, NULL);
@@ -2463,6 +2477,7 @@ static void test_execute(void) {
             if (i == 0) {
                 expect_run(debug_exe, "ok", 0, k_ok_out, "");
                 expect_run(debug_exe, "overflow", 1, "", "panic: integer overflow\n  at ov.jog:8\n");
+                expect_run(debug_exe, "shldrop", 1, "", "panic: integer overflow\n  at sh.jog:4\n");
                 expect_run(debug_exe, "div0", 1, "", "panic: division by zero\n  at div.jog:4\n");
                 expect_run(debug_exe, "bounds", 1, "", "panic: index 3 out of bounds for length 3\n  at b.jog:5\n");
                 expect_run(debug_exe, "null", 1, "", "panic: null pointer\n  at n.jog:6\n");
@@ -2481,6 +2496,7 @@ static void test_execute(void) {
                 expect_run(fast_exe, "ok", 0, k_ok_out, "");
                 expect_run(fast_exe, "bounds", 0, "7\n", "");
                 expect_run(fast_exe, "overflow", 1, "", "panic: integer overflow\n  at ov.jog:8\n");
+                expect_run(fast_exe, "shldrop", 1, "", "panic: integer overflow\n  at sh.jog:4\n");
             }
         }
         CHECK(debug_built);

@@ -370,16 +370,26 @@ static const char *mangle_fn(Lower *L, const JogPackage *pkg, JogNode *fn) {
     }
     piece = method_spell(fn->as.fn.name);
     append_c_piece(&sb, piece);
+    /* File-local names may repeat in one package. The C file is one
+       translation unit, so the declaring file keeps the symbols apart. */
+    if (fn->visibility == JOG_VIS_FILE && fn->pos.file && fn->pos.file[0] != '\0') {
+        ct_sb_append_cstr(&sb, "__");
+        append_c_piece(&sb, fn->pos.file);
+    }
     return dup_sb(L, &sb);
 }
 
-static const char *mangle_global(Lower *L, const JogPackage *pkg, const char *name) {
+static const char *mangle_global(Lower *L, const JogPackage *pkg, JogNode *node, const char *name) {
     CtSb sb;
     ct_sb_init(&sb);
     ct_sb_append_cstr(&sb, "jog_");
     append_c_piece(&sb, pkg_source(L, pkg));
     ct_sb_append_cstr(&sb, "__");
     append_c_piece(&sb, name && name[0] != '\0' ? name : "global");
+    if (node && node->visibility == JOG_VIS_FILE && node->pos.file && node->pos.file[0] != '\0') {
+        ct_sb_append_cstr(&sb, "__");
+        append_c_piece(&sb, node->pos.file);
+    }
     return dup_sb(L, &sb);
 }
 
@@ -785,12 +795,19 @@ static const char *float_lit_msg(JogFloatLitStatus st) {
 
 static bool try_fold(Lower *L, JogNode *node, JirOperand *out) {
     JogConst value;
-    if (node && jog_float_lit_tree(node) && node->type &&
-        (node->type->kind == JOG_TY_FLOAT || node->type->kind == JOG_TY_UNTYPED_FLOAT)) {
+    JogType *saved_ty = node ? node->type : NULL;
+    JogType *fold_ty = saved_ty;
+    /* A literal wrapped into T? is still the element's constant. */
+    if (fold_ty && fold_ty->kind == JOG_TY_OPTION && fold_ty->as.elem.elem && node &&
+        (is_int_lit_tree(node) || is_bool_lit_tree(node) || jog_float_lit_tree(node))) {
+        fold_ty = fold_ty->as.elem.elem;
+    }
+    if (node && jog_float_lit_tree(node) && fold_ty &&
+        (fold_ty->kind == JOG_TY_FLOAT || fold_ty->kind == JOG_TY_UNTYPED_FLOAT)) {
         double fvalue = 0.0;
-        unsigned bits = node->type->kind == JOG_TY_FLOAT && node->type->as.flt.bits == 32 ? 32 : 64;
+        unsigned bits = fold_ty->kind == JOG_TY_FLOAT && fold_ty->as.flt.bits == 32 ? 32 : 64;
         JogFloatLitStatus st = jog_float_lit_eval(node, bits, &fvalue);
-        JogType *ty = node->type->kind == JOG_TY_FLOAT ? node->type : NULL;
+        JogType *ty = fold_ty->kind == JOG_TY_FLOAT ? fold_ty : NULL;
         if (st != JOG_FLOAT_LIT_OK) {
             fail_at(L, node->pos, "%s", float_lit_msg(st));
             *out = jir_none();
@@ -805,13 +822,16 @@ static bool try_fold(Lower *L, JogNode *node, JirOperand *out) {
             return true;
         }
         *out = jir_float(ty, fvalue);
+        if (node && node->type != saved_ty && saved_ty && saved_ty->kind == JOG_TY_OPTION) {
+            node->type = saved_ty;
+        }
         return true;
     }
     if (!is_int_lit_tree(node) && !is_bool_lit_tree(node)) {
         return false;
     }
     memset(&value, 0, sizeof(value));
-    if (!jog_const_eval(L->program->arena, L->program->diag, L->program->types, node, node->type, &value) || !value.type) {
+    if (!jog_const_eval(L->program->arena, L->program->diag, L->program->types, node, fold_ty, &value) || !value.type) {
         L->failed = true;
         *out = jir_none();
         return true;
@@ -822,6 +842,9 @@ static bool try_fold(Lower *L, JogNode *node, JirOperand *out) {
         return true;
     }
     *out = jir_int(value.type, value.bits);
+    if (node && saved_ty && saved_ty->kind == JOG_TY_OPTION) {
+        node->type = saved_ty;
+    }
     return true;
 }
 
@@ -1383,6 +1406,53 @@ static bool lower_builtin_align(Lower *L, JogNode *node, JirOperand *out) {
     return lower_builtin_layout(L, node, out, "align", 1);
 }
 
+/* Unchecked integer wrap. The checker already required one same-type argument. */
+static bool lower_wrapping(Lower *L, JogNode *node, JirOperand *out) {
+    const JogNode *callee;
+    const char *name;
+    JogNode *base;
+    JogNode *arg;
+    JogNode *value;
+    JirBinOp op;
+    JirOperand lhs;
+    JirOperand rhs;
+    if (!node || node->kind != JOG_NODE_CALL || !out) {
+        return false;
+    }
+    callee = node->as.call.callee;
+    if (!callee || callee->kind != JOG_NODE_MEMBER || !callee->as.member.name) {
+        return false;
+    }
+    name = callee->as.member.name;
+    if (strcmp(name, "wrappingAdd") == 0) {
+        op = JIR_ADD;
+    } else if (strcmp(name, "wrappingSub") == 0) {
+        op = JIR_SUB;
+    } else if (strcmp(name, "wrappingMul") == 0) {
+        op = JIR_MUL;
+    } else {
+        return false;
+    }
+    *out = jir_none();
+    if (!L || L->failed) {
+        return true;
+    }
+    base = callee->as.member.base;
+    arg = node->as.call.args.count == 1 ? list_at(node->as.call.args, 0) : NULL;
+    value = arg && arg->kind == JOG_NODE_ARG ? arg->as.arg.value : arg;
+    if (!base || !value || !node->type) {
+        jog_lower_fail(L, node->pos, "wrapping call is not lowered yet");
+        return true;
+    }
+    lhs = lower_expr(L, base);
+    rhs = lower_expr(L, value);
+    if (L->failed) {
+        return true;
+    }
+    *out = emit_binop(L, op, false, lhs, rhs, node->type, node->pos);
+    return true;
+}
+
 static JirOperand lower_call(Lower *L, JogNode *node) {
     JogNode *callee_node;
     JogNode *decl;
@@ -1414,6 +1484,9 @@ static JirOperand lower_call(Lower *L, JogNode *node) {
             return sized;
         }
         if (lower_builtin_align(L, node, &sized)) {
+            return sized;
+        }
+        if (lower_wrapping(L, node, &sized)) {
             return sized;
         }
     }
@@ -1807,9 +1880,35 @@ static bool lower_option_view(Lower *L, JogNode *node, JirOperand *out) {
 }
 
 /* bytes and str are one header. Const only changes the pointer's view,
-   so this reinterprets those bits and does not copy the text. */
+   so this reinterprets those bits and does not copy the text. []T and
+   []const T are the same header when the element type matches. */
 static bool bytes_to_const_view(const JogType *got, const JogType *want) {
     return got && want && got->kind == JOG_TY_BYTES && want->kind == JOG_TY_BYTES && !got->is_const && want->is_const;
+}
+
+static bool slice_to_const_view(const JogType *got, const JogType *want) {
+    return got && want && got->kind == JOG_TY_SLICE && want->kind == JOG_TY_SLICE && !got->is_const && want->is_const &&
+           got->as.elem.elem && got->as.elem.elem == want->as.elem.elem;
+}
+
+static bool u8_slice_to_str_view(const JogType *got, const JogType *want) {
+    const JogType *elem;
+    if (!got || !want || got->kind != JOG_TY_SLICE || want->kind != JOG_TY_BYTES || !want->is_const) {
+        return false;
+    }
+    elem = got->as.elem.elem;
+    if (elem && elem->kind == JOG_TY_DISTINCT) {
+        elem = jog_type_underlying((JogType *)elem);
+    }
+    return elem && elem->kind == JOG_TY_INT && !elem->as.integer.is_signed && elem->as.integer.bits == 8 &&
+           !elem->as.integer.is_size;
+}
+
+static bool bytes_n_reinterpret(const JogType *got, const JogType *want) {
+    if (!got || !want || !got->has_layout || !want->has_layout || got->size == 0 || got->size != want->size) {
+        return false;
+    }
+    return got->kind == JOG_TY_BYTES_N || want->kind == JOG_TY_BYTES_N;
 }
 
 static JirOperand bitcast_value(Lower *L, JirOperand src, JogType *dest, JogPos pos) {
@@ -1824,6 +1923,332 @@ static JirOperand bitcast_value(Lower *L, JirOperand src, JogType *dest, JogPos 
     }
     inst->a = src;
     return operand_local(L, dst);
+}
+
+static JirOperand wrap_option_some(Lower *L, JirOperand value, JogType *opt, JogPos pos) {
+    uint32_t dst;
+    JirInst *inst;
+    JogType *boolean;
+    JirOperand args[2];
+    if (L->failed || !opt) {
+        return value_none();
+    }
+    if (jog_type_option_is_niche(opt)) {
+        return bitcast_value(L, value, opt, pos);
+    }
+    boolean = jog_type_builtin(L->program->types, JOG_BUILTIN_BOOL);
+    if (!boolean || !new_local(L, NULL, opt, &dst)) {
+        return value_none();
+    }
+    args[0] = jir_int(boolean, 1);
+    args[1] = value;
+    inst = emit(L, JIR_AGGREGATE, (int32_t)dst, pos);
+    if (!inst || !jir_set_args(L->module, inst, args, 2)) {
+        oom(L);
+        return value_none();
+    }
+    return operand_local(L, dst);
+}
+
+static JirOperand option_none_value(Lower *L, JogType *opt, JogPos pos) {
+    uint32_t dst;
+    uint32_t zero;
+    JirInst *inst;
+    JogType *boolean;
+    JogType *elem;
+    JirOperand args[2];
+    if (L->failed || !opt) {
+        return value_none();
+    }
+    if (jog_type_option_is_niche(opt)) {
+        return jir_null(opt);
+    }
+    boolean = jog_type_builtin(L->program->types, JOG_BUILTIN_BOOL);
+    elem = opt->as.elem.elem;
+    if (!boolean || !elem || !new_local(L, NULL, opt, &dst) || !new_local(L, NULL, elem, &zero)) {
+        return value_none();
+    }
+    if (!emit(L, JIR_ZERO, (int32_t)zero, pos)) {
+        return value_none();
+    }
+    args[0] = jir_int(boolean, 0);
+    args[1] = operand_local(L, zero);
+    inst = emit(L, JIR_AGGREGATE, (int32_t)dst, pos);
+    if (!inst || !jir_set_args(L->module, inst, args, 2)) {
+        oom(L);
+        return value_none();
+    }
+    return operand_local(L, dst);
+}
+
+static bool option_ctor_name(const JogNode *node, const char **name) {
+    if (!node || !name) {
+        return false;
+    }
+    if (node->kind == JOG_NODE_DOT_VARIANT) {
+        *name = node->as.ident.name;
+        return *name != NULL;
+    }
+    if (node->kind == JOG_NODE_MEMBER && !node->as.member.safe && node->as.member.base &&
+        node->as.member.base->kind == JOG_NODE_IDENT && node->as.member.base->as.ident.name &&
+        strcmp(node->as.member.base->as.ident.name, "Option") == 0) {
+        *name = node->as.member.name;
+        return *name != NULL;
+    }
+    return false;
+}
+
+static bool lower_option_ctor(Lower *L, JogNode *node, JirOperand *out) {
+    const char *name = NULL;
+    JogType *opt;
+    if (!node || !node->type || !option_ctor_name(node, &name)) {
+        return false;
+    }
+    opt = jog_type_underlying(node->type);
+    if (!opt || opt->kind != JOG_TY_OPTION) {
+        return false;
+    }
+    if (strcmp(name, "None") == 0) {
+        *out = option_none_value(L, node->type, node->pos);
+        return true;
+    }
+    if (strcmp(name, "Some") == 0) {
+        fail_at(L, node->pos, "variant 'Some' needs arguments");
+        *out = value_none();
+        return true;
+    }
+    return false;
+}
+
+static bool lower_option_ctor_call(Lower *L, JogNode *node, JirOperand *out) {
+    JogNode *callee;
+    const char *name = NULL;
+    JogType *opt;
+    JogNode *arg;
+    JogNode *value;
+    JirOperand inner;
+    if (!node || node->kind != JOG_NODE_CALL || !node->type) {
+        return false;
+    }
+    callee = node->as.call.callee;
+    if (!option_ctor_name(callee, &name)) {
+        return false;
+    }
+    opt = jog_type_underlying(node->type);
+    if (!opt || opt->kind != JOG_TY_OPTION) {
+        return false;
+    }
+    if (strcmp(name, "None") == 0) {
+        *out = option_none_value(L, node->type, node->pos);
+        return true;
+    }
+    if (strcmp(name, "Some") != 0) {
+        return false;
+    }
+    if (node->as.call.args.count != 1) {
+        fail_at(L, node->pos, "variant 'Some' takes one argument");
+        *out = value_none();
+        return true;
+    }
+    arg = list_at(node->as.call.args, 0);
+    value = arg && arg->kind == JOG_NODE_ARG ? arg->as.arg.value : arg;
+    inner = lower_expr(L, value);
+    if (L->failed) {
+        *out = value_none();
+        return true;
+    }
+    *out = wrap_option_some(L, inner, node->type, node->pos);
+    return true;
+}
+
+static bool enum_field_is_unit(JogType *type) {
+    JogType *underlying = type ? jog_type_underlying(type) : NULL;
+    return !underlying || underlying->kind == JOG_TY_UNIT;
+}
+
+static JirOperand lower_enum_eq(Lower *L, JirOperand lhs, JirOperand rhs, bool negate, JogPos pos);
+
+static bool enum_fields_eq(Lower *L, JirOperand lhs, JirOperand rhs, JogType *en, size_t variant_index, JogPos pos, JirOperand *out) {
+    const JogVariant *variant;
+    JogType *boolean;
+    uint32_t acc;
+    size_t f;
+    if (!en || !en->as.nominal.variants || variant_index >= en->as.nominal.variant_count) {
+        fail_at(L, pos, "enum comparison is missing a variant");
+        return false;
+    }
+    variant = &en->as.nominal.variants[variant_index];
+    boolean = jog_type_builtin(L->program->types, JOG_BUILTIN_BOOL);
+    if (!boolean || !new_local(L, NULL, boolean, &acc)) {
+        return false;
+    }
+    emit_copy(L, acc, jir_int(boolean, 1), pos);
+    for (f = 0; f < variant->field_count; f++) {
+        JogType *field = variant->fields ? variant->fields[f].type : NULL;
+        JogType *underlying = field ? jog_type_underlying(field) : NULL;
+        JirOperand left;
+        JirOperand right;
+        JirOperand eq;
+        JirOperand both;
+        uint32_t dst_l;
+        uint32_t dst_r;
+        JirInst *inst;
+        if (enum_field_is_unit(field)) {
+            continue;
+        }
+        if (!underlying) {
+            fail_at(L, pos, "enum payload is not comparable");
+            return false;
+        }
+        lhs = jog_lower_as_local(L, lhs, pos);
+        rhs = jog_lower_as_local(L, rhs, pos);
+        if (L->failed || !new_local(L, NULL, field, &dst_l) || !new_local(L, NULL, field, &dst_r)) {
+            return false;
+        }
+        inst = emit(L, JIR_EXTRACT, (int32_t)dst_l, pos);
+        if (!inst) {
+            return false;
+        }
+        inst->a = lhs;
+        inst->aux = (uint32_t)f;
+        inst->aux2 = (uint32_t)variant_index + 1;
+        left = operand_local(L, dst_l);
+        inst = emit(L, JIR_EXTRACT, (int32_t)dst_r, pos);
+        if (!inst) {
+            return false;
+        }
+        inst->a = rhs;
+        inst->aux = (uint32_t)f;
+        inst->aux2 = (uint32_t)variant_index + 1;
+        right = operand_local(L, dst_r);
+        if (underlying->kind == JOG_TY_ENUM) {
+            eq = lower_enum_eq(L, left, right, false, pos);
+        } else if (underlying->kind == JOG_TY_BYTES) {
+            eq = lower_bytes_cmp(L, left, right, false, pos);
+        } else if (underlying->kind == JOG_TY_INT || underlying->kind == JOG_TY_BOOL || underlying->kind == JOG_TY_FLOAT) {
+            eq = emit_binop(L, JIR_EQ, false, left, right, boolean, pos);
+        } else {
+            fail_at(L, pos, "enum payload is not comparable");
+            return false;
+        }
+        if (L->failed) {
+            return false;
+        }
+        both = emit_binop(L, JIR_AND, false, operand_local(L, acc), eq, boolean, pos);
+        emit_copy(L, acc, both, pos);
+    }
+    *out = operand_local(L, acc);
+    return !L->failed;
+}
+
+static JirOperand lower_enum_eq(Lower *L, JirOperand lhs, JirOperand rhs, bool negate, JogPos pos) {
+    JogType *en;
+    JogType *boolean;
+    JogType *tag_ty;
+    JirOperand ltag;
+    JirOperand rtag;
+    JirOperand tags_eq;
+    uint32_t result;
+    uint32_t join;
+    uint32_t mismatch;
+    uint32_t payload;
+    uint32_t ltag_dst;
+    uint32_t rtag_dst;
+    JirInst *inst;
+    size_t i;
+    int any_payload;
+    if (L->failed) {
+        return value_none();
+    }
+    en = lhs.type ? jog_type_underlying(lhs.type) : NULL;
+    boolean = jog_type_builtin(L->program->types, JOG_BUILTIN_BOOL);
+    if (!en || en->kind != JOG_TY_ENUM || !en->as.nominal.base || !boolean) {
+        fail_at(L, pos, "enum comparison is missing a type");
+        return value_none();
+    }
+    tag_ty = en->as.nominal.base;
+    lhs = jog_lower_as_local(L, lhs, pos);
+    rhs = jog_lower_as_local(L, rhs, pos);
+    if (L->failed || !new_local(L, NULL, tag_ty, &ltag_dst) || !new_local(L, NULL, tag_ty, &rtag_dst)) {
+        return value_none();
+    }
+    inst = emit(L, JIR_ENUM_TAG, (int32_t)ltag_dst, pos);
+    if (!inst) {
+        return value_none();
+    }
+    inst->a = lhs;
+    ltag = operand_local(L, ltag_dst);
+    inst = emit(L, JIR_ENUM_TAG, (int32_t)rtag_dst, pos);
+    if (!inst) {
+        return value_none();
+    }
+    inst->a = rhs;
+    rtag = operand_local(L, rtag_dst);
+    tags_eq = emit_binop(L, JIR_EQ, false, ltag, rtag, boolean, pos);
+    any_payload = 0;
+    for (i = 0; i < en->as.nominal.variant_count; i++) {
+        const JogVariant *variant = en->as.nominal.variants ? &en->as.nominal.variants[i] : NULL;
+        size_t f;
+        if (!variant) {
+            break;
+        }
+        for (f = 0; f < variant->field_count; f++) {
+            JogType *field = variant->fields ? variant->fields[f].type : NULL;
+            if (!enum_field_is_unit(field)) {
+                any_payload = 1;
+            }
+        }
+    }
+    if (!any_payload) {
+        if (!negate) {
+            return tags_eq;
+        }
+        return emit_unop(L, JIR_NOT, false, tags_eq, boolean, pos);
+    }
+    if (!new_local(L, NULL, boolean, &result)) {
+        return value_none();
+    }
+    emit_copy(L, result, jir_int(boolean, 0), pos);
+    if (!new_block(L, "enum.eq.pay", &payload) || !new_block(L, "enum.eq.miss", &mismatch) ||
+        !new_block(L, "enum.eq.join", &join)) {
+        return value_none();
+    }
+    emit_cond(L, tags_eq, payload, mismatch, pos);
+    use_block(L, mismatch);
+    emit_br(L, join, pos);
+    use_block(L, payload);
+    for (i = 0; i < en->as.nominal.variant_count; i++) {
+        const JogVariant *variant = &en->as.nominal.variants[i];
+        uint32_t match;
+        uint32_t next;
+        int last = i + 1 == en->as.nominal.variant_count;
+        JirOperand fields;
+        if (!last) {
+            JirOperand is_var;
+            if (!new_block(L, "enum.eq.var", &match) || !new_block(L, "enum.eq.next", &next)) {
+                return value_none();
+            }
+            is_var = emit_binop(L, JIR_EQ, false, ltag, jir_int(tag_ty, (uint64_t)variant->tag), boolean, pos);
+            emit_cond(L, is_var, match, next, pos);
+            use_block(L, match);
+        }
+        if (!enum_fields_eq(L, lhs, rhs, en, i, pos, &fields)) {
+            return value_none();
+        }
+        emit_copy(L, result, fields, pos);
+        emit_br(L, join, pos);
+        if (!last) {
+            use_block(L, next);
+        }
+    }
+    if (!L->terminated) {
+        emit_br(L, join, pos);
+    }
+    use_block(L, join);
+    if (negate) {
+        return emit_unop(L, JIR_NOT, false, operand_local(L, result), boolean, pos);
+    }
+    return operand_local(L, result);
 }
 
 static JirOperand lower_expr_raw(Lower *L, JogNode *node) {
@@ -1871,6 +2296,9 @@ static JirOperand lower_expr_raw(Lower *L, JogNode *node) {
         }
         {
             JirOperand en;
+            if (lower_option_ctor(L, node, &en)) {
+                return en;
+            }
             if (jog_lower_enum_member(L, node, &en)) {
                 return L->failed ? value_none() : en;
             }
@@ -1971,6 +2399,12 @@ static JirOperand lower_expr_raw(Lower *L, JogNode *node) {
             lhs.type->kind == JOG_TY_BYTES) {
             return lower_bytes_cmp(L, lhs, rhs, node->as.binary.op == JOG_TOK_NEQ, node->pos);
         }
+        if ((node->as.binary.op == JOG_TOK_EQ || node->as.binary.op == JOG_TOK_NEQ) && lhs.type) {
+            JogType *lu = jog_type_underlying(lhs.type);
+            if (lu && lu->kind == JOG_TY_ENUM) {
+                return lower_enum_eq(L, lhs, rhs, node->as.binary.op == JOG_TOK_NEQ, node->pos);
+            }
+        }
         {
             JirOperand constrained;
             if (jog_lower_constraint_binop(L, node, lhs, rhs, &constrained)) {
@@ -2016,7 +2450,8 @@ static JirOperand lower_expr_raw(Lower *L, JogNode *node) {
             if (L->failed) {
                 return value_none();
             }
-            if (bytes_to_const_view(lhs.type, dest_ty)) {
+            if (bytes_to_const_view(lhs.type, dest_ty) || slice_to_const_view(lhs.type, dest_ty) ||
+                u8_slice_to_str_view(lhs.type, dest_ty) || bytes_n_reinterpret(lhs.type, dest_ty)) {
                 return bitcast_value(L, lhs, dest_ty, node->pos);
             }
         }
@@ -2037,6 +2472,9 @@ static JirOperand lower_expr_raw(Lower *L, JogNode *node) {
     }
     case JOG_NODE_CALL: {
         JirOperand en;
+        if (lower_option_ctor_call(L, node, &en)) {
+            return en;
+        }
         if (jog_lower_enum_call(L, node, &en)) {
             return L->failed ? value_none() : en;
         }
@@ -2049,8 +2487,13 @@ static JirOperand lower_expr_raw(Lower *L, JogNode *node) {
         }
         return jog_lower_enum_is(L, node);
     }
-    case JOG_NODE_DOT_VARIANT:
+    case JOG_NODE_DOT_VARIANT: {
+        JirOperand en;
+        if (lower_option_ctor(L, node, &en)) {
+            return en;
+        }
         return jog_lower_enum_dot(L, node);
+    }
     case JOG_NODE_WHEN: {
         JirOperand en;
         if (jog_lower_iface_when(L, node, true, &en)) {
@@ -2097,8 +2540,11 @@ static JirOperand lower_expr(Lower *L, JogNode *node) {
     if (L->failed || !want) {
         return op;
     }
-    if (bytes_to_const_view(op.type, want)) {
+    if (bytes_to_const_view(op.type, want) || slice_to_const_view(op.type, want) || u8_slice_to_str_view(op.type, want)) {
         return bitcast_value(L, op, want, node->pos);
+    }
+    if (want->kind == JOG_TY_OPTION && op.type && want->as.elem.elem == op.type) {
+        return wrap_option_some(L, op, want, node->pos);
     }
     if (want->kind != JOG_TY_INTERFACE) {
         return op;
@@ -3787,7 +4233,7 @@ static bool push_global(Lower *L, const JogPackage *pkg, JogNode *node, JogSymbo
         fail_at(L, node->pos, "%s are not lowered yet", gap);
         return false;
     }
-    mangled = mangle_global(L, pkg, name);
+    mangled = mangle_global(L, pkg, node, name);
     if (!mangled) {
         return false;
     }

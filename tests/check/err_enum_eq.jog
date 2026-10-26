@@ -1,0 +1,13 @@
+struct Box {
+    n: i32
+}
+
+enum E {
+    Wrap(b: Box)
+}
+
+fn eq(a: E, b: E): bool {
+    return a == b
+}
+
+// error: operator '==' does not apply to E

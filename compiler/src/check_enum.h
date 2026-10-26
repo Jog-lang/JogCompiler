@@ -6,8 +6,8 @@
 /* Enums, when, patterns, exhaustiveness, Option sugar, and `is`.
    Not a contract header. T? stays the structural option type from the
    error slice: null, T? == null, and niche *T? are not reimplemented here.
-   There is no implicit conversion from T to T?. Nested when patterns and
-   variant field defaults are checked here. */
+   T converts implicitly to T?, and Some / Option name that option.
+   Nested when patterns and variant field defaults are checked here. */
 
 /* Fill variants, symbols, the tag type, and C layout. The nominal type is
    published before payloads are resolved so *E inside E is not a cycle. */
@@ -18,7 +18,8 @@ bool jog_enum_has_zero(const JogType *type);
 
 /* 1 when call builds a variant. 0 when the caller should keep checking.
    -1 when the checker has stopped. */
-int jog_check_enum_call(Check *ck, CheckJob *job, JogBlockScope *scope, JogNode *call, JogType **out);
+int jog_check_enum_call(Check *ck, CheckJob *job, JogBlockScope *scope, JogNode *call, JogType *target,
+                        JogType **out);
 
 /* 1 when member is a payload-free variant value. 0 when it is not an enum
    variant. -1 when the checker has stopped. */

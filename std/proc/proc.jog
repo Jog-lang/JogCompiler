@@ -5,13 +5,16 @@
 // is ok == false. That is not exit code 0 by itself: code is meaningful
 // only when ok is true.
 //
-// proc.windows.jog calls CreateProcessA. args[0] is the module, so PATH
+// proc.windows.jog calls CreateProcessW. args[0] is the module, so PATH
 // is not searched, and the command line is quoted. proc.posix.jog calls
 // posix_spawnp and passes the arguments as an argv array. Both send
 // stdout and stderr to temporary files, inherited by the child. Pipes
 // are not used, so a chatty child cannot fill a buffer and stall while
-// the parent waits. free_output releases both blocks. The allocator is
-// a with (a: mem.Allocator) context. It is not stored.
+// the parent waits. run_inherit is the same start and wait, with the
+// child's stdout and stderr left on the parent's streams. It does not
+// yield the bytes as they are written. free_output releases both blocks
+// from run. The allocator is a with (a: mem.Allocator) context. It is
+// not stored.
 
 import std.c
 import std.io
@@ -46,7 +49,7 @@ private fn contains_nul(text: str): bool {
 
 // false means the program name is empty or some argument contains a NUL.
 // The command line and each argv slot are C strings, so a NUL cannot be passed.
-private fn args_ok(args: []str): bool {
+fn args_ok(args: []str): bool {
     if args[0].len == 0 {
         return false
     }
@@ -87,7 +90,7 @@ private fn path_view(path: *u8): str {
     return view
 }
 
-private fn read_captures(out_path: *u8, err_path: *u8, code: i32): Output with (a: mem.Allocator) {
+fn read_captures(out_path: *u8, err_path: *u8, code: i32): Output with (a: mem.Allocator) {
     val (stdout_bytes, stdout_ok) = io.read_all(path_view(out_path))
     val (stderr_bytes, stderr_ok) = io.read_all(path_view(err_path))
     if !stdout_ok || !stderr_ok {

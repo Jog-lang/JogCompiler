@@ -129,24 +129,29 @@ jog emit-c [package]    print the generated C
 
 ```
 compiler/src/
-  main.c          driver and argument parsing
-  token.h         token kinds
-  lexer.c/.h      tokens, newline rule, interpolation          milestone 0
-  ast.h parser.c  AST and parser                               milestone 1
-  loader.c        jog.mod, packages, files                     milestone 2
-  types.c/.h      type table                                   milestone 2
-  resolve.c       scopes and names                             milestone 2
-  check.c         type checker                                 milestone 2
-  ir.h lower.c    IR and lowering                              milestone 2
-  emit_c.c        C backend                                    milestone 2
-  cc.c            running clang or gcc                         milestone 2
-  interp.c        compile-time interpreter                     milestone 7
+  main.c                    driver and argument parsing
+  token.h                   token kinds
+  lexer.c/.h                tokens, newline rule, interpolation
+  ast.h ast.c parser.c      AST and parser
+  loader.c                  jog.mod, packages, files
+  types.c/.h                type table
+  resolve_package.c/.h      package scopes, imports, and declarations
+  resolve_universe.c/.h     universe scope
+  check.c check_*.c         type checker slices
+  ir.h ir.c lower.c         IR and lowering
+  lower_*.c                 lowering slices
+  emit_c.c                  C backend
+  cc.c                      running clang or gcc
+  interp.c                  compile-time interpreter
+  wasm_host.c/.h            wasm32 host imports
 runtime/
-  jogrt.h jogrt.c startup, panics, checks, allocator, shims
+  jogrt.h jogrt.c jogrt_main.c          startup, panics, checks, allocator, shims
+  jogrt_sched.c jogrt_switch.c          single-threaded coroutine scheduler
+  wasm/jogrt_wasm.c wasm/host.js        freestanding wasm32 runtime and Node host
 std/
-  c/  io/  mem/   Jog sources
-tools/            shared C utilities (arena, da, map, diag, file, coro, str, intern, fs)
-tests/            C unit tests, and later tests/jog/ end-to-end programs
+  arena/  c/  cmp/  fs/  io/  list/  map/  math/  mem/  os/  proc/  strbuilder/  testing/
+tools/            shared C utilities (arena, da, map, diag, file, coro, str, intern, fs, proc)
+tests/            C unit tests and tests/jog/ end-to-end programs
 ```
 
 ## Milestones
@@ -163,16 +168,29 @@ tests/            C unit tests, and later tests/jog/ end-to-end programs
 | 7 | Compile-time interpreter: top-level `val` beyond constant folding, `@comptime`, `@embed` | a CRC table is computed at compile time |
 | Step 2 | Wasm: generated C through `clang --target=wasm32`, a Wasm runtime, `wasm-ld` | hello world runs in a Wasm host |
 
-Until milestone 7, a top-level `val` must be a constant expression that the checker can fold.
+A pointer-free top-level `val`, and `@comptime`, run in the interpreter. A `val` whose type contains a pointer still initializes at startup.
 
 ### Status
 
-- **Milestone 0 is done.** `jog lex` and `lexer_test` exist, and the new tools (`str`, `intern`, `fs`) are covered by `util_test`. Every Jog code block in the language notes lexes cleanly, with one exception: the `${...}` splices inside `quote { }` in JogDocs: design/language/Comptime.md. Quoted code comes after V1, and the lexer will learn it then.
-- **Contracts are in place.** The AST, types, IR, program, phase, command, and runtime ABI headers are written. Every phase links as a stub, and `scripts/check.ps1` (Windows) or `scripts/check.sh` (Linux) is the merge gate.
-- **Next:** milestones 1 and 2 in parallel streams, as laid out in [[plans/V1Parallel]].
-- **Self-hosting** is planned in JogDocs: bootstrap/Roadmap.md. This compiler becomes stage 0 and the reference that each stage of the Jog-written compiler is checked against.
+Milestones 0 through 7, and Wasm Step 2, have largely landed. The pipeline is the loader, the parser, `resolve_package.c` and `resolve_universe.c`, the checker slices (`check_*.c`), the lowering slices (`lower_*.c`), `interp.c`, the C backend, and `jog run --target wasm32`. `scripts/check.ps1` on Windows, or `scripts/check.sh` on Linux, is the merge gate. How the slices were split is in [[plans/V1Parallel]].
 
-Step 2 uses a freestanding wasm32 runtime, not WASI. The native scheduler's stacks are OS calls Wasm cannot link. `extern` functions stay C prototypes; wasm-ld imports each undefined symbol from `env`. `runtime/wasm/jogrt_wasm.c` talks to the host through `jogrt_host_write`, `jogrt_host_abort`, and `jogrt_host_exit`. `jog run --target wasm32` executes the module with Node. Hello world's `puts` is the `env.puts` import. `go` runs its body to completion; any other scheduler call aborts. Program arguments and `@link` import-module names are not wired yet.
+- **Milestone 0.** `jog lex` and the lexer tests. `str`, `intern`, and `fs` are covered by `util_test`. Quoted `${...}` splices inside `quote { }` in JogDocs: design/language/Comptime.md are still not lexed. Quoted code comes after V1.
+- **Milestone 1.** The parser covers the V1 grammar. `jog parse` prints the AST.
+- **Milestone 2.** Hello world builds through C. `jog run examples/hello` prints `Hello from Jog!`.
+- **Milestones 3 through 6.** Structs, methods, pointers, arrays, slices, `bytes`, tuples, `error?`, `defer` and `errdefer`, enums, `when`, packages and imports, `jog test`, contexts, string interpolation, generics, interfaces, and the single-threaded coroutine runtime (`go`, `scope`, `Task`, `Chan`, `select`) are in the checker and lowering slices.
+- **Milestone 7.** `interp.c` evaluates pointer-free top-level `val` and `@comptime`. `@embed` reads a file into `const bytes`.
+- **Step 2.** Freestanding wasm32, through `clang --target=wasm32` and `wasm-ld`. `runtime/wasm/jogrt_wasm.c` talks to the Node host (`runtime/wasm/host.js`) through `jogrt_host_write`, `jogrt_host_abort`, and `jogrt_host_exit`. `jog run --target wasm32 examples/hello` prints `Hello from Jog!`. Arguments after `--` reach the program, and `@link` names the Wasm import module. `go` runs its body to completion on Wasm. Any other scheduler call aborts.
+
+Still open, as recorded in [[plans/V1Parallel]]:
+
+- Top-level destructuring `val (a, b)` is not lowered.
+- Escaping lambdas and `f.free()` are open. `go` inside a capturing lambda is not lowered. A generic function is not a value yet.
+- An or-pattern cannot bind a name. `is` on an enum does not narrow. `in` on a collection is not a pattern.
+- Scheduling stays single-threaded. There is no multi-thread scheduler, I/O poller, or `Executor`.
+- Wasm has no WASI and no stack switching.
+- The `Format` and `Writer` interfaces are absent. Injecting a `Testing` context into `@test` is open. Generic interfaces stay rejected.
+
+Self-hosting is planned in JogDocs: bootstrap/Roadmap.md. This compiler is stage 0, the reference a later compiler written in Jog is checked against.
 
 ## Testing
 

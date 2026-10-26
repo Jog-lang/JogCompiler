@@ -1,0 +1,11 @@
+struct Box {
+    n: i64
+}
+
+fn make(): Box {
+    return Box(n: 4)
+}
+
+fn Box.get(): i64 {
+    return self.n
+}

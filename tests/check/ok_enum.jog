@@ -61,6 +61,14 @@ fn empty(s: Shape): bool {
     return s is Empty
 }
 
+fn same(a: Flag, b: Flag): bool {
+    return a == b
+}
+
+fn same_shape(a: Shape, b: Shape): bool {
+    return a == b
+}
+
 fn some_of(p: i32?): i32 {
     return when p {
         Some(v) -> v
@@ -164,6 +172,9 @@ fn main() {
         return
     }
     if named_some(q) != ranged_some(q) {
+        return
+    }
+    if !same(f, Flag.On) || same_shape(s, e) {
         return
     }
     sign(n)

@@ -1,0 +1,15 @@
+// expect: ok
+
+import std.c
+
+extern {
+    fn puts(s: *const i8): i32
+}
+
+fn main() {
+    var n: c.size_t = 0
+    val p = c.jogrt_argv(0, &n)
+    if p != null && n > 0 {
+        puts(c"ok")
+    }
+}

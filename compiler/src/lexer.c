@@ -635,6 +635,11 @@ static JogTokenKind keyword_kind(const char *start, size_t len) {
     for (int kind = JOG_TOK_KW_FN; kind <= JOG_TOK_KW_QUOTE; kind++) {
         const char *spelling = g_spellings[kind];
         if (strlen(spelling) == len && memcmp(spelling, start, len) == 0) {
+            /* `op` is special only as the start of an operator method name.
+               Everywhere else it is an ordinary identifier. */
+            if ((JogTokenKind)kind == JOG_TOK_KW_OP) {
+                return JOG_TOK_IDENT;
+            }
             return (JogTokenKind)kind;
         }
     }

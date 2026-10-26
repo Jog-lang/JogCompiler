@@ -99,6 +99,15 @@ fn List<T>.get(i: usize): T {
     return self.ptr!![i]
 }
 
+// Pointer to element i. The caller can write through it. The pointer is
+// valid until the next push, insert, reserve, or free that grows the buffer.
+fn *List<T>.at(i: usize): *T {
+    if i >= self.len {
+        panic("index out of range")
+    }
+    return self.ptr!! + i
+}
+
 fn *List<T>.set(i: usize, x: T) {
     if i >= self.len {
         panic("index out of range")

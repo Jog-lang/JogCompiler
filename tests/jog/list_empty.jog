@@ -1,0 +1,11 @@
+// expect: ok
+
+import std.io
+import std.list
+
+fn main() {
+    var xs = list.empty<i64>()
+    if xs.len == 0 {
+        io.println("ok")
+    }
+}

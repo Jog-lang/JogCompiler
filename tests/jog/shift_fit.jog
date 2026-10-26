@@ -1,0 +1,18 @@
+// expect: ok
+
+extern {
+    fn puts(s: *const i8): i32
+}
+
+fn main() {
+    val a: u32 = 1 << 31
+    val b: u32 = 0x7FFFFFFF << 1
+    val c: i32 = -1 << 1
+    var d: u32 = 1
+    var e: i32 = -1
+    d = d << 31
+    e = e << 1
+    if a == 0x80000000 && b == 0xFFFFFFFE && c == -2 && d == 0x80000000 && e == -2 {
+        puts(c"ok")
+    }
+}

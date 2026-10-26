@@ -1,17 +1,78 @@
-// Win32 declarations for std.fs and the 32-bit LLP64 long. HANDLE is
-// intptr_t. INVALID_HANDLE_VALUE is -1. This host is Windows x64, so
-// the kernel32 names are the A forms. Loaded only for a Windows target.
+// Win32 declarations for std.fs, std.io, std.os, and std.proc, and the
+// 32-bit LLP64 long. HANDLE is intptr_t. INVALID_HANDLE_VALUE is -1.
+// Paths cross this boundary as UTF-16. Loaded only for a Windows target.
 
 type long = i32
 type unsigned_long = u32
 
 extern {
-    // data is a WIN32_FIND_DATAA: 320 bytes, cFileName at offset 44.
-    fn FindFirstFileA(path: *const char, data: *u8): intptr_t
-    fn FindNextFileA(find: intptr_t, data: *u8): int
+    // data is a WIN32_FIND_DATAW: 592 bytes, cFileName at offset 44.
+    fn FindFirstFileW(path: *u16, data: *u8): intptr_t
+    fn FindNextFileW(find: intptr_t, data: *u8): int
     fn FindClose(find: intptr_t): int
-    fn GetTempPathA(cap: unsigned_long, buffer: *char): unsigned_long
-    fn CreateDirectoryA(path: *const char, security: intptr_t): int
-    fn RemoveDirectoryA(path: *const char): int
-    fn DeleteFileA(path: *const char): int
+    fn GetTempPathW(cap: unsigned_long, buffer: *u16): unsigned_long
+    fn CreateDirectoryW(path: *u16, security: intptr_t): int
+    fn RemoveDirectoryW(path: *u16): int
+    fn DeleteFileW(path: *u16): int
+    fn MoveFileExW(from: *u16, to: *u16, flags: unsigned_long): int
+    fn GetFileAttributesW(path: *u16): unsigned_long
+    fn GetCurrentDirectoryW(cap: unsigned_long, buffer: *u16): unsigned_long
+    fn GetEnvironmentVariableW(name: *u16, buf: *u16, cap: unsigned_long): unsigned_long
+    fn MultiByteToWideChar(
+        code_page: unsigned_int,
+        flags: unsigned_long,
+        src: *const char,
+        src_len: int,
+        dest: *u16,
+        dest_chars: int,
+    ): int
+    fn WideCharToMultiByte(
+        code_page: unsigned_int,
+        flags: unsigned_long,
+        src: *u16,
+        src_len: int,
+        dest: *char,
+        dest_bytes: int,
+        default_char: *const char?,
+        used: *int?,
+    ): int
+    fn _wfopen(path: *u16, mode: *u16): *FILE?
+}
+
+// UTF-8 text into a NUL-terminated UTF-16 buffer. cap counts u16 slots,
+// including the NUL. false means the text is not UTF-8 or does not fit.
+fn utf8_to_wide(text: str, dest: *u16, cap: usize): bool {
+    if cap == 0 {
+        return false
+    }
+    if text.len == 0 {
+        dest[0] = 0
+        return true
+    }
+    if text.len > 2147483647 || cap - 1 > 2147483647 {
+        return false
+    }
+    val n = MultiByteToWideChar(65001, 8, text.ptr as *const char, text.len as int, dest, (cap - 1) as int)
+    if n <= 0 {
+        return false
+    }
+    dest[n as usize] = 0
+    return true
+}
+
+// src_chars wide characters, not including a NUL, into dest. The result is
+// the byte count, or 0 when the conversion does not fit. An empty source
+// is 0.
+fn wide_to_utf8(src: *u16, src_chars: usize, dest: *u8, cap: usize): usize {
+    if src_chars == 0 || cap == 0 {
+        return 0
+    }
+    if src_chars > 2147483647 || cap > 2147483647 {
+        return 0
+    }
+    val n = WideCharToMultiByte(65001, 0, src, src_chars as int, dest as *char, cap as int, null, null)
+    if n <= 0 {
+        return 0
+    }
+    return n as usize
 }

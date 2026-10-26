@@ -1,0 +1,41 @@
+// expect: ok
+
+extern {
+    fn puts(s: *const i8): i32
+}
+
+enum Kind {
+    A
+    B
+}
+
+struct Buf {
+    xs: [4]i64
+    buf: [8]u8
+    nodes: [2]Kind
+}
+
+fn *Buf.word(i: usize): i64 {
+    return self.xs[i]
+}
+
+fn *Buf.read(off: usize): u64 {
+    return self.buf[off] as u64
+}
+
+fn *Buf.kind_at(i: usize): i64 {
+    return when self.nodes[i] {
+        A -> 1
+        B -> 2
+    }
+}
+
+fn main() {
+    var b = Buf()
+    b.xs[1] = 9
+    b.buf[2] = 3
+    b.nodes[0] = Kind.B
+    if b.word(1) == 9 && b.read(2) == 3 && b.kind_at(0) == 2 {
+        puts(c"ok")
+    }
+}

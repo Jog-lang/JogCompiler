@@ -1,5 +1,11 @@
-import std.io
+import std.+
 
-fn main() {
-    io.println("Hello from the playground!")
+fn main(){
+    go sample()
+    go sample()
+}
+
+
+fn sample() {
+   io.println("Hello from the playground!") 
 }

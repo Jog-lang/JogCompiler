@@ -1,0 +1,17 @@
+// expect: ok
+
+extern {
+    fn puts(s: *const i8): i32
+}
+
+enum Color {
+    Red
+    Blue
+}
+
+fn main() {
+    var c = Color.Red
+    if c is Color.Red && !(c is Color.Blue) {
+        puts(c"ok")
+    }
+}

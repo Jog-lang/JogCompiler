@@ -191,7 +191,7 @@ int jogrt_argc(void) {
     return g_argc;
 }
 
-const char *jogrt_argv(int i, size_t *len) {
+const int8_t *jogrt_argv(int i, size_t *len) {
     const char *arg;
     size_t n = 0;
     if (i < 0 || i >= g_argc || !g_argv || !g_argv[i]) {
@@ -207,21 +207,20 @@ const char *jogrt_argv(int i, size_t *len) {
     if (len) {
         *len = n;
     }
-    return arg;
+    return (const int8_t *)(const void *)arg;
 }
 
-/* Jog *const i8 is const int8_t *. This is not in jogrt.h, so a program
-   can declare it without clashing with const char *jogrt_argv. */
+/* Same bytes as jogrt_argv, without the length out-parameter. */
 const int8_t *jogrt_arg_ptr(int32_t i) {
-    const char *arg;
+    const int8_t *arg;
     if (i < 0 || i >= g_argc || !g_argv) {
         return NULL;
     }
-    arg = g_argv[i];
+    arg = (const int8_t *)(const void *)g_argv[i];
     if (!arg) {
         return NULL;
     }
-    return (const int8_t *)(const void *)arg;
+    return arg;
 }
 
 _Noreturn void jogrt_exit(int code) {

@@ -1,0 +1,34 @@
+// slice, starts_with, ends_with, and index_of are views. clone owns a copy.
+
+import std.mem
+import std.testing
+
+private fn drop(s: str) with (a: mem.Allocator) {
+    if s.len == 0 {
+        return
+    }
+    var block = bytes()
+    block.ptr = s.ptr as *u8
+    block.len = s.len
+    a.free(block)
+}
+
+@test
+fn viewsAndCopy() with (t: testing.Testing) {
+    t.expect(starts_with("hello", "he"))
+    t.expect(!starts_with("hello", "hi"))
+    t.expect(ends_with("hello", "lo"))
+    t.expect(!ends_with("hello", "x"))
+    t.expectEq(slice("hello", 1, 4), "ell")
+    val (at, ok) = index_of("hello", "ll")
+    t.expect(ok)
+    t.expect(at == 2)
+    val (miss, no) = index_of("hello", "x")
+    t.expect(!no)
+    t.expect(miss == 0)
+    with (mem.heap()) {
+        val owned = clone("hello")
+        t.expectEq(owned, "hello")
+        drop(owned)
+    }
+}

@@ -1,0 +1,25 @@
+// POSIX env. getenv. The value is a view of the C runtime's copy.
+
+import std.c
+
+private fn fill_name(name: str, dest: *u8): bool {
+    if name.len == 0 || name.len >= 4096 {
+        return false
+    }
+    c.memcpy(dest as *void, name.ptr as *const void, name.len)
+    *(dest + name.len) = 0
+    return true
+}
+
+fn env(name: str): (str, bool) {
+    var buf: bytes[4096]
+    val dest = buf[..].ptr
+    if !fill_name(name, dest) {
+        return "", false
+    }
+    val p = c.getenv(dest as *const c.char)
+    if p == null {
+        return "", false
+    }
+    return c_view(p!! as *u8, c.strlen(p!! as *const c.char)), true
+}

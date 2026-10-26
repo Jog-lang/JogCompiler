@@ -42,12 +42,12 @@ static void test_start_and_args(void) {
     CHECK(jogrt_argc() == 2);
 
     len = 0;
-    const char *first = jogrt_argv(0, &len);
+    const char *first = (const char *)jogrt_argv(0, &len);
     CHECK(first != NULL && len == 4 && memcmp(first, "prog", 4) == 0);
     CHECK(jogrt_argv(1, NULL) != NULL && memcmp(jogrt_argv(1, NULL), "hello", 5) == 0);
 
     len = 9;
-    const char *second = jogrt_argv(1, &len);
+    const char *second = (const char *)jogrt_argv(1, &len);
     CHECK(second != NULL && len == 5 && memcmp(second, "hello", 5) == 0);
     const int8_t *raw = jogrt_arg_ptr(0);
     CHECK(raw != NULL && memcmp(raw, "prog", 4) == 0);
@@ -82,7 +82,7 @@ static void test_start_and_args(void) {
     char *only_empty[] = {empty};
     jogrt_start(1, only_empty);
     len = 8;
-    const char *blank = jogrt_argv(0, &len);
+    const char *blank = (const char *)jogrt_argv(0, &len);
     CHECK(blank != NULL && len == 0);
     const int8_t *blank_ptr = jogrt_arg_ptr(0);
     CHECK(blank_ptr != NULL && blank_ptr[0] == 0);
@@ -92,7 +92,7 @@ static void test_start_and_args(void) {
     jogrt_start(1, again);
     CHECK(jogrt_argc() == 1);
     len = 0;
-    const char *next = jogrt_argv(0, &len);
+    const char *next = (const char *)jogrt_argv(0, &len);
     CHECK(next != NULL && len == 4 && memcmp(next, "next", 4) == 0);
 }
 

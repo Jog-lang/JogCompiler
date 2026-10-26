@@ -566,25 +566,16 @@ bool jog_lower_context_cast(Lower *L, JogNode *node, JirOperand *out) {
     return true;
 }
 
-bool jog_lower_testing_finish(Lower *L, JogPos pos) {
+static JogNode *testing_decl(Lower *L, const char *name, JogPos pos) {
     const char *interned;
     size_t i;
-    int found_pkg = 0;
-    JogNode *decl = NULL;
-    int32_t index;
-    JirFunc *func;
-    JirInst *inst;
-    JogType *ret;
-    if (!L || L->failed) {
-        return false;
-    }
     if (!L->program || !L->program->intern || !L->program->packages) {
-        return true;
+        return NULL;
     }
-    interned = ct_intern_cstr(L->program->intern, "finish");
+    interned = ct_intern_cstr(L->program->intern, name);
     if (!interned) {
         jog_lower_fail(L, pos, "out of memory");
-        return false;
+        return NULL;
     }
     for (i = 0; i < L->program->package_count; i++) {
         JogPackage *pkg = L->program->packages[i];
@@ -592,18 +583,36 @@ bool jog_lower_testing_finish(Lower *L, JogPos pos) {
         if (!pkg || !pkg->path || strcmp(pkg->path, "std.testing") != 0) {
             continue;
         }
-        found_pkg = 1;
         sym = pkg->scope ? jog_package_scope_lookup(pkg->scope, interned) : NULL;
         if (!sym || !sym->decl || sym->decl->kind != JOG_NODE_FN) {
             jog_lower_fail(L, pos, "missing test result");
-            return false;
+            return NULL;
         }
-        decl = sym->decl;
-        break;
+        return sym->decl;
     }
-    if (!found_pkg) {
-        return true;
+    return NULL;
+}
+
+static int testing_loaded(Lower *L) {
+    size_t i;
+    if (!L->program || !L->program->packages) {
+        return 0;
     }
+    for (i = 0; i < L->program->package_count; i++) {
+        JogPackage *pkg = L->program->packages[i];
+        if (pkg && pkg->path && strcmp(pkg->path, "std.testing") == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static bool emit_testing_call(Lower *L, JogNode *decl, const JirOperand *args, size_t argc, size_t expect_params,
+                             JogPos pos) {
+    int32_t index;
+    JirFunc *func;
+    JirInst *inst;
+    JogType *ret;
     index = jog_lower_find_fn(L, decl);
     if (index < 0) {
         jog_lower_fail(L, pos, "missing test result");
@@ -611,7 +620,7 @@ bool jog_lower_testing_finish(Lower *L, JogPos pos) {
     }
     func = jir_func(L->module, (uint32_t)index);
     ret = func && func->type && func->type->kind == JOG_TY_FN ? func->type->as.fn.ret : NULL;
-    if (!func || !func->type || func->type->kind != JOG_TY_FN || func->type->as.fn.param_count != 0 ||
+    if (!func || !func->type || func->type->kind != JOG_TY_FN || func->type->as.fn.param_count != expect_params ||
         func->type->as.fn.context_count != 0 || !ret || ret->kind != JOG_TY_UNIT) {
         jog_lower_fail(L, pos, "test result has the wrong type");
         return false;
@@ -621,9 +630,55 @@ bool jog_lower_testing_finish(Lower *L, JogPos pos) {
         return false;
     }
     inst->a = jir_func_ref(L->module, (uint32_t)index);
-    if (!jir_set_args(L->module, inst, NULL, 0)) {
+    if (!jir_set_args(L->module, inst, args, argc)) {
         jog_lower_fail(L, pos, "out of memory");
         return false;
     }
     return !L->failed;
+}
+
+bool jog_lower_testing_note(Lower *L, const char *name, JogPos pos) {
+    JogNode *decl;
+    JogType *str;
+    JirOperand arg;
+    if (!L || L->failed) {
+        return false;
+    }
+    if (!testing_loaded(L)) {
+        return true;
+    }
+    decl = testing_decl(L, "note", pos);
+    if (!decl || L->failed) {
+        return false;
+    }
+    str = jog_type_builtin(L->program->types, JOG_BUILTIN_CONST_BYTES);
+    if (!str || !name) {
+        jog_lower_fail(L, pos, "missing test result");
+        return false;
+    }
+    arg = jir_string(str, name, strlen(name));
+    return emit_testing_call(L, decl, &arg, 1, 1, pos);
+}
+
+bool jog_lower_testing_finish(Lower *L, JogPos pos, int32_t ran) {
+    JogNode *decl;
+    JogType *i32;
+    JirOperand arg;
+    if (!L || L->failed) {
+        return false;
+    }
+    if (!testing_loaded(L)) {
+        return true;
+    }
+    decl = testing_decl(L, "report", pos);
+    if (!decl || L->failed) {
+        return false;
+    }
+    i32 = jog_type_builtin(L->program->types, JOG_BUILTIN_I32);
+    if (!i32) {
+        jog_lower_fail(L, pos, "missing test result");
+        return false;
+    }
+    arg = jir_int(i32, (uint64_t)ran);
+    return emit_testing_call(L, decl, &arg, 1, 1, pos);
 }

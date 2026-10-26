@@ -15,12 +15,16 @@ private fn cstr_ok(path: str, buf: *u8, cap: usize): bool {
     return true
 }
 
-private fn make_dir(path: str): bool {
+fn make_dir(path: str): bool {
     var buf: [4096]u8
     if !cstr_ok(path, buf[..].ptr, 4096) {
         return false
     }
-    return c.CreateDirectoryA(buf[..].ptr as *const c.char, 0) != 0
+    var wide: [4096]u16
+    if !c.utf8_to_wide(path, wide[..].ptr, 4096) {
+        return false
+    }
+    return c.CreateDirectoryW(wide[..].ptr, 0) != 0
 }
 
 private fn delete_file(path: str) {
@@ -28,7 +32,11 @@ private fn delete_file(path: str) {
     if !cstr_ok(path, buf[..].ptr, 4096) {
         return
     }
-    c.DeleteFileA(buf[..].ptr as *const c.char)
+    var wide: [4096]u16
+    if !c.utf8_to_wide(path, wide[..].ptr, 4096) {
+        return
+    }
+    c.DeleteFileW(wide[..].ptr)
 }
 
 private fn remove_dir(path: str) {
@@ -36,7 +44,11 @@ private fn remove_dir(path: str) {
     if !cstr_ok(path, buf[..].ptr, 4096) {
         return
     }
-    c.RemoveDirectoryA(buf[..].ptr as *const c.char)
+    var wide: [4096]u16
+    if !c.utf8_to_wide(path, wide[..].ptr, 4096) {
+        return
+    }
+    c.RemoveDirectoryW(wide[..].ptr)
 }
 
 private fn remove_child(dir: str, name: str) with (a: mem.Allocator) {
@@ -54,6 +66,8 @@ private fn wipe(dir: str) with (a: mem.Allocator) {
     remove_child(dir, "c")
     remove_child(dir, "m")
     remove_child(dir, "hello.txt")
+    remove_child(dir, "old.txt")
+    remove_child(dir, "new.txt")
     remove_child(dir, "nul.bin")
     val sub = join(dir, "sub")
     remove_child(sub, "f.txt")
@@ -62,10 +76,15 @@ private fn wipe(dir: str) with (a: mem.Allocator) {
     remove_dir(dir)
 }
 
-private fn scratch(name: str): str with (a: mem.Allocator) {
+fn scratch(name: str): str with (a: mem.Allocator) {
     var buf: [4096]u8
-    val n = c.GetTempPathA(4096, buf[..].ptr as *c.char)
-    val len = n as usize
+    var wide: [4096]u16
+    val n = c.GetTempPathW(4096, wide[..].ptr)
+    val chars = n as usize
+    if chars == 0 || chars >= 4096 {
+        panic("no temp directory")
+    }
+    val len = c.wide_to_utf8(wide[..].ptr, chars, buf[..].ptr, 4096)
     if len == 0 || len >= 4096 {
         panic("no temp directory")
     }
@@ -77,12 +96,12 @@ private fn scratch(name: str): str with (a: mem.Allocator) {
     return dir
 }
 
-private fn close_dir(dir: str) with (a: mem.Allocator) {
+fn close_dir(dir: str) with (a: mem.Allocator) {
     wipe(dir)
     free_str(dir)
 }
 
-private fn put(dir: str, name: str, text: str): bool with (a: mem.Allocator) {
+fn put(dir: str, name: str, text: str): bool with (a: mem.Allocator) {
     val path = join(dir, name)
     var data = bytes()
     data.ptr = text.ptr as *u8
@@ -92,7 +111,7 @@ private fn put(dir: str, name: str, text: str): bool with (a: mem.Allocator) {
     return wrote
 }
 
-private fn mkdir_at(dir: str, name: str): bool with (a: mem.Allocator) {
+fn mkdir_at(dir: str, name: str): bool with (a: mem.Allocator) {
     val path = join(dir, name)
     val made = make_dir(path)
     free_str(path)

@@ -11,7 +11,7 @@ b0 entry:
   l2 = checked add l0, l1  ; context.jog:6:14
   ret l2  ; context.jog:6:5
 
-fn f1 internal jog_app__twice "app.twice": (i64, i64) -> i64  ; context.jog:9:9
+fn f1 internal jog_app__twice__context_jog "app.twice": (i64, i64) -> i64  ; context.jog:9:9
   l0 n: i64 param
   l1 ctx0: i64 param
   l2: i64

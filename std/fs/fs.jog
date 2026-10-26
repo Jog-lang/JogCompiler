@@ -1,6 +1,6 @@
 // Package std.fs. read_all and write_all are std.io: a missing file is
 // false, not a panic, and the bytes come from the Allocator context.
-// list names the directory. The Windows file uses FindFirstFileA and
+// list names the directory. The Windows file uses FindFirstFileW and
 // the POSIX file uses opendir. "." and ".." are dropped. The names are
 // then sorted here, by unsigned byte value, so the order does not follow
 // the file system. join copies one path. '/' and '\\' are both separators.
@@ -15,6 +15,7 @@ import std.c
 import std.io
 import std.list as lists
 import std.mem
+import std.text
 
 fn read_all(path: str): (bytes, bool) with (a: mem.Allocator) {
     val (data, ok) = io.read_all(path)
@@ -42,16 +43,8 @@ fn free_str(text: str) with (a: mem.Allocator) {
 }
 
 // Copies text. An empty str allocates nothing.
-private fn copy_str(text: str): str with (a: mem.Allocator) {
-    if text.len == 0 {
-        return text
-    }
-    val (raw, err) = a.alloc(text.len, align(u8))
-    if err != null {
-        panic("out of memory")
-    }
-    c.memcpy(raw.ptr as *void, text.ptr as *const void, text.len)
-    return raw
+fn copy_str(s: str): str with (a: mem.Allocator) {
+    return text.clone(s)
 }
 
 // A separator already at the end of left or the start of right is kept.
@@ -104,7 +97,7 @@ private fn is_dot(p: *u8, n: usize): bool {
 }
 
 // Copies one directory entry. "." and ".." are dropped.
-private fn push_copied(names: *lists.List<str>, name_ptr: *u8, n: usize) with (a: mem.Allocator) {
+fn push_copied(names: *lists.List<str>, name_ptr: *u8, n: usize) with (a: mem.Allocator) {
     if n == 0 || is_dot(name_ptr, n) {
         return
     }
@@ -138,7 +131,7 @@ private fn name_before(left: str, right: str): bool {
     return left.len < right.len
 }
 
-private fn sort_names(names: *lists.List<str>) {
+fn sort_names(names: *lists.List<str>) {
     var i: usize = 1
     for i < names.len {
         val key = names.get(i)

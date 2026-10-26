@@ -1,0 +1,12 @@
+// expect: ok
+
+extern {
+    fn puts(s: *const i8): i32
+}
+
+fn main() {
+    if size(*u8) == 8 && align(*u8) == 8 && size(*const u8) == size(*u8) && size([4]u8) == 4 && align([4]u8) == 1 &&
+        size(i32?) > 0 {
+        puts(c"ok")
+    }
+}

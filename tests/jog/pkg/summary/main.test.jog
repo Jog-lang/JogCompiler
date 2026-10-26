@@ -1,0 +1,6 @@
+import std.testing
+
+@test
+fn passes() with (t: testing.Testing) {
+    t.expect(true)
+}

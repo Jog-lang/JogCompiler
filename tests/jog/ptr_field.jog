@@ -1,0 +1,25 @@
+// expect: ok
+
+extern {
+    fn puts(s: *const i8): i32
+}
+
+struct Inner {
+    n: i64
+}
+
+struct Outer {
+    f: *Inner
+}
+
+fn *Outer.read(): i64 {
+    return self.f.n
+}
+
+fn main() {
+    var inner = Inner(n: 5)
+    var outer = Outer(f: &inner)
+    if outer.read() == 5 {
+        puts(c"ok")
+    }
+}

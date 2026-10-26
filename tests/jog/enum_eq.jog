@@ -1,0 +1,33 @@
+// expect: ok
+
+extern {
+    fn puts(s: *const i8): i32
+}
+
+enum Flag { Off, On }
+
+enum Item {
+    Num(n: i32)
+    Text(s: str)
+}
+
+struct Pair {
+    a: Flag
+    b: Flag
+}
+
+fn main() {
+    var flags: [2]Flag
+    var pair: Pair
+    var on = Flag.On
+    var a = Item.Num(n: 3)
+    var b = Item.Num(n: 3)
+    var c = Item.Text(s: "a")
+    var d = Item.Text(s: "a")
+    var e = Item.Text(s: "b")
+    if flags[0] == Flag.Off && pair.a == Flag.Off && on != Flag.Off && on == Flag.On {
+        if a == b && a != c && c == d && c != e {
+            puts(c"ok")
+        }
+    }
+}

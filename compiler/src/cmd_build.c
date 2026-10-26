@@ -1030,6 +1030,50 @@ static int expects_match(CtDa *expect, char *stdout_text) {
     return same;
 }
 
+static int decl_is_test(const JogNode *fn) {
+    size_t i;
+    if (!fn || fn->kind != JOG_NODE_FN) {
+        return 0;
+    }
+    for (i = 0; i < fn->attrs.count; i++) {
+        const JogNode *attr = fn->attrs.items ? fn->attrs.items[i] : NULL;
+        if (attr && attr->kind == JOG_NODE_ATTRIBUTE && attr->as.attribute.name &&
+            strcmp(attr->as.attribute.name, "test") == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int program_has_test(const JogProgram *program) {
+    size_t p;
+    size_t f;
+    size_t d;
+    if (!program) {
+        return 0;
+    }
+    for (p = 0; p < program->package_count; p++) {
+        JogPackage *pkg = program->packages ? program->packages[p] : NULL;
+        if (!pkg) {
+            continue;
+        }
+        for (f = 0; f < pkg->file_count; f++) {
+            JogSourceFile *source = pkg->files ? pkg->files[f] : NULL;
+            JogNode *root = source ? source->ast : NULL;
+            if (!root || root->kind != JOG_NODE_FILE) {
+                continue;
+            }
+            for (d = 0; d < root->as.file.decls.count; d++) {
+                const JogNode *decl = root->as.file.decls.items ? root->as.file.decls.items[d] : NULL;
+                if (decl_is_test(decl)) {
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 static int compile_pipeline(const CmdRequest *req) {
     CtArena *arena = NULL;
     CtDiag *diag = NULL;
@@ -1114,6 +1158,12 @@ static int compile_pipeline(const CmdRequest *req) {
         goto report;
     }
     if (req->stop == STOP_CHECK) {
+        status = 0;
+        goto report;
+    }
+    if (req->include_tests && !program_has_test(&program)) {
+        fputs("no tests\n", stdout);
+        fflush(stdout);
         status = 0;
         goto report;
     }

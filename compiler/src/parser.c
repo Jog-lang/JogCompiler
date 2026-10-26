@@ -1228,10 +1228,14 @@ static JogNode *parse_if(Parser *p) {
     return node;
 }
 
-/* [4]T(...), [_]T(...), and []T(...). The bracket type stops at the '('. */
+/* [4]T(...), [_]T(...), and []T(...). The bracket type stops at the '('.
+   Without the '(', the brackets are the type itself: size([4]u8). */
 static JogNode *parse_array_lit(Parser *p) {
     JogPos pos = here(p);
     JogNode *type = parse_bracket_type(p);
+    if (type && !give_up(p) && !check(p, JOG_TOK_LPAREN)) {
+        return type;
+    }
     if (type) {
         pos = type->pos;
     }
@@ -1563,11 +1567,20 @@ static JogNode *parse_postfix(Parser *p, bool trail) {
     return node;
 }
 
+static bool type_closer(JogTokenKind kind) {
+    return kind == JOG_TOK_RPAREN || kind == JOG_TOK_COMMA || kind == JOG_TOK_RBRACKET || kind == JOG_TOK_RBRACE ||
+           kind == JOG_TOK_SEP || kind == JOG_TOK_EOF;
+}
+
 static JogNode *parse_unary(Parser *p, bool trail) {
     if (give_up(p)) {
         return NULL;
     }
     JogTokenKind kind = peek_kind(p);
+    /* *const T is a type, not a dereference of a const value. */
+    if (kind == JOG_TOK_STAR && peek_n(p, 1) == JOG_TOK_KW_CONST) {
+        return parse_type(p);
+    }
     if (!is_prefix(kind)) {
         return parse_postfix(p, trail);
     }
@@ -1590,6 +1603,17 @@ static JogNode *parse_prec(Parser *p, int min_prec, bool range_ok, bool trail) {
     JogNode *left = parse_unary(p, trail);
     if (!left) {
         return NULL;
+    }
+    /* T? binds loosest. Only when the next token closes a type argument,
+       so a value expression does not swallow a following operator. */
+    while (!give_up(p) && peek_kind(p) == JOG_TOK_QUESTION && type_closer(peek_n(p, 1))) {
+        advance(p);
+        JogNode *opt = make_at(p, JOG_NODE_TYPE_OPTION, left->pos);
+        if (!opt) {
+            return NULL;
+        }
+        opt->as.type_elem.elem = left;
+        left = opt;
     }
     for (;;) {
         if (give_up(p)) {
@@ -2492,7 +2516,7 @@ static JogVisibility parse_visibility(Parser *p) {
     }
     if (!eat(p, JOG_TOK_LPAREN)) {
         skip_seps(p);
-        return JOG_VIS_PACKAGE;
+        return JOG_VIS_FILE;
     }
     JogVisibility vis = JOG_VIS_PACKAGE;
     if (!check(p, JOG_TOK_IDENT)) {
@@ -2650,31 +2674,55 @@ static const char *intern_op_name(Parser *p, const char *spelling) {
     return name;
 }
 
+/* True when the next tokens are `op` and then an operator, as in `fn T.op+`. */
+static bool at_op_method(const Parser *p) {
+    const JogToken *t;
+    JogTokenKind next;
+    if (!check(p, JOG_TOK_IDENT)) {
+        return false;
+    }
+    t = cur(p);
+    if (!t || t->length != 2 || !t->start || t->start[0] != 'o' || t->start[1] != 'p') {
+        return false;
+    }
+    next = peek_n(p, 1);
+    return is_overload_op(next) || next == JOG_TOK_LBRACKET;
+}
+
+static bool parse_op_body(Parser *p, const char **name, JogTokenKind *op) {
+    if (check(p, JOG_TOK_LBRACKET)) {
+        advance(p);
+        expect(p, JOG_TOK_RBRACKET, "']'");
+        if (eat(p, JOG_TOK_ASSIGN)) {
+            *name = intern_op_name(p, "[]=");
+        } else {
+            *name = intern_op_name(p, "[]");
+        }
+        /* '[' stands for both '[]' and '[]='; the name distinguishes them. */
+        *op = JOG_TOK_LBRACKET;
+        return !p->oom;
+    }
+    JogTokenKind kind = peek_kind(p);
+    if (!is_overload_op(kind)) {
+        error_here(p, "expected an operator, found %s", jog_token_spelling(kind));
+        return false;
+    }
+    *op = kind;
+    *name = intern_op_name(p, jog_token_spelling(kind));
+    advance(p);
+    return !p->oom;
+}
+
 static bool parse_fn_name(Parser *p, const char **name, JogTokenKind *op) {
     *name = "";
     *op = JOG_TOK_EOF;
-    if (eat(p, JOG_TOK_KW_OP)) {
-        if (check(p, JOG_TOK_LBRACKET)) {
-            advance(p);
-            expect(p, JOG_TOK_RBRACKET, "']'");
-            if (eat(p, JOG_TOK_ASSIGN)) {
-                *name = intern_op_name(p, "[]=");
-            } else {
-                *name = intern_op_name(p, "[]");
-            }
-            /* '[' stands for both '[]' and '[]='; the name distinguishes them. */
-            *op = JOG_TOK_LBRACKET;
-            return !p->oom;
-        }
-        JogTokenKind kind = peek_kind(p);
-        if (!is_overload_op(kind)) {
-            error_here(p, "expected an operator, found %s", jog_token_spelling(kind));
-            return false;
-        }
-        *op = kind;
-        *name = intern_op_name(p, jog_token_spelling(kind));
+    /* `op` is an identifier except at the start of an operator method. */
+    if (at_op_method(p)) {
         advance(p);
-        return !p->oom;
+        return parse_op_body(p, name, op);
+    }
+    if (eat(p, JOG_TOK_KW_OP)) {
+        return parse_op_body(p, name, op);
     }
     if (check(p, JOG_TOK_IDENT)) {
         *name = ident_text(p);

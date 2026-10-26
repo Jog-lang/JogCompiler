@@ -1,0 +1,12 @@
+extern {
+    fn puts(s: *const i8): i32
+}
+
+fn main() {
+    var h = sample()
+    if h.b.get() == 4 {
+        puts(c"ok")
+    } else {
+        puts(c"no")
+    }
+}

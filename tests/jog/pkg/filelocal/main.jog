@@ -1,0 +1,17 @@
+extern {
+    fn puts(s: *const i8): i32
+}
+
+private fn helper(): i64 {
+    return 1
+}
+
+fn from_main(): i64 {
+    return helper()
+}
+
+fn main() {
+    if from_main() + from_other() == 3 {
+        puts(c"ok")
+    }
+}

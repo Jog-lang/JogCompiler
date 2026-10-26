@@ -486,6 +486,11 @@ static const char *make_nominal(Emit *e, const JogType *type) {
     if (sb->len == before) {
         ct_sb_appendf(sb, "t%u", (unsigned)type->id);
     }
+    if (type->as.nominal.decl && type->as.nominal.decl->visibility == JOG_VIS_FILE && type->as.nominal.decl->pos.file &&
+        type->as.nominal.decl->pos.file[0] != '\0') {
+        ct_sb_append_cstr(sb, "__");
+        append_sanitized(sb, type->as.nominal.decl->pos.file);
+    }
     if (type->as.nominal.type_arg_count > 0 && type->as.nominal.type_args) {
         ct_sb_append_cstr(sb, "__");
         for (size_t i = 0; i < type->as.nominal.type_arg_count; i++) {
@@ -1908,6 +1913,32 @@ static void emit_checked_shift(Emit *e, const JirFunc *func, const JirInst *inst
     ct_sb_appendf(e->out, "jog_rhs >= %u) {\n            jogrt_panic_overflow(", width);
     append_loc(e->out, inst->pos);
     ct_sb_append_cstr(e->out, ");\n        }\n        ");
+    /* A left shift that would drop bits panics. The count check above
+       already rejected n < 0 and n >= width, and panic does not return. */
+    if (spell && spell[0] == '<' && spell[1] == '<' && spell[2] == '\0' &&
+        (width == 8 || width == 16 || width == 32 || width == 64)) {
+        int signed_shift = int_signed(inst->a.type);
+        ct_sb_appendf(e->out, "{\n            uint%u_t jog_bits = (uint%u_t)", width, width);
+        append_paren(e, &inst->a);
+        ct_sb_appendf(e->out, ";\n            unsigned jog_n = (unsigned)jog_rhs;\n            if (jog_n > 0u && jog_n < %uu) {\n                ", width);
+        if (!signed_shift) {
+            ct_sb_appendf(e->out, "if ((jog_bits >> (%uu - jog_n)) != 0) {\n                    jogrt_panic_overflow(", width);
+            append_loc(e->out, inst->pos);
+            ct_sb_append_cstr(e->out, ");\n                }\n");
+        } else {
+            ct_sb_appendf(e->out,
+                          "uint%u_t jog_mask = (jog_n + 1u >= %uu) ? (uint%u_t)-1 : "
+                          "(uint%u_t)(((uint%u_t)1 << (jog_n + 1u)) - 1u);\n"
+                          "                uint%u_t jog_top = (uint%u_t)(jog_bits >> (%uu - 1u - jog_n));\n"
+                          "                uint%u_t jog_sign = (uint%u_t)(jog_bits >> %uu);\n"
+                          "                if ((jog_top & jog_mask) != (jog_sign ? jog_mask : (uint%u_t)0)) {\n"
+                          "                    jogrt_panic_overflow(",
+                          width, width, width, width, width, width, width, width, width, width, width - 1, width);
+            append_loc(e->out, inst->pos);
+            ct_sb_append_cstr(e->out, ");\n                }\n");
+        }
+        ct_sb_append_cstr(e->out, "            }\n        }\n        ");
+    }
     if (!append_dst(e, func, inst->dst)) {
         return;
     }

@@ -1,0 +1,21 @@
+// expect: ok
+
+extern {
+    fn puts(s: *const i8): i32
+}
+
+fn take(s: str): bool {
+    return s == "hi"
+}
+
+fn main() {
+    var buf: [2]u8
+    buf[0] = 104
+    buf[1] = 105
+    val view: []u8 = buf[..]
+    val s: str = view
+    val t = view as str
+    if take(view) && s == "hi" && t == "hi" {
+        puts(c"ok")
+    }
+}

@@ -154,15 +154,19 @@ static JirOperand emit_load(Lower *L, JirOperand ptr, JogPos pos) {
     return jog_lower_local_op(L, dst);
 }
 
+static JirOperand along_path(Lower *L, JirOperand ptr, JogType *start, const uint32_t *index, uint8_t len, JogPos pos);
+
 /* Pointer to the value of node. A pointer-typed root is that pointer.
-   A value root is the address of its local. */
+   A value root is the address of its local. An index or a dereference is
+   the address of that element, not a copy. Each pointer field in the
+   chain is loaded once before the next field, matching the checker. */
 static JirOperand pointer_to(Lower *L, JogNode *node) {
     AddrPath addr;
     JirOperand op;
     JogType *root_ty;
     JogType *cur;
     int was_ptr = 0;
-    uint8_t i;
+    int lvalue = 0;
     memset(&addr, 0, sizeof(addr));
     addr.ok = true;
     collect_addr(L, node, &addr);
@@ -170,33 +174,34 @@ static JirOperand pointer_to(Lower *L, JogNode *node) {
         return jog_lower_local_op(L, 0);
     }
     root_ty = addr.root->type ? jog_lower_type(L, addr.root->type) : NULL;
-    cur = peel_ptr(root_ty, &was_ptr);
-    op = jir_none();
-    if (addr.root->kind == JOG_NODE_IDENT && addr.root->symbol) {
-        JirOperand cap;
-        if (!was_ptr && jog_lower_lambda_addr(L, addr.root->symbol, &cap)) {
-            op = cap;
-        } else if (was_ptr && jog_lower_lambda_name(L, addr.root, addr.root->symbol, &cap)) {
-            op = cap;
+    lvalue = addr.root->kind == JOG_NODE_INDEX ||
+             (addr.root->kind == JOG_NODE_UNARY && addr.root->as.unary.op == JOG_TOK_STAR);
+    if (lvalue) {
+        op = jog_lower_lvalue_ptr(L, addr.root);
+        cur = root_ty;
+    } else {
+        cur = peel_ptr(root_ty, &was_ptr);
+        op = jir_none();
+        if (addr.root->kind == JOG_NODE_IDENT && addr.root->symbol) {
+            JirOperand cap;
+            if (!was_ptr && jog_lower_lambda_addr(L, addr.root->symbol, &cap)) {
+                op = cap;
+            } else if (was_ptr && jog_lower_lambda_name(L, addr.root, addr.root->symbol, &cap)) {
+                op = cap;
+            }
+        }
+        if (op.kind == JIR_OPND_NONE && !L->failed) {
+            op = jog_lower_expr(L, addr.root);
+            if (L->failed) {
+                return op;
+            }
+            if (!was_ptr) {
+                op = jog_lower_as_local(L, op, addr.root->pos);
+                op = emit_addr(L, op, cur, node->pos);
+            }
         }
     }
-    if (op.kind == JIR_OPND_NONE && !L->failed) {
-        op = jog_lower_expr(L, addr.root);
-        if (L->failed) {
-            return op;
-        }
-        if (!was_ptr) {
-            op = jog_lower_as_local(L, op, addr.root->pos);
-            op = emit_addr(L, op, cur, node->pos);
-        }
-    }
-    for (i = 0; i < addr.len && !L->failed; i++) {
-        op = emit_field_addr(L, op, cur, addr.index[i], node->pos);
-        if (cur && cur->kind == JOG_TY_STRUCT && cur->as.nominal.fields && addr.index[i] < cur->as.nominal.field_count) {
-            cur = cur->as.nominal.fields[addr.index[i]].type;
-        }
-    }
-    return op;
+    return along_path(L, op, cur, addr.index, addr.len, node->pos);
 }
 
 JirOperand jog_lower_field_ptr(Lower *L, JogNode *node) {
@@ -260,9 +265,11 @@ static JirOperand emit_binop(Lower *L, JogTokenKind op, JirOperand lhs, JirOpera
         break;
     case JOG_TOK_SHL:
         bin = JIR_SHL;
+        checked = true;
         break;
     case JOG_TOK_SHR:
         bin = JIR_SHR;
+        checked = true;
         break;
     default:
         jog_lower_fail(L, pos, "operator '%s' is not lowered yet", jog_token_spelling(op));
@@ -494,9 +501,17 @@ static JirOperand along_path(Lower *L, JirOperand ptr, JogType *start, const uin
     JogType *cur = start;
     uint8_t i;
     for (i = 0; i < len && !L->failed; i++) {
+        int was = 0;
+        JogType *peeled = peel_ptr(cur, &was);
+        if (was) {
+            ptr = emit_load(L, ptr, pos);
+            cur = peeled;
+        }
         ptr = emit_field_addr(L, ptr, cur, index[i], pos);
         if (cur && cur->kind == JOG_TY_STRUCT && cur->as.nominal.fields && index[i] < cur->as.nominal.field_count) {
             cur = cur->as.nominal.fields[index[i]].type;
+        } else {
+            cur = NULL;
         }
     }
     return ptr;
@@ -768,6 +783,65 @@ static void walk_self(JogNode *node, JogNode *fn, JogSymbol **out) {
         return;
     case JOG_NODE_INTERP:
         walk_list(node->as.interp.parts, fn, out);
+        return;
+    case JOG_NODE_INDEX:
+        walk_self(node->as.index.base, fn, out);
+        walk_self(node->as.index.index, fn, out);
+        return;
+    case JOG_NODE_SLICE:
+        walk_self(node->as.slice.base, fn, out);
+        walk_self(node->as.slice.lo, fn, out);
+        walk_self(node->as.slice.hi, fn, out);
+        return;
+    case JOG_NODE_WHEN:
+        walk_self(node->as.when.subject, fn, out);
+        walk_list(node->as.when.arms, fn, out);
+        return;
+    case JOG_NODE_WHEN_ARM:
+        walk_list(node->as.when_arm.conds, fn, out);
+        walk_self(node->as.when_arm.body, fn, out);
+        return;
+    case JOG_NODE_IS:
+        walk_self(node->as.is.expr, fn, out);
+        return;
+    case JOG_NODE_TUPLE:
+        walk_list(node->as.tuple.elems, fn, out);
+        return;
+    case JOG_NODE_ARRAY_LIT:
+        walk_list(node->as.array_lit.elems, fn, out);
+        return;
+    case JOG_NODE_GO:
+        walk_list(node->as.go.args, fn, out);
+        walk_list(node->as.go.contexts, fn, out);
+        walk_self(node->as.go.body, fn, out);
+        return;
+    case JOG_NODE_DEFER:
+    case JOG_NODE_ERRDEFER:
+        walk_self(node->as.defer.body, fn, out);
+        return;
+    case JOG_NODE_LAMBDA:
+        walk_self(node->as.lambda.body, fn, out);
+        return;
+    case JOG_NODE_DESTRUCTURE:
+        walk_list(node->as.destructure.targets, fn, out);
+        walk_self(node->as.destructure.value, fn, out);
+        return;
+    case JOG_NODE_WITH:
+        walk_list(node->as.with.values, fn, out);
+        walk_self(node->as.with.body, fn, out);
+        return;
+    case JOG_NODE_ATTR_BLOCK:
+        walk_self(node->as.attr_block.body, fn, out);
+        return;
+    case JOG_NODE_PAT_VARIANT:
+        walk_list(node->as.pat_variant.fields, fn, out);
+        return;
+    case JOG_NODE_PAT_FIELD:
+        walk_self(node->as.pat_field.pattern, fn, out);
+        return;
+    case JOG_NODE_PAT_IN:
+    case JOG_NODE_PAT_EXPR:
+        walk_self(node->as.pat_expr.expr, fn, out);
         return;
     default:
         return;

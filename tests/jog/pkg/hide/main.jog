@@ -1,0 +1,8 @@
+import store
+
+fn parse(store: str) {
+    val n = store.value()
+}
+
+fn main() {
+}

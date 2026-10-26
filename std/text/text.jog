@@ -1,0 +1,86 @@
+// Package std.text. slice, starts_with, ends_with, and index_of are views:
+// they allocate nothing. clone copies into the Allocator context.
+// A range that does not fit the string panics. An empty needle is a match
+// at the start. index_of returns the byte offset and false when the needle
+// is absent.
+
+import std.c
+import std.mem
+
+fn slice(s: str, from: usize, to: usize): str {
+    if from > to || to > s.len {
+        panic("slice out of range")
+    }
+    var view = bytes()
+    if from == to {
+        return view
+    }
+    view.ptr = (s.ptr + from) as *u8
+    view.len = to - from
+    return view
+}
+
+fn starts_with(s: str, prefix: str): bool {
+    if prefix.len > s.len {
+        return false
+    }
+    var i: usize = 0
+    for i < prefix.len {
+        if s.ptr[i] != prefix.ptr[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn ends_with(s: str, suffix: str): bool {
+    if suffix.len > s.len {
+        return false
+    }
+    val from = s.len - suffix.len
+    var i: usize = 0
+    for i < suffix.len {
+        if s.ptr[from + i] != suffix.ptr[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Byte offset of the first match. false means the needle is absent.
+fn index_of(s: str, needle: str): (usize, bool) {
+    if needle.len == 0 {
+        return 0, true
+    }
+    if needle.len > s.len {
+        return 0, false
+    }
+    var i: usize = 0
+    val last = s.len - needle.len
+    for i <= last {
+        if starts_with(slice(s, i, s.len), needle) {
+            return i, true
+        }
+        if i == last {
+            break
+        }
+        i = i + 1
+    }
+    return 0, false
+}
+
+// An owned copy. An empty str allocates nothing. The caller frees it
+// with the same allocator, through fs.free_str or an equivalent block.
+fn clone(s: str): str with (a: mem.Allocator) {
+    if s.len == 0 {
+        return s
+    }
+    val (raw, err) = a.alloc(s.len, align(u8))
+    if err != null {
+        panic("out of memory")
+    }
+    c.memcpy(raw.ptr as *void, s.ptr as *const void, s.len)
+    return raw
+}

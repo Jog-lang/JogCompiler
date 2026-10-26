@@ -1,0 +1,23 @@
+// newSlice zero-fills. freeSlice releases the block. An empty count
+// allocates nothing.
+
+import std.testing
+
+struct Slot {
+    n: i32
+}
+
+@test
+fn zeroedSlice() with (t: testing.Testing) {
+    with (heap()) {
+        var slots = newSlice<Slot>(2)
+        t.expect(slots.len == 2)
+        t.expect(slots[0].n == 0)
+        slots[0].n = 4
+        t.expect(slots[0].n == 4)
+        freeSlice(slots)
+        var none = newSlice<Slot>(0)
+        t.expect(none.len == 0)
+        freeSlice(none)
+    }
+}

@@ -1,6 +1,5 @@
 // expect: ok
 
-import std.mem
 import std.io
 
 fn main() {

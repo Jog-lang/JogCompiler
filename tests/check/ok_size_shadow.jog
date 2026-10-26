@@ -1,0 +1,10 @@
+fn size(n: i64): i64 {
+    return n
+}
+
+fn main() {
+    val n = size(4)
+    if n != 4 {
+        return
+    }
+}

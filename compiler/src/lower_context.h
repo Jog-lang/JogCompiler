@@ -31,10 +31,15 @@ bool jog_lower_context_default(Lower *L, JogNode *node, JogSymbol *symbol, JirOp
    The value is a bitcast. False when the cast is something else. */
 bool jog_lower_context_cast(Lower *L, JogNode *node, JirOperand *out);
 
-/* Call std.testing.finish in the current function when that package is
-   loaded. finish exits the process when a test recorded a failure.
-   A program that never loaded the package has nothing to report.
+/* Call std.testing.note(name) before an @test when that package is loaded.
+   A program that never loaded the package has nothing to name.
    False after a diagnostic. */
-bool jog_lower_testing_finish(Lower *L, JogPos pos);
+bool jog_lower_testing_note(Lower *L, const char *name, JogPos pos);
+
+/* Call std.testing.report(ran) in the current function when that package
+   is loaded. report prints the summary, then exits when a test recorded
+   a failure. A program that never loaded the package has nothing to report.
+   False after a diagnostic. */
+bool jog_lower_testing_finish(Lower *L, JogPos pos, int32_t ran);
 
 #endif

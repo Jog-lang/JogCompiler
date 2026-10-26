@@ -161,6 +161,15 @@ static bool method_visible(const CheckJob *job, const JogSymbol *method) {
     if (!method->package || method->package == pkg) {
         return true;
     }
+    /* A method declared in the type's package is visible wherever the type
+       is. An extension still needs its package imported in this file. */
+    if (method->decl && method->decl->kind == JOG_NODE_FN) {
+        JogType *on = NULL;
+        jog_method_receiver(method->decl, &on, NULL);
+        if (type_in_package(on, method->package)) {
+            return true;
+        }
+    }
     return file_imports(job, method->package);
 }
 
@@ -954,7 +963,18 @@ static void scan_methods(FindWalk *find, JogType *type, const uint32_t *path, ui
                 if (!decl || decl->kind != JOG_NODE_FN || !decl->as.fn.receiver || !decl->symbol || !decl->as.fn.name) {
                     continue;
                 }
-                if (strcmp(decl->as.fn.name, find->name) != 0 || !method_visible(find->job, decl->symbol)) {
+                if (strcmp(decl->as.fn.name, find->name) != 0) {
+                    continue;
+                }
+                /* A method in another package needs its signature before
+                   visibility can tell a method from an extension. */
+                if (decl->symbol->package && find->job && decl->symbol->package != find->job->package) {
+                    if (!jog_check_wait(find->ck, find->job, decl->symbol)) {
+                        find->waiting = true;
+                        return;
+                    }
+                }
+                if (!method_visible(find->job, decl->symbol)) {
                     continue;
                 }
                 if (!jog_check_wait(find->ck, find->job, decl->symbol)) {
@@ -1064,6 +1084,23 @@ static bool addressable_node(const JogNode *node) {
             return !base_ty->is_const;
         }
         return addressable_node(node->as.member.base);
+    }
+    if (node->kind == JOG_NODE_UNARY && node->as.unary.op == JOG_TOK_STAR) {
+        JogType *op_ty = node->as.unary.operand ? node->as.unary.operand->type : NULL;
+        return op_ty && op_ty->kind == JOG_TY_PTR && !op_ty->is_const;
+    }
+    if (node->kind == JOG_NODE_INDEX) {
+        JogType *base_ty = node->as.index.base ? node->as.index.base->type : NULL;
+        if (!base_ty) {
+            return false;
+        }
+        if (base_ty->kind == JOG_TY_PTR || base_ty->kind == JOG_TY_SLICE || base_ty->kind == JOG_TY_BYTES) {
+            return !base_ty->is_const;
+        }
+        if (base_ty->kind == JOG_TY_ARRAY || base_ty->kind == JOG_TY_BYTES_N) {
+            return addressable_node(node->as.index.base);
+        }
+        return false;
     }
     return false;
 }
@@ -1348,6 +1385,36 @@ typedef struct MethodEnv {
     JogBlockScope *scope;
 } MethodEnv;
 
+/* The call's base name is a parameter, variable, or constant, and the
+   same file imported a package under that name. 1 after the diagnostic. */
+static int report_hidden_package(Check *ck, CheckJob *job, JogBlockScope *scope, JogNode *base) {
+    JogSymbol *local;
+    JogSymbol *hidden;
+    const char *what;
+    if (!base || base->kind != JOG_NODE_IDENT || !base->as.ident.name) {
+        return 0;
+    }
+    local = lookup_name(job, scope, base->as.ident.name);
+    if (!local || (local->kind != JOG_SYM_PARAMETER && local->kind != JOG_SYM_VARIABLE &&
+                   local->kind != JOG_SYM_CONSTANT && local->kind != JOG_SYM_CONTEXT)) {
+        return 0;
+    }
+    hidden = jog_check_lookup_file(job, base->as.ident.name);
+    if (!hidden || hidden->kind != JOG_SYM_PACKAGE || hidden == local) {
+        return 0;
+    }
+    what = "parameter";
+    if (local->kind == JOG_SYM_VARIABLE) {
+        what = "variable";
+    } else if (local->kind == JOG_SYM_CONSTANT) {
+        what = "constant";
+    } else if (local->kind == JOG_SYM_CONTEXT) {
+        what = "context";
+    }
+    jog_check_fail(ck, base->pos, "%s '%s' hides imported package '%s'", what, base->as.ident.name, base->as.ident.name);
+    return 1;
+}
+
 static JogType *method_probe(void *env, JogNode *node, JogType *target) {
     MethodEnv *method = env;
     return jog_check_expr(method->ck, method->job, method->scope, node, target);
@@ -1588,6 +1655,11 @@ int jog_check_struct_call(Check *ck, CheckJob *job, JogBlockScope *scope, JogNod
                 if (constrained > 0) {
                     return 1;
                 }
+            }
+            if (report_hidden_package(ck, job, scope, base)) {
+                call->type = error;
+                *out = error;
+                return 1;
             }
             return 0;
         }

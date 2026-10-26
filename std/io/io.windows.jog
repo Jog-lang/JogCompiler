@@ -1,0 +1,23 @@
+// Windows open. _wfopen takes UTF-16, so a path outside the ANSI code
+// page still opens. The mode is a short ASCII string.
+
+import std.c
+
+fn open_c_file(path: str, mode: *const c.char): *c.FILE? {
+    var wide_path: [4096]u16
+    if path.len >= 4096 || !c.utf8_to_wide(path, wide_path[..].ptr, 4096) {
+        return null
+    }
+    var wide_mode: [8]u16
+    var i: usize = 0
+    val raw = mode as *const u8
+    for i < 7 {
+        val b = raw[i]
+        wide_mode[i] = b as u16
+        if b == 0 {
+            return c._wfopen(wide_path[..].ptr, wide_mode[..].ptr)
+        }
+        i = i + 1
+    }
+    return null
+}

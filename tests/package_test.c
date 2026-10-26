@@ -506,6 +506,37 @@ static void expect_stdout(CtArena *arena, CtDiag *diag, const char *jog, const c
     finish_case(arena, diag, mod, out_text, err_text);
 }
 
+static void expect_stdout_err(CtArena *arena, CtDiag *diag, const char *jog, const char *root, const char *name,
+                              const char *cmd, const char *stdout_text, const char *stderr_needle) {
+    char *mod = stage(arena, diag, root, name);
+    char *out_path = NULL;
+    char *err_path = NULL;
+    char *out_text = NULL;
+    char *err_text = NULL;
+    int code = -1;
+    if (!mod) {
+        return;
+    }
+    out_path = temp_path(arena, ".out");
+    err_path = temp_path(arena, ".err");
+    if (!out_path || !err_path || !run_jog(jog, mod, cmd, out_path, err_path, &code)) {
+        fprintf(stderr, "FAIL %s: cannot run jog %s\n", name, cmd);
+        CHECK(0);
+        finish_case(arena, diag, mod, NULL, NULL);
+        return;
+    }
+    out_text = read_stripped(out_path);
+    err_text = read_stripped(err_path);
+    remove(out_path);
+    remove(err_path);
+    if (!out_text || !err_text || code != 0 || strcmp(out_text, stdout_text) != 0 || !strstr(err_text, stderr_needle)) {
+        fprintf(stderr, "FAIL %s: jog %s exited %d\nstdout: %s\nstderr: %s\n", name, cmd, code,
+                out_text ? out_text : "", err_text ? err_text : "");
+        CHECK(0);
+    }
+    finish_case(arena, diag, mod, out_text, err_text);
+}
+
 static void expect_diag(CtArena *arena, CtDiag *diag, const char *jog, const char *root, const char *name,
                         const char *needle) {
     char *mod = stage(arena, diag, root, name);
@@ -843,8 +874,8 @@ static void expect_test_failure(CtArena *arena, CtDiag *diag, const char *jog, c
     err_text = read_stripped(err_path);
     remove(out_path);
     remove(err_path);
-    if (!out_text || !err_text || code != 1 || strcmp(out_text, "still\n") != 0 || !strstr(err_text, "fail") ||
-        !strstr(err_text, "test exited with status 1")) {
+    if (!out_text || !err_text || code != 1 || strcmp(out_text, "still\n") != 0 || !strstr(err_text, "checks: fail") ||
+        !strstr(err_text, "1 tests,") || !strstr(err_text, "test exited with status 1")) {
         fprintf(stderr, "FAIL failtest: jog test exited %d\nstdout: %s\nstderr: %s\n", code, out_text ? out_text : "",
                 err_text ? err_text : "");
         CHECK(0);
@@ -1227,12 +1258,19 @@ int main(void) {
     expect_init_order(arena, diag, jog, root);
     expect_stdout(arena, diag, jog, root, "initorder", "run", "leaf-first\n");
     expect_stdout(arena, diag, jog, root, "visible", "run", "visible\n");
-    expect_diag(arena, diag, jog, root, "hidden", "type 'Secret' is not visible");
-    expect_diag(arena, diag, jog, root, "hidden", "name 'hidden' is not visible");
+    expect_diag(arena, diag, jog, root, "hidden", "undefined type 'store.Secret'");
+    expect_diag(arena, diag, jog, root, "hidden", "undefined name 'hidden'");
     expect_diag(arena, diag, jog, root, "hidden", "undefined name 'secret'");
     expect_diag(arena, diag, jog, root, "filepriv", "undefined name 'secret'");
+    expect_stdout(arena, diag, jog, root, "filelocal", "run", "ok\n");
     expect_stdout(arena, diag, jog, root, "testrun", "run", "run\n");
     expect_stdout(arena, diag, jog, root, "testrun", "test", "ok\n");
+    expect_stdout(arena, diag, jog, root, "methoduse", "run", "ok\n");
+    expect_stdout(arena, diag, jog, root, "enumis", "run", "ok\n");
+    expect_stdout(arena, diag, jog, root, "notest", "test", "no tests\n");
+    expect_stdout_err(arena, diag, jog, root, "summary", "test", "", "1 tests, 1 passed");
+    expect_diag(arena, diag, jog, root, "hide", "parameter 'store' hides imported package 'store'");
+    expect_diag(arena, diag, jog, root, "unused", "unused import 'store'");
     expect_stdout(arena, diag, jog, root, "ctx", "run", "run\n");
     expect_stdout(arena, diag, jog, root, "ctx", "test", "tested\n");
     expect_stdout(arena, diag, jog, root, "testing", "run", "run\n");
@@ -1250,6 +1288,12 @@ int main(void) {
         CHECK(std_root != NULL);
         if (std_root) {
             expect_stdout(arena, diag, jog, std_root, "io", "test", "");
+            expect_stdout(arena, diag, jog, std_root, "list", "test", "");
+            expect_stdout(arena, diag, jog, std_root, "mem", "test", "");
+            expect_stdout(arena, diag, jog, std_root, "text", "test", "");
+            expect_stdout(arena, diag, jog, std_root, "fs", "test", "");
+            expect_stdout(arena, diag, jog, std_root, "os", "test", "");
+            expect_stdout(arena, diag, jog, std_root, "proc", "test", "");
         }
     }
     if (had_root) {

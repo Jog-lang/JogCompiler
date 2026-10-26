@@ -73,6 +73,9 @@ struct JogSymbol {
     JogType **nominal_insts;
     size_t nominal_inst_count;
     size_t nominal_inst_cap;
+    /* An imported package name that a file actually used. The checker
+       reports an import whose symbol stays false. Other kinds ignore it. */
+    bool referenced;
 };
 
 typedef struct JogBlockScope JogBlockScope;

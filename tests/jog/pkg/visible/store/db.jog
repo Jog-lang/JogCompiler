@@ -2,7 +2,7 @@ fn open(): i64 {
     return 1
 }
 
-private fn hidden(): i64 {
+fn hidden(): i64 {
     return 2
 }
 

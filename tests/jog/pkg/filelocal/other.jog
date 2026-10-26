@@ -1,0 +1,7 @@
+private fn helper(): i64 {
+    return 2
+}
+
+fn from_other(): i64 {
+    return helper()
+}

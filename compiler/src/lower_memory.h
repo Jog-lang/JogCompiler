@@ -8,6 +8,10 @@
    skips those checks and leaves integer overflow checked. */
 
 JirOperand jog_lower_memory_expr(Lower *L, JogNode *node);
+
+/* Address of an assignable node: an index, a field, a dereference, or a local.
+   A temporary is spilled to a local first. */
+JirOperand jog_lower_lvalue_ptr(Lower *L, JogNode *node);
 JirOperand jog_lower_memory_unary(Lower *L, JogNode *node);
 
 /* True when node is pointer arithmetic or a pointer comparison. */

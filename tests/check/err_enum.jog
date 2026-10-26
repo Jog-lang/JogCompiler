@@ -14,7 +14,7 @@ fn needs_else(n: i32): i32 {
     }
 }
 
-fn no_wrap(n: i32): i32? {
+fn no_wrap(n: i32): (i32?)? {
     return n
 }
 
@@ -85,7 +85,7 @@ fn diagonal(p: Both): i32 {
 // error: when does not cover 'Green'
 // error: when does not cover 'Blue'
 // error: when needs an else
-// error: type mismatch: expected i32?, got i32
+// error: type mismatch: expected i32??, got i32
 // error: operator '!!' needs an option
 // error: 'Nope' is not a variant of 'Color'
 // error: constant does not fit

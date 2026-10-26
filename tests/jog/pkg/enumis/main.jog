@@ -1,0 +1,14 @@
+import colors
+
+extern {
+    fn puts(s: *const i8): i32
+}
+
+fn main() {
+    val c = colors.sample()
+    if c is colors.Color.Red {
+        puts(c"ok")
+    } else {
+        puts(c"no")
+    }
+}

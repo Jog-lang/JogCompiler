@@ -913,6 +913,8 @@ JogType *jog_check_generic_instantiate(Check *ck, CheckJob *job, void *env, JogN
     written.items = NULL;
     if (callee->kind == JOG_NODE_IDENT) {
         written = callee->as.ident.type_args;
+    } else if (callee->kind == JOG_NODE_MEMBER) {
+        written = callee->as.member.type_args;
     }
     args = ct_arena_alloc(ck->program->arena, n * sizeof(*args), _Alignof(JogType *));
     if (!args) {

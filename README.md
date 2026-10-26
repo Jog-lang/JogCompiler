@@ -64,4 +64,4 @@ A compiler written in Jog will be checked against this one. This tree stays stag
 
 ## License
 
-[JogCompiler](https://github.com/Jog-lang/JogCompiler) carries the LICENSE. This working tree does not include a license file yet.
+This tree is licensed under GPL-3.0. See [LICENSE](LICENSE).

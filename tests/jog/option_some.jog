@@ -1,0 +1,22 @@
+// expect: ok
+
+extern {
+    fn puts(s: *const i8): i32
+}
+
+fn take(p: i32?): i32 {
+    return p ?: 0
+}
+
+fn main() {
+    var a: i32? = 7
+    var b: Option<i32> = a
+    var c: i32? = .Some(value: 8)
+    var d: i32? = .None
+    var e: Option<i32> = 3
+    var f = Option<i32>.Some(value: 4)
+    var g = Option<i32>.None
+    if take(a) == 7 && take(b) == 7 && take(c) == 8 && take(d) == 0 && take(e) == 3 && take(f) == 4 && take(g) == 0 {
+        puts(c"ok")
+    }
+}

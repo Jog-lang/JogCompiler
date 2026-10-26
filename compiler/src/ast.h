@@ -43,8 +43,8 @@ typedef struct JogNames {
 
 typedef enum JogVisibility {
     JOG_VIS_PUBLIC = 0,
-    JOG_VIS_PACKAGE, /* private, private(package) */
-    JOG_VIS_FILE,    /* private(file) */
+    JOG_VIS_PACKAGE, /* private(package) */
+    JOG_VIS_FILE,    /* private, private(file) */
     JOG_VIS_SCOPE    /* private(scope) */
 } JogVisibility;
 

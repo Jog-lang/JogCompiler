@@ -85,9 +85,10 @@ bool jog_check_wait(Check *ck, CheckJob *job, JogSymbol *symbol);
 bool jog_check_wait_finished(Check *ck, CheckJob *job, JogSymbol *symbol);
 JogSymbol *jog_check_lookup_file(const CheckJob *job, const char *name);
 
-/* Poison and scalars have a zero value. Non-null pointers and function
-   values do not. A struct has a zero value when every field does.
-   Enums and interfaces do not. */
+/* Poison and scalars have a zero value. Non-null pointers, function
+   values, and interfaces do not. A struct has a zero value when every
+   field does. An enum has one when a variant's tag is 0 and that
+   payload has a zero value. */
 bool jog_check_type_has_zero(const JogType *type);
 
 /* Typecheck node. A NULL target infers, and an untyped integer becomes

@@ -1,0 +1,16 @@
+// POSIX open. fopen takes a trailing NUL.
+
+import std.c
+
+fn open_c_file(path: str, mode: *const c.char): *c.FILE? {
+    var buf: bytes[4096]
+    if path.len >= 4096 {
+        return null
+    }
+    val dest = buf[..].ptr
+    if path.len > 0 {
+        c.memcpy(dest as *void, path.ptr as *const void, path.len)
+    }
+    *(dest + path.len) = 0
+    return c.fopen(dest as *const c.char, mode)
+}

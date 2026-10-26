@@ -12,12 +12,13 @@
 
 /* Enums, when, patterns, and the Option operators.
    T? is the structural option from check_error.c. null, comparisons with
-   null, and niche *T? stay there. T does not convert to T?. A when on an
-   enum or on T? must cover every variant, including through nested enum,
-   option, and struct patterns. Any other when used as a value needs an
-   else. in a..b is half-open, matching for i in a..b. An or-pattern
-   (comma) does not bind names. A variant field default is checked here
-   and may be omitted at the construction site. */
+   null, and niche *T? stay there. T converts implicitly to T?, and Some
+   and Option name that option. A when on an enum or on T? must cover
+   every variant, including through nested enum, option, and struct
+   patterns. Any other when used as a value needs an else. in a..b is
+   half-open, matching for i in a..b. An or-pattern (comma) does not bind
+   names. A variant field default is checked here and may be omitted at
+   the construction site. */
 
 enum { JOG_ENUM_DEPTH = 32 };
 
@@ -681,6 +682,125 @@ static JogType *variant_value(Check *ck, JogNode *node, JogType *type, const Jog
     return type;
 }
 
+/* Option<T> is the structural option, unless this file already has a type
+   named Option. Some and None name that option. A user method named Some
+   is not this path: the base has to be the name Option. */
+static JogType *builtin_option_type(Check *ck, CheckJob *job, JogBlockScope *scope, JogNode *base) {
+    JogSymbol *symbol;
+    JogType *elem;
+    JogType *built;
+    JogNode *arg;
+    if (!ck || !base || base->kind != JOG_NODE_IDENT || !base->as.ident.name || strcmp(base->as.ident.name, "Option") != 0) {
+        return NULL;
+    }
+    symbol = scope ? jog_block_scope_lookup(scope, "Option") : NULL;
+    if (!symbol && job) {
+        symbol = jog_check_lookup_file(job, "Option");
+    }
+    if (symbol && symbol->kind == JOG_SYM_TYPE) {
+        return NULL;
+    }
+    if (base->as.ident.type_args.count != 1) {
+        jog_check_fail(ck, base->pos, "Option takes one type argument");
+        return error_type(ck);
+    }
+    arg = list_at(base->as.ident.type_args, 0);
+    elem = jog_check_resolve_type(ck, job, arg);
+    if (!elem || ck->stop) {
+        return NULL;
+    }
+    if (elem->kind == JOG_TY_ERROR) {
+        return elem;
+    }
+    built = jog_type_option(ck->program->types, elem);
+    if (!built) {
+        jog_check_fail(ck, base->pos, "out of memory");
+        return NULL;
+    }
+    base->type = built;
+    return built;
+}
+
+static int finish_option_name(Check *ck, JogNode *node, JogType *opt, const char *name, JogType **out) {
+    JogType *error;
+    if (!opt) {
+        return 0;
+    }
+    if (opt->kind == JOG_TY_ERROR) {
+        node->type = opt;
+        if (out) {
+            *out = opt;
+        }
+        return 1;
+    }
+    if (opt->kind != JOG_TY_OPTION) {
+        return 0;
+    }
+    error = error_type(ck);
+    if (name && strcmp(name, "None") == 0) {
+        node->type = opt;
+        if (out) {
+            *out = opt;
+        }
+        return 1;
+    }
+    if (name && strcmp(name, "Some") == 0) {
+        jog_check_fail(ck, node->pos, "variant 'Some' needs arguments");
+        node->type = error;
+        if (out) {
+            *out = error;
+        }
+        return 1;
+    }
+    jog_check_fail(ck, node->pos, "unknown variant '%s'", name ? name : "?");
+    node->type = error;
+    if (out) {
+        *out = error;
+    }
+    return 1;
+}
+
+static JogType *check_option_call(Check *ck, CheckJob *job, JogBlockScope *scope, JogNode *call, JogType *opt, const char *name) {
+    JogType *error = error_type(ck);
+    JogNode *arg;
+    JogNode *value;
+    JogType *got;
+    if (!opt || opt->kind != JOG_TY_OPTION) {
+        return NULL;
+    }
+    if (name && strcmp(name, "None") == 0) {
+        if (call->as.call.args.count != 0) {
+            jog_check_fail(ck, call->pos, "variant 'None' does not take arguments");
+            call->type = error;
+            return error;
+        }
+        call->type = opt;
+        return opt;
+    }
+    if (!name || strcmp(name, "Some") != 0) {
+        jog_check_fail(ck, call->pos, "unknown variant '%s'", name ? name : "?");
+        call->type = error;
+        return error;
+    }
+    if (call->as.call.args.count != 1) {
+        jog_check_fail(ck, call->pos, "variant 'Some' takes one argument");
+        call->type = error;
+        return error;
+    }
+    arg = list_at(call->as.call.args, 0);
+    value = arg && arg->kind == JOG_NODE_ARG ? arg->as.arg.value : arg;
+    got = jog_check_expr(ck, job, scope, value, opt->as.elem.elem);
+    if (!got || ck->stop) {
+        return NULL;
+    }
+    if (got->kind == JOG_TY_ERROR) {
+        call->type = got;
+        return got;
+    }
+    call->type = opt;
+    return opt;
+}
+
 int jog_check_enum_member(Check *ck, CheckJob *job, JogBlockScope *scope, JogNode *member, JogType **out) {
     JogNode *base;
     JogType *type;
@@ -692,6 +812,13 @@ int jog_check_enum_member(Check *ck, CheckJob *job, JogBlockScope *scope, JogNod
     base = member->as.member.base;
     if (!base || base->kind != JOG_NODE_IDENT) {
         return 0;
+    }
+    type = builtin_option_type(ck, job, scope, base);
+    if (ck->stop) {
+        return -1;
+    }
+    if (type) {
+        return finish_option_name(ck, member, type, member->as.member.name, out);
     }
     type = lookup_enum_type(ck, job, scope, base->as.ident.name, base);
     if (ck->stop) {
@@ -736,6 +863,16 @@ JogType *jog_check_enum_dot(Check *ck, CheckJob *job, JogNode *node, JogType *ta
     }
     error = error_type(ck);
     name = node->as.ident.name;
+    {
+        JogType *opt = peel(target);
+        if (opt && opt->kind == JOG_TY_OPTION) {
+            JogType *got = NULL;
+            if (!finish_option_name(ck, node, opt, name, &got)) {
+                return NULL;
+            }
+            return node->type;
+        }
+    }
     type = enum_from_expr_type(ck, job, target);
     if (ck->stop) {
         return NULL;
@@ -852,7 +989,7 @@ static JogType *check_variant_call(Check *ck, CheckJob *job, JogBlockScope *scop
     return call->type;
 }
 
-int jog_check_enum_call(Check *ck, CheckJob *job, JogBlockScope *scope, JogNode *call, JogType **out) {
+int jog_check_enum_call(Check *ck, CheckJob *job, JogBlockScope *scope, JogNode *call, JogType *target, JogType **out) {
     JogNode *callee;
     JogType *type = NULL;
     const JogVariant *variant = NULL;
@@ -866,6 +1003,29 @@ int jog_check_enum_call(Check *ck, CheckJob *job, JogBlockScope *scope, JogNode 
     }
     if (callee->kind == JOG_NODE_MEMBER && !callee->as.member.safe && callee->as.member.name && callee->as.member.base &&
         callee->as.member.base->kind == JOG_NODE_IDENT) {
+        type = builtin_option_type(ck, job, scope, callee->as.member.base);
+        if (ck->stop) {
+            return -1;
+        }
+        if (type) {
+            JogType *built;
+            if (type->kind == JOG_TY_ERROR) {
+                call->type = type;
+                if (out) {
+                    *out = type;
+                }
+                return 1;
+            }
+            callee->type = type;
+            built = check_option_call(ck, job, scope, call, type, callee->as.member.name);
+            if (!built || ck->stop) {
+                return -1;
+            }
+            if (out) {
+                *out = built;
+            }
+            return 1;
+        }
         type = lookup_enum_type(ck, job, scope, callee->as.member.base->as.ident.name, callee->as.member.base);
         if (ck->stop) {
             return -1;
@@ -893,7 +1053,19 @@ int jog_check_enum_call(Check *ck, CheckJob *job, JogBlockScope *scope, JogNode 
         callee->symbol = variant && variant->decl ? variant->decl->symbol : NULL;
         callee->type = type;
     } else if (callee->kind == JOG_NODE_DOT_VARIANT) {
-        return 0;
+        JogType *opt = peel(target);
+        JogType *built;
+        if (!opt || opt->kind != JOG_TY_OPTION) {
+            return 0;
+        }
+        built = check_option_call(ck, job, scope, call, opt, callee->as.ident.name);
+        if (!built || ck->stop) {
+            return -1;
+        }
+        if (out) {
+            *out = built;
+        }
+        return 1;
     } else {
         return 0;
     }
@@ -911,6 +1083,63 @@ static const char *single_type_name(const JogNode *type) {
         return NULL;
     }
     return type->as.type_name.path.items[0];
+}
+
+/* -2 when the checker stopped. -1 when the path is not a variant of en.
+   0 and up is the variant index. A bare name, Enum.Variant, and
+   pkg.Enum.Variant all name a variant of the expression's enum. */
+static int is_variant_index(Check *ck, CheckJob *job, JogNode *type_node, JogType *en, const char **name_out) {
+    const char *const *items;
+    size_t count;
+    JogSymbol *sym;
+    const char *file;
+    *name_out = NULL;
+    if (!type_node || type_node->kind != JOG_NODE_TYPE_NAME || !type_node->as.type_name.path.items) {
+        return -1;
+    }
+    items = type_node->as.type_name.path.items;
+    count = type_node->as.type_name.path.count;
+    if (count == 0 || !items[count - 1]) {
+        return -1;
+    }
+    *name_out = items[count - 1];
+    if (count == 1) {
+        return find_variant(en, items[0]);
+    }
+    file = job && job->decl ? job->decl->pos.file : NULL;
+    if (count == 2) {
+        sym = jog_check_lookup_file(job, items[0]);
+        if (!sym || sym->kind != JOG_SYM_TYPE) {
+            return -1;
+        }
+        if (!jog_check_wait(ck, job, sym)) {
+            return -2;
+        }
+        if (sym->type != en) {
+            return -1;
+        }
+        type_node->symbol = sym;
+        return find_variant(en, items[1]);
+    }
+    if (count == 3) {
+        JogSymbol *pkg = jog_check_lookup_file(job, items[0]);
+        if (!pkg || pkg->kind != JOG_SYM_PACKAGE || !pkg->package || !pkg->package->scope) {
+            return -1;
+        }
+        sym = jog_package_scope_lookup(pkg->package->scope, items[1]);
+        if (!sym || sym->kind != JOG_SYM_TYPE) {
+            return -1;
+        }
+        if (!jog_check_wait(ck, job, sym)) {
+            return -2;
+        }
+        if (sym->type != en || !jog_symbol_visible_from(sym, job ? job->package : NULL, file)) {
+            return -1;
+        }
+        type_node->symbol = sym;
+        return find_variant(en, items[2]);
+    }
+    return -1;
 }
 
 static JogType *check_is_type(Check *ck, CheckJob *job, JogNode *node, JogNode *expr, JogNode *type_node) {
@@ -943,8 +1172,11 @@ static JogType *check_is_type(Check *ck, CheckJob *job, JogNode *node, JogNode *
         node->type = error;
         return error;
     }
-    name = single_type_name(type_node);
-    index = name ? find_variant(en, name) : -1;
+    name = NULL;
+    index = is_variant_index(ck, job, type_node, en, &name);
+    if (index == -2) {
+        return NULL;
+    }
     if (index < 0) {
         jog_check_fail(ck, type_node ? type_node->pos : node->pos, "'%s' is not a variant of '%s'", name ? name : "?",
                        type_label(en));

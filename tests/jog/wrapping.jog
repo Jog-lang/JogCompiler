@@ -1,0 +1,17 @@
+// expect: ok
+
+extern {
+    fn puts(s: *const i8): i32
+}
+
+fn main() {
+    var h: u64 = 18446744073709551615
+    val m = h.wrappingMul(2)
+    var a: u8 = 255
+    val s = a.wrappingAdd(1)
+    var b: i8 = -128
+    val d = b.wrappingSub(1)
+    if m == 18446744073709551614 && s == 0 && d == 127 {
+        puts(c"ok")
+    }
+}

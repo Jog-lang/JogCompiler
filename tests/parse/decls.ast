@@ -249,7 +249,7 @@
     =
       (IDENT defaultAllocator)
   )
-  (FN hidden private
+  (FN hidden private(file)
     ->
       (TYPE_UNIT)
     =

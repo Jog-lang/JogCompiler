@@ -17,6 +17,7 @@ extern {
     fn rmdir(path: *const char): int
     fn unlink(path: *const char): int
     fn rename(old_path: *const char, new_path: *const char): int
+    fn getcwd(buf: *char, size: size_t): *char?
     fn setenv(name: *const char, value: *const char, overwrite: int): int
     fn posix_spawnp(
         pid: *int,

@@ -1,0 +1,9 @@
+import store
+
+struct Hold {
+    b: store.Box
+}
+
+fn sample(): Hold {
+    return Hold(b: store.make())
+}

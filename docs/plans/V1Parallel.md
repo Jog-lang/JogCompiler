@@ -12,9 +12,8 @@ This splits the V1 compiler from [[plans/V1Compiler]] into **streams** that sepa
 
 ## Before anyone starts
 
-1. **Make the baseline commit.** The repository has no commits yet, so agents have nothing to branch from. Commit the current tree to `master`, and push it to a remote if agents run elsewhere.
-2. **One branch, or one worktree, per stream:** `v1/<stream>-<step>`, for example `v1/parser-1-decls`. Keep pull requests small, one step from a stream's list below.
-3. **Merge gate:** `pwsh scripts/check.ps1` on Windows, or `scripts/check.sh` on Linux, must print `check: OK` before merging. It configures and builds and fails on any warning, runs every ctest, and syntax-checks every C file with clang using `-Werror`.
+1. **One branch, or one worktree, per stream:** `v1/<stream>-<step>`, for example `v1/parser-1-decls`. Keep pull requests small, one step from a stream's list below.
+2. **Merge gate:** `pwsh scripts/check.ps1` on Windows, or `scripts/check.sh` on Linux, must print `check: OK` before merging. It configures and builds and fails on any warning, runs every ctest, and syntax-checks every C file with clang using `-Werror`.
 
 ## Ground rules
 
@@ -245,24 +244,6 @@ When a stream needs something from another, it adds a line here: who needs what 
 - errors: `t.0 = 1` stores the element. `jog_check_field_assign` accepts a nameless member after `jog_check_error_field`: the place is a `var`, a parameter, or one non-const pointer (`p.0` is `(*p).0`), and the right-hand side takes the element type. Integer compound operators match a struct field. `lower_assign` stores through `jog_lower_tuple_field_ptr` and does not call `jog_lower_field_assign`. `tests/jog/tuple_assign.jog` assigns `t.0` and prints the new value. Destructuring `(t.0, t.1) = ...` is unchanged.
 - pack parameters: `...T: name` on a Jog function is a slice local `[]T`. The caller builds a stack array and passes the slice header `{ptr, len}`. Zero arguments is a zero slice. A parameter after the pack is a compile error. Bare `...` stays the extern C variadic. Interface methods, context parameters, and enum payloads cannot use a pack.
 
-## Stream notes
-
-### D
-
-- `JOG_ROOT`, when set and non-empty, is the directory that contains `std/` and `runtime/`. Otherwise those directories are `<directory of the jog executable>/../std` and `../runtime`.
-- `JogProgram.std_root` is the `std` directory itself, so `import std.io` loads `std_root/io`.
-- `jog.mod` `link` names are stored, in order, on `JogProgram.link_libs`. With `--module`, the mapped modules' lines follow the root's; see the P2.5 note below.
-- An import cycle is reported as a chain of import paths. The back-edge is omitted from `JogPackage.imports`, so `JogProgram.packages` stays in dependency order for every edge that was kept.
-- A package folder with no `.jog` files in the build (test files count only when `include_tests` is set) is an error.
-- With no package argument the start path is `.`. Generated C is `<module root>/out/<module name>.c`. The executable is that directory and base name, with `.exe` on Windows, unless `-o` sets it. `--target wasm32` writes `<name>.wasm` instead, and `-o` for that target must end in `.wasm`. A native `-o` path must not end in `.wasm`. `--keep-c` keeps the C file; a successful link without the flag deletes it, and a failed link leaves it. `jog run` returns the program's exit status. The type table uses pointer size 4 for `--target wasm32` and 8 otherwise.
-- `build`, `run`, `check`, `emit-c`, and `emit-ir` share `jog_load` → `jog_check` → `jog_lower` → `jog_emit_c` → `jog_cc_build`. `check` stops after the checker, `emit-ir` prints `jir_dump` after lowering, and `emit-c` prints the C after `jog_emit_c`. A phase that reports an error is the last one. The driver prints at most 50 diagnostics, then a count of any left out.
-- `examples/hello/jog.mod` declares `module hello`, so `jog build examples/hello` loads that folder.
-- `tests/e2e_test.c` runs each flat `tests/jog/*.jog` file (`*.test.jog` excluded) as its own temporary module. `// expect:` lines are the whole stdout. A compile that says a phase is not implemented is reported as a skip.
-- `jog check <path>` with a file or folder below the module root also checks the package of that folder and its imports, even when the root does not import it. A folder on that path that is not an identifier is an error. `jog check` with no argument, or with the root, checks the root package and its imports, as before. Other commands ignore the start folder beyond finding `jog.mod`.
-- Paths, arguments, and environment values are UTF-8 inside the tools. On Windows, `main` reads the UTF-16 command line, and `tools/fs.h` (`ct_fs_fopen`, `ct_fs_remove`, `ct_fs_mkdir`, `ct_fs_getenv`, `ct_fs_widen`, `ct_fs_narrow`) and `tools/proc.c` convert at the OS boundary and call the W APIs. Generated programs also take argv from the UTF-16 command line, in `jogrt_main.c`.
-- `*.test.jog` files are loaded only for packages of the module being tested, never for std packages or mapped modules.
-- P2.5 (see JogDocs: design/Packages.md): `jog.mod` v2 is parsed in `loader.c`. `build`, `run`, `test`, `check`, `emit-c`, and `emit-ir` accept a repeatable `--module <name>=<dir>` or `--module=<name>=<dir>`. A value without `=`, or with an empty side, is usage (exit 2); the loader checks the name and the folder. The first segment of an import in module M is std, then a module M's `jog.mod` requires (through its mapping), then a folder under M's root. A dependency's packages have canonical paths `<name>` and `<name>.<rest>`, and the resolver binds an import through `JogPackage.imports`. Packages of two modules whose C prefixes would match (`lib.util` and `lib_util`) are an error. `jog build` and `jog run` on a `kind library` module fail; `check` and `test` load its root and every exported package. The compiler version is `JOG_VERSION` in `compiler/src/version.h`.
-
 ## Contract change log
 
 - *(baseline)*: `token.h`, `ast.h`, `types.h`, `ir.h`, `program.h`, `phases.h`, `commands.h`, `jogrt.h`, with stubs and `contracts_test.c`.
@@ -288,6 +269,22 @@ Give each agent this prompt, with the stream filled in:
 > You are implementing stream **X** of the Jog V1 compiler in this repository. Read `docs/plans/V1Parallel.md` (your stream's section, the ground rules, and the contracts), `docs/plans/V1Compiler.md`, and the language notes your stream touches in [JogDocs](https://github.com/Jog-lang/JogDocs) (`design/language/`). A local checkout is `../JogDocs`, or `../Jog/JogDocs`. Work on branch `v1/<stream>-<step>`, one step per pull request. Edit only files your stream owns. Do not change contract headers except through the contract change process. Before you finish a step, the check command must print `check: OK`: `pwsh scripts/check.ps1` on Windows, or `scripts/check.sh` on Linux. Record decisions the language notes did not cover in those notes, and add hand-off notes to the plan when you need something from another stream.
 
 ## Stream notes
+
+### D
+
+- `JOG_ROOT`, when set and non-empty, is the directory that contains `std/` and `runtime/`. Otherwise those directories are `<directory of the jog executable>/../std` and `../runtime`.
+- `JogProgram.std_root` is the `std` directory itself, so `import std.io` loads `std_root/io`.
+- `jog.mod` `link` names are stored, in order, on `JogProgram.link_libs`. With `--module`, the mapped modules' lines follow the root's; see the P2.5 note below.
+- An import cycle is reported as a chain of import paths. The back-edge is omitted from `JogPackage.imports`, so `JogProgram.packages` stays in dependency order for every edge that was kept.
+- A package folder with no `.jog` files in the build (test files count only when `include_tests` is set) is an error.
+- With no package argument the start path is `.`. Generated C is `<module root>/out/<module name>.c`. The executable is that directory and base name, with `.exe` on Windows, unless `-o` sets it. `--target wasm32` writes `<name>.wasm` instead, and `-o` for that target must end in `.wasm`. A native `-o` path must not end in `.wasm`. `--keep-c` keeps the C file; a successful link without the flag deletes it, and a failed link leaves it. `jog run` returns the program's exit status. The type table uses pointer size 4 for `--target wasm32` and 8 otherwise.
+- `build`, `run`, `check`, `emit-c`, and `emit-ir` share `jog_load` → `jog_check` → `jog_lower` → `jog_emit_c` → `jog_cc_build`. `check` stops after the checker, `emit-ir` prints `jir_dump` after lowering, and `emit-c` prints the C after `jog_emit_c`. A phase that reports an error is the last one. The driver prints at most 50 diagnostics, then a count of any left out.
+- `examples/hello/jog.mod` declares `module hello`, so `jog build examples/hello` loads that folder.
+- `tests/e2e_test.c` runs each flat `tests/jog/*.jog` file (`*.test.jog` excluded) as its own temporary module. `// expect:` lines are the whole stdout. A compile that says a phase is not implemented is reported as a skip.
+- `jog check <path>` with a file or folder below the module root also checks the package of that folder and its imports, even when the root does not import it. A folder on that path that is not an identifier is an error. `jog check` with no argument, or with the root, checks the root package and its imports, as before. Other commands ignore the start folder beyond finding `jog.mod`.
+- Paths, arguments, and environment values are UTF-8 inside the tools. On Windows, `main` reads the UTF-16 command line, and `tools/fs.h` (`ct_fs_fopen`, `ct_fs_remove`, `ct_fs_mkdir`, `ct_fs_getenv`, `ct_fs_widen`, `ct_fs_narrow`) and `tools/proc.c` convert at the OS boundary and call the W APIs. Generated programs also take argv from the UTF-16 command line, in `jogrt_main.c`.
+- `*.test.jog` files are loaded only for packages of the module being tested, never for std packages or mapped modules.
+- P2.5 (see JogDocs: design/Packages.md): `jog.mod` v2 is parsed in `loader.c`. `build`, `run`, `test`, `check`, `emit-c`, and `emit-ir` accept a repeatable `--module <name>=<dir>` or `--module=<name>=<dir>`. A value without `=`, or with an empty side, is usage (exit 2); the loader checks the name and the folder. The first segment of an import in module M is std, then a module M's `jog.mod` requires (through its mapping), then a folder under M's root. A dependency's packages have canonical paths `<name>` and `<name>.<rest>`, and the resolver binds an import through `JogPackage.imports`. Packages of two modules whose C prefixes would match (`lib.util` and `lib_util`) are an error. `jog build` and `jog run` on a `kind library` module fail; `check` and `test` load its root and every exported package. The compiler version is `JOG_VERSION` in `compiler/src/version.h`.
 
 ### T — checker
 

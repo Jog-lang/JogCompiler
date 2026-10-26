@@ -192,7 +192,7 @@ int jogrt_argc(void) {
     return g_argc;
 }
 
-const char *jogrt_argv(int i, size_t *len) {
+const int8_t *jogrt_argv(int i, size_t *len) {
     if (i < 0 || i >= g_argc || !g_argv || !g_argv[i]) {
         if (len) {
             *len = 0;
@@ -202,14 +202,13 @@ const char *jogrt_argv(int i, size_t *len) {
     if (len) {
         *len = strlen(g_argv[i]);
     }
-    return g_argv[i];
+    return (const int8_t *)(const void *)g_argv[i];
 }
 
-/* Jog *const i8 is const int8_t *. Not declared in jogrt.h: a generated
-   redeclaration of const char *jogrt_argv conflicts with that spelling.
+/* Same bytes as jogrt_argv, without the length out-parameter.
    The wasm runtime has the same function. */
 const int8_t *jogrt_arg_ptr(int32_t i) {
-    const char *arg = jogrt_argv((int)i, NULL);
+    const int8_t *arg = jogrt_argv((int)i, NULL);
     if (!arg) {
         return NULL;
     }

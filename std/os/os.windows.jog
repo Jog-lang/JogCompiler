@@ -1,0 +1,23 @@
+// Windows env. GetEnvironmentVariableW. The UTF-8 copy lives in
+// env_utf until the next env call.
+
+import std.c
+
+var env_utf: [4096]u8
+
+fn env(name: str): (str, bool) {
+    var wide_name: [4096]u16
+    var wide_value: [4096]u16
+    if name.len == 0 || !c.utf8_to_wide(name, wide_name[..].ptr, 4096) {
+        return "", false
+    }
+    val n = c.GetEnvironmentVariableW(wide_name[..].ptr, wide_value[..].ptr, 4096)
+    if n == 0 || n >= 4096 {
+        return "", false
+    }
+    val len = c.wide_to_utf8(wide_value[..].ptr, n as usize, env_utf[..].ptr, 4095)
+    if len == 0 {
+        return "", false
+    }
+    return c_view(env_utf[..].ptr, len), true
+}

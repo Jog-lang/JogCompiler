@@ -311,6 +311,7 @@ static void test_mode(JogBuildMode mode, const char *stdout_text, const char *fl
         expect_has(stderr_text, "jogrt.c", __FILE__, __LINE__);
         expect_has(stderr_text, "jogrt_main.c", __FILE__, __LINE__);
         expect_has(stderr_text, "-Wno-incompatible-library-redeclaration", __FILE__, __LINE__);
+        expect_has(stderr_text, "-Wno-builtin-requires-header", __FILE__, __LINE__);
         if (mode == JOG_BUILD_DEBUG) {
             expect_has(stderr_text, " -g ", __FILE__, __LINE__);
         } else {
@@ -344,6 +345,7 @@ static void test_gcc_override(void) {
             expect_has(stderr_text, " -g ", __FILE__, __LINE__);
             expect_has(stderr_text, "-Wno-builtin-declaration-mismatch", __FILE__, __LINE__);
             expect_lacks(stderr_text, "-Wno-incompatible-library-redeclaration", __FILE__, __LINE__);
+            expect_lacks(stderr_text, "-Wno-builtin-requires-header", __FILE__, __LINE__);
             expect_clean(stderr_text, __FILE__, __LINE__);
             EXPECT_RUN(exe, "jogrt gcc dbg\n");
         }
