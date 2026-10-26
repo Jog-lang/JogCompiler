@@ -1,0 +1,5 @@
+import std.io as io
+import store
+
+fn main() {
+}

@@ -1,0 +1,115 @@
+main f0
+init none
+
+global g0 var jog_app__n: i32 = hex:01 00 00 00  ; memory.jog:6:1
+global g1 var jog_app__xs: [4]i32 = hex:01 00 00 00 02 00 00 00 03 00 00 00 04 00 00 00  ; memory.jog:7:1
+
+fn f0 public jog_app__main "app.main": () -> ()  ; memory.jog:9:1
+  l0 p: *i32 addr
+  l1 second: i32
+  l2: *i32
+  l3: *i32
+  l4: i32
+  l5 s: []i32
+  l6: [3]i32 addr
+  l7: *[3]i32
+  l8: *i32
+  l9: *i32
+  l10: *i32
+  l11: *i32
+  l12: *[3]i32
+  l13: *i32
+  l14: []i32
+  l15 mid: i32
+  l16: *i32
+  l17: usize
+  l18: *i32
+  l19: i32
+  l20 part: []i32
+  l21: *i32
+  l22: usize
+  l23: usize
+  l24: usize
+  l25: usize
+  l26: *i32
+  l27: []i32
+  l28 through: i32
+  l29: i32
+  l30 q: *i32
+  l31: *i32
+  l32 back: isize
+  l33: isize
+  l34: isize
+  l35: isize
+  l36: isize
+  l37: **i32
+  l38: *i32
+  l39: *i32
+  l40 pt: Point addr
+  l41: Point
+  l42 pp: *Point
+  l43: *Point
+  l44 fx: *i32
+  l45: *i32
+  l46 same: bool
+  l47: bool
+b0 entry:
+  l0 = copy g0  ; memory.jog:10:5
+  l2 = bitcast g1  ; memory.jog:11:20
+  bounds_check usize 1, usize 4  ; memory.jog:11:20
+  l3 = elem_addr l2, usize 1  ; memory.jog:11:20
+  l4 = load l3  ; memory.jog:11:20
+  l1 = copy l4  ; memory.jog:11:5
+  l6 = zero  ; memory.jog:12:13
+  l7 = addr l6  ; memory.jog:12:13
+  l8 = bitcast l7  ; memory.jog:12:13
+  l9 = elem_addr l8, usize 0  ; memory.jog:12:19
+  store l9, i32 10  ; memory.jog:12:19
+  l10 = elem_addr l8, usize 1  ; memory.jog:12:23
+  store l10, i32 20  ; memory.jog:12:23
+  l11 = elem_addr l8, usize 2  ; memory.jog:12:27
+  store l11, i32 30  ; memory.jog:12:27
+  l12 = addr l6  ; memory.jog:12:13
+  l13 = bitcast l12  ; memory.jog:12:13
+  l14 = aggregate (l13, usize 3)  ; memory.jog:12:13
+  l5 = copy l14  ; memory.jog:12:5
+  l16 = extract l5, 0  ; memory.jog:13:16
+  l17 = extract l5, 1  ; memory.jog:13:16
+  bounds_check usize 1, l17  ; memory.jog:13:16
+  l18 = elem_addr l16, usize 1  ; memory.jog:13:16
+  l19 = load l18  ; memory.jog:13:16
+  l15 = copy l19  ; memory.jog:13:5
+  l21 = extract l5, 0  ; memory.jog:14:17
+  l22 = extract l5, 1  ; memory.jog:14:17
+  l23 = checked add usize 2, usize 1  ; memory.jog:14:17
+  bounds_check usize 0, l23  ; memory.jog:14:17
+  l24 = checked add l22, usize 1  ; memory.jog:14:17
+  bounds_check usize 2, l24  ; memory.jog:14:17
+  l25 = checked sub usize 2, usize 0  ; memory.jog:14:17
+  l26 = elem_addr l21, usize 0  ; memory.jog:14:17
+  l27 = aggregate (l26, l25)  ; memory.jog:14:17
+  l20 = copy l27  ; memory.jog:14:5
+  l29 = load l0  ; memory.jog:15:19
+  l28 = copy l29  ; memory.jog:15:5
+  store l0, i32 5  ; memory.jog:16:8
+  l31 = elem_addr l0, i64 1  ; memory.jog:17:15
+  l30 = copy l31  ; memory.jog:17:5
+  l33 = bitcast l30  ; memory.jog:18:18
+  l34 = bitcast l0  ; memory.jog:18:18
+  l35 = sub l33, l34  ; memory.jog:18:18
+  l36 = checked div l35, isize 4  ; memory.jog:18:18
+  l32 = copy l36  ; memory.jog:18:5
+  l37 = addr l0  ; memory.jog:19:5
+  l38 = load l37  ; memory.jog:19:7
+  l39 = elem_addr l38, i64 1  ; memory.jog:19:7
+  store l37, l39  ; memory.jog:19:7
+  l41 = aggregate (i32 1, i32 2)  ; memory.jog:20:14
+  l40 = copy l41  ; memory.jog:20:5
+  l43 = addr l40  ; memory.jog:21:23
+  l42 = copy l43  ; memory.jog:21:5
+  l45 = field_addr l42, 0  ; memory.jog:22:17
+  l44 = copy l45  ; memory.jog:22:5
+  store l44, i32 8  ; memory.jog:23:9
+  l47 = eq l0, l30  ; memory.jog:24:18
+  l46 = copy l47  ; memory.jog:24:5
+  ret  ; memory.jog:9:1

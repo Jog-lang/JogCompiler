@@ -1,0 +1,39 @@
+// expect: ok
+
+import std.mem
+
+extern {
+    fn puts(s: *const c_char): c_int
+}
+
+type c_char = i8
+type c_int = i32
+
+fn sized(): usize with (a: mem.Allocator) {
+    val (b, err) = a.alloc(4, 8)
+    if err != null {
+        return 0
+    }
+    a.free(b)
+    return b.len
+}
+
+fn main() {
+    val a = mem.heap()
+    val (b, err) = a.alloc(4, 8)
+    if err != null || b.len != 4 {
+        return
+    }
+    *b.ptr = 42
+    val (c, err2) = a.resize(b, 8)
+    if err2 != null || c.len != 8 || *c.ptr != 42 {
+        return
+    }
+    a.free(c)
+    val n = sized() with (mem.heap())
+    if n == 4 {
+        if puts(c"ok") < 0 {
+            return
+        }
+    }
+}

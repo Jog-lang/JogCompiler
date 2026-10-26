@@ -1,0 +1,7 @@
+import store
+
+fn main() {
+    val n = store.use_secret()
+    if n == 3 {
+    }
+}

@@ -1,0 +1,71 @@
+// Package std.testing. testing() is the value an @test receives when it
+// asks for Testing and no context global has that type. expect and
+// expectEq print nothing when the check holds. fail and a failing check
+// write to stderr and increment failures. fatal writes, then panics.
+// finish is what the test harness calls after every @test: a nonzero
+// count exits the process with status 1, and a zero count returns so
+// the process exits 0. One shared value, not a checking allocator.
+// expectPanic catches a panic inside the closure. A panic outside it
+// still aborts.
+
+import std.c
+import std.io
+
+interface Testing {
+    fn expect(cond: bool)
+    fn expectEq(got: str, want: str)
+    fn fail(msg: str)
+    fn fatal(msg: str)
+    fn expectPanic(body: () -> ())
+}
+
+struct Test {
+    tag: u8
+}
+
+var test_value: Test
+var failures: i32 = 0
+
+fn testing(): Testing {
+    return &test_value
+}
+
+fn Test.expect(cond: bool) {
+    if !cond {
+        failures = failures + 1
+        io.eprint("fail\n")
+    }
+}
+
+fn Test.expectEq(got: str, want: str) {
+    if got != want {
+        failures = failures + 1
+        io.eprint("fail\n")
+    }
+}
+
+fn Test.fail(msg: str) {
+    failures = failures + 1
+    io.eprint(msg)
+}
+
+fn Test.fatal(msg: str) {
+    failures = failures + 1
+    io.eprint(msg)
+    panic(msg)
+}
+
+fn Test.expectPanic(body: () -> ()) {
+    // A panic is success. A normal return is a recorded failure.
+    // Nested calls save the previous handler and restore it.
+    if c.jogrt_panic_call(&body as *void) == 0 {
+        failures = failures + 1
+        io.eprint("fail\n")
+    }
+}
+
+fn finish() {
+    if failures != 0 {
+        c.jogrt_exit(1)
+    }
+}

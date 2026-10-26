@@ -1,0 +1,13 @@
+import std.io
+import lib
+import lib.shapes
+import util
+
+fn main() {
+    io.println(util.name())
+    io.println(lib.greet())
+    io.println(shapes.kind())
+    if shapes.banner_len() == 7 {
+        io.println("embed ok")
+    }
+}

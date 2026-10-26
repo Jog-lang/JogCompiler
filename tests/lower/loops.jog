@@ -1,0 +1,18 @@
+// module: app
+
+fn main() {
+    var sum: i32 = 0
+    val n: i32 = 4
+    for i in 0..n {
+        if i == 0 {
+            continue
+        }
+        sum = sum + i
+    }
+    for sum < 10 {
+        sum += 1
+    }
+    for {
+        break
+    }
+}

@@ -1,0 +1,6 @@
+// expect: tested
+
+@test
+fn shows() with (on: i64) {
+    say(c"tested")
+}

@@ -1,0 +1,30 @@
+// module: app
+
+struct Box<T> {
+    value: T
+}
+
+fn Box<T>.get(): T {
+    return self.value
+}
+
+fn Box<T>.map<R>(x: R): R {
+    return x
+}
+
+fn *Box<T>.set(x: T): T {
+    self.value = x
+    return x
+}
+
+fn main() {
+    var a = Box<i32>(value: 1)
+    var b = Box<bool>(value: true)
+    val n = a.get()
+    val flag = b.get()
+    val m = a.map<i32>(n)
+    a.set(m)
+    if n == 1 && flag && m == 1 {
+        return
+    }
+}

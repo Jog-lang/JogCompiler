@@ -1,0 +1,163 @@
+main f2
+init none
+
+global g0 const jog_tid_27: u8 = zero
+global g1 const jog_vt_30_27: u8 = zero
+global g2 const jog_vt_28_27: u8 = zero
+
+fn f0 public jog_app__Circle__id "app.Circle.id": (Circle) -> i32  ; iface_prop.jog:20:1
+  l0 self: Circle param addr
+  l1: *Circle
+  l2: *i32
+  l3: i32
+b0 entry:
+  l1 = addr l0  ; iface_prop.jog:21:16
+  l2 = field_addr l1, 0  ; iface_prop.jog:21:16
+  l3 = load l2  ; iface_prop.jog:21:16
+  ret l3  ; iface_prop.jog:21:5
+
+fn f1 public jog_app__use "app.use": (Shape) -> i32  ; iface_prop.jog:24:1
+  l0 s: Shape param
+  l1: *void
+  l2: **void
+  l3: *void
+  l4: *void
+  l5: bool
+  l6: *void
+  l7: *Circle
+  l8: *Entity
+  l9: *i32
+  l10: i32
+  l11: i32
+  l12: *void
+  l13: **void
+  l14: *void
+  l15: *void
+  l16: bool
+b0 entry:
+  l1 = extract l0, 1  ; iface_prop.jog:25:10
+  l2 = bitcast l1  ; iface_prop.jog:25:10
+  l3 = load l2  ; iface_prop.jog:25:10
+  l4 = bitcast g0  ; iface_prop.jog:25:10
+  l5 = eq l3, l4  ; iface_prop.jog:25:10
+  cond_br l5, b1 "if.then", b2 "if.join"  ; iface_prop.jog:25:5
+b1 "if.then":
+  l6 = extract l0, 0  ; iface_prop.jog:26:16
+  l7 = bitcast l6  ; iface_prop.jog:26:16
+  l8 = field_addr l7, 1  ; iface_prop.jog:26:17
+  l9 = field_addr l8, 0  ; iface_prop.jog:26:17
+  l10 = load l9  ; iface_prop.jog:26:17
+  ret l10  ; iface_prop.jog:26:9
+b2 "if.join":
+  l12 = extract l0, 1  ; iface_prop.jog:29:9
+  l13 = bitcast l12  ; iface_prop.jog:29:9
+  l14 = load l13  ; iface_prop.jog:29:9
+  l15 = bitcast g0  ; iface_prop.jog:29:9
+  l16 = eq l14, l15  ; iface_prop.jog:29:9
+  cond_br l16, b4, b6  ; iface_prop.jog:29:9
+b3:
+  ret l11  ; iface_prop.jog:28:5
+b4:
+  l11 = copy i32 1  ; iface_prop.jog:29:9
+  br b3  ; iface_prop.jog:29:9
+b5:
+  l11 = copy i32 0  ; iface_prop.jog:30:9
+  br b3  ; iface_prop.jog:30:9
+b6:
+  br b5  ; iface_prop.jog:30:9
+
+fn f2 public jog_app__main "app.main": () -> ()  ; iface_prop.jog:34:1
+  l0 c: Circle addr
+  l1: Entity
+  l2: Circle
+  l3 s: Shape
+  l4: *Circle
+  l5: *void
+  l6: *void
+  l7: Shape
+  l8 named: Named
+  l9: *Circle
+  l10: *void
+  l11: *void
+  l12: Named
+  l13: *void
+  l14: *void
+  l15: *usize
+  l16: *usize
+  l17: usize
+  l18: *u8
+  l19: *u8
+  l20: *i32
+  l21 x: i32
+  l22: *void
+  l23: *void
+  l24: *usize
+  l25: *usize
+  l26: usize
+  l27: *u8
+  l28: *u8
+  l29: *i32
+  l30: i32
+  l31 y: i32
+  l32: *void
+  l33: *void
+  l34: *extern (*void) -> i32
+  l35: *extern (*void) -> i32
+  l36: extern (*void) -> i32
+  l37: i32
+  l38 z: i32
+  l39: i32
+b0 entry:
+  l1 = aggregate (i32 3)  ; iface_prop.jog:35:36
+  l2 = aggregate (i32 1, l1, i32 1)  ; iface_prop.jog:35:13
+  l0 = copy l2  ; iface_prop.jog:35:5
+  l4 = addr l0  ; iface_prop.jog:36:21
+  l5 = bitcast l4  ; iface_prop.jog:36:20
+  l6 = bitcast g1  ; iface_prop.jog:36:20
+  l7 = aggregate (l5, l6)  ; iface_prop.jog:36:20
+  l3 = copy l7  ; iface_prop.jog:36:5
+  l9 = addr l0  ; iface_prop.jog:37:25
+  l10 = bitcast l9  ; iface_prop.jog:37:24
+  l11 = bitcast g2  ; iface_prop.jog:37:24
+  l12 = aggregate (l10, l11)  ; iface_prop.jog:37:24
+  l8 = copy l12  ; iface_prop.jog:37:5
+  l13 = extract l3, 0  ; iface_prop.jog:38:6
+  l14 = extract l3, 1  ; iface_prop.jog:38:6
+  l15 = bitcast l14  ; iface_prop.jog:38:6
+  l16 = elem_addr l15, usize 3  ; iface_prop.jog:38:6
+  l17 = load l16  ; iface_prop.jog:38:6
+  l18 = bitcast l13  ; iface_prop.jog:38:6
+  l19 = elem_addr l18, l17  ; iface_prop.jog:38:6
+  l20 = bitcast l19  ; iface_prop.jog:38:6
+  store l20, i32 4  ; iface_prop.jog:38:9
+  l22 = extract l8, 0  ; iface_prop.jog:39:18
+  l23 = extract l8, 1  ; iface_prop.jog:39:18
+  l24 = bitcast l23  ; iface_prop.jog:39:18
+  l25 = elem_addr l24, usize 4  ; iface_prop.jog:39:18
+  l26 = load l25  ; iface_prop.jog:39:18
+  l27 = bitcast l22  ; iface_prop.jog:39:18
+  l28 = elem_addr l27, l26  ; iface_prop.jog:39:18
+  l29 = bitcast l28  ; iface_prop.jog:39:18
+  l30 = load l29  ; iface_prop.jog:39:18
+  l21 = copy l30  ; iface_prop.jog:39:5
+  l32 = extract l8, 0  ; iface_prop.jog:40:18
+  l33 = extract l8, 1  ; iface_prop.jog:40:18
+  l34 = bitcast l33  ; iface_prop.jog:40:18
+  l35 = elem_addr l34, usize 3  ; iface_prop.jog:40:18
+  l36 = load l35  ; iface_prop.jog:40:18
+  l37 = call_indirect l36(l32)  ; iface_prop.jog:40:18
+  l31 = copy l37  ; iface_prop.jog:40:5
+  l39 = call f1(l3)  ; iface_prop.jog:41:13
+  l38 = copy l39  ; iface_prop.jog:41:5
+  ret  ; iface_prop.jog:34:1
+
+fn f3 internal jog_ifn_28_27_0 "jog_ifn_28_27_0": extern (*void) -> i32  ; iface_prop.jog:37:24
+  l0: *void param
+  l1: *Circle
+  l2: Circle
+  l3: i32
+b0 entry:
+  l1 = bitcast l0  ; iface_prop.jog:37:24
+  l2 = load l1  ; iface_prop.jog:37:24
+  l3 = call f0(l2)  ; iface_prop.jog:37:24
+  ret l3  ; iface_prop.jog:37:24

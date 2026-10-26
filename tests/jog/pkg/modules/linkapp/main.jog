@@ -1,0 +1,5 @@
+import linklib
+
+fn main() {
+    linklib.touch()
+}

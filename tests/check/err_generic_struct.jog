@@ -1,0 +1,32 @@
+struct Bound<T: i32> {
+    n: i32
+}
+
+struct Rec<T> {
+    inner: Rec<T>
+}
+
+struct Def<T> {
+    value: T = 1
+}
+
+struct Pair<A, B> {
+    a: A
+    b: B
+}
+
+struct Box<T> {
+    value: T
+}
+
+fn need(p: Pair<i32>) {
+}
+
+fn bare(p: Pair) {
+}
+
+// error: a constraint must be an interface
+// error: struct 'Rec' recursively contains itself
+// error: a type parameter cannot have a default value yet
+// error: expected 2 type arguments, found 1
+// error: missing type arguments for 'Pair'

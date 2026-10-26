@@ -1,0 +1,16 @@
+// expect: Hello from io
+
+import std.io
+
+fn main() {
+    if !io.print("Hello") {
+        return
+    }
+    if !io.eprint("") {
+        return
+    }
+    if !io.eprintln("") {
+        return
+    }
+    io.println(" from io")
+}

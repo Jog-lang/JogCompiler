@@ -1,0 +1,15 @@
+// The milestone 2 target: hello world through a direct libc call.
+
+extern {
+    fn puts(s: *const c_char): c_int
+}
+
+type c_char = i8
+type c_int = i32
+
+fn main() {
+    val greeting = c"Hello from Jog!"
+    if puts(greeting) < 0 {
+        return
+    }
+}

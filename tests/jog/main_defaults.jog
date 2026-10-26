@@ -1,0 +1,50 @@
+// expect: ok
+
+import std.mem
+import std.io
+
+extern {
+    fn puts(s: *const c_char): c_int
+}
+
+type c_char = i8
+type c_int = i32
+
+fn sized(): usize with (a: mem.Allocator) {
+    val (b, err) = a.alloc(4, 8)
+    if err != null {
+        return 0
+    }
+    a.free(b)
+    return b.len
+}
+
+fn erred(): usize with (ea: mem.ErrorAllocator) {
+    val a = ea as mem.Allocator
+    val (b, err) = a.alloc(8, 8)
+    if err != null {
+        return 0
+    }
+    return b.len
+}
+
+fn shout(msg: str): bool with (l: io.Logger) {
+    return l.write(msg)
+}
+
+fn need_scope(): i32 with (s: Scope, a: mem.Allocator) {
+    go { }
+    return 1
+}
+
+fn main() {
+    val n = sized()
+    val m = erred()
+    val logged = shout("logged")
+    val child = need_scope()
+    if n == 4 && m == 8 && logged && child == 1 {
+        if puts(c"ok") < 0 {
+            return
+        }
+    }
+}

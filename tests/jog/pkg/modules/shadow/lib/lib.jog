@@ -1,0 +1,3 @@
+fn local(): i32 {
+    return 1
+}

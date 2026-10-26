@@ -1,0 +1,70 @@
+// Package proc, same as proc.jog, so the tests see run, Output, and
+// free_output with no import of std.proc. run and free_output need the
+// allocator context: with (mem.heap()). t.expect takes a bool.
+// t.expectEq takes two str values; captured bytes convert to str.
+//
+// A missing program is ok == false, not a panic. An empty argument
+// vector is expectPanic. The exit-code cases are per OS: cmd.exe through
+// COMSPEC on Windows, /bin/sh on POSIX. The space case starts this test
+// executable again with one argument that contains a space. child_gate
+// sees that argument and exits before any test can start another process.
+
+import std.c
+import std.mem
+import std.os
+import std.testing
+
+private fn child_gate() {
+    if os.argc() < 3 {
+        return
+    }
+    if os.argv(1) != "--proc-space" {
+        return
+    }
+    if os.argv(2) == "hello world" {
+        c.jogrt_exit(0)
+    }
+    c.jogrt_exit(4)
+}
+
+@test
+fn missingProgram() with (t: testing.Testing) {
+    child_gate()
+    with (mem.heap()) {
+        val got = run([]str("no/such/jog-missing-proc-251025.exe"))
+        t.expect(!got.ok)
+        t.expect(got.stdout.len == 0)
+        t.expect(got.stderr.len == 0)
+        free_output(got)
+    }
+}
+
+@test
+fn emptyProgram() with (t: testing.Testing) {
+    child_gate()
+    with (mem.heap()) {
+        val got = run([]str(""))
+        t.expect(!got.ok)
+        free_output(got)
+    }
+}
+
+@test
+fn emptyArgs() with (t: testing.Testing) {
+    child_gate()
+    with (mem.heap()) {
+        t.expectPanic() { run([]str()) }
+    }
+}
+
+@test
+fn spaceArg() with (t: testing.Testing) {
+    child_gate()
+    with (mem.heap()) {
+        val self = os.argv(0)
+        val got = run([]str(self, "--proc-space", "hello world"))
+        t.expect(got.ok)
+        t.expect(got.code == 0)
+        free_output(got)
+    }
+}

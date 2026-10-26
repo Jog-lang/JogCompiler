@@ -1,0 +1,54 @@
+main f2
+init none
+
+fn f0 public jog_app__Point__sum "app.Point.sum": (Point) -> i32  ; struct.jog:6:1
+  l0 self: Point param addr
+  l1: *Point
+  l2: *i32
+  l3: i32
+  l4: *Point
+  l5: *i32
+  l6: i32
+  l7: i32
+b0 entry:
+  l1 = addr l0  ; struct.jog:7:16
+  l2 = field_addr l1, 0  ; struct.jog:7:16
+  l3 = load l2  ; struct.jog:7:16
+  l4 = addr l0  ; struct.jog:7:25
+  l5 = field_addr l4, 1  ; struct.jog:7:25
+  l6 = load l5  ; struct.jog:7:25
+  l7 = checked add l3, l6  ; struct.jog:7:19
+  ret l7  ; struct.jog:7:5
+
+fn f1 public jog_app__Point__set_x "app.Point.set_x": (*Point, i32) -> ()  ; struct.jog:10:1
+  l0 self: *Point param
+  l1 v: i32 param
+  l2: *i32
+b0 entry:
+  l2 = field_addr l0, 0  ; struct.jog:11:9
+  store l2, l1  ; struct.jog:11:12
+  ret  ; struct.jog:10:1
+
+fn f2 public jog_app__main "app.main": () -> ()  ; struct.jog:14:1
+  l0 p: Point addr
+  l1: Point
+  l2: *Point
+  l3: *i32
+  l4 s: i32
+  l5: *Point
+  l6: Point
+  l7: i32
+  l8: *Point
+b0 entry:
+  l1 = aggregate (i32 1, i32 2)  ; struct.jog:15:13
+  l0 = copy l1  ; struct.jog:15:5
+  l2 = addr l0  ; struct.jog:16:6
+  l3 = field_addr l2, 0  ; struct.jog:16:6
+  store l3, i32 3  ; struct.jog:16:9
+  l5 = addr l0  ; struct.jog:17:13
+  l6 = load l5  ; struct.jog:17:14
+  l7 = call f0(l6)  ; struct.jog:17:14
+  l4 = copy l7  ; struct.jog:17:5
+  l8 = addr l0  ; struct.jog:18:5
+  call f1(l8, l4)  ; struct.jog:18:6
+  ret  ; struct.jog:14:1

@@ -1,0 +1,12 @@
+// module: app
+
+extern {
+    fn side(): bool
+}
+
+fn main() {
+    val f = false
+    val g = f && side()
+    val h = f || side()
+    val n = !f
+}

@@ -1,0 +1,10 @@
+fn drain(ch: Chan<i32>) {
+    var sum: i32 = 0
+    for v in ch {
+        sum = sum + v
+    }
+}
+
+fn main() {
+    return
+}

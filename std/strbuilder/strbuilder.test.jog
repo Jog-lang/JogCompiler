@@ -1,0 +1,321 @@
+// Package strbuilder, same as strbuilder.jog, so the tests see StrBuilder
+// and empty with no import of std.strbuilder. append, append_byte,
+// append_char, append_int, and free need the allocator context:
+// with (mem.heap()). t.expect takes a bool. t.expectEq takes two str
+// values. parse_i64 does not allocate.
+//
+// Programmer-error panics are expectPanic tests at the bottom.
+// Out of memory in grow is not an @test.
+
+import std.mem
+import std.testing
+
+@test
+fn emptyBuilder() with (t: testing.Testing) {
+    var b = empty()
+    t.expect(b.len == 0)
+    t.expect(b.cap == 0)
+    t.expectEq(b.str(), "")
+    with (mem.heap()) {
+        b.append("")
+        t.expect(b.len == 0)
+        t.expect(b.cap == 0)
+        t.expectEq(b.str(), "")
+    }
+}
+
+@test
+fn appendStr() with (t: testing.Testing) {
+    var b = empty()
+    with (mem.heap()) {
+        b.append("hi")
+        t.expect(b.len == 2)
+        t.expect(b.cap == 8)
+        t.expectEq(b.str(), "hi")
+        b.append("!")
+        t.expect(b.len == 3)
+        t.expect(b.cap == 8)
+        t.expectEq(b.str(), "hi!")
+        b.free()
+    }
+}
+
+@test
+fn appendByte() with (t: testing.Testing) {
+    var b = empty()
+    with (mem.heap()) {
+        b.append_byte(65)
+        b.append("bc")
+        t.expect(b.len == 3)
+        t.expect(b.cap == 8)
+        t.expectEq(b.str(), "Abc")
+        b.append_byte(33)
+        t.expectEq(b.str(), "Abc!")
+        b.free()
+    }
+}
+
+@test
+fn growPastFirstCap() with (t: testing.Testing) {
+    // First block is 8 bytes, then capacity doubles.
+    var b = empty()
+    with (mem.heap()) {
+        b.append("abcdefgh")
+        t.expect(b.len == 8)
+        t.expect(b.cap == 8)
+        b.append_byte(88)
+        t.expect(b.len == 9)
+        t.expect(b.cap == 16)
+        t.expectEq(b.str(), "abcdefghX")
+        b.free()
+    }
+}
+
+@test
+fn growToRequest() with (t: testing.Testing) {
+    // 20 is past the first block and past the doubled 16, so the
+    // request itself is the capacity. The next growth doubles that.
+    var b = empty()
+    with (mem.heap()) {
+        b.append("0123456789abcdefghij")
+        t.expect(b.len == 20)
+        t.expect(b.cap == 20)
+        t.expectEq(b.str(), "0123456789abcdefghij")
+        b.append_byte(33)
+        t.expect(b.len == 21)
+        t.expect(b.cap == 40)
+        t.expectEq(b.str(), "0123456789abcdefghij!")
+        b.free()
+    }
+}
+
+@test
+fn clearKeepsCap() with (t: testing.Testing) {
+    var b = empty()
+    with (mem.heap()) {
+        b.append("abcdefgh")
+        b.append_byte(88)
+        val cap = b.cap
+        b.clear()
+        t.expect(b.len == 0)
+        t.expect(b.cap == cap)
+        t.expectEq(b.str(), "")
+        b.append("z")
+        t.expect(b.cap == cap)
+        t.expect(b.len == 1)
+        t.expectEq(b.str(), "z")
+        b.free()
+    }
+}
+
+@test
+fn viewSharesBuffer() with (t: testing.Testing) {
+    var b = empty()
+    with (mem.heap()) {
+        b.append("hi")
+        var view = b.str()
+        t.expectEq(view, "hi")
+        val p = b.ptr!!
+        p[0] = 72
+        t.expectEq(view, "Hi")
+        t.expectEq(b.str(), "Hi")
+        b.free()
+    }
+}
+
+@test
+fn freeThenAppend() with (t: testing.Testing) {
+    var b = empty()
+    with (mem.heap()) {
+        b.append("hi")
+        b.free()
+        t.expect(b.len == 0)
+        t.expect(b.cap == 0)
+        t.expectEq(b.str(), "")
+        b.append("ok")
+        t.expect(b.cap == 8)
+        t.expectEq(b.str(), "ok")
+        b.free()
+        b.free()
+        t.expect(b.cap == 0)
+    }
+}
+
+fn roundTrip(n: i64, base: i64) with (t: testing.Testing, a: mem.Allocator) {
+    var b = empty()
+    b.append_int(n, base)
+    val (got, ok) = parse_i64(b.str(), base)
+    t.expect(ok)
+    t.expect(got == n)
+    b.free()
+}
+
+@test
+fn formatInts() with (t: testing.Testing) {
+    val min: i64 = -9223372036854775808
+    val max: i64 = 9223372036854775807
+    with (mem.heap()) {
+        roundTrip(0, 2)
+        roundTrip(0, 10)
+        roundTrip(0, 16)
+        roundTrip(-1, 2)
+        roundTrip(-1, 10)
+        roundTrip(-1, 16)
+        roundTrip(min, 2)
+        roundTrip(min, 10)
+        roundTrip(min, 16)
+        roundTrip(max, 2)
+        roundTrip(max, 10)
+        roundTrip(max, 16)
+        var b = empty()
+        b.append_int(0, 10)
+        t.expectEq(b.str(), "0")
+        b.clear()
+        b.append_int(-1, 10)
+        t.expectEq(b.str(), "-1")
+        b.clear()
+        b.append_int(-1, 2)
+        t.expectEq(b.str(), "-1")
+        b.clear()
+        b.append_int(-1, 16)
+        t.expectEq(b.str(), "-1")
+        b.clear()
+        b.append("n=")
+        b.append_int(255, 16)
+        t.expectEq(b.str(), "n=ff")
+        b.clear()
+        b.append_int(10, 2)
+        t.expectEq(b.str(), "1010")
+        b.clear()
+        b.append_int(35, 36)
+        t.expectEq(b.str(), "z")
+        b.clear()
+        b.append_int(max, 10)
+        t.expectEq(b.str(), "9223372036854775807")
+        b.clear()
+        b.append_int(min, 10)
+        t.expectEq(b.str(), "-9223372036854775808")
+        b.clear()
+        b.append_int(max, 16)
+        t.expectEq(b.str(), "7fffffffffffffff")
+        b.clear()
+        b.append_int(min, 16)
+        t.expectEq(b.str(), "-8000000000000000")
+        b.clear()
+        b.append_int(min, 2)
+        val bits = b.str()
+        t.expect(bits.len == 65)
+        t.expect(bits.ptr[0] == '-' as u8)
+        t.expect(bits.ptr[1] == '1' as u8)
+        t.expect(bits.ptr[64] == '0' as u8)
+        b.free()
+    }
+}
+
+@test
+fn parseInts() with (t: testing.Testing) {
+    val (z, okz) = parse_i64("0", 10)
+    t.expect(okz && z == 0)
+    val (neg0, okn0) = parse_i64("-0", 10)
+    t.expect(okn0 && neg0 == 0)
+    val (plus, okp) = parse_i64("+42", 10)
+    t.expect(okp && plus == 42)
+    val (hex, okh) = parse_i64("FF", 16)
+    t.expect(okh && hex == 255)
+    val (letter, okl) = parse_i64("Z", 36)
+    t.expect(okl && letter == 35)
+    val (bin, okb) = parse_i64("1010", 2)
+    t.expect(okb && bin == 10)
+    val (empty, oke) = parse_i64("", 10)
+    t.expect(!oke && empty == 0)
+    val (sign, oks) = parse_i64("-", 10)
+    t.expect(!oks && sign == 0)
+    val (plusonly, okpo) = parse_i64("+", 10)
+    t.expect(!okpo && plusonly == 0)
+    val (bad, okbad) = parse_i64("12a", 10)
+    t.expect(!okbad && bad == 0)
+    val (sp, oksp) = parse_i64(" 1", 10)
+    t.expect(!oksp && sp == 0)
+    val (over, oko) = parse_i64("9223372036854775808", 10)
+    t.expect(!oko && over == 0)
+    val (under, oku) = parse_i64("-9223372036854775809", 10)
+    t.expect(!oku && under == 0)
+    val (hexover, okho) = parse_i64("8000000000000000", 16)
+    t.expect(!okho && hexover == 0)
+    val (base, okbase) = parse_i64("10", 1)
+    t.expect(!okbase && base == 0)
+    val (wide, okw) = parse_i64("10", 37)
+    t.expect(!okw && wide == 0)
+    val (min, okmin) = parse_i64("-9223372036854775808", 10)
+    t.expect(okmin && min == -9223372036854775808)
+    val (max, okmax) = parse_i64("9223372036854775807", 10)
+    t.expect(okmax && max == 9223372036854775807)
+}
+
+@test
+fn appendChars() with (t: testing.Testing) {
+    var b = empty()
+    with (mem.heap()) {
+        b.append_char('A')
+        b.append_char('!')
+        b.append("c")
+        t.expectEq(b.str(), "A!c")
+        b.clear()
+        b.append_char(0xE9)
+        t.expect(b.len == 2)
+        t.expect(b.ptr!![0] == 0xC3 as u8)
+        t.expect(b.ptr!![1] == 0xA9 as u8)
+        b.clear()
+        b.append_char(0x20AC)
+        t.expect(b.len == 3)
+        t.expect(b.ptr!![0] == 0xE2 as u8)
+        t.expect(b.ptr!![1] == 0x82 as u8)
+        t.expect(b.ptr!![2] == 0xAC as u8)
+        b.clear()
+        b.append_char(0x1F600)
+        t.expect(b.len == 4)
+        t.expect(b.ptr!![0] == 0xF0 as u8)
+        t.expect(b.ptr!![1] == 0x9F as u8)
+        t.expect(b.ptr!![2] == 0x98 as u8)
+        t.expect(b.ptr!![3] == 0x80 as u8)
+        b.free()
+    }
+}
+
+@test
+fn appendPastMegabyte() with (t: testing.Testing) {
+    // 65536 copies of 16 bytes is 1 MiB. One more copy crosses it.
+    var b = empty()
+    with (mem.heap()) {
+        val chunk = "0123456789abcdef"
+        for _ in 0 as usize..65537 {
+            b.append(chunk)
+        }
+        t.expect(b.len == 1048592)
+        t.expect(b.len > 1048576)
+        t.expect(b.cap >= b.len)
+        val p = b.ptr!!
+        val mid: usize = 1048576
+        t.expect(p[0] == '0' as u8)
+        t.expect(p[mid] == '0' as u8)
+        t.expect(p[b.len - 1] == 'f' as u8)
+        b.free()
+    }
+}
+
+// Out of memory panics inside grow. Not an @test.
+
+@test
+fn panicFormat() with (t: testing.Testing) {
+    var b = empty()
+    with (mem.heap()) {
+        b.append("hi")
+        t.expectPanic(() -> { b.append_int(1, 1) })
+        t.expectPanic(() -> { b.append_int(1, 37) })
+        t.expectPanic(() -> { b.append_char(-1) })
+        t.expectPanic(() -> { b.append_char(0xD800) })
+        t.expectPanic() { b.append_char(0x110000) }
+        t.expectEq(b.str(), "hi")
+        b.free()
+    }
+}

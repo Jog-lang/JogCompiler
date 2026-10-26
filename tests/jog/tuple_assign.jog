@@ -1,0 +1,26 @@
+// expect: 1
+// expect: 5
+// expect: 2
+
+extern {
+    fn printf(fmt: *const c_char, ...): c_int
+}
+
+type c_char = i8
+type c_int = i32
+
+fn main() {
+    var t: (i32, i32) = (0, 2)
+    var p: *(i32, i32) = &t
+    t.0 = 1
+    if printf(c"%d\n", t.0) < 0 {
+        return
+    }
+    p.0 += 4
+    if printf(c"%d\n", t.0) < 0 {
+        return
+    }
+    if printf(c"%d\n", t.1) < 0 {
+        return
+    }
+}

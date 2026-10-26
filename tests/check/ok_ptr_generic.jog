@@ -1,0 +1,21 @@
+fn put<T>(p: *T, i: usize, x: T) {
+    p[i] = x
+}
+
+fn get<T>(p: *T, i: usize): T {
+    return p[i]
+}
+
+fn from_raw<T>(p: *u8): *T {
+    return p as *T
+}
+
+fn main() {
+    var n: i32 = 1
+    val p = from_raw<i32>(&n as *u8)
+    put(p, 0, 2)
+    val got = get(p, 0)
+    if got == 2 {
+        return
+    }
+}

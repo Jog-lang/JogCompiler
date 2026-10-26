@@ -1,0 +1,116 @@
+// expect: ok
+
+import std.mem
+
+extern {
+    fn puts(s: *const c_char): c_int
+}
+
+type c_char = i8
+type c_int = i32
+
+fn msg(n: i32): str with (a: mem.Allocator) {
+    return "n=${n}"
+}
+
+struct Point {
+    x: i32
+    y: i32
+}
+
+fn Point.format(buf: bytes): (str, error?) {
+    return fmt(buf, "${self.x},${self.y}")
+}
+
+fn point_text(p: Point): str with (a: mem.Allocator) {
+    return "p=${p}"
+}
+
+struct Box {
+    n: i32
+}
+
+fn *Box.format(buf: bytes): (str, error?) {
+    return fmt(buf, "b=${self.n}")
+}
+
+struct Inner {
+    n: i32
+}
+
+struct Outer {
+    Inner
+}
+
+fn Inner.format(buf: bytes): (str, error?) {
+    return fmt(buf, "${self.n}")
+}
+
+fn main() {
+    var raw: bytes[32]
+    var tiny: bytes[4]
+    var n: i32 = 7
+    var m: i32 = -2
+    var u: u64 = 3
+    var flag = true
+    var name = "ab"
+    val (s, err) = fmt(raw[..], "n=${n} m=${m} u=${u} f=${flag} s=${name}")
+    if err != null {
+        return
+    }
+    if s != "n=7 m=-2 u=3 f=true s=ab" {
+        return
+    }
+    val (_, err2) = fmt(tiny[..], "n=${n} m=${m} u=${u} f=${flag} s=${name}")
+    if err2 == null {
+        return
+    }
+    val got = msg(7) with (mem.heap())
+    if got != "n=7" {
+        return
+    }
+    var p = Point(x: 4, y: 5)
+    var pp = &p
+    val (sp, errp) = fmt(raw[..], "n=${n} p=${p}")
+    if errp != null {
+        return
+    }
+    if sp != "n=7 p=4,5" {
+        return
+    }
+    val (spp, errpp) = fmt(raw[..], "${pp}")
+    if errpp != null {
+        return
+    }
+    if spp != "4,5" {
+        return
+    }
+    var tiny2: bytes[2]
+    val (_, errt) = fmt(tiny2[..], "${p}")
+    if errt == null {
+        return
+    }
+    var box = Box(n: 6)
+    val (sb, errb) = fmt(raw[..], "${box}")
+    if errb != null {
+        return
+    }
+    if sb != "b=6" {
+        return
+    }
+    var o = Outer(Inner: Inner(n: 8))
+    val (so, erro) = fmt(raw[..], "o=${o}")
+    if erro != null {
+        return
+    }
+    if so != "o=8" {
+        return
+    }
+    val gotp = point_text(p) with (mem.heap())
+    if gotp != "p=4,5" {
+        return
+    }
+    if puts(c"ok") < 0 {
+        return
+    }
+}

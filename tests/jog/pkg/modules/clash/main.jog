@@ -1,0 +1,7 @@
+import lib
+import lib_util
+
+fn main() {
+    val a = lib.greet()
+    val b = lib_util.name()
+}

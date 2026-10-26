@@ -1,0 +1,31 @@
+// expect: ok
+// bytes converts to str. The header is the same pointer and length.
+// "" is the empty header. 'h' is 104 and 'i' is 105.
+
+extern {
+    fn puts(s: *const c_char): c_int
+}
+
+type c_char = i8
+type c_int = i32
+
+fn from_bytes(view: bytes): str {
+    return view
+}
+
+fn main() {
+    var buf: [2]u8
+    var view = bytes()
+    buf[0] = 104
+    buf[1] = 105
+    view.ptr = &buf[0]
+    view.len = 2
+    val s: str = view
+    val t = view as str
+    val u = from_bytes(view)
+    if s == "hi" && t == "hi" && u == "hi" && from_bytes(bytes()) == "" {
+        if puts(c"ok") < 0 {
+            return
+        }
+    }
+}

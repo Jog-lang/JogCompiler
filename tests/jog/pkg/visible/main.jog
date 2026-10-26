@@ -1,0 +1,13 @@
+import store
+
+extern {
+    fn puts(s: *const i8): i32
+}
+
+fn main() {
+    if store.open() + store.use_hidden() + store.from_extra() == 5 {
+        puts(c"visible")
+    } else {
+        puts(c"no")
+    }
+}

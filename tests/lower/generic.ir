@@ -1,0 +1,46 @@
+main f0
+init none
+
+fn f0 public jog_app__main "app.main": () -> ()  ; generic.jog:11:1
+  l0 n: i64
+  l1: i64
+  l2 flag: bool
+  l3: bool
+  l4: bool
+  l5: bool
+b0 entry:
+  l1 = call f1(i64 1)  ; generic.jog:12:13
+  l0 = copy l1  ; generic.jog:12:5
+  l3 = call f2(bool true)  ; generic.jog:13:16
+  l2 = copy l3  ; generic.jog:13:5
+  l5 = eq l0, i64 1  ; generic.jog:14:10
+  cond_br l5, b1 "and.rhs", b2 "and.false"  ; generic.jog:14:15
+b1 "and.rhs":
+  l4 = copy l2  ; generic.jog:14:15
+  br b3 "and.join"  ; generic.jog:14:15
+b2 "and.false":
+  l4 = copy bool false  ; generic.jog:14:15
+  br b3 "and.join"  ; generic.jog:14:15
+b3 "and.join":
+  cond_br l4, b4 "if.then", b5 "if.join"  ; generic.jog:14:5
+b4 "if.then":
+  ret  ; generic.jog:15:9
+b5 "if.join":
+  ret  ; generic.jog:11:1
+
+fn f1 public jog_app__wrap__i64 "app.wrap<i64>": (i64) -> i64  ; generic.jog:7:1
+  l0 x: i64 param
+  l1: i64
+b0 entry:
+  l1 = call f3(l0)  ; generic.jog:8:12
+  ret l1  ; generic.jog:8:5
+
+fn f2 public jog_app__id__bool "app.id<bool>": (bool) -> bool  ; generic.jog:3:1
+  l0 x: bool param
+b0 entry:
+  ret l0  ; generic.jog:4:5
+
+fn f3 public jog_app__id__i64 "app.id<i64>": (i64) -> i64  ; generic.jog:3:1
+  l0 x: i64 param
+b0 entry:
+  ret l0  ; generic.jog:4:5

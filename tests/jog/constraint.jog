@@ -1,0 +1,100 @@
+// expect: ok
+
+extern {
+    fn puts(s: *const c_char): c_int
+}
+
+type c_char = i8
+type c_int = i32
+
+enum Ordering: i8 {
+    Less = -1
+    Equal = 0
+    Greater = 1
+}
+
+interface Ordered {
+    fn op<=>(o: Ordered): Ordering
+}
+
+interface Signed {
+    ~i8 | ~i16 | ~i32 | ~i64 | ~isize
+}
+
+interface Integer {
+    Signed | ~u8 | ~u16 | ~u32 | ~u64 | ~usize
+}
+
+interface Approx {
+    ~i32
+}
+
+interface Named {
+    fn name(): i32
+}
+
+interface Positioned {
+    var x: i32
+}
+
+type Meters: i32
+
+struct Point {
+    x: i32
+}
+
+struct Person {
+    n: i32
+}
+
+fn Person.name(): i32 {
+    return self.n
+}
+
+fn max<T: Ordered>(a: T, b: T): T {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn add<T: Integer>(a: T, b: T): T {
+    return a + b
+}
+
+fn add_m<T: Approx>(a: T, b: T): T {
+    return a + b
+}
+
+fn call<T: Named>(x: T): i32 {
+    return x.name()
+}
+
+fn bump<T: Positioned>(p: *T) {
+    p.x = p.x + 1
+}
+
+fn main() {
+    var a: i32 = 3
+    var b: i32 = 7
+    var m: Meters
+    var p = Point(x: 1)
+    var person = Person(n: 4)
+    if max(a, b) != 7 {
+        return
+    }
+    if add(a, b) != 10 {
+        return
+    }
+    add_m(m, m)
+    if call(person) != 4 {
+        return
+    }
+    bump(&p)
+    if p.x != 2 {
+        return
+    }
+    if puts(c"ok") < 0 {
+        return
+    }
+}

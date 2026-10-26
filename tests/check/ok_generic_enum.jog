@@ -1,0 +1,40 @@
+enum Result<T> {
+    Ok(value: T)
+    Err(code: i32)
+}
+
+enum Flag<T> { Off, On }
+
+enum Node<T> {
+    Leaf(value: T)
+    Link(next: *Node<T>)
+}
+
+fn code_of(r: Result<i32>): i32 {
+    return when r {
+        Ok(value) -> value
+        Err(code) -> code
+    }
+}
+
+fn make<T>(x: T): Result<T> {
+    return Result<T>.Ok(value: x)
+}
+
+fn main() {
+    var a = Result<i32>.Ok(value: 4)
+    var b = Result<bool>.Ok(value: true)
+    var bad = Result<i32>.Err(code: 7)
+    var leaf = Node<i32>.Leaf(value: 1)
+    var flag = Flag<i32>.On
+    val n: i32 = when a {
+        Ok(value) -> value
+        Err(code) -> code
+    }
+    val made = make(9)
+    val got = code_of(a)
+    val code = when bad {
+        Ok(value) -> value
+        Err(code) -> code
+    }
+}

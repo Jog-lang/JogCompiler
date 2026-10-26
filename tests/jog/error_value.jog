@@ -1,0 +1,58 @@
+// expect: found
+// expect: named
+// expect: cancelled
+// expect: ok
+// expect: pair
+
+import std.io
+
+struct NotFound {
+    tag: u8
+}
+
+var not_found: NotFound
+
+fn NotFound.message(): str {
+    return "not found"
+}
+
+val ErrNotFound = &not_found
+
+fn missing(): error? {
+    return &not_found
+}
+
+fn by_name(): error? {
+    return ErrNotFound
+}
+
+fn cancelled(): error? {
+    return ErrCancelled
+}
+
+fn ok(): error? {
+    return null
+}
+
+fn pair(): (i32, error?) {
+    return 7, &not_found
+}
+
+fn main() {
+    if missing() == &not_found {
+        io.println("found")
+    }
+    if by_name() == ErrNotFound {
+        io.println("named")
+    }
+    if cancelled() == ErrCancelled {
+        io.println("cancelled")
+    }
+    if ok() == null {
+        io.println("ok")
+    }
+    val (n, e) = pair()
+    if e == &not_found && n == 7 {
+        io.println("pair")
+    }
+}

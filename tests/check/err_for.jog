@@ -1,0 +1,35 @@
+struct Box {
+    n: i32
+}
+
+fn main() {
+    var a = [2]i32(1, 2)
+    for x in a {
+        x = 1
+    }
+    for i, y in a {
+        val bad: i32 = i
+    }
+    for i, i in a {
+    }
+    for q in 1 {
+    }
+    var p: *i32 = &a[0]
+    for z in p {
+    }
+    for n, m in 0..2 {
+    }
+    var b = Box(n: 1)
+    for w in b {
+    }
+    continue
+}
+
+// error: cannot assign to 'x'
+// error: type mismatch: expected i32, got usize
+// error: duplicate declaration of 'i'
+// error: for-in over a collection is not checked yet
+// error: for-in over a collection is not checked yet
+// error: for-in over a collection is not checked yet
+// error: for-in over a collection is not checked yet
+// error: continue outside of a loop

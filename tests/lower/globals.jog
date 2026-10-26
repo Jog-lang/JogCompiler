@@ -1,0 +1,19 @@
+// module: app
+
+fn id(n: i32): i32 = n
+
+val limit: u8 = 200 + 100 - 250
+val ready = true
+var count: i32
+var second = first + id(1)
+var first = id(10)
+val title = "jog"
+
+fn main(): i32 {
+    val s = title
+    if ready {
+        count = limit as i32
+        count = count + first
+    }
+    return second + count
+}

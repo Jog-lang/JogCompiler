@@ -1,0 +1,146 @@
+// Package std.io. print and eprint write a str through jogrt_write.
+// fd 1 is stdout and fd 2 is stderr, the split jogrt_write implements.
+// False means the write failed. A newline is a second write of "\n".
+// read_some and binary_stdio are for a program that speaks a byte
+// protocol over stdin and stdout, such as a language server.
+// read_all and write_all take a str path. fopen needs a trailing NUL, so
+// the path is copied into a temporary buffer. Failure is a bool.
+
+import std.c
+import std.mem
+
+private fn write_fd(fd: c.int, text: str): bool {
+    return c.jogrt_write(fd, text.ptr as *const void?, text.len)
+}
+
+fn print(text: str): bool {
+    return write_fd(1, text)
+}
+
+fn println(text: str): bool {
+    if !print(text) {
+        return false
+    }
+    return print("\n")
+}
+
+fn eprint(text: str): bool {
+    return write_fd(2, text)
+}
+
+fn eprintln(text: str): bool {
+    if !eprint(text) {
+        return false
+    }
+    return eprint("\n")
+}
+
+// 4095 bytes of path plus one NUL. A longer path does not open.
+// The local is zeroed; the byte after the copy is written 0 anyway.
+private fn open_file(path: str, mode: *const c.char): *c.FILE? {
+    var buf: bytes[4096]
+    if path.len >= 4096 {
+        return null
+    }
+    val dest = buf[..].ptr
+    if path.len > 0 {
+        c.memcpy(dest as *void, path.ptr as *const void, path.len)
+    }
+    *(dest + path.len) = 0
+    return c.fopen(dest as *const c.char, mode)
+}
+
+// Reads up to buf.len bytes from stdin and returns as soon as at least
+// one is available, so a pipe does not wait for a full buffer. (n, true)
+// with n > 0 is data, (0, true) is end of input, and (0, false) is a read
+// error. An empty buf is a programmer error and panics. The handle is read
+// directly, past C stdio's buffer, so do not mix this with fread on stdin.
+fn read_some(buf: bytes): (usize, bool) {
+    if buf.len == 0 {
+        panic("read_some needs a non-empty buffer")
+    }
+    val n = c.jogrt_stdin_read(buf.ptr as *void, buf.len)
+    if n < 0 {
+        return 0, false
+    }
+    return n as usize, true
+}
+
+// Puts stdin and stdout in binary mode, so print writes "\n" as one byte
+// and reads see "\r\n" unchanged. stdout is flushed first. false means a
+// mode could not be set. On hosts with no text mode it does nothing and
+// returns true.
+fn binary_stdio(): bool {
+    return c.jogrt_stdio_binary()
+}
+
+// Bytes come from the Allocator already in scope. false means open, read,
+// or close failed, and the bytes are empty. A short read ends the file.
+fn read_all(path: str): (bytes, bool) with (a: mem.Allocator) {
+    val file = open_file(path, c"rb")
+    if file == null {
+        return bytes(), false
+    }
+    var acc = bytes()
+    var chunk: bytes[4096]
+    val chunk_ptr = chunk[..].ptr
+    for {
+        val n = c.fread(chunk_ptr as *void, 1, 4096, file!!)
+        if n == 0 {
+            break
+        }
+        val old = acc.len
+        val (grown, err) = a.resize(acc, old + n)
+        if err != null {
+            a.free(acc)
+            c.fclose(file!!)
+            return bytes(), false
+        }
+        c.memcpy((grown.ptr + old) as *void, chunk_ptr as *const void, n)
+        acc = grown
+        if n < 4096 {
+            break
+        }
+    }
+    if c.fclose(file!!) != 0 {
+        a.free(acc)
+        return bytes(), false
+    }
+    return acc, true
+}
+
+// Creates or replaces the file. false means open, write, or close failed.
+fn write_all(path: str, data: bytes): bool {
+    val file = open_file(path, c"wb")
+    if file == null {
+        return false
+    }
+    if data.len > 0 {
+        val n = c.fwrite(data.ptr as *const void, 1, data.len, file!!)
+        if n != data.len {
+            c.fclose(file!!)
+            return false
+        }
+    }
+    return c.fclose(file!!) == 0
+}
+
+// Logger writes to stderr. The value is one Stderr, the same shape as
+// mem.heap's one Malloc.
+interface Logger {
+    fn write(msg: str): bool
+}
+
+struct Stderr {
+    tag: u8
+}
+
+var stderr_logger: Stderr
+
+fn logger(): Logger {
+    return &stderr_logger
+}
+
+fn Stderr.write(msg: str): bool {
+    return eprint(msg)
+}

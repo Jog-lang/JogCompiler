@@ -1,0 +1,28 @@
+fn add(a: i32, b: i32): i32 {
+    return a + b
+}
+
+fn apply(f: (i32) -> i32, n: i32): i32 {
+    return f(n)
+}
+
+fn twice(n: i32, body: (i32) -> i32): i32 {
+    return body(body(n))
+}
+
+fn main() {
+    val f: (i32, i32) -> i32 = add
+    val double = (x: i32) -> { x * 2 }
+    val sum = (a: i32, b: i32): i32 -> a + b
+    val one: () -> i32 = () -> { return 1 }
+    val local = () -> {
+        val n = 4
+        n
+    }
+    val noop = () -> {}
+    noop()
+    if apply(double, 3) == 6 && (twice(2) { x -> x + 1 }) == 4 && (twice(2) { it + 1 }) == 4 && f(1, 2) == 3 &&
+        sum(2, 3) == 5 && one() == 1 && local() == 4 {
+        return
+    }
+}

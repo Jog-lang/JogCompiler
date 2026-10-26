@@ -1,0 +1,19 @@
+main f1
+init none
+
+fn f0 extern puts "hello.puts": extern (*const i8) -> i32  ; hello.jog:4:5
+  l0 s: *const i8 param
+
+fn f1 public jog_hello__main "hello.main": () -> ()  ; hello.jog:10:1
+  l0 greeting: *const i8
+  l1: i32
+  l2: bool
+b0 entry:
+  l0 = copy *const i8 c"Hello from Jog!"  ; hello.jog:11:5
+  l1 = call f0(l0)  ; hello.jog:12:8
+  l2 = lt l1, i32 0  ; hello.jog:12:23
+  cond_br l2, b1 "if.then", b2 "if.join"  ; hello.jog:12:5
+b1 "if.then":
+  ret  ; hello.jog:13:9
+b2 "if.join":
+  ret  ; hello.jog:10:1

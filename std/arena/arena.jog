@@ -1,0 +1,207 @@
+// Package std.arena. Arena is a bump allocator. It implements the
+// std.mem.Allocator methods alloc, resize, and free, so &arena is an
+// Allocator. The handle holds a pointer to its blocks. That pointer is
+// not an allocator field: copies of the handle bump the same blocks,
+// and the methods do not take a with (a: mem.Allocator) context.
+//
+// Blocks come from jogrt_alloc. The first block for a small request is
+// chunk_size bytes, at least 16-aligned, so alignments 1, 2, 4, 8, and
+// 16 share it. A request that does not fit, including one larger than
+// every existing block, is a new block. A request bigger than chunk_size
+// gets one block of that size, so the bytes stay contiguous across what
+// would have been several chunks.
+//
+// free of one allocation does nothing. The bytes stay until reset or
+// release. reset sets every block's cursor to 0 and keeps the memory.
+// release frees every block and the header.
+
+import std.c
+
+// One jogrt block. used is the bump cursor. block_align is the alignment
+// jogrt_alloc was given, so an offset that is a multiple of a smaller
+// power of two stays aligned. next is the older block.
+private struct Chunk {
+    ptr: *u8?
+    cap: usize
+    used: usize
+    block_align: usize
+    next: *Chunk?
+}
+
+// head is the newest block. chunk_size is the default block size.
+private struct State {
+    head: *Chunk?
+    chunk_size: usize
+}
+
+struct Arena {
+    private state: *State?
+}
+
+private fn pow2(n: usize): bool {
+    if n == 0 {
+        return false
+    }
+    return (n & (n - 1)) == 0
+}
+
+// Round n up to a multiple of align. align is a non-zero power of two.
+private fn align_up(n: usize, align: usize): usize {
+    val rem = n % align
+    if rem == 0 {
+        return n
+    }
+    return n + (align - rem)
+}
+
+private fn fits(chunk: *Chunk, size: usize, align: usize): bool {
+    if chunk.block_align < align {
+        return false
+    }
+    val start = align_up(chunk.used, align)
+    if start < chunk.used {
+        return false
+    }
+    if start > chunk.cap {
+        return false
+    }
+    return size <= chunk.cap - start
+}
+
+private fn *Chunk.place(size: usize, align: usize): bytes {
+    val start = align_up(self.used, align)
+    self.used = start + size
+    val p = self.ptr!! + start
+    var view = bytes()
+    view.ptr = p
+    view.len = size
+    return view
+}
+
+// The header and the bytes are two jogrt blocks. A null result panics.
+private fn new_chunk(cap: usize, chunk_align: usize, next: *Chunk?): *Chunk {
+    val meta = c.jogrt_alloc(size(Chunk), align(Chunk))
+    if meta == null {
+        panic("out of memory")
+    }
+    val chunk = meta as *Chunk
+    val raw = c.jogrt_alloc(cap, chunk_align)
+    if raw == null {
+        c.jogrt_free(meta, size(Chunk), align(Chunk))
+        panic("out of memory")
+    }
+    chunk.ptr = raw as *u8?
+    chunk.cap = cap
+    chunk.used = 0
+    chunk.block_align = chunk_align
+    chunk.next = next
+    return chunk
+}
+
+private fn *State.bump(size: usize, align: usize): bytes {
+    var at = self.head
+    for at != null {
+        val chunk = at!!
+        if fits(chunk, size, align) {
+            return chunk.place(size, align)
+        }
+        at = chunk.next
+    }
+    var cap = self.chunk_size
+    if cap < size {
+        cap = size
+    }
+    var chunk_align = align
+    if chunk_align < 16 {
+        chunk_align = 16
+    }
+    val chunk = new_chunk(cap, chunk_align, self.head)
+    self.head = chunk as *Chunk?
+    return chunk.place(size, align)
+}
+
+// chunk_size 0 means 4096. The header is one jogrt block. There is no
+// data block until the first alloc.
+fn init(chunk_size: usize): Arena {
+    var n = chunk_size
+    if n == 0 {
+        n = 4096
+    }
+    val raw = c.jogrt_alloc(size(State), align(State))
+    if raw == null {
+        panic("out of memory")
+    }
+    val st = raw as *State
+    st.head = null
+    st.chunk_size = n
+    var arena = Arena()
+    arena.state = st as *State?
+    return arena
+}
+
+fn Arena.alloc(size: usize, align: usize): (bytes, error?) {
+    if self.state == null {
+        panic("arena is not initialized")
+    }
+    if !pow2(align) {
+        panic("alignment is not a power of two")
+    }
+    val block = self.state!!.bump(size, align)
+    return block, null
+}
+
+// A new block of size bytes at align 1, with the overlapping prefix
+// copied. The old block stays until reset or release. Keep the returned
+// bytes. alloc panics when out of memory, so the error is null.
+fn Arena.resize(b: bytes, size: usize): (bytes, error?) {
+    val (fresh, err) = self.alloc(size, 1)
+    if err != null {
+        return fresh, err
+    }
+    var n = b.len
+    if n > size {
+        n = size
+    }
+    if n > 0 {
+        c.memcpy(fresh.ptr as *void, b.ptr as *const void, n)
+    }
+    return fresh, null
+}
+
+// Does nothing. One allocation is not returned to the cursor. reset
+// rewinds every block. release frees them.
+fn Arena.free(b: bytes) {
+}
+
+fn *Arena.reset() {
+    if self.state == null {
+        return
+    }
+    var at = self.state!!.head
+    for at != null {
+        val chunk = at!!
+        chunk.used = 0
+        at = chunk.next
+    }
+}
+
+// Frees every block and the header. A second call does nothing.
+// alloc after release panics.
+fn *Arena.release() {
+    if self.state == null {
+        return
+    }
+    var at = self.state!!.head
+    for at != null {
+        val chunk = at!!
+        val next = chunk.next
+        val data = chunk.ptr
+        val cap = chunk.cap
+        val block_align = chunk.block_align
+        c.jogrt_free(data as *void?, cap, block_align)
+        c.jogrt_free(chunk as *void?, size(Chunk), align(Chunk))
+        at = next
+    }
+    c.jogrt_free(self.state as *void?, size(State), align(State))
+    self.state = null
+}

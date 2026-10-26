@@ -1,0 +1,96 @@
+enum Dup { A, A }
+
+enum Color: u8 { Red = 1, Green, Blue }
+
+fn missing(c: Color): i32 {
+    return when c {
+        Red -> 1
+    }
+}
+
+fn needs_else(n: i32): i32 {
+    return when n {
+        1 -> 1
+    }
+}
+
+fn no_wrap(n: i32): i32? {
+    return n
+}
+
+fn bang(n: i32): i32 {
+    return n!!
+}
+
+fn bad_is(c: Color): bool {
+    return c is Nope
+}
+
+enum BadDefault {
+    Num(n: i32 = true)
+}
+
+enum Need {
+    Pair(a: i32, b: i32)
+}
+
+fn omit(): Need {
+    return Need.Pair(b: 1)
+}
+
+enum HalfInner {
+    A(n: i32)
+    B
+}
+
+enum HalfOuter {
+    Wrap(inner: HalfInner)
+}
+
+fn half(o: HalfOuter): i32 {
+    return when o {
+        Wrap(A(n)) -> n
+    }
+}
+
+struct Spot {
+    x: i32
+    y: i32
+}
+
+fn bad_spot(p: Spot): i32 {
+    return when p {
+        Spot(z: 1, y: 2) -> 1
+        else -> 0
+    }
+}
+
+enum Side {
+    One
+    Two
+}
+
+enum Both {
+    P(x: Side, y: Side)
+}
+
+fn diagonal(p: Both): i32 {
+    return when p {
+        P(One, Two) -> 1
+        P(Two, One) -> 2
+    }
+}
+
+// error: duplicate variant 'A'
+// error: when does not cover 'Green'
+// error: when does not cover 'Blue'
+// error: when needs an else
+// error: type mismatch: expected i32?, got i32
+// error: operator '!!' needs an option
+// error: 'Nope' is not a variant of 'Color'
+// error: constant does not fit
+// error: missing field 'a'
+// error: when does not cover 'Wrap'
+// error: unknown field 'z'
+// error: missing field 'x'
+// error: when does not cover 'P'

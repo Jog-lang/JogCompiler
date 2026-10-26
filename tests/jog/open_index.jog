@@ -1,0 +1,52 @@
+// expect: ok
+// *Box<T> is indexed inside a generic. Box<Pair> is not the size of Box<i32>.
+// null assigned to *Box<T>? uses the concrete pointer.
+
+extern {
+    fn puts(s: *const c_char): c_int
+}
+
+type c_char = i8
+type c_int = i32
+
+struct Pair {
+    tag: u8
+    n: i32
+}
+
+struct Box<T> {
+    value: T
+}
+
+fn set_at<T>(p: *Box<T>, i: usize, x: T) {
+    p[i] = Box<T>(value: x)
+}
+
+fn get_at<T>(p: *Box<T>, i: usize): T {
+    val item = p[i]
+    return item.value
+}
+
+struct Holder<T> {
+    p: *Box<T>?
+}
+
+fn clear<T>(h: *Holder<T>) {
+    h.p = null
+}
+
+fn main() {
+    var nums: [2]Box<i32>
+    var items: [2]Box<Pair>
+    set_at<i32>(&nums[0], 1, 7)
+    set_at<Pair>(&items[0], 1, Pair(tag: 3, n: 9))
+    val n = get_at<i32>(&nums[0], 1)
+    val it = get_at<Pair>(&items[0], 1)
+    var held = Holder<i32>(p: null)
+    clear<i32>(&held)
+    if nums[0].value == 0 && n == 7 && items[0].value.n == 0 && items[0].value.tag == 0 && it.tag == 3 && it.n == 9 && held.p == null {
+        if puts(c"ok") < 0 {
+            return
+        }
+    }
+}

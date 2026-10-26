@@ -1,0 +1,7 @@
+fn main() {
+    val n: u8 = 300
+    val m: u8 = 200 + 100
+}
+
+// error: integer constant does not fit
+// error: integer overflow

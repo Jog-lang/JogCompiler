@@ -1,0 +1,53 @@
+// module: errors
+
+fn close(n: i32) {}
+
+fn open(): (i32, error?) {
+    return 1, null
+}
+
+fn pair(): (i32, i32) {
+    val t: (i32, i32) = (1, 2)
+    return t.0, t.1
+}
+
+fn maybe(): *i32? {
+    return null
+}
+
+fn process(): error? {
+    var (n, err) = open()
+    if err != null {
+        return err
+    }
+    defer close(n)
+    errdefer close(0)
+    (n, err) = open()
+    if err != null {
+        return err
+    }
+    return null
+}
+
+fn loop_defer() {
+    for {
+        defer close(1)
+        break
+    }
+}
+
+fn main() {
+    val (n, err) = open()
+    if err != null {
+        return
+    }
+    defer close(n)
+    val (a) = n
+    if a == 0 {
+        return
+    }
+    val p = maybe()
+    if p == null {
+        panic("boom")
+    }
+}

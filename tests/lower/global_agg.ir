@@ -1,0 +1,25 @@
+main f1
+init none
+
+global g0 const jog_app__title: const bytes = hex:00 00 00 00 00 00 00 00 03 00 00 00 00 00 00 00 reloc 0 str "jog"  ; global_agg.jog:17:1
+global g1 const jog_app__pair: Pair = hex:00 00 00 00 00 00 00 00 03 00 00 00 00 00 00 00 02 00 00 00 00 00 00 00 reloc 0 str "jog"  ; global_agg.jog:18:1
+global g2 const jog_app__tag: Tag = hex:01 00 00 00  ; global_agg.jog:19:1
+global g3 const jog_app__shape: Shape = hex:00 00 00 00 04 00 00 00  ; global_agg.jog:20:1
+global g4 const jog_app__a: i64 = hex:01 00 00 00 00 00 00 00  ; global_agg.jog:21:1
+global g5 const jog_app__b: i64 = hex:02 00 00 00 00 00 00 00  ; global_agg.jog:21:1
+global g6 const jog_app__point: (i64, i64) = hex:03 00 00 00 00 00 00 00 04 00 00 00 00 00 00 00  ; global_agg.jog:22:1
+global g7 const jog_app__c: i64 = hex:03 00 00 00 00 00 00 00  ; global_agg.jog:23:1
+global g8 const jog_app__d: i64 = hex:04 00 00 00 00 00 00 00  ; global_agg.jog:23:1
+global g9 const jog_app__n: i32 = hex:07 00 00 00  ; global_agg.jog:24:1
+global g10 const jog_app__p: *const i32 = hex:00 00 00 00 00 00 00 00 reloc 0 global g9  ; global_agg.jog:25:1
+global g11 const jog_app__f: (i32) -> i32 = hex:00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 reloc 0 func f0  ; global_agg.jog:26:1
+global g12 const jog_app__nums: [2]i32 = hex:01 00 00 00 02 00 00 00  ; global_agg.jog:27:1
+
+fn f0 public jog_app__id "app.id": (i32) -> i32  ; global_agg.jog:15:1
+  l0 n: i32 param
+b0 entry:
+  ret l0  ; global_agg.jog:15:22
+
+fn f1 public jog_app__main "app.main": () -> ()  ; global_agg.jog:29:1
+b0 entry:
+  ret  ; global_agg.jog:30:5

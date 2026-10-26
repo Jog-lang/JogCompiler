@@ -1,0 +1,54 @@
+// Exit-code cases go through COMSPEC, which is cmd.exe. echo writes
+// CRLF. child_gate is in proc.test.jog.
+
+import std.mem
+import std.os
+import std.testing
+
+private fn comspec(): str with (t: testing.Testing) {
+    val (cmd, ok) = os.env("COMSPEC")
+    if !ok || cmd.len == 0 {
+        t.fatal("COMSPEC is not set")
+    }
+    return cmd
+}
+
+@test
+fn exitZero() with (t: testing.Testing) {
+    child_gate()
+    with (mem.heap()) {
+        val cmd = comspec()
+        val got = run([]str(cmd, "/c", "exit", "0"))
+        t.expect(got.ok)
+        t.expect(got.code == 0)
+        t.expect(got.stdout.len == 0)
+        t.expect(got.stderr.len == 0)
+        free_output(got)
+    }
+}
+
+@test
+fn exitThree() with (t: testing.Testing) {
+    child_gate()
+    with (mem.heap()) {
+        val cmd = comspec()
+        val got = run([]str(cmd, "/c", "exit", "3"))
+        t.expect(got.ok)
+        t.expect(got.code == 3)
+        free_output(got)
+    }
+}
+
+@test
+fn captureStreams() with (t: testing.Testing) {
+    child_gate()
+    with (mem.heap()) {
+        val cmd = comspec()
+        val got = run([]str(cmd, "/c", "echo out&echo err>&2"))
+        t.expect(got.ok)
+        t.expect(got.code == 0)
+        t.expectEq(got.stdout, "out\r\n")
+        t.expectEq(got.stderr, "err\r\n")
+        free_output(got)
+    }
+}

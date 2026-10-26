@@ -1,0 +1,13 @@
+// expect: ok
+
+import std.testing
+
+@test
+fn passes() with (t: testing.Testing) {
+    var n = 1
+    t.expect(true)
+    t.expectEq("v", "v")
+    t.expectPanic(() -> { if n == 1 { panic("boom") } })
+    t.expectPanic() { panic("again") }
+    puts(c"ok")
+}

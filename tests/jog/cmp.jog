@@ -1,0 +1,27 @@
+// expect: ok
+
+import std.cmp
+
+extern {
+    fn puts(s: *const c_char): c_int
+}
+
+type c_char = i8
+type c_int = i32
+
+fn max<T: cmp.Ordered>(a: T, b: T): T {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn main() {
+    var a: i32 = 3
+    var b: i32 = 7
+    if max(a, b) == 7 {
+        if puts(c"ok") < 0 {
+            return
+        }
+    }
+}

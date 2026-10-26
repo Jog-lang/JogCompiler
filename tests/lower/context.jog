@@ -1,0 +1,40 @@
+// module: app
+
+context step: i32 = 4
+
+fn add(n: i64): i64 with (k: i64) {
+    return n + k
+}
+
+private fn twice(n: i64): i64 {
+    return add(n)
+}
+
+fn pick(): i64 with (k: i64) = k
+
+struct Box {
+    n: i32
+}
+
+fn Box.bump(): i32 with (k: i32) {
+    return self.n + k
+}
+
+fn main() {
+    var a: i64 = 0
+    with (3) {
+        a = add(1)
+    }
+    var b: i64 = 0
+    with (8) {
+        b = twice(2)
+    }
+    context k: i64 = 5
+    val c = pick()
+    var box = Box(n: 1)
+    val d = box.bump()
+    val e = add(6) with (7)
+    if a == 4 && b == 10 && c == 5 && d == 5 && e == 13 {
+        return
+    }
+}

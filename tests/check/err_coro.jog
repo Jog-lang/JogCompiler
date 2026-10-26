@@ -1,0 +1,20 @@
+fn f() {
+    go { }
+}
+
+interface Allocator {
+    fn alloc(size: usize, align: usize): i32
+}
+
+fn mismatch() with (a: Allocator, s: Scope) {
+    go {
+        if true {
+            return 1
+        }
+        return 1, 2
+    }
+}
+
+// error: missing context Scope
+// error: missing context Allocator
+// error: return type does not match the go result

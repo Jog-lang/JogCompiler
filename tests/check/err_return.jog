@@ -1,0 +1,10 @@
+fn f(): i32 {
+    val n = 1
+}
+
+fn g() {
+    return 1
+}
+
+// error: missing return
+// error: unexpected return value

@@ -1,0 +1,70 @@
+struct Box {
+    n: i32
+}
+
+struct No {
+    n: i32
+}
+
+struct Plain {
+    n: i32
+}
+
+interface Named {
+    fn name(): i32
+}
+
+interface Set {
+    fn *set(x: i32)
+}
+
+interface Both {
+    fn name(): i32
+    fn *set(x: i32)
+}
+
+interface Empty {}
+
+interface Ping {
+    fn ping(): i32 with (k: i32)
+}
+
+fn Box.name(): i32 {
+    return self.n
+}
+
+fn *Box.set(x: i32) {
+    self.n = x
+}
+
+fn Box.ping(): i32 with (k: i32) {
+    return self.n + k
+}
+
+fn take(): i32 with (s: Named) {
+    return s.name()
+}
+
+fn main() {
+    var b = Box(n: 1)
+    val named: Named = &b
+    var both: Both = &b
+    both.set(4)
+    val n = both.name()
+    val p = both as *Box
+    val q = both as? *Box
+    val z = both as? *No
+    val c = take() with (&b)
+    var plain = Plain(n: 1)
+    val e: Empty = &plain
+    val frozen = Box(n: 2)
+    val ro: Named = &frozen
+    val s: Ping = &b
+    var g: i32 = 0
+    with (9 as i32) {
+        g = s.ping()
+    }
+    if n == 4 && named.name() == 4 && p.name() == 4 && q != null && z == null && c == 4 && g == 13 && ro.name() == 2 && plain.n == 1 {
+        return
+    }
+}

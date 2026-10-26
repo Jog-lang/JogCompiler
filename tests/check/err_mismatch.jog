@@ -1,0 +1,8 @@
+fn main() {
+    val a: i32 = 1
+    val b: i64 = a
+    val c = a + b
+}
+
+// error: type mismatch: expected i64, got i32
+// error: mismatched types i32 and i64

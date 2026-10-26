@@ -1,0 +1,83 @@
+// Package io, same as io.jog, so the tests call read_some and
+// binary_stdio with no import of std.io.
+//
+// Each case starts this test executable again through std.proc with one
+// flag. child_gate sees the flag, does that one thing, and exits before
+// any test runs. std.proc gives the child NUL as stdin and captures stdout
+// to a file, so these cases see the bytes the child wrote and an empty
+// stdin. std.proc cannot pipe into a child's stdin, so the partial read
+// on a pipe that stays open is covered by tests/runtime_io_test.c, which
+// spawns a child with a pipe and calls jogrt_stdin_read.
+// Text-mode newline translation is per OS. io.windows.test.jog expects
+// "\r\n". io.posix.test.jog expects "\n". binary_stdio leaves "\n" as
+// one byte on both.
+
+import std.c
+import std.mem
+import std.os
+import std.proc
+import std.testing
+
+private fn child_gate() {
+    if os.argc() < 2 {
+        return
+    }
+    val flag = os.argv(1)
+    if flag == "--io-text" {
+        print("a\nb\n")
+        c.jogrt_exit(0)
+    }
+    if flag == "--io-binary" {
+        if !binary_stdio() {
+            c.jogrt_exit(3)
+        }
+        print("a\nb\n")
+        c.jogrt_exit(0)
+    }
+    if flag == "--io-eof" {
+        var buf: bytes[16]
+        val (n, ok) = read_some(buf[..])
+        if !ok {
+            c.jogrt_exit(4)
+        }
+        if n != 0 {
+            c.jogrt_exit(5)
+        }
+        print("eof")
+        c.jogrt_exit(0)
+    }
+}
+
+private fn run_child(flag: str): proc.Output with (a: mem.Allocator) {
+    return proc.run([]str(os.argv(0), flag))
+}
+
+@test
+fn binaryStdout() with (t: testing.Testing) {
+    child_gate()
+    with (mem.heap()) {
+        val got = run_child("--io-binary")
+        t.expect(got.ok)
+        t.expect(got.code == 0)
+        t.expectEq(got.stdout, "a\nb\n")
+        proc.free_output(got)
+    }
+}
+
+@test
+fn readSomeEof() with (t: testing.Testing) {
+    child_gate()
+    with (mem.heap()) {
+        val got = run_child("--io-eof")
+        t.expect(got.ok)
+        t.expect(got.code == 0)
+        t.expectEq(got.stdout, "eof")
+        proc.free_output(got)
+    }
+}
+
+@test
+fn readSomeEmpty() with (t: testing.Testing) {
+    child_gate()
+    t.expectPanic() { read_some(bytes()) }
+}

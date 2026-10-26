@@ -1,0 +1,5 @@
+@test
+fn notHere() {
+}
+
+// error: @test is only allowed in a test file

@@ -1,0 +1,4 @@
+fn main() {
+    val n = missing
+    val bad = true < false
+}

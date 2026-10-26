@@ -1,0 +1,120 @@
+main f8
+init none
+
+fn f0 public jog_app__add "app.add": (i32, i32) -> i32  ; arith.jog:3:1
+  l0 a: i32 param
+  l1 b: i32 param
+  l2: i32
+b0 entry:
+  l2 = checked add l0, l1  ; arith.jog:4:14
+  ret l2  ; arith.jog:4:5
+
+fn f1 public jog_app__abs "app.abs": (i32) -> i32  ; arith.jog:7:1
+  l0 x: i32 param
+  l1: bool
+  l2: i32
+b0 entry:
+  l1 = lt l0, i32 0  ; arith.jog:8:10
+  cond_br l1, b1 "if.then", b2 "if.join"  ; arith.jog:8:5
+b1 "if.then":
+  l2 = checked neg l0  ; arith.jog:9:16
+  ret l2  ; arith.jog:9:9
+b2 "if.join":
+  ret l0  ; arith.jog:11:5
+
+fn f2 public jog_app__square "app.square": (i32) -> i32  ; arith.jog:14:1
+  l0 x: i32 param
+  l1: i32
+b0 entry:
+  l1 = checked mul l0, l0  ; arith.jog:14:28
+  ret l1  ; arith.jog:14:28
+
+fn f3 public jog_app__sh "app.sh": (u8) -> u8  ; arith.jog:16:1
+  l0 x: u8 param
+  l1: u8
+b0 entry:
+  l1 = checked shl l0, u8 3  ; arith.jog:17:14
+  ret l1  ; arith.jog:17:5
+
+fn f4 public jog_app__mask "app.mask": (u8) -> u8  ; arith.jog:20:1
+  l0 x: u8 param
+  l1: u8
+b0 entry:
+  l1 = and l0, u8 15  ; arith.jog:21:14
+  ret l1  ; arith.jog:21:5
+
+fn f5 public jog_app__inv "app.inv": (i32) -> i32  ; arith.jog:24:1
+  l0 x: i32 param
+  l1: i32
+b0 entry:
+  l1 = bitnot l0  ; arith.jog:25:12
+  ret l1  ; arith.jog:25:5
+
+fn f6 public jog_app__widen "app.widen": (i32) -> i64  ; arith.jog:28:1
+  l0 x: i32 param
+  l1: i64
+b0 entry:
+  l1 = checked convert l0  ; arith.jog:29:14
+  ret l1  ; arith.jog:29:5
+
+fn f7 public jog_app__pick "app.pick": (bool) -> i32  ; arith.jog:32:1
+  l0 c: bool param
+  l1: i32
+b0 entry:
+  cond_br l0, b1 "if.then", b2 "if.else"  ; arith.jog:33:12
+b1 "if.then":
+  l1 = copy i32 1  ; arith.jog:33:12
+  br b3 "if.join"  ; arith.jog:33:12
+b2 "if.else":
+  l1 = copy i32 2  ; arith.jog:33:12
+  br b3 "if.join"  ; arith.jog:33:12
+b3 "if.join":
+  ret l1  ; arith.jog:33:5
+
+fn f8 public jog_app__main "app.main": () -> ()  ; arith.jog:36:1
+  l0 n: i32
+  l1: i32
+  l2: i32
+  l3 w: i64
+  l4: i64
+  l5 bits: u8
+  l6: u8
+  l7 m: u8
+  l8: u8
+  l9 flipped: i32
+  l10: i32
+  l11 chosen: i32
+  l12: bool
+  l13: i32
+  l14: bool
+  l15 z: i32
+  l16: i32
+  l17 z: i32
+  l18: i32
+b0 entry:
+  l1 = call f0(i32 1, i32 2)  ; arith.jog:37:20
+  l2 = call f2(l1)  ; arith.jog:37:13
+  l0 = copy l2  ; arith.jog:37:5
+  l4 = call f6(l0)  ; arith.jog:38:13
+  l3 = copy l4  ; arith.jog:38:5
+  l6 = call f3(u8 1)  ; arith.jog:39:16
+  l5 = copy l6  ; arith.jog:39:5
+  l8 = call f4(l5)  ; arith.jog:40:13
+  l7 = copy l8  ; arith.jog:40:5
+  l10 = call f5(l0)  ; arith.jog:41:19
+  l9 = copy l10  ; arith.jog:41:5
+  l12 = gt l0, i32 0  ; arith.jog:42:25
+  l13 = call f7(l12)  ; arith.jog:42:18
+  l11 = copy l13  ; arith.jog:42:5
+  l14 = lt l11, i32 0  ; arith.jog:43:15
+  cond_br l14, b1 "if.then", b3 "if.else"  ; arith.jog:43:5
+b1 "if.then":
+  l16 = call f1(l9)  ; arith.jog:44:17
+  l15 = copy l16  ; arith.jog:44:9
+  br b2 "if.join"  ; arith.jog:43:5
+b2 "if.join":
+  ret  ; arith.jog:36:1
+b3 "if.else":
+  l18 = checked convert l7  ; arith.jog:46:19
+  l17 = copy l18  ; arith.jog:46:9
+  br b2 "if.join"  ; arith.jog:43:5

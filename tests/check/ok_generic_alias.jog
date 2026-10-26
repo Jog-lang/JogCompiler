@@ -1,0 +1,72 @@
+struct T {
+    n: i32
+}
+
+struct Box<T> {
+    value: T
+}
+
+enum Result<T> {
+    Ok(value: T)
+    Err(code: i32)
+}
+
+type Pair<A, B> = (A, B)
+type Swap<A, B> = Pair<B, A>
+type Id<T> = T
+type Ref<T> = *Box<T>
+type Boxed<T> = Box<T>
+type Res<T> = Result<T>
+type IntBox = Box<i32>
+type IntPair = (i32, bool)
+type Forget<T> = i32
+
+fn first<T>(p: Pair<T, bool>): T {
+    return p.0
+}
+
+fn swapped<T>(p: Swap<T, i32>): i32 {
+    return p.0
+}
+
+fn make_box<T>(x: T): Boxed<T> {
+    return Boxed<T>(value: x)
+}
+
+fn make_res<T>(x: T): Res<T> {
+    return Res<T>.Ok(value: x)
+}
+
+fn main() {
+    var p: Pair<i32, bool> = (1, true)
+    var same: (i32, bool) = p
+    var s: Swap<bool, i32> = p
+    var ip: IntPair = s
+    var n: Id<i32> = 4
+    var forgotten: Forget<bool> = 8
+    var b = Boxed<i32>(value: 2)
+    var ib = IntBox(value: 6)
+    var box = Box<i32>(value: 7)
+    var rp: Ref<i32> = &box
+    var r = Res<i32>.Ok(value: 3)
+    var copied = make_box(b.value)
+    var made = make_res(n)
+    val got = first(same)
+    val back = swapped(s)
+    val idn: i32 = n
+    val boxn = copied.value
+    val via = rp.value
+    val plain = ib.value
+    val code = when r {
+        Ok(value) -> value
+        Err(code) -> code
+    }
+    val made_code = when made {
+        Ok(value) -> value
+        Err(code) -> code
+    }
+    var hidden: T = T(n: 5)
+    if got == 1 && same.1 && back == 1 && ip.0 == p.0 && idn == 4 && forgotten == 8 && boxn == 2 && via == 7 && plain == 6 && code == 3 && made_code == 4 && hidden.n == 5 {
+        return
+    }
+}

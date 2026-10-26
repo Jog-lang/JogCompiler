@@ -1,0 +1,15 @@
+// module: app
+
+type Pair<A, B> = (A, B)
+
+fn make<T>(x: T): Pair<T, bool> {
+    return (x, true)
+}
+
+fn main() {
+    val p: Pair<i32, bool> = (4, true)
+    val q = make(p.0)
+    if p.0 == q.0 && p.1 {
+        return
+    }
+}

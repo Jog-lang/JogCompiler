@@ -1,0 +1,31 @@
+// module: app
+
+struct Pair {
+    name: str
+    n: i32
+}
+
+enum Tag: i32 { Off, On }
+
+enum Shape {
+    Circle(r: i32)
+    Empty
+}
+
+fn id(n: i32): i32 = n
+
+val title = "jog"
+val pair = Pair(name: "jog", n: 2)
+val tag = Tag.On
+val shape = Shape.Circle(r: 4)
+val (a, b) = (1, 2)
+val point = (3, 4)
+val (c, d) = point
+val n: i32 = 7
+val p = &n
+val f = id
+val nums = [2]i32(1, 2)
+
+fn main() {
+    return
+}

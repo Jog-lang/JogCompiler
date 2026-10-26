@@ -1,0 +1,5 @@
+import util
+
+fn greet(): str {
+    return util.name()
+}

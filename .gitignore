@@ -1,0 +1,13 @@
+build/
+build-linux/
+build-linux-*/
+out/
+*.exe
+*.o
+*.obj
+*.ilk
+*.pdb
+*.wasm
+.ninja_*
+.vscode/
+docs/.obsidian/

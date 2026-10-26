@@ -1,0 +1,33 @@
+// expect: ok
+// *u8 as *T, then p[i], inside a generic. Pair is 8 bytes, so the second
+// slot is not the next i32.
+
+extern {
+    fn puts(s: *const c_char): c_int
+}
+
+type c_char = i8
+type c_int = i32
+
+struct Pair {
+    tag: u8
+    n: i32
+}
+
+fn from_raw<T>(p: *u8): *T {
+    return p as *T
+}
+
+fn main() {
+    var nums: [2]i32
+    var items: [2]Pair
+    val n = from_raw<i32>(&nums[0] as *u8)
+    val it = from_raw<Pair>(&items[0] as *u8)
+    n[1] = 7
+    it[1] = Pair(tag: 3, n: 9)
+    if nums[0] == 0 && nums[1] == 7 && items[0].n == 0 && items[0].tag == 0 && items[1].tag == 3 && items[1].n == 9 {
+        if puts(c"ok") < 0 {
+            return
+        }
+    }
+}

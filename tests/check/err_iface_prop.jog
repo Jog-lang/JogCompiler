@@ -1,0 +1,101 @@
+struct Entity {
+    pos: i32
+}
+
+struct Circle {
+    tag: i32
+    Entity
+    n: i32
+    extra: i32
+}
+
+struct Gap {
+    n: i32
+}
+
+struct Wide {
+    pos: i64
+}
+
+struct Box {
+    n: i32
+}
+
+interface Named {
+    val pos: i32
+}
+
+interface Shape {
+    var n: i32
+}
+
+interface Act {
+    fn run(): i32
+}
+
+fn Box.run(): i32 {
+    return self.n
+}
+
+fn bad_missing() {
+    var g = Gap(n: 1)
+    val s: Named = &g
+}
+
+fn bad_type() {
+    var w = Wide(pos: 1)
+    val s: Named = &w
+}
+
+fn bad_val() {
+    var c = Circle(tag: 1, Entity: Entity(pos: 3), n: 1, extra: 7)
+    val n: Named = &c
+    n.pos = 1
+}
+
+fn bad_unknown() {
+    var c = Circle(tag: 1, Entity: Entity(pos: 3), n: 1, extra: 7)
+    val n: Named = &c
+    val x = n.nope
+}
+
+fn bad_is() {
+    var c = Circle(tag: 1, Entity: Entity(pos: 3), n: 1, extra: 7)
+    val s: Shape = &c
+    val b = s is i32
+}
+
+fn bad_var() {
+    var c = Circle(tag: 1, Entity: Entity(pos: 3), n: 1, extra: 7)
+    var s: Shape = &c
+    if s is Circle {
+        val x = s.extra
+    }
+}
+
+fn bad_const() {
+    val c = Circle(tag: 1, Entity: Entity(pos: 3), n: 1, extra: 7)
+    val s: Shape = &c
+}
+
+fn bad_op() {
+    var c = Circle(tag: 1, Entity: Entity(pos: 3), n: 1, extra: 7)
+    var s: Shape = &c
+    s.n += 1
+}
+
+fn bad_method() {
+    var b = Box(n: 1)
+    val s: Act = &b
+    val x = s.run
+}
+
+// error: type 'Gap' is missing property 'pos' for interface 'Named'
+// error: property 'pos' has the wrong type for interface 'Named'
+// error: cannot assign to property 'pos'
+// error: unknown property 'nope'
+// error: is expects a struct or enum
+// error: unknown property 'extra'
+// error: cannot convert
+// error: operator '+=' is not checked yet
+// error: method 'run' must be called

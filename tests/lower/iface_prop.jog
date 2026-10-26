@@ -1,0 +1,42 @@
+struct Entity {
+    pos: i32
+}
+
+struct Circle {
+    tag: i32
+    Entity
+    n: i32
+}
+
+interface Named {
+    fn id(): i32
+    val pos: i32
+}
+
+interface Shape {
+    var n: i32
+}
+
+fn Circle.id(): i32 {
+    return self.tag
+}
+
+fn use(s: Shape): i32 {
+    if s is Circle {
+        return s.pos
+    }
+    return when s {
+        is Circle -> 1
+        else -> 0
+    }
+}
+
+fn main() {
+    var c = Circle(tag: 1, Entity: Entity(pos: 3), n: 1)
+    var s: Shape = &c
+    val named: Named = &c
+    s.n = 4
+    val x = named.pos
+    val y = named.id()
+    val z = use(s)
+}

@@ -1,0 +1,98 @@
+fn close(n: i32) {}
+
+fn open(): (i32, error?) {
+    return 1, null
+}
+
+fn pair(): (i32, i32) {
+    val t: (i32, i32) = (1, 2)
+    return t.0, t.1
+}
+
+fn maybe(): *i32? {
+    return null
+}
+
+fn process(): error? {
+    var (n, err) = open()
+    if err != null {
+        return err
+    }
+    defer close(n)
+    errdefer {
+        close(n)
+    }
+    (n, err) = open()
+    if err != null {
+        return err
+    }
+    return null
+}
+
+fn die(): i32 {
+    panic("boom")
+}
+
+struct Pair {
+    lo: i32
+    hi: i32
+}
+
+fn split(n: i32): (i32, i32) {
+    return n, n + 1
+}
+
+fn places() {
+    var t: (i32, i32) = (1, 2)
+    var p: *(i32, i32) = &t
+    var a: i32 = 0
+    var b: i32 = 0
+    var s = Pair(lo: 0, hi: 0)
+    var arr = [2]i32(0, 0)
+    var row = [](i32, i32)((0, 0))
+    var flag = false
+    var (c, d): (i32, i32)
+    val x = p.0
+    val y = (*p).1
+    (a, b) = (1, 2)
+    (a, b) = split(4)
+    (s.lo, s.hi) = (a, b)
+    (arr[0], arr[1]) = (s.lo, s.hi)
+    (row[0].0, row[0].1) = (arr[0], arr[1])
+    (*(&a), b) = (7, row[0].1)
+    ((a, b), flag) = ((3, 4), true)
+    (p.0, p.1) = (a, b)
+    (t.0, t.1) = (a, b)
+    t.0 = 1
+    t.1 += b
+    p.0 = a
+    (c, d) = (1, 2)
+    (_, d) = (c, x)
+    if x != 1 || y != 2 || flag == false || c != d {
+        return
+    }
+}
+
+fn main() {
+    val (n, err) = open()
+    if err != null {
+        return
+    }
+    defer close(n)
+    val (a) = n
+    val (g, h) = (1, 2)
+    val p: *i32? = null
+    if p == null || a == 0 || g == h {
+        return
+    }
+    val both = pair()
+    if both.0 == n && both.1 == a {
+        return
+    }
+    val q = maybe()
+    if q != null {
+        return
+    }
+    val code = die()
+    close(code)
+}

@@ -1,0 +1,52 @@
+struct NotFound {
+    tag: u8
+}
+
+fn NotFound.message(): str {
+    return "not found"
+}
+
+fn missing(): error? {
+    var not_found: NotFound
+    return &not_found
+}
+
+fn by_name(): error? {
+    var not_found: NotFound
+    val ErrNotFound = &not_found
+    return ErrNotFound
+}
+
+fn cancelled(): error? {
+    return ErrCancelled
+}
+
+fn ok(): error? {
+    return null
+}
+
+fn pair(): (i32, error?) {
+    var not_found: NotFound
+    return 7, &not_found
+}
+
+fn held(): error? {
+    var not_found: NotFound
+    var err: error? = &not_found
+    return err
+}
+
+fn take(err: error?) {
+}
+
+fn passed(): error? {
+    var not_found: NotFound
+    take(&not_found)
+    return &not_found
+}
+
+fn same(): bool {
+    var not_found: NotFound
+    val ErrNotFound = &not_found
+    return missing() == &not_found && by_name() == ErrNotFound && cancelled() == ErrCancelled && ok() == null
+}

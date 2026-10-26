@@ -1,0 +1,177 @@
+// Package std.list. List<T> is a growable array. The value is one buffer of
+// T stored by value, a length, and a capacity. The allocator is not a
+// field: new, push, insert, reserve, and free take it as a context,
+// with (a: mem.Allocator), the same way std.mem and std.io do.
+//
+// One allocation owns the element buffer. The first block holds 8
+// elements, then the capacity doubles. A request larger than that next
+// capacity uses the request. empty is the zero value: len 0, cap 0,
+// ptr null, no block. pop and clear do not free the block or the
+// elements. If a T owns memory of its own, the caller frees that.
+
+import std.mem
+
+// ptr is null until the first allocation. len is the live count. cap is
+// how many T slots the block holds.
+struct List<T> {
+    ptr: *T?
+    len: usize
+    cap: usize
+}
+
+fn empty<T>(): List<T> {
+    return List<T>()
+}
+
+// Copies every packed element into a new buffer. No elements means the
+// zero list and no allocation.
+fn new<T>(...T: elements): List<T> with (a: mem.Allocator) {
+    var xs = List<T>()
+    if elements.len == 0 {
+        return xs
+    }
+    xs.reserve(elements.len)
+    for i in 0 as usize..elements.len {
+        xs.ptr!![i] = elements[i]
+    }
+    xs.len = elements.len
+    return xs
+}
+
+// alloc, copy the live values, free the old block. raw.ptr as *T is the
+// typed pointer. bytes as []T is still rejected.
+private fn *List<T>.grow(minCap: usize) with (a: mem.Allocator) {
+    var newCap: usize = 8
+    if self.cap != 0 {
+        newCap = self.cap * 2
+    }
+    if newCap < minCap {
+        newCap = minCap
+    }
+    val (raw, err) = a.alloc(size(T) * newCap, align(T))
+    if err != null {
+        panic("out of memory")
+    }
+    val fresh = raw.ptr as *T
+    if self.len > 0 {
+        val old = self.ptr!!
+        for i in 0 as usize..self.len {
+            fresh[i] = old[i]
+        }
+    }
+    if self.cap > 0 {
+        var block = bytes()
+        block.ptr = self.ptr!! as *u8
+        block.len = size(T) * self.cap
+        a.free(block)
+    }
+    self.ptr = fresh as *T?
+    self.cap = newCap
+}
+
+fn *List<T>.push(...T: elements) with (a: mem.Allocator) {
+    if elements.len == 0 {
+        return
+    }
+    val need = self.len + elements.len
+    if need > self.cap {
+        self.grow(need)
+    }
+    val p = self.ptr!!
+    for i in 0 as usize..elements.len {
+        p[self.len] = elements[i]
+        self.len = self.len + 1
+    }
+}
+
+fn *List<T>.pop(): T {
+    if self.len == 0 {
+        panic("pop on empty list")
+    }
+    self.len = self.len - 1
+    return self.ptr!![self.len]
+}
+
+fn List<T>.get(i: usize): T {
+    if i >= self.len {
+        panic("index out of range")
+    }
+    return self.ptr!![i]
+}
+
+fn *List<T>.set(i: usize, x: T) {
+    if i >= self.len {
+        panic("index out of range")
+    }
+    self.ptr!![i] = x
+}
+
+fn *List<T>.clear() {
+    self.len = 0
+}
+
+// i == len appends. i > len panics. The tail shifts up one slot.
+fn *List<T>.insert(i: usize, x: T) with (a: mem.Allocator) {
+    if i > self.len {
+        panic("index out of range")
+    }
+    if self.len == self.cap {
+        self.grow(self.len + 1)
+    }
+    val p = self.ptr!!
+    var k = self.len
+    for k > i {
+        p[k] = p[k - 1]
+        k = k - 1
+    }
+    p[i] = x
+    self.len = self.len + 1
+}
+
+// Shifts the tail down and returns the element. Does not shrink cap.
+fn *List<T>.remove(i: usize): T {
+    if i >= self.len {
+        panic("index out of range")
+    }
+    val p = self.ptr!!
+    val removed = p[i]
+    var k = i
+    for k + 1 < self.len {
+        p[k] = p[k + 1]
+        k = k + 1
+    }
+    self.len = self.len - 1
+    return removed
+}
+
+fn *List<T>.reserve(n: usize) with (a: mem.Allocator) {
+    if self.cap >= n {
+        return
+    }
+    self.grow(n)
+}
+
+fn *List<T>.free() with (a: mem.Allocator) {
+    if self.cap == 0 {
+        return
+    }
+    var block = bytes()
+    block.ptr = self.ptr!! as *u8
+    block.len = size(T) * self.cap
+    a.free(block)
+    self.ptr = null
+    self.len = 0
+    self.cap = 0
+}
+
+// Live elements as []T, length len, not capacity. No copy.
+// A later growth moves the block and invalidates this slice.
+fn List<T>.slice_view(): []T {
+    var view: []T
+    if self.len == 0 {
+        return view
+    }
+    view.ptr = self.ptr!!
+    view.len = self.len
+    return view
+}

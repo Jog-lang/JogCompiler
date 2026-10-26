@@ -1,0 +1,10 @@
+// expect: ok
+
+@test
+fn answerIsFour() {
+    if answer() == 4 {
+        puts(c"ok")
+    } else {
+        puts(c"bad")
+    }
+}

@@ -1,0 +1,45 @@
+struct Box {
+    n: i32
+}
+
+fn read(b: Box?): i32? {
+    return b?.n
+}
+
+fn read_ptr(b: *Box?): i32? {
+    return b?.n
+}
+
+fn len_of(name: str?): usize? {
+    return name?.len
+}
+
+fn ptr_of(name: str?): *const u8? {
+    return name?.ptr
+}
+
+fn bytes_len(text: bytes?): usize? {
+    return text?.len
+}
+
+fn bytes_ptr(text: bytes?): *u8? {
+    return text?.ptr
+}
+
+fn slice_len(xs: ([]i32)?): usize? {
+    return xs?.len
+}
+
+fn slice_ptr(xs: ([]const u8)?): *const u8? {
+    return xs?.ptr
+}
+
+fn main() {
+    val name: str? = null
+    val n = len_of(name)
+    val box: Box? = null
+    val field = read(box)
+    val p = ptr_of(name)
+    val s: ([]i32)? = null
+    val sl = slice_len(s)
+}

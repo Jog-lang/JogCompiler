@@ -1,0 +1,100 @@
+// Windows directory helpers for the fs tests. The scratch directory is
+// under the Windows temp path.
+
+import std.c
+import std.mem
+
+private fn cstr_ok(path: str, buf: *u8, cap: usize): bool {
+    if path.len >= cap {
+        return false
+    }
+    if path.len > 0 {
+        c.memcpy(buf as *void, path.ptr as *const void, path.len)
+    }
+    buf[path.len] = 0
+    return true
+}
+
+private fn make_dir(path: str): bool {
+    var buf: [4096]u8
+    if !cstr_ok(path, buf[..].ptr, 4096) {
+        return false
+    }
+    return c.CreateDirectoryA(buf[..].ptr as *const c.char, 0) != 0
+}
+
+private fn delete_file(path: str) {
+    var buf: [4096]u8
+    if !cstr_ok(path, buf[..].ptr, 4096) {
+        return
+    }
+    c.DeleteFileA(buf[..].ptr as *const c.char)
+}
+
+private fn remove_dir(path: str) {
+    var buf: [4096]u8
+    if !cstr_ok(path, buf[..].ptr, 4096) {
+        return
+    }
+    c.RemoveDirectoryA(buf[..].ptr as *const c.char)
+}
+
+private fn remove_child(dir: str, name: str) with (a: mem.Allocator) {
+    val path = join(dir, name)
+    delete_file(path)
+    remove_dir(path)
+    free_str(path)
+}
+
+private fn wipe(dir: str) with (a: mem.Allocator) {
+    remove_child(dir, ".hid")
+    remove_child(dir, "B")
+    remove_child(dir, "a")
+    remove_child(dir, "a2")
+    remove_child(dir, "c")
+    remove_child(dir, "m")
+    remove_child(dir, "hello.txt")
+    remove_child(dir, "nul.bin")
+    val sub = join(dir, "sub")
+    remove_child(sub, "f.txt")
+    free_str(sub)
+    remove_child(dir, "sub")
+    remove_dir(dir)
+}
+
+private fn scratch(name: str): str with (a: mem.Allocator) {
+    var buf: [4096]u8
+    val n = c.GetTempPathA(4096, buf[..].ptr as *c.char)
+    val len = n as usize
+    if len == 0 || len >= 4096 {
+        panic("no temp directory")
+    }
+    var view = bytes()
+    view.ptr = buf[..].ptr
+    view.len = len
+    val dir = join(view, name)
+    wipe(dir)
+    return dir
+}
+
+private fn close_dir(dir: str) with (a: mem.Allocator) {
+    wipe(dir)
+    free_str(dir)
+}
+
+private fn put(dir: str, name: str, text: str): bool with (a: mem.Allocator) {
+    val path = join(dir, name)
+    var data = bytes()
+    data.ptr = text.ptr as *u8
+    data.len = text.len
+    val wrote = write_all(path, data)
+    free_str(path)
+    return wrote
+}
+
+private fn mkdir_at(dir: str, name: str): bool with (a: mem.Allocator) {
+    val path = join(dir, name)
+    val made = make_dir(path)
+    free_str(path)
+    return made
+}

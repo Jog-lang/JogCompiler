@@ -1,0 +1,44 @@
+// expect: ok
+// A private function is checked twice. The bytes store has to use the
+// local from the second check. 'h' is 104 and 'i' is 105.
+
+extern {
+    fn puts(s: *const c_char): c_int
+}
+
+type c_char = i8
+type c_int = i32
+
+private fn pack(p: *u8, n: usize): bytes {
+    var view = bytes()
+    view.ptr = p
+    view.len = n
+    return view
+}
+
+struct Hold {
+    n: u8
+}
+
+private fn Hold.pack(p: *u8): bytes {
+    var view = bytes()
+    view.ptr = p
+    view.len = 1
+    view.ptr[0] = self.n
+    return view
+}
+
+fn main() {
+    var buf: [2]u8
+    var one: [1]u8
+    var hold = Hold(n: 105)
+    buf[0] = 104
+    buf[1] = 105
+    val packed = pack(&buf[0], 2)
+    val second = hold.pack(&one[0])
+    if packed.len == 2 && packed.ptr[0] == 104 && packed.ptr[1] == 105 && second.len == 1 && second.ptr[0] == 105 {
+        if puts(c"ok") < 0 {
+            return
+        }
+    }
+}

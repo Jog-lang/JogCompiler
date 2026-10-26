@@ -1,0 +1,66 @@
+extern {
+    fn puts(s: *const c_char): c_int
+}
+
+type c_char = i8
+type c_int = i32
+
+struct Pair {
+    name: str
+    n: i32
+}
+
+enum Tag: i32 { Off, On }
+
+enum Shape {
+    Circle(r: i32)
+    Empty
+}
+
+fn id(n: i32): i32 = n
+
+val title = "jog"
+val pair = Pair(name: "jog", n: 2)
+val tag = Tag.On
+val shape = Shape.Circle(r: 4)
+val (a, b) = (1, 2)
+val point = (3, 4)
+val (c, d) = point
+val n: i32 = 7
+val p = &n
+val f = id
+val nums = [2]i32(1, 2)
+val blob = @embed("jog.mod")
+
+fn radius(s: Shape): i32 {
+    return when s {
+        Circle(r) -> r
+        Empty -> 0
+    }
+}
+
+fn main() {
+    if title != "jog" || pair.name != title || pair.n != 2 {
+        return
+    }
+    if tag as i32 != 1 {
+        return
+    }
+    if radius(shape) != 4 {
+        return
+    }
+    if a + b != 3 || c + d != 7 || *p != 7 || f(40) != 40 {
+        return
+    }
+    if nums[0] != 1 || nums[1] != 2 {
+        return
+    }
+    if blob != "module e2e\n" || blob.len != 11 {
+        return
+    }
+    if puts(c"ok") < 0 {
+        return
+    }
+}
+
+// expect: ok

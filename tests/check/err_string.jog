@@ -1,0 +1,67 @@
+interface Allocator {
+    fn alloc(size: usize, align: usize): i32
+}
+
+struct Point {
+    x: i32
+}
+
+fn bare(n: i32): str {
+    return "n=${n}"
+}
+
+fn point(p: Point): str with (a: Allocator) {
+    return "${p}"
+}
+
+fn bad_buf(s: str, n: i32): (str, error?) {
+    return fmt(s, "n=${n}")
+}
+
+fn bad_tmpl(buf: bytes, n: i32): (str, error?) {
+    return fmt(buf, n)
+}
+
+struct Bad {
+    n: i32
+}
+
+fn Bad.format(): i32 {
+    return 1
+}
+
+fn bad(b: Bad): str with (a: Allocator) {
+    return "${b}"
+}
+
+struct A {
+    n: i32
+}
+
+struct B {
+    n: i32
+}
+
+struct Both {
+    A
+    B
+}
+
+fn A.format(buf: bytes): (str, error?) {
+    return fmt(buf, "a")
+}
+
+fn B.format(buf: bytes): (str, error?) {
+    return fmt(buf, "b")
+}
+
+fn both(x: Both): str with (a: Allocator) {
+    return "${x}"
+}
+
+// error: string interpolation needs an Allocator context
+// error: type Point cannot be formatted
+// error: fmt buffer must be bytes
+// error: fmt template must be a string
+// error: format method must be fn format(buf: bytes): (str, error?)
+// error: ambiguous format method

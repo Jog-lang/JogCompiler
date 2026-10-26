@@ -1,0 +1,68 @@
+struct Entity {
+    pos: i32
+}
+
+struct Circle {
+    tag: i32
+    Entity
+    n: i32
+    extra: i32
+}
+
+struct Rect {
+    n: i32
+    extra: i32
+}
+
+interface Named {
+    fn id(): i32
+    val pos: i32
+}
+
+interface Shape {
+    var n: i32
+}
+
+interface Both {
+    Named
+    var n: i32
+}
+
+fn Circle.id(): i32 {
+    return self.tag
+}
+
+fn look(s: Shape): i32 {
+    if s is Circle && s.extra == 7 {
+        return s.n
+    }
+    return when s {
+        is Rect -> s.extra
+        else -> 0
+    }
+}
+
+fn main() {
+    var c = Circle(tag: 1, Entity: Entity(pos: 3), n: 1, extra: 7)
+    var r = Rect(n: 2, extra: 9)
+    val frozen = Circle(tag: 0, Entity: Entity(pos: 8), n: 0, extra: 0)
+    var s: Shape = &c
+    val named_frozen: Named = &frozen
+    s.n = 4
+    val named: Named = &c
+    val both: Both = &c
+    val same = s is Circle
+    val ptr = s is *Circle
+    val other = s is Rect
+    val via = look(s)
+    val rect = look(&r)
+    val id = named.id()
+    val w = when s {
+        is Circle -> s.n
+        is Rect -> 2
+        else -> 0
+    }
+    if same && ptr && !other && s.n == 4 && named.pos == 3 && both.pos == 3 && both.n == 4 && named_frozen.pos == 8 && via == 4 && rect == 9 && id == 1 && w == 4 {
+        s = &r
+    }
+}

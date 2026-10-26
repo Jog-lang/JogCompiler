@@ -1,0 +1,375 @@
+(FILE
+  (FN sample
+    (PARAM code
+      (TYPE_NAME i32)
+    )
+    (PARAM shape
+      (TYPE_NAME Shape)
+    )
+    (PARAM event
+      (TYPE_NAME Event)
+    )
+    ->
+      (TYPE_NAME i32)
+    (BLOCK
+      (VAL kind
+        =
+          (WHEN
+            (IDENT code)
+            (WHEN_ARM
+              (PAT_EXPR
+                (INT_LIT 200)
+              )
+              (PAT_EXPR
+                (INT_LIT 204)
+              )
+              (INT_LIT 1)
+            )
+            (WHEN_ARM
+              (PAT_IN
+                (BINARY ..
+                  (INT_LIT 300)
+                  (INT_LIT 400)
+                )
+              )
+              (INT_LIT 2)
+            )
+            (WHEN_ARM else
+              (INT_LIT 0)
+            )
+          )
+      )
+      (VAL area
+        =
+          (WHEN
+            (IDENT shape)
+            (WHEN_ARM
+              (PAT_VARIANT Circle
+                (PAT_FIELD
+                  (PAT_BIND r)
+                )
+              )
+              (IDENT r)
+            )
+            (WHEN_ARM
+              (PAT_VARIANT Rect
+                (PAT_FIELD w
+                  (PAT_BIND width)
+                )
+                (PAT_FIELD
+                  (PAT_BIND h)
+                )
+              )
+              (IDENT width)
+            )
+            (WHEN_ARM
+              (PAT_BIND Empty)
+              (INT_LIT 0)
+            )
+            (WHEN_ARM else
+              (BLOCK
+                (EXPR_STMT
+                  (INT_LIT 1)
+                )
+              )
+            )
+          )
+      )
+      (VAL nested
+        =
+          (WHEN
+            (IDENT event)
+            (WHEN_ARM
+              (PAT_VARIANT Some
+                (PAT_FIELD
+                  (PAT_VARIANT Click
+                    (PAT_FIELD
+                      (PAT_VARIANT Point
+                        (PAT_FIELD x
+                          (PAT_EXPR
+                            (INT_LIT 0)
+                          )
+                        )
+                        (PAT_FIELD
+                          (PAT_BIND y)
+                        )
+                      )
+                    )
+                  )
+                )
+              )
+              (IDENT y)
+            )
+            (WHEN_ARM
+              (PAT_VARIANT Some
+                (PAT_FIELD
+                  (PAT_WILDCARD)
+                )
+              )
+              (INT_LIT 0)
+            )
+            (WHEN_ARM
+              (PAT_BIND None)
+              (INT_LIT 1)
+            )
+          )
+      )
+      (VAL cond
+        =
+          (WHEN
+            (WHEN_ARM
+              (PAT_EXPR
+                (BINARY <
+                  (IDENT code)
+                  (INT_LIT 0)
+                )
+              )
+              (INT_LIT 1)
+            )
+            (WHEN_ARM else
+              (INT_LIT 0)
+            )
+          )
+      )
+      (VAL typed
+        =
+          (WHEN
+            (IDENT shape)
+            (WHEN_ARM
+              (PAT_IS
+                (TYPE_NAME Circle)
+              )
+              (INT_LIT 1)
+            )
+            (WHEN_ARM
+              (PAT_IS
+                (TYPE_NAME Rect)
+              )
+              (INT_LIT 2)
+            )
+            (WHEN_ARM else
+              (INT_LIT 0)
+            )
+          )
+      )
+      (VAL double
+        =
+          (LAMBDA
+            (PARAM x
+              (TYPE_NAME i32)
+            )
+            (BLOCK
+              (EXPR_STMT
+                (BINARY *
+                  (IDENT x)
+                  (INT_LIT 2)
+                )
+              )
+            )
+          )
+      )
+      (VAL add
+        =
+          (LAMBDA
+            (PARAM a
+              (TYPE_NAME i32)
+            )
+            (PARAM b
+              (TYPE_NAME i32)
+            )
+            ->
+              (TYPE_NAME i32)
+            =
+              (BINARY +
+                (IDENT a)
+                (IDENT b)
+              )
+          )
+      )
+      (VAL noop
+        =
+          (LAMBDA
+            (BLOCK)
+          )
+      )
+      (VAL paren
+        =
+          (BINARY *
+            (BINARY +
+              (IDENT a)
+              (IDENT b)
+            )
+            (IDENT c)
+          )
+      )
+      (EXPR_STMT
+        (GO
+          (CALL
+            (IDENT fetch)
+            (ARG
+              (IDENT url)
+            )
+          )
+        )
+      )
+      (EXPR_STMT
+        (GO
+          (BLOCK
+            (EXPR_STMT
+              (CALL
+                (IDENT process)
+                (ARG
+                  (IDENT item)
+                )
+              )
+            )
+          )
+        )
+      )
+      (EXPR_STMT
+        (GO
+          with
+            (IDENT logger)
+          (BLOCK
+            (EXPR_STMT
+              (CALL
+                (IDENT handle)
+                (ARG
+                  (IDENT conn)
+                )
+              )
+            )
+          )
+        )
+      )
+      (EXPR_STMT
+        (GO
+          args
+            (ARG stack
+              (BINARY <<
+                (INT_LIT 1)
+                (INT_LIT 20)
+              )
+            )
+          (BLOCK
+            (EXPR_STMT
+              (CALL
+                (IDENT work)
+              )
+            )
+          )
+        )
+      )
+      (VAL xs
+        =
+          (CALL
+            (IDENT List
+              (TYPE_NAME i32)
+            )
+          )
+      )
+      (VAL ys
+        =
+          (CALL
+            (IDENT List
+              (TYPE_NAME List
+                (TYPE_NAME i32)
+              )
+            )
+          )
+      )
+      (VAL ch
+        =
+          (CALL
+            (MEMBER
+              (IDENT Chan
+                (TYPE_NAME i32)
+              )
+              init
+            )
+            (ARG
+              (INT_LIT 16)
+            )
+          )
+      )
+      (VAL n
+        =
+          (CALL
+            (IDENT max
+              (TYPE_NAME f32)
+            )
+            (ARG
+              (INT_LIT 1)
+            )
+            (ARG
+              (FLOAT_LIT 2.5)
+            )
+          )
+      )
+      (VAL cmp
+        =
+          (BINARY <
+            (IDENT a)
+            (IDENT b)
+          )
+      )
+      (VAL call
+        =
+          (CALL
+            (IDENT a
+              (TYPE_NAME b)
+            )
+            (ARG
+              (IDENT c)
+            )
+          )
+      )
+      (VAL words
+        =
+          (BUILTIN comptime
+            (ARG
+              (CALL
+                (IDENT makeCrcTable)
+              )
+            )
+          )
+      )
+      (VAL blob
+        =
+          (BUILTIN embed
+            (ARG
+              (STRING_LIT "table.bin")
+            )
+          )
+      )
+      (VAL sum
+        =
+          (BUILTIN add
+            (ARG
+              (IDENT self)
+            )
+            (ARG
+              (IDENT o)
+            )
+          )
+      )
+      (VAL p
+        =
+          (CALL
+            (IDENT Point)
+            (ARG x
+              (INT_LIT 1)
+            )
+            (ARG y
+              (INT_LIT 2)
+            )
+          )
+      )
+      (RETURN
+        (CALL
+          (IDENT bytes)
+        )
+      )
+    )
+  )
+)

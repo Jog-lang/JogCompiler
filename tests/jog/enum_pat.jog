@@ -1,0 +1,72 @@
+// expect: ok
+
+extern {
+    fn puts(s: *const c_char): c_int
+}
+
+type c_char = i8
+type c_int = i32
+
+struct Point {
+    x: i32
+    y: i32
+}
+
+enum Event {
+    Click(at: Point)
+    Key(code: i32)
+}
+
+enum Inner {
+    A(n: i32)
+    B
+}
+
+enum Outer {
+    Wrap(inner: Inner)
+}
+
+enum Item {
+    Num(n: i32 = 7)
+    Pair(a: i32, b: i32 = 2)
+}
+
+fn edge(e: Event): i32 {
+    return when e {
+        Click(Point(x: 0, y)) -> y
+        Click(Point(x, y)) -> x + y
+        Key(code: in 1..10) -> code
+        Key(code) -> 0
+    }
+}
+
+fn nested(o: Outer): i32 {
+    return when o {
+        Wrap(A(n)) -> n
+        Wrap(B) -> 0
+    }
+}
+
+fn taken(it: Item): i32 {
+    return when it {
+        Num(n) -> n
+        Pair(a, b) -> a + b
+    }
+}
+
+fn main() {
+    val click = Event.Click(at: Point(x: 0, y: 4))
+    val other = Event.Click(at: Point(x: 2, y: 3))
+    val key = Event.Key(code: 3)
+    val key2 = Event.Key(code: 20)
+    val wrap = Outer.Wrap(inner: Inner.A(n: 5))
+    val bare = Outer.Wrap(inner: Inner.B)
+    val num = Item.Num()
+    val pair = Item.Pair(a: 3)
+    if edge(click) == 4 && edge(other) == 5 && edge(key) == 3 && edge(key2) == 0 && nested(wrap) == 5 &&
+        nested(bare) == 0 && taken(num) == 7 && taken(pair) == 5 {
+        if puts(c"ok") < 0 {
+            return
+        }
+    }
+}

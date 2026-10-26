@@ -1,0 +1,53 @@
+main f0
+init none
+
+fn f0 public jog_app__main "app.main": () -> ()  ; loops.jog:3:1
+  l0 sum: i32
+  l1 n: i32
+  l2 i: i32
+  l3: i32
+  l4: bool
+  l5: bool
+  l6: i32
+  l7: i32
+  l8: bool
+  l9: i32
+  l10: i32
+b0 entry:
+  l0 = copy i32 0  ; loops.jog:4:5
+  l1 = copy i32 4  ; loops.jog:5:5
+  l2 = copy i32 0  ; loops.jog:6:5
+  l3 = copy l1  ; loops.jog:6:5
+  br b1 "for.head"  ; loops.jog:6:5
+b1 "for.head":
+  l4 = lt l2, l3  ; loops.jog:6:5
+  cond_br l4, b2 "for.body", b4 "for.exit"  ; loops.jog:6:5
+b2 "for.body":
+  l5 = eq l2, i32 0  ; loops.jog:7:14
+  cond_br l5, b5 "if.then", b6 "if.join"  ; loops.jog:7:9
+b3 "for.step":
+  l7 = checked add l2, i32 1  ; loops.jog:6:5
+  l2 = copy l7  ; loops.jog:6:5
+  br b1 "for.head"  ; loops.jog:6:5
+b4 "for.exit":
+  br b7 "for.head"  ; loops.jog:12:5
+b5 "if.then":
+  br b3 "for.step"  ; loops.jog:8:13
+b6 "if.join":
+  l6 = checked add l0, l2  ; loops.jog:10:19
+  l0 = copy l6  ; loops.jog:10:13
+  br b3 "for.step"  ; loops.jog:6:5
+b7 "for.head":
+  l8 = lt l0, i32 10  ; loops.jog:12:13
+  cond_br l8, b8 "for.body", b9 "for.exit"  ; loops.jog:12:5
+b8 "for.body":
+  l9 = copy l0  ; loops.jog:13:13
+  l10 = checked add l9, i32 1  ; loops.jog:13:13
+  l0 = copy l10  ; loops.jog:13:13
+  br b7 "for.head"  ; loops.jog:12:5
+b9 "for.exit":
+  br b10 "for.head"  ; loops.jog:15:5
+b10 "for.head":
+  br b11 "for.exit"  ; loops.jog:16:9
+b11 "for.exit":
+  ret  ; loops.jog:3:1

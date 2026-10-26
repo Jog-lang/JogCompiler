@@ -1,0 +1,108 @@
+// Package std.proc. run starts args[0], waits until it exits, and returns
+// the exit code together with the bytes the child wrote to stdout and
+// stderr. An empty argument vector is a programmer error and panics.
+// A missing program, an empty program name, or any other failed start
+// is ok == false. That is not exit code 0 by itself: code is meaningful
+// only when ok is true.
+//
+// proc.windows.jog calls CreateProcessA. args[0] is the module, so PATH
+// is not searched, and the command line is quoted. proc.posix.jog calls
+// posix_spawnp and passes the arguments as an argv array. Both send
+// stdout and stderr to temporary files, inherited by the child. Pipes
+// are not used, so a chatty child cannot fill a buffer and stall while
+// the parent waits. free_output releases both blocks. The allocator is
+// a with (a: mem.Allocator) context. It is not stored.
+
+import std.c
+import std.io
+import std.mem
+
+// code is the process exit code when ok is true. stdout and stderr are
+// empty when ok is false, and otherwise the captured bytes. The caller
+// owns those blocks.
+struct Output {
+    code: i32
+    ok: bool
+    stdout: bytes
+    stderr: bytes
+}
+
+// Releases both captured blocks. An empty block frees nothing.
+fn free_output(out: Output) with (a: mem.Allocator) {
+    a.free(out.stdout)
+    a.free(out.stderr)
+}
+
+private fn contains_nul(text: str): bool {
+    var i: usize = 0
+    for i < text.len {
+        if text.ptr[i] == 0 {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// false means the program name is empty or some argument contains a NUL.
+// The command line and each argv slot are C strings, so a NUL cannot be passed.
+private fn args_ok(args: []str): bool {
+    if args[0].len == 0 {
+        return false
+    }
+    var i: usize = 0
+    for i < args.len {
+        if contains_nul(args[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// len + 1 bytes, trailing NUL. The caller frees the block.
+private fn c_string(text: str): bytes with (a: mem.Allocator) {
+    val (raw, err) = a.alloc(text.len + 1, align(u8))
+    if err != null {
+        panic("out of memory")
+    }
+    if text.len > 0 {
+        c.memcpy(raw.ptr as *void, text.ptr as *const void, text.len)
+    }
+    raw.ptr[text.len] = 0
+    return raw
+}
+
+private fn path_view(path: *u8): str {
+    var n: usize = 0
+    for n < 4096 {
+        if path[n] == 0 {
+            break
+        }
+        n = n + 1
+    }
+    var view = bytes()
+    view.ptr = path
+    view.len = n
+    return view
+}
+
+private fn read_captures(out_path: *u8, err_path: *u8, code: i32): Output with (a: mem.Allocator) {
+    val (stdout_bytes, stdout_ok) = io.read_all(path_view(out_path))
+    val (stderr_bytes, stderr_ok) = io.read_all(path_view(err_path))
+    if !stdout_ok || !stderr_ok {
+        if stdout_ok {
+            a.free(stdout_bytes)
+        }
+        if stderr_ok {
+            a.free(stderr_bytes)
+        }
+        return Output()
+    }
+    var out: Output
+    out.code = code
+    out.ok = true
+    out.stdout = stdout_bytes
+    out.stderr = stderr_bytes
+    return out
+}

@@ -1,0 +1,11 @@
+fn main() {
+    val n = missing
+    val bad = true < false
+    val s = "a" + "b"
+    val p = null
+}
+
+// error: undefined name 'missing'
+// error: operator '<' does not apply to bool
+// error: operator '+' does not apply to str
+// error: null needs an option type

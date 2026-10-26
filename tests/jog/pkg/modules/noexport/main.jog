@@ -1,0 +1,5 @@
+import lib.internal
+
+fn main() {
+    val n = internal.secret()
+}

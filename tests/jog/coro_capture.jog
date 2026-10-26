@@ -1,0 +1,82 @@
+// expect: 41
+// expect: 0
+// expect: 1
+// expect: 1
+// expect: 10
+// expect: 22
+
+import std.mem
+
+extern {
+    fn printf(fmt: *const c_char, ...): c_int
+}
+
+type c_char = i8
+type c_int = i32
+
+var ticks: i32 = 0
+
+fn id(v: i32): i32 {
+    return v
+}
+
+fn add(a: i32, b: i32): i32 {
+    return a + b
+}
+
+fn bump(): i32 {
+    ticks += 1
+    return ticks
+}
+
+fn main() {
+    var late: i32 = 1
+    var acc: i32 = 20
+    scope {
+        val shifted = go with (mem.heap()) id(late + 1)
+        late = 40
+        val shifted_v = shifted.join()
+        if printf(c"%d\n", shifted_v) < 0 {
+            return
+        }
+
+        val side = go with (mem.heap()) id(bump())
+        val early = ticks
+        val side_v = side.join()
+        if printf(c"%d\n", early) < 0 {
+            return
+        }
+        if printf(c"%d\n", side_v) < 0 {
+            return
+        }
+
+        late = 2
+        val both = go with (mem.heap()) add(late, bump())
+        late = 8
+        val before = ticks
+        val sum = both.join()
+        if printf(c"%d\n", before) < 0 {
+            return
+        }
+        if printf(c"%d\n", sum) < 0 {
+            return
+        }
+
+        go with (mem.heap()) {
+            acc += 5
+            acc -= 3
+            acc *= 2
+            acc /= 4
+            acc %= 7
+            acc <<= 2
+            acc >>= 1
+            acc |= 3
+            acc &= 14
+            acc ^= 1
+            acc += acc
+        }
+    }
+    if printf(c"%d\n", acc) < 0 {
+        return
+    }
+}

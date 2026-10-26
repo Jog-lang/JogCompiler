@@ -1,0 +1,3 @@
+fn size(): usize {
+    return @embed("../../main.jog").len
+}

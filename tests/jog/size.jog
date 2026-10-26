@@ -1,0 +1,29 @@
+// expect: ok
+// bool's layout is 1 byte. Pad is u8 then i32: 3 bytes of padding, size 8.
+
+extern {
+    fn puts(s: *const c_char): c_int
+}
+
+type c_char = i8
+type c_int = i32
+
+struct Pad {
+    tag: u8
+    n: i32
+}
+
+fn bytes_of<T>(): usize {
+    return size(T)
+}
+
+fn main() {
+    var scratch: [size(i32)]u8
+    scratch[0] = 0
+    if size(i32) == 4 && size(u8) == 1 && size(bool) == 1 && size(Pad) == 8 &&
+       bytes_of<i32>() == 4 && bytes_of<Pad>() == 8 && size(i32) * 2 == 8 && scratch[0] == 0 {
+        if puts(c"ok") < 0 {
+            return
+        }
+    }
+}

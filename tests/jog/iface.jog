@@ -1,0 +1,49 @@
+// expect: ok
+
+extern {
+    fn puts(s: *const c_char): c_int
+}
+
+type c_char = i8
+type c_int = i32
+
+struct Box {
+    n: i32
+}
+
+struct No {
+    n: i32
+}
+
+interface Shape {
+    fn name(): i32
+    fn *set(x: i32)
+}
+
+fn Box.name(): i32 {
+    return self.n
+}
+
+fn *Box.set(x: i32) {
+    self.n = x
+}
+
+fn take(): i32 with (s: Shape) {
+    return s.name()
+}
+
+fn main() {
+    var b = Box(n: 1)
+    var s: Shape = &b
+    s.set(4)
+    val n = s.name()
+    val p = s as *Box
+    val q = s as? *Box
+    val z = s as? *No
+    val m = take() with (&b)
+    if n == 4 && m == 4 && p.name() == 4 && q != null && z == null {
+        if puts(c"ok") < 0 {
+            return
+        }
+    }
+}

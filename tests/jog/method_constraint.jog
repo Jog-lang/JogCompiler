@@ -1,0 +1,54 @@
+// expect: ok
+// A method's type parameters keep the struct's constraints. Box<T: Ordered>
+// can use >. EqBox<T: Eq> can use ==, including on str.
+
+extern {
+    fn puts(s: *const c_char): c_int
+}
+
+type c_char = i8
+type c_int = i32
+
+enum Ordering: i8 {
+    Less = -1
+    Equal = 0
+    Greater = 1
+}
+
+interface Ordered {
+    fn op<=>(o: Ordered): Ordering
+}
+
+interface Eq {
+    fn op==(o: Eq): bool
+}
+
+struct Box<T: Ordered> {
+    value: T
+}
+
+fn Box<T>.max(o: T): T {
+    if self.value > o {
+        return self.value
+    }
+    return o
+}
+
+struct EqBox<T: Eq> {
+    value: T
+}
+
+fn EqBox<T>.same(o: T): bool {
+    return self.value == o
+}
+
+fn main() {
+    var a = Box<i32>(value: 3)
+    var words = EqBox<str>(value: "ab")
+    var nums = EqBox<i32>(value: 4)
+    if a.max(7) == 7 && a.max(1) == 3 && words.same("ab") && !words.same("zz") && nums.same(4) && !nums.same(5) {
+        if puts(c"ok") < 0 {
+            return
+        }
+    }
+}

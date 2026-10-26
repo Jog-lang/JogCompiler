@@ -1,0 +1,6 @@
+// expect: a dependency's tests are never loaded
+
+@test
+fn neverLoaded() {
+    val n: i32 = "this file does not type-check"
+}

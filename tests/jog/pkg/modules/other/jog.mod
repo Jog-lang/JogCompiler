@@ -1,0 +1,2 @@
+module other
+kind library

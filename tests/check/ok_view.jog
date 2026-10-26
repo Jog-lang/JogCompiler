@@ -1,0 +1,29 @@
+fn bytes_ptr(text: bytes): *u8 {
+    return text.ptr
+}
+
+fn bytes_len(text: bytes): usize {
+    return text.len
+}
+
+fn slice_ptr(xs: []const u8): *const u8 {
+    return xs.ptr
+}
+
+fn slice_len(xs: []i64): usize {
+    return xs.len
+}
+
+fn as_void(p: *u8): *void {
+    return p as *void
+}
+
+fn main() {
+    val text = "hi"
+    val n = text.len
+    val p = text.ptr
+    val q = p as *const void?
+    if n == 2 {
+        val r = q
+    }
+}

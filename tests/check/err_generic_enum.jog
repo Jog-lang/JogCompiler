@@ -1,0 +1,23 @@
+enum Rec<T> {
+    Loop(inner: Rec<T>)
+}
+
+enum Def<T> {
+    Ok(value: T = 1)
+}
+
+enum Result<T> {
+    Ok(value: T)
+    Err(code: i32)
+}
+
+fn need(r: Result<i32, bool>) {
+}
+
+fn bare(r: Result) {
+}
+
+// error: enum 'Rec' recursively contains itself
+// error: a type parameter cannot have a default value yet
+// error: expected 1 type arguments, found 2
+// error: missing type arguments for 'Result'

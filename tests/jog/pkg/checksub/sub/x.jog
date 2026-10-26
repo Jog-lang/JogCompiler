@@ -1,0 +1,4 @@
+fn broken(): i32 {
+    val s: str = "text"
+    return s
+}

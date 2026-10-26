@@ -1,0 +1,100 @@
+struct Point {
+    x: i32
+    y: i32
+}
+
+val gs = []i32(1, 2)
+
+fn lengths() {
+    val a = [2]i32(1)
+}
+
+fn const_array() {
+    val a = [1]i32(1)
+    a[0] = 2
+}
+
+fn no_addr() {
+    val p = &(1 + 2)
+}
+
+fn no_size(p: *void) {
+    val q = p + 1
+}
+
+fn bad_index() {
+    var a = [2]i32(1, 2)
+    var i: i32 = 0
+    val x = a[i]
+}
+
+fn bad_cmp(a: *i32, b: *u8) {
+    val c = a == b
+}
+
+fn no_slice(p: *i32) {
+    val s = p[0..1]
+}
+
+fn const_deref(p: *const i32) {
+    *p = 1
+}
+
+fn add_ptrs(p: *i32) {
+    val q = p + p
+}
+
+fn sub_ptr(p: *i32) {
+    val q = 1 - p
+}
+
+fn bad_bytes() {
+    val b = bytes(1)
+}
+
+fn bad_attr() {
+    @foo {
+    }
+}
+
+fn unassigned() {
+    var p: *i32
+    *p = 1
+}
+
+fn no_const_conv(): *const i32 {
+    var x: i32 = 1
+    return &x
+}
+
+fn const_field(p: *const Point) {
+    p.x = 1
+}
+
+fn const_cmp(a: *i32, b: *const i32) {
+    val c = a == b
+}
+
+fn const_slice() {
+    val c = []const i32(1, 2)
+    c[0] = 3
+}
+
+// error: slice literal in a global initializer does not outlive initialization
+// error: array literal length mismatch: expected 2, got 1
+// error: cannot assign through a const view
+// error: cannot take the address of this value
+// error: pointer arithmetic needs a size
+// error: type mismatch: expected usize, got i32
+// error: mismatched types *i32 and *u8
+// error: cannot slice *i32
+// error: cannot assign through a const view
+// error: operator '+' does not apply to *i32
+// error: operator '-' does not apply to *i32
+// error: bytes() does not take arguments
+// error: attribute 'foo' is not checked yet
+// error: variable 'p' is used before it is assigned
+// error: type mismatch: expected *const i32, got *i32
+// error: cannot assign to field 'x'
+// error: mismatched types *i32 and *const i32
+// error: cannot assign through a const view

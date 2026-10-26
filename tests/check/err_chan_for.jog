@@ -1,0 +1,10 @@
+fn bad(ch: Chan<i32>) {
+    for i, v in ch {
+    }
+}
+
+fn main() {
+    return
+}
+
+// error: for-in over a channel has one name

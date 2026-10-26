@@ -1,0 +1,22 @@
+extern {
+    fn get(): *i32
+}
+
+fn both(c: bool): *i32 {
+    var p: *i32
+    if c {
+        p = get()
+    } else {
+        p = get()
+    }
+    return p
+}
+
+fn after_break(): *i32 {
+    var p: *i32
+    for {
+        p = get()
+        break
+    }
+    return p
+}

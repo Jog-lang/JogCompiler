@@ -1,0 +1,170 @@
+fn one(): i32 {
+    return 1, 2
+}
+
+fn elems(): (i32, i32) {
+    val x: i32 = 1
+    return x
+}
+
+fn noerr() {
+    errdefer {}
+}
+
+fn bad_panic() {
+    var k: i32 = 1
+    panic(k)
+}
+
+fn panic_count() {
+    panic()
+}
+
+fn field() {
+    val t = (1, 2)
+    val x = t.2
+}
+
+fn not_tuple() {
+    var a: i32 = 1
+    var b: i32 = 2
+    (a, b) = a
+}
+
+fn bad_slot() {
+    var (a, b): (i32, i32) = (1, 2)
+    var flag = false
+    (a, b) = (flag, a)
+}
+
+fn dup() {
+    val (a, a) = (1, 2)
+}
+
+fn missing() {
+    (a, b) = (1, 2)
+}
+
+fn frozen() {
+    val n = 1
+    val e = 2
+    (n, e) = (3, 4)
+}
+
+fn nulls() {
+    val n: i32 = 1
+    val bad = n == null
+}
+
+fn both_null() {
+    val bad = null == null
+}
+
+fn eq_err(a: error?, b: error?): bool {
+    return a == b
+}
+
+fn gap(): i32 {
+    var n: *i32
+    defer {
+        val p = n
+    }
+    return 1
+}
+
+fn safe(p: *i32) {
+    val x = p?.raw
+}
+
+fn arity(): (i32, i32, i32) {
+    return 1, 2
+}
+
+struct Pair {
+    lo: i32
+    hi: i32
+}
+
+fn const_tuple() {
+    val t: (i32, i32) = (1, 2)
+    (t.0, t.1) = (3, 4)
+}
+
+fn const_ptr(p: *const (i32, i32)) {
+    (p.0, p.1) = (3, 4)
+}
+
+fn not_place() {
+    var a: i32 = 1
+    (1, a) = (2, 3)
+}
+
+fn ptr_int() {
+    var n: i32 = 1
+    var p: *i32 = &n
+    val x: i32 = p.0
+    if x == 0 {
+        return
+    }
+}
+
+fn const_index() {
+    val arr = [2]i32(1, 2)
+    var a: i32 = 0
+    var b: i32 = 0
+    (arr[0], arr[1]) = (a, b)
+}
+
+fn const_field() {
+    val s = Pair(lo: 1, hi: 2)
+    (s.lo, s.hi) = (3, 4)
+}
+
+fn nested_bad() {
+    var a: i32 = 0
+    var b: i32 = 0
+    var flag = false
+    ((a, b), flag) = (1, true)
+}
+
+fn assign_val() {
+    val t: (i32, i32) = (1, 2)
+    t.0 = 3
+}
+
+fn assign_const_ptr(p: *const (i32, i32)) {
+    p.0 = 4
+}
+
+// error: return expects 1 value, got 2
+// error: type mismatch: expected (i32, i32), got i32
+// error: errdefer requires a function that returns error?
+// error: type mismatch: expected str, got i32
+// error: panic expects 1 argument
+// error: tuple field 2 is out of range
+// error: destructuring expects a tuple, got i32
+// error: type mismatch: expected i32, got bool
+// error: duplicate declaration of 'a'
+// error: undefined name 'a'
+// error: undefined name 'b'
+// error: cannot assign to 'n'
+// error: cannot assign to 'e'
+// error: mismatched types i32 and null
+// error: null needs an option type
+// error: operator '==' does not apply to error?
+// error: variable 'n' is used before it is assigned
+// error: operator '?.' needs an option
+// error: return expects 3 values, got 2
+// error: cannot assign through a const view
+// error: cannot assign through a const view
+// error: cannot assign through a const view
+// error: cannot assign through a const view
+// error: cannot assign to this value
+// error: tuple field on i32
+// error: cannot assign through a const view
+// error: cannot assign through a const view
+// error: cannot assign to field 'lo'
+// error: cannot assign to field 'hi'
+// error: destructuring expects a tuple, got i64
+// error: cannot assign through a const view
+// error: cannot assign through a const view

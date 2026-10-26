@@ -1,0 +1,46 @@
+// expect: ok
+
+extern {
+    fn puts(s: *const c_char): c_int
+}
+
+type c_char = i8
+type c_int = i32
+
+struct Pair {
+    lo: i32
+    hi: i32
+}
+
+fn split(n: i32): (i32, i32) {
+    return n, n + 1
+}
+
+fn main() {
+    var t: (i32, i32) = (1, 2)
+    var p: *(i32, i32) = &t
+    var a: i32 = 0
+    var b: i32 = 0
+    var s = Pair(lo: 0, hi: 0)
+    var arr = [2]i32(0, 0)
+    var row = [](i32, i32)((0, 0))
+    var flag = false
+    if p.0 != 1 || (*p).1 != 2 {
+        return
+    }
+    (a, b) = split(4)
+    if a != 4 || b != 5 {
+        return
+    }
+    (s.lo, s.hi) = (a, b)
+    (arr[0], arr[1]) = (s.lo, s.hi)
+    (row[0].0, row[0].1) = (arr[0], arr[1])
+    (*(&a), b) = (7, row[0].1)
+    ((a, b), flag) = ((3, 4), true)
+    (p.0, p.1) = (a, b)
+    if p.0 == 3 && t.1 == 4 && flag && arr[1] == 5 && s.hi == 5 && row[0].0 == 4 && b == 4 {
+        if puts(c"ok") < 0 {
+            return
+        }
+    }
+}

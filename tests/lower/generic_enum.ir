@@ -1,0 +1,17 @@
+main f1
+init none
+
+fn f0 public jog_generic_enum__make "generic_enum.make": (i32) -> Result<i32>  ; generic_enum.jog:8:1
+  l0 x: i32 param
+  l1: Result<i32>
+b0 entry:
+  l1 = aggregate (l0)  ; generic_enum.jog:9:23
+  ret l1  ; generic_enum.jog:9:5
+
+fn f1 public jog_generic_enum__main "generic_enum.main": () -> ()  ; generic_enum.jog:12:1
+  l0 a: Result<i32>
+  l1: Result<i32>
+b0 entry:
+  l1 = call f0(i32 4)  ; generic_enum.jog:13:13
+  l0 = copy l1  ; generic_enum.jog:13:5
+  ret  ; generic_enum.jog:12:1

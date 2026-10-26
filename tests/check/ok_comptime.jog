@@ -1,0 +1,8 @@
+fn id(n: i32): i32 = n
+
+fn main() {
+    val m = @comptime(id(7))
+    if m != 7 {
+        return
+    }
+}

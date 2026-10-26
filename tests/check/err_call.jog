@@ -1,0 +1,11 @@
+fn add(a: i32, b: i32 = 1): i32 {
+    return a + b
+}
+
+fn main() {
+    val n = add()
+    val m = add(a: 1, 2)
+}
+
+// error: missing argument 'a'
+// error: positional argument after a named argument

@@ -1,0 +1,84 @@
+// module: enums
+
+enum Color: u8 { Red = 1, Green, Blue }
+
+enum Shape {
+    Circle(r: i32)
+    Rect(w: i32, h: i32)
+    Empty
+}
+
+struct Box {
+    n: i32
+}
+
+fn area(s: Shape): i32 {
+    return when s {
+        Circle(r) -> r
+        Rect(w, h) -> w + h
+        Empty -> 0
+    }
+}
+
+fn kind(code: i32): i32 {
+    return when code {
+        200, 404 -> 1
+        else -> 0
+    }
+}
+
+fn bucket(code: i32): i32 {
+    return when code {
+        in 1..10 -> 2
+        else -> 0
+    }
+}
+
+fn forced(p: i32?): i32 {
+    return p!!
+}
+
+fn fallback(p: i32?): i32 {
+    return p ?: 0
+}
+
+fn read(b: Box?): i32? {
+    return b?.n
+}
+
+fn empty(s: Shape): bool {
+    return s is Empty
+}
+
+fn some_of(p: i32?): i32 {
+    return when p {
+        Some(v) -> v
+        null -> 0
+    }
+}
+
+fn main() {
+    val c = Color.Green
+    val s = Shape.Circle(r: 3)
+    val e: Shape = .Empty
+    val q: i32? = null
+    val box: Box? = null
+    if empty(e) {
+        return
+    }
+    if c as u8 == 0 {
+        return
+    }
+    if area(s) == kind(200) {
+        return
+    }
+    if bucket(3) == forced(q) {
+        return
+    }
+    if fallback(q) == some_of(q) {
+        return
+    }
+    if read(box) != null {
+        return
+    }
+}

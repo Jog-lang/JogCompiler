@@ -1,0 +1,32 @@
+// expect: ok
+
+extern {
+    fn puts(s: *const c_char): c_int
+}
+
+type c_char = i8
+type c_int = i32
+
+type Pair<A, B> = (A, B)
+
+struct Box<T> {
+    value: T
+}
+
+type Boxed<T> = Box<T>
+
+fn first<T>(p: Pair<T, bool>): T {
+    return p.0
+}
+
+fn main() {
+    val p: Pair<i32, bool> = (1, true)
+    val q: (i32, bool) = p
+    val b = Boxed<i32>(value: 4)
+    val n = first(q)
+    if n == 1 && q.1 && b.value == 4 {
+        if puts(c"ok") < 0 {
+            return
+        }
+    }
+}

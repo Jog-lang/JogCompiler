@@ -1,0 +1,99 @@
+enum Ordering: i8 {
+    Less = -1
+    Equal = 0
+    Greater = 1
+}
+
+interface Ordered {
+    fn op<=>(o: Ordered): Ordering
+}
+
+interface Small {
+    ~i32
+}
+
+interface Exact {
+    i32
+}
+
+interface Ints {
+    ~i32 | ~i64
+}
+
+interface Mix {
+    bool | i32
+}
+
+interface Nums {
+    ~i32 | ~i64 | ~f32 | ~f64
+}
+
+interface Has {
+    val n: i32
+}
+
+interface OnlyName {
+    fn name(): i32
+}
+
+interface NeedsAge {
+    fn age(): i32
+}
+
+type Meters: i32
+
+struct Box {
+    x: i32
+}
+
+fn plus<T: Mix>(a: T, b: T): T {
+    return a + b
+}
+
+fn rem<T: Nums>(a: T, b: T): T {
+    return a % b
+}
+
+fn only<T: Small>(x: T): T {
+    return x
+}
+
+fn id<T: Exact>(x: T): T {
+    return x
+}
+
+fn need<T: Has>(p: T): i32 {
+    return p.n
+}
+
+fn locked<T: Has>(p: T) {
+    p.n = 1
+}
+
+fn need_age<T: NeedsAge>(x: T): i32 {
+    return x.age()
+}
+
+fn no<U: OnlyName>(x: U): i32 {
+    return need_age(x)
+}
+
+fn as_value(x: Ints) {
+}
+
+fn bad() {
+    var m: Meters
+    var b = Box(x: 1)
+    only(1)
+    id(m)
+    need(b)
+}
+
+// error: operator '+' does not apply to T
+// error: operator '%' does not apply to T
+// error: type i64 does not satisfy Small
+// error: type Meters does not satisfy Exact
+// error: type Box does not satisfy Has
+// error: cannot assign to property 'n'
+// error: type U does not satisfy NeedsAge
+// error: type set interface 'Ints' cannot be used as a value

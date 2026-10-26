@@ -1,0 +1,80 @@
+struct Box<T> {
+    value: T
+}
+
+struct Plain {
+    n: i32
+}
+
+struct Name<T> {
+    value: T
+}
+
+enum Result<T> {
+    Ok(value: T)
+    Err(code: i32)
+}
+
+type Boxed<T> = Box<T>
+
+fn Box<T>.get(): T {
+    return self.value
+}
+
+fn *Box<T>.set(x: T): T {
+    self.value = x
+    return self.value
+}
+
+fn Box<T>.map<R>(x: R): R {
+    return x
+}
+
+fn Box<U>.renamed(): U {
+    return self.value
+}
+
+fn Plain.pick<T>(x: T): T {
+    return x
+}
+
+fn Name<i32>.get(): i32 {
+    return self.value
+}
+
+fn Result<T>.code(): i32 {
+    return 1
+}
+
+fn take<T>(b: Box<T>): T {
+    return b.get()
+}
+
+fn main() {
+    var a = Box<i32>(value: 1)
+    var b = Box<bool>(value: true)
+    var alias = Boxed<i32>(value: 3)
+    var named = Name<bool>(value: true)
+    var number = Name<i32>(value: 4)
+    var result = Result<i32>.Ok(value: 9)
+    var plain = Plain(n: 1)
+    val one: i32 = 1
+    val n = a.get()
+    val flag = b.get()
+    val via = a.renamed()
+    val mapped = a.map(true)
+    val chosen = a.map<i32>(n)
+    val picked = plain.pick(one)
+    val explicit = plain.pick<bool>(true)
+    val from_alias = alias.get()
+    val from_name = named.get()
+    val from_number = number.get()
+    val code = result.code()
+    val direct = Box<i32>.get(a)
+    a.set(chosen)
+    val got = take(a)
+    if n == via && n == 1 && flag && mapped && chosen == picked && explicit && from_alias == 3 && from_name &&
+        from_number == 4 && code == 1 && direct == 1 && got == 1 {
+        return
+    }
+}

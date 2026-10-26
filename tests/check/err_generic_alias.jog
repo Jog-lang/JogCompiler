@@ -1,0 +1,27 @@
+type Loop<T> = Loop<T>
+
+type Bad<T: i32> = i32
+
+type Dup<A, A> = i32
+
+type Dist<T>: i32
+
+type Pair<A, B> = (A, B)
+
+fn need(p: Pair<i32>) {
+}
+
+fn bare(p: Pair) {
+}
+
+fn Pair<T>.no(): i32 {
+    return 0
+}
+
+// error: declaration cycle: Loop -> Loop
+// error: a constraint must be an interface
+// error: duplicate type parameter 'A'
+// error: generic distinct types are not checked yet
+// error: expected 2 type arguments, found 1
+// error: missing type arguments for 'Pair'
+// error: generic methods are not checked yet

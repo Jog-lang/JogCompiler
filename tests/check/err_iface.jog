@@ -1,0 +1,141 @@
+struct Box {
+    n: i32
+}
+
+struct A {
+    n: i32
+}
+
+struct B {
+    n: i32
+}
+
+struct C {
+    n: i32
+}
+
+struct D {
+    n: i32
+}
+
+struct E {
+    n: i32
+}
+
+struct F {
+    n: i32
+}
+
+interface Named {
+    fn hi(): i32
+}
+
+interface NeedPtr {
+    fn *run()
+}
+
+interface NeedVal {
+    fn run()
+}
+
+interface Get {
+    fn get(): i32
+}
+
+interface Mut {
+    fn *set(x: i32)
+}
+
+interface Go {
+    fn run(x: i32)
+}
+
+interface Read {
+    fn name(): i32
+}
+
+interface Prop {
+    val n: i32
+}
+
+interface Em {
+    Read
+}
+
+interface Nums {
+    ~i32
+}
+
+fn A.run() {}
+
+fn *B.run() {}
+
+fn C.get<T>(): i32 {
+    return self.n
+}
+
+fn *D.set(x: i32) {
+    self.n = x
+}
+
+fn E.run() {}
+
+fn F.name(): i32 {
+    return self.n
+}
+
+fn missing() {
+    var b = Box(n: 1)
+    val s: Named = &b
+}
+
+fn bad_need_ptr() {
+    var a = A(n: 1)
+    val s: NeedPtr = &a
+}
+
+fn bad_need_val() {
+    var b = B(n: 1)
+    val s: NeedVal = &b
+}
+
+fn bad_generic() {
+    var c = C(n: 1)
+    val s: Get = &c
+}
+
+fn bad_const() {
+    val d = D(n: 1)
+    val s: Mut = &d
+}
+
+fn bad_sig() {
+    var e = E(n: 1)
+    val s: Go = &e
+}
+
+fn bad_asq() {
+    val x = 1 as? i32
+}
+
+fn bad_asq_dest() {
+    var f = F(n: 1)
+    val s: Read = &f
+    val x = s as? i32
+}
+
+fn bad_type_args() {
+    var f = F(n: 1)
+    val s: Read = &f
+    s.name<i32>()
+}
+
+// error: type 'Box' is missing method 'hi' for interface 'Named'
+// error: method 'run' needs a pointer receiver
+// error: method 'run' has a pointer receiver
+// error: generic method 'get' cannot satisfy interface 'Get'
+// error: cannot convert
+// error: method 'run' has the wrong signature for interface 'Go'
+// error: as? is not checked yet
+// error: as? expects a pointer to a struct or enum
+// error: an interface method cannot have type parameters

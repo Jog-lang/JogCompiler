@@ -1,0 +1,40 @@
+main f1
+init none
+
+fn f0 extern side "app.side": extern () -> bool  ; logic.jog:4:5
+
+fn f1 public jog_app__main "app.main": () -> ()  ; logic.jog:7:1
+  l0 f: bool
+  l1 g: bool
+  l2: bool
+  l3: bool
+  l4 h: bool
+  l5: bool
+  l6: bool
+  l7 n: bool
+  l8: bool
+b0 entry:
+  l0 = copy bool false  ; logic.jog:8:5
+  cond_br l0, b1 "and.rhs", b2 "and.false"  ; logic.jog:9:15
+b1 "and.rhs":
+  l3 = call f0()  ; logic.jog:9:18
+  l2 = copy l3  ; logic.jog:9:15
+  br b3 "and.join"  ; logic.jog:9:15
+b2 "and.false":
+  l2 = copy bool false  ; logic.jog:9:15
+  br b3 "and.join"  ; logic.jog:9:15
+b3 "and.join":
+  l1 = copy l2  ; logic.jog:9:5
+  cond_br l0, b5 "or.true", b4 "or.rhs"  ; logic.jog:10:15
+b4 "or.rhs":
+  l6 = call f0()  ; logic.jog:10:18
+  l5 = copy l6  ; logic.jog:10:15
+  br b6 "or.join"  ; logic.jog:10:15
+b5 "or.true":
+  l5 = copy bool true  ; logic.jog:10:15
+  br b6 "or.join"  ; logic.jog:10:15
+b6 "or.join":
+  l4 = copy l5  ; logic.jog:10:5
+  l8 = not l0  ; logic.jog:11:13
+  l7 = copy l8  ; logic.jog:11:5
+  ret  ; logic.jog:7:1

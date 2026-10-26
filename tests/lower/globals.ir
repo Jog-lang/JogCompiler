@@ -1,0 +1,60 @@
+main f1
+init f2
+
+global g0 const jog_app__limit: u8 = hex:32  ; globals.jog:5:1
+global g1 const jog_app__ready: bool = hex:01  ; globals.jog:6:1
+global g2 var jog_app__count: i32 = zero  ; globals.jog:7:1
+global g3 var jog_app__second: i32 = zero  ; globals.jog:8:1
+global g4 var jog_app__first: i32 = zero  ; globals.jog:9:1
+global g5 const jog_app__title: const bytes = hex:00 00 00 00 00 00 00 00 03 00 00 00 00 00 00 00 reloc 0 str "jog"  ; globals.jog:10:1
+
+fn f0 public jog_app__id "app.id": (i32) -> i32  ; globals.jog:3:1
+  l0 n: i32 param
+b0 entry:
+  ret l0  ; globals.jog:3:22
+
+fn f1 public jog_app__main "app.main": () -> i32  ; globals.jog:12:1
+  l0 s: const bytes
+  l1: const bytes
+  l2: bool
+  l3: u8
+  l4: i32
+  l5: i32
+  l6: i32
+  l7: i32
+  l8: i32
+  l9: i32
+  l10: i32
+b0 entry:
+  l1 = load g5  ; globals.jog:13:13
+  l0 = copy l1  ; globals.jog:13:5
+  l2 = load g1  ; globals.jog:14:8
+  cond_br l2, b1 "if.then", b2 "if.join"  ; globals.jog:14:5
+b1 "if.then":
+  l3 = load g0  ; globals.jog:15:17
+  l4 = checked convert l3  ; globals.jog:15:23
+  store g2, l4  ; globals.jog:15:15
+  l5 = load g2  ; globals.jog:16:17
+  l6 = load g4  ; globals.jog:16:25
+  l7 = checked add l5, l6  ; globals.jog:16:23
+  store g2, l7  ; globals.jog:16:15
+  br b2 "if.join"  ; globals.jog:14:5
+b2 "if.join":
+  l8 = load g3  ; globals.jog:18:12
+  l9 = load g2  ; globals.jog:18:21
+  l10 = checked add l8, l9  ; globals.jog:18:19
+  ret l10  ; globals.jog:18:5
+
+fn f2 internal jog_app__0init "app.init": () -> ()
+  l0: i32
+  l1: i32
+  l2: i32
+  l3: i32
+b0 entry:
+  l0 = call f0(i32 10)  ; globals.jog:9:13
+  store g4, l0  ; globals.jog:9:13
+  l1 = load g4  ; globals.jog:8:14
+  l2 = call f0(i32 1)  ; globals.jog:8:22
+  l3 = checked add l1, l2  ; globals.jog:8:20
+  store g3, l3  ; globals.jog:8:20
+  ret

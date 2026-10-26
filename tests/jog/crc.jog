@@ -1,0 +1,48 @@
+extern {
+    fn puts(s: *const c_char): c_int
+}
+
+type c_char = i8
+type c_int = i32
+
+fn makeCrcTable(): [256]u32 {
+    var t: [256]u32
+    for i in 0 as usize..256 {
+        var c = i as u32
+        for _ in 0 as usize..8 {
+            if c & 1 != 0 {
+                c = 0xEDB88320 ^ (c >> 1)
+            } else {
+                c = c >> 1
+            }
+        }
+        t[i] = c
+    }
+    return t
+}
+
+val CrcTable = makeCrcTable()
+
+fn main() {
+    val words = @comptime(makeCrcTable())
+    if CrcTable[0] != 0 {
+        return
+    }
+    if CrcTable[1] != 0x77073096 {
+        return
+    }
+    if CrcTable[255] != 0x2D02EF8D {
+        return
+    }
+    if words[1] != CrcTable[1] {
+        return
+    }
+    if words[8] != 0xEDB8832 {
+        return
+    }
+    if puts(c"ok") < 0 {
+        return
+    }
+}
+
+// expect: ok

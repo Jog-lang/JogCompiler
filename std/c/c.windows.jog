@@ -1,0 +1,17 @@
+// Win32 declarations for std.fs and the 32-bit LLP64 long. HANDLE is
+// intptr_t. INVALID_HANDLE_VALUE is -1. This host is Windows x64, so
+// the kernel32 names are the A forms. Loaded only for a Windows target.
+
+type long = i32
+type unsigned_long = u32
+
+extern {
+    // data is a WIN32_FIND_DATAA: 320 bytes, cFileName at offset 44.
+    fn FindFirstFileA(path: *const char, data: *u8): intptr_t
+    fn FindNextFileA(find: intptr_t, data: *u8): int
+    fn FindClose(find: intptr_t): int
+    fn GetTempPathA(cap: unsigned_long, buffer: *char): unsigned_long
+    fn CreateDirectoryA(path: *const char, security: intptr_t): int
+    fn RemoveDirectoryA(path: *const char): int
+    fn DeleteFileA(path: *const char): int
+}

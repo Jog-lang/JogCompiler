@@ -1,0 +1,46 @@
+fn bad<T: i32>(x: T): T {
+    return x
+}
+
+fn add<T>(x: T): T {
+    return x + x
+}
+
+fn make<T>(): i32 {
+    return 0
+}
+
+fn clash<T>(a: T, b: T): T {
+    return a
+}
+
+fn id<T>(x: T): T {
+    return x
+}
+
+fn calls() {
+    make()
+    clash(1, true)
+    id<i32, bool>(1)
+}
+
+@export
+fn exp<T>(x: T): T {
+    return x
+}
+
+fn def<T>(x: T = 1): T {
+    return x
+}
+
+fn main<T>() {
+}
+
+// error: a constraint must be an interface
+// error: operator '+' does not apply to T
+// error: cannot infer type parameter 'T'
+// error: conflicting types for type parameter 'T'
+// error: expected 1 type arguments, found 2
+// error: an exported function cannot have type parameters
+// error: a type parameter cannot have a default value yet
+// error: fn main cannot have type parameters

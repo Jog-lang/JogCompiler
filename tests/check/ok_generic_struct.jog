@@ -1,0 +1,45 @@
+struct T {
+    n: i32
+}
+
+struct Box<T> {
+    value: T
+}
+
+struct Pair<A, B> {
+    a: A
+    b: B
+}
+
+struct Node<T> {
+    next: *Node<T>
+    value: T
+}
+
+struct Wrap<T> {
+    inner: Box<T>
+}
+
+fn take<T>(b: Box<T>): T {
+    return b.value
+}
+
+fn make<T>(x: T): Box<T> {
+    return Box<T>(value: x)
+}
+
+fn main() {
+    var a = Box<i32>(value: 4)
+    var b = Box<bool>(value: true)
+    var p = Pair<i32, bool>(a: 1, b: true)
+    var w = Wrap<i32>(inner: a)
+    var copied = make(a.value)
+    val n: i32 = a.value
+    val flag = b.value
+    val got = take(a)
+    val inner = w.inner.value
+    val pa = p.a
+    if n == got && flag && inner == pa && copied.value == 4 {
+        return
+    }
+}

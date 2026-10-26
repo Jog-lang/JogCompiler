@@ -1,0 +1,11 @@
+private fn answer(): i64 {
+    return 4
+}
+
+extern {
+    fn puts(s: *const i8): i32
+}
+
+fn main() {
+    puts(c"run")
+}

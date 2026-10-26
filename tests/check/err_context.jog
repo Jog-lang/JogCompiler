@@ -1,0 +1,47 @@
+fn use(n: i64): i64 with (a: i64) {
+    return n + a
+}
+
+fn plain(n: i64): i64 {
+    return n
+}
+
+fn bare() {
+    val x = use(1)
+}
+
+fn amb() with (a: i64, b: i64) {
+    val x = use(1)
+}
+
+fn extra() {
+    val x = plain(1) with (2)
+}
+
+fn wrong() {
+    val x = use(1) with (true)
+}
+
+private fn hidden() {
+    val x = use(1)
+}
+
+fn outer() {
+    hidden()
+}
+
+fn main() with (a: i64) {
+}
+
+@export
+fn ex() with (a: i64) {
+}
+
+// error: missing context i64
+// error: ambiguous context i64
+// error: this function takes no contexts
+// error: missing context i64
+// error: context value matches no parameter
+// error: missing context i64 (hidden -> use)
+// error: fn main cannot declare contexts yet
+// error: an exported function cannot declare contexts

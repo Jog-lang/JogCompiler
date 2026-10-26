@@ -1,0 +1,30 @@
+// module: returns
+
+struct Pair {
+    lo: i32
+    hi: i32
+}
+
+fn split(n: i32): (i32, i32) {
+    return n, n + 1
+}
+
+fn main() {
+    var t: (i32, i32) = (1, 2)
+    var p: *(i32, i32) = &t
+    var a: i32 = 0
+    var b: i32 = 0
+    var s = Pair(lo: 0, hi: 0)
+    var arr = [2]i32(0, 0)
+    var row = [](i32, i32)((9, 8))
+    val x = p.0
+    val y = (*p).1
+    (a, b) = split(x)
+    (s.lo, s.hi) = (x, y)
+    (arr[0], arr[1]) = (a, b)
+    (row[0].0, row[0].1) = (a, b)
+    (*(&a), b) = (7, y)
+    ((a, b), _) = ((x, y), true)
+    (p.0, p.1) = (a, b)
+    (t.0, t.1) = (a, b)
+}

@@ -1,0 +1,122 @@
+// Package std.mem. Allocator is the allocation interface. Malloc is the
+// process heap: its methods call jogrt_alloc, jogrt_realloc, and jogrt_free.
+// ErrorArena is the root error arena. Out of memory panics; these methods
+// do not return an error value.
+
+import std.c
+
+// alloc(size, align) returns a block of size bytes whose address is a
+// multiple of align. align is a power of two, and 1 means no alignment.
+// resize grows or shrinks a block this allocator returned and may move it:
+// keep the bytes it returns. free releases a block this allocator returned.
+interface Allocator {
+    fn alloc(size: usize, align: usize): (bytes, error?)
+    fn resize(b: bytes, size: usize): (bytes, error?)
+    fn free(b: bytes)
+}
+
+// The process-heap value. One package-level Malloc backs heap().
+struct Malloc {
+    tag: u8
+}
+
+var heap_value: Malloc
+
+// That one Malloc, as Allocator.
+fn heap(): Allocator {
+    return &heap_value
+}
+
+// A block of size bytes from the process heap, aligned to align.
+// jogrt_alloc returning null panics, including when align is not a
+// power of two. A size of 0 is still a live block and must be freed.
+fn Malloc.alloc(size: usize, align: usize): (bytes, error?) {
+    val p = c.jogrt_alloc(size, align)
+    if p == null {
+        panic("out of memory")
+    }
+    var b = bytes()
+    b.ptr = p as *u8
+    b.len = size
+    return b, null
+}
+
+// Grows or shrinks b. jogrt_realloc allocates a new block at align 1,
+// copies the overlapping prefix, and frees the old pointer when it is
+// not null, so a larger alignment from alloc is not kept. Keep the
+// returned bytes. A null result panics.
+fn Malloc.resize(b: bytes, size: usize): (bytes, error?) {
+    val p = c.jogrt_realloc(b.ptr as *void?, b.len, size, 1)
+    if p == null {
+        panic("out of memory")
+    }
+    var out = bytes()
+    out.ptr = p as *u8
+    out.len = size
+    return out, null
+}
+
+// Releases a block this heap returned, through jogrt_free. A null pointer
+// is ignored there. A non-null block is released, including length 0.
+fn Malloc.free(b: bytes) {
+    c.jogrt_free(b.ptr as *void?, b.len, 1)
+}
+
+// Distinct type over Allocator, so an ordinary allocation cannot take the
+// error arena by accident. It does not convert to Allocator implicitly.
+type ErrorAllocator: Allocator
+
+// The root error arena. alloc bumps it. free does not return a block.
+// The runtime rewinds the arena by mark and release, and frees it at
+// process exit. These methods do not mark or release.
+struct ErrorArena {
+    tag: u8
+}
+
+var error_arena_value: ErrorArena
+
+// The one ErrorArena, as Allocator. That value is the root error arena.
+fn error_heap(): Allocator {
+    return &error_arena_value
+}
+
+// Bumps the root error arena by size bytes at align. align is a power of
+// two, and 1 means no alignment. jogrt_error_alloc returning null panics.
+fn ErrorArena.alloc(size: usize, align: usize): (bytes, error?) {
+    val p = c.jogrt_error_alloc(size, align)
+    if p == null {
+        panic("out of memory")
+    }
+    var b = bytes()
+    b.ptr = p as *u8
+    b.len = size
+    return b, null
+}
+
+// A new arena block of size bytes at align 1, with the overlapping prefix
+// copied across. The old block stays in the arena. Keep the returned
+// bytes. A null result panics.
+fn ErrorArena.resize(b: bytes, size: usize): (bytes, error?) {
+    val p = c.jogrt_error_alloc(size, 1)
+    if p == null {
+        panic("out of memory")
+    }
+    var n = b.len
+    if n > size {
+        n = size
+    }
+    if n > 0 {
+        val dest = p as *void
+        val src = b.ptr as *const void
+        c.memcpy(dest, src, n)
+    }
+    var out = bytes()
+    out.ptr = p as *u8
+    out.len = size
+    return out, null
+}
+
+// Does nothing. The block, null or not, is not released. The arena drops
+// its storage at process exit, not per call.
+fn ErrorArena.free(b: bytes) {
+}

@@ -1,0 +1,66 @@
+struct Box<T> {
+    value: T
+}
+
+struct Plain {
+    n: i32
+}
+
+fn Box.get(): i32 {
+    return 0
+}
+
+fn Box<A, B>.wide(): i32 {
+    return 0
+}
+
+fn Box<T>.dup<T>(x: T): T {
+    return x
+}
+
+fn Box<T>.add(x: T): T {
+    return x + x
+}
+
+@export
+fn Box<T>.exp(): i32 {
+    return 0
+}
+
+fn Box<T>.same(): i32 {
+    return 0
+}
+
+fn Box<U>.same(): i32 {
+    return 0
+}
+
+fn Box<T>.id(): T {
+    return self.value
+}
+
+fn Plain.pick<T>(x: T): T {
+    return x
+}
+
+fn Plain.make<R>(): i32 {
+    return 0
+}
+
+fn calls() {
+    var a = Box<i32>(value: 1)
+    var p = Plain(n: 1)
+    val n = a.id<bool>()
+    p.pick()
+    p.make()
+}
+
+// error: expected 1 type parameters on the receiver, found 0
+// error: expected 1 type parameters on the receiver, found 2
+// error: duplicate type parameter 'T'
+// error: operator '+' does not apply to T
+// error: an exported function cannot have type parameters
+// error: duplicate method 'same'
+// error: expected 0 type arguments, found 1
+// error: cannot infer type parameter 'T'
+// error: cannot infer type parameter 'R'

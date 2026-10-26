@@ -1,0 +1,15 @@
+// module: app
+
+fn add(a: i32, b: i32 = 1): i32 {
+    return a + b
+}
+
+fn echo(a: i32, b: i32 = a): i32 {
+    return b
+}
+
+fn main() {
+    val n = add(2)
+    val m = add(b: 3, a: 4)
+    val e = echo(5)
+}

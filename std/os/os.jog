@@ -1,0 +1,61 @@
+// Package std.os. argc is jogrt_argc. argv views one argument through
+// jogrt_arg_ptr, the const int8_t * form of the bytes jogrt_argv
+// returns. The runtime owns that pointer. Do not free it. A process
+// argument has no interior NUL, so the length is strlen. An index
+// outside 0..argc is a programmer error.
+//
+// env reads one variable through getenv. The value is a view of the C
+// runtime's copy. Do not free it, and do not keep it across another
+// env call: a later getenv may reuse the buffer. A missing name, an
+// empty name, or a name that does not fit in 4095 bytes plus NUL is
+// ("", false), not a panic. The name is copied into a temporary
+// buffer so getenv gets a trailing NUL.
+
+import std.c
+
+fn argc(): i64 {
+    return c.jogrt_argc() as i64
+}
+
+private fn c_view(p: *u8, n: usize): str {
+    var view = bytes()
+    view.ptr = p
+    view.len = n
+    return view
+}
+
+// i is the zero-based index. argv(0) is the program path the host passed.
+fn argv(i: i64): str {
+    val n = c.jogrt_argc() as i64
+    if i < 0 || i >= n {
+        panic("argument index out of range")
+    }
+    val p = c.jogrt_arg_ptr(i as c.int)
+    if p == null {
+        panic("argument index out of range")
+    }
+    return c_view(p!! as *u8, c.strlen(p!!))
+}
+
+// 4095 bytes of name plus one NUL. A longer name does not look up.
+private fn fill_name(name: str, dest: *u8): bool {
+    if name.len == 0 || name.len >= 4096 {
+        return false
+    }
+    c.memcpy(dest as *void, name.ptr as *const void, name.len)
+    *(dest + name.len) = 0
+    return true
+}
+
+fn env(name: str): (str, bool) {
+    var buf: bytes[4096]
+    val dest = buf[..].ptr
+    if !fill_name(name, dest) {
+        return "", false
+    }
+    val p = c.getenv(dest as *const c.char)
+    if p == null {
+        return "", false
+    }
+    return c_view(p!! as *u8, c.strlen(p!! as *const c.char)), true
+}

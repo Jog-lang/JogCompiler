@@ -1,0 +1,5 @@
+@test
+fn broken() {
+    val a: i32 = 1
+    val b: i64 = a
+}

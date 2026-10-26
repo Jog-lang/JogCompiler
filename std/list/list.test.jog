@@ -1,0 +1,268 @@
+// Package list, same as list.jog, so the tests see List and empty with
+// no import of std.list. push, reserve, insert, new, and free need the
+// allocator context: with (mem.heap()). t.expect takes a bool.
+//
+// Programmer-error panics are expectPanic tests at the bottom.
+// Out of memory in grow is not an @test.
+
+import std.mem
+import std.testing
+
+struct Item {
+    tag: u8
+    n: i32
+}
+
+@test
+fn emptyList() with (t: testing.Testing) {
+    var xs = empty<i32>()
+    t.expect(xs.len == 0)
+    t.expect(xs.cap == 0)
+}
+
+@test
+fn pushOne() with (t: testing.Testing) {
+    var xs = empty<i32>()
+    with (mem.heap()) {
+        xs.push(7)
+        t.expect(xs.len == 1)
+        t.expect(xs.cap == 8)
+        t.expect(xs.get(0) == 7)
+        xs.free()
+    }
+}
+
+@test
+fn pushPack() with (t: testing.Testing) {
+    var xs = empty<i32>()
+    with (mem.heap()) {
+        xs.push(1, 2, 3)
+        t.expect(xs.len == 3)
+        t.expect(xs.get(0) == 1)
+        t.expect(xs.get(1) == 2)
+        t.expect(xs.get(2) == 3)
+        t.expect(xs.cap == 8)
+        xs.free()
+    }
+}
+
+@test
+fn growPastFirstCap() with (t: testing.Testing) {
+    // First block is 8 slots, then capacity doubles.
+    var xs = empty<i32>()
+    with (mem.heap()) {
+        for _ in 0 as usize..8 {
+            xs.push(1)
+        }
+        t.expect(xs.len == 8)
+        t.expect(xs.cap == 8)
+        xs.push(1)
+        t.expect(xs.len == 9)
+        t.expect(xs.cap == 16)
+        xs.free()
+    }
+}
+
+@test
+fn getAndSet() with (t: testing.Testing) {
+    var xs = empty<i32>()
+    with (mem.heap()) {
+        xs.push(1)
+        xs.push(2)
+        xs.set(0, 9)
+        t.expect(xs.get(0) == 9)
+        t.expect(xs.get(1) == 2)
+        t.expect(xs.len == 2)
+        xs.free()
+    }
+}
+
+@test
+fn popLast() with (t: testing.Testing) {
+    var xs = empty<i32>()
+    with (mem.heap()) {
+        xs.push(1)
+        xs.push(2)
+        val cap = xs.cap
+        t.expect(xs.pop() == 2)
+        t.expect(xs.len == 1)
+        t.expect(xs.get(0) == 1)
+        t.expect(xs.cap == cap)
+        xs.free()
+    }
+}
+
+@test
+fn clearKeepsCap() with (t: testing.Testing) {
+    var xs = empty<i32>()
+    with (mem.heap()) {
+        xs.push(1)
+        xs.push(2)
+        val cap = xs.cap
+        xs.clear()
+        t.expect(xs.len == 0)
+        t.expect(xs.cap == cap)
+        xs.push(3)
+        t.expect(xs.cap == cap)
+        t.expect(xs.len == 1)
+        t.expect(xs.get(0) == 3)
+        xs.free()
+    }
+}
+
+@test
+fn reserveEmpty() with (t: testing.Testing) {
+    var xs = empty<i32>()
+    with (mem.heap()) {
+        xs.reserve(10)
+        t.expect(xs.len == 0)
+        t.expect(xs.cap >= 10)
+        val cap = xs.cap
+        xs.push(1)
+        t.expect(xs.cap == cap)
+        t.expect(xs.get(0) == 1)
+        xs.free()
+    }
+}
+
+@test
+fn newCopiesPack() with (t: testing.Testing) {
+    with (mem.heap()) {
+        var none = new<i32>()
+        t.expect(none.len == 0)
+        t.expect(none.cap == 0)
+        var xs = new<i32>(4, 5, 6)
+        t.expect(xs.len == 3)
+        t.expect(xs.cap >= 3)
+        t.expect(xs.get(0) == 4)
+        t.expect(xs.get(1) == 5)
+        t.expect(xs.get(2) == 6)
+        xs.free()
+    }
+}
+
+@test
+fn sliceViewSharesElements() with (t: testing.Testing) {
+    var xs = empty<i32>()
+    with (mem.heap()) {
+        xs.push(1)
+        xs.push(2)
+        var view = xs.slice_view()
+        t.expect(view.len == 2)
+        t.expect(view[0] == 1)
+        t.expect(view[1] == 2)
+        view[0] = 9
+        t.expect(xs.get(0) == 9)
+        t.expect(xs.get(1) == 2)
+        xs.clear()
+        var emptyView = xs.slice_view()
+        t.expect(emptyView.len == 0)
+        xs.free()
+    }
+}
+
+@test
+fn insertAndRemove() with (t: testing.Testing) {
+    var xs = empty<i32>()
+    with (mem.heap()) {
+        xs.push(1)
+        xs.push(3)
+        xs.insert(1, 2)
+        t.expect(xs.len == 3)
+        t.expect(xs.get(0) == 1)
+        t.expect(xs.get(1) == 2)
+        t.expect(xs.get(2) == 3)
+        xs.insert(xs.len, 4)
+        t.expect(xs.get(3) == 4)
+        val gone = xs.remove(1)
+        t.expect(gone == 2)
+        t.expect(xs.len == 3)
+        t.expect(xs.get(0) == 1)
+        t.expect(xs.get(1) == 3)
+        t.expect(xs.get(2) == 4)
+        val last = xs.remove(xs.len - 1)
+        t.expect(last == 4)
+        t.expect(xs.len == 2)
+        val cap = xs.cap
+        for _ in 0 as usize..6 {
+            xs.push(1)
+        }
+        t.expect(xs.len == 8)
+        t.expect(xs.cap == cap)
+        xs.insert(0, 7)
+        t.expect(xs.len == 9)
+        t.expect(xs.cap == 16)
+        t.expect(xs.get(0) == 7)
+        t.expect(xs.get(1) == 1)
+        t.expect(xs.get(8) == 1)
+        val head = xs.remove(0)
+        t.expect(head == 7)
+        t.expect(xs.len == 8)
+        t.expect(xs.cap == 16)
+        xs.free()
+        t.expect(xs.len == 0)
+        t.expect(xs.cap == 0)
+        xs.push(5)
+        t.expect(xs.get(0) == 5)
+        t.expect(xs.cap == 8)
+        xs.free()
+    }
+}
+
+@test
+fn structElements() with (t: testing.Testing) {
+    var xs = empty<Item>()
+    with (mem.heap()) {
+        xs.push(Item(tag: 1, n: 10))
+        xs.push(Item(tag: 2, n: 20))
+        t.expect(xs.len == 2)
+        t.expect(xs.cap == 8)
+        val first = xs.get(0)
+        val second = xs.get(1)
+        t.expect(first.tag == 1)
+        t.expect(first.n == 10)
+        t.expect(second.tag == 2)
+        t.expect(second.n == 20)
+        xs.set(0, Item(tag: 9, n: 11))
+        val updated = xs.get(0)
+        t.expect(updated.tag == 9)
+        t.expect(updated.n == 11)
+        val last = xs.pop()
+        t.expect(last.tag == 2)
+        t.expect(last.n == 20)
+        t.expect(xs.cap == 8)
+        var built = new<Item>(Item(tag: 3, n: 30), Item(tag: 4, n: 40))
+        t.expect(built.len == 2)
+        val fromNew = built.get(1)
+        t.expect(fromNew.n == 40)
+        var view = built.slice_view()
+        t.expect(view.len == 2)
+        view[0] = Item(tag: 8, n: 80)
+        val seen = built.get(0)
+        t.expect(seen.tag == 8)
+        t.expect(seen.n == 80)
+        built.free()
+        xs.free()
+    }
+}
+
+@test
+fn panicUse() with (t: testing.Testing) {
+    var xs = empty<i32>()
+    t.expectPanic(() -> { xs.pop() })
+    t.expect(xs.len == 0)
+    with (mem.heap()) {
+        xs.push(1)
+    }
+    t.expectPanic(() -> { xs.get(1) })
+    t.expectPanic() { xs.set(1, 2) }
+    t.expect(xs.get(0) == 1)
+    t.expect(xs.len == 1)
+    with (mem.heap()) {
+        t.expectPanic(() -> { xs.insert(2, 3) })
+        t.expectPanic(() -> { xs.remove(1) })
+        t.expect(xs.len == 1)
+        t.expect(xs.get(0) == 1)
+        xs.free()
+    }
+}

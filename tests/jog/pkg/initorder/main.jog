@@ -1,0 +1,19 @@
+import leaf
+
+extern {
+    fn puts(s: *const i8): i32
+}
+
+fn read(): i64 {
+    return leaf.step
+}
+
+var seen: i64 = read()
+
+fn main() {
+    if seen == 1 {
+        puts(c"leaf-first")
+    } else {
+        puts(c"leaf-late")
+    }
+}

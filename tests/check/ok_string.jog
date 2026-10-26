@@ -1,0 +1,65 @@
+interface Allocator {
+    fn alloc(size: usize, align: usize): i32
+}
+
+fn msg(n: i32): str with (a: Allocator) {
+    return "n=${n}"
+}
+
+fn fill(buf: bytes, n: i32, name: str, flag: bool): (str, error?) {
+    return fmt(buf, "${name}:${flag}:${n}")
+}
+
+fn show(buf: bytes) {
+    var raw: bytes[8]
+    var u: u64 = 1
+    var name = "ab"
+    var flag = true
+    fill(raw[..], 2, name, flag)
+    fmt(buf, "${u}")
+}
+
+struct Point {
+    x: i32
+    y: i32
+}
+
+fn Point.format(buf: bytes): (str, error?) {
+    return fmt(buf, "${self.x},${self.y}")
+}
+
+fn show_point(buf: bytes, p: Point): (str, error?) {
+    return fmt(buf, "p=${p}")
+}
+
+fn point_text(p: Point): str with (a: Allocator) {
+    return "p=${p}"
+}
+
+struct Box {
+    n: i32
+}
+
+fn *Box.format(buf: bytes): (str, error?) {
+    return fmt(buf, "${self.n}")
+}
+
+fn show_box(buf: bytes, b: Box): (str, error?) {
+    return fmt(buf, "${b}")
+}
+
+struct Inner {
+    n: i32
+}
+
+struct Outer {
+    Inner
+}
+
+fn Inner.format(buf: bytes): (str, error?) {
+    return fmt(buf, "${self.n}")
+}
+
+fn show_outer(buf: bytes, o: Outer): (str, error?) {
+    return fmt(buf, "${o}")
+}

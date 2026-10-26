@@ -1,0 +1,26 @@
+// module: app
+
+extern {
+    fn printf(...): i32
+}
+
+@export
+fn start(): i32 {
+    return 1
+}
+
+@export("c_entry")
+fn entry(): i32 {
+    return 2
+}
+
+private fn hidden(): i32 {
+    return 3
+}
+
+fn main() {
+    val a = start()
+    val b = entry()
+    val c = hidden()
+    printf(1)
+}

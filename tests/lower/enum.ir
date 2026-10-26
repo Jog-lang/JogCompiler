@@ -1,0 +1,239 @@
+main f8
+init none
+
+fn f0 public jog_enums__area "enums.area": (Shape) -> i32  ; enum.jog:15:1
+  l0 s: Shape param
+  l1: i32
+  l2: u8
+  l3: i32
+  l4 r: i32
+  l5: i32
+  l6 w: i32
+  l7: i32
+  l8 h: i32
+  l9: i32
+b0 entry:
+  l2 = enum_tag l0  ; enum.jog:16:12
+  switch l2, b5 "when.miss"  ; enum.jog:16:12
+    0 -> b6 "when.tag"
+    1 -> b7 "when.tag"
+    2 -> b8 "when.tag"
+b1 "when.join":
+  ret l1  ; enum.jog:16:5
+b2 "when.arm":
+  l3 = extract l0, 0 aux2 1  ; enum.jog:17:9
+  l4 = copy l3  ; enum.jog:17:16
+  l1 = copy l4  ; enum.jog:17:9
+  br b1 "when.join"  ; enum.jog:17:9
+b3 "when.arm":
+  l5 = extract l0, 0 aux2 2  ; enum.jog:18:9
+  l6 = copy l5  ; enum.jog:18:14
+  l7 = extract l0, 1 aux2 2  ; enum.jog:18:9
+  l8 = copy l7  ; enum.jog:18:17
+  l9 = checked add l6, l8  ; enum.jog:18:25
+  l1 = copy l9  ; enum.jog:18:9
+  br b1 "when.join"  ; enum.jog:18:9
+b4 "when.arm":
+  l1 = copy i32 0  ; enum.jog:19:9
+  br b1 "when.join"  ; enum.jog:19:9
+b5 "when.miss":
+  unreachable  ; enum.jog:16:12
+b6 "when.tag":
+  br b2 "when.arm"  ; enum.jog:17:9
+b7 "when.tag":
+  br b3 "when.arm"  ; enum.jog:18:9
+b8 "when.tag":
+  br b4 "when.arm"  ; enum.jog:19:9
+
+fn f1 public jog_enums__kind "enums.kind": (i32) -> i32  ; enum.jog:23:1
+  l0 code: i32 param
+  l1: i32
+b0 entry:
+  switch l0, b3 "when.arm"  ; enum.jog:24:12
+    200 -> b2 "when.arm"
+    404 -> b2 "when.arm"
+b1 "when.join":
+  ret l1  ; enum.jog:24:5
+b2 "when.arm":
+  l1 = copy i32 1  ; enum.jog:25:9
+  br b1 "when.join"  ; enum.jog:25:9
+b3 "when.arm":
+  l1 = copy i32 0  ; enum.jog:26:9
+  br b1 "when.join"  ; enum.jog:26:9
+
+fn f2 public jog_enums__bucket "enums.bucket": (i32) -> i32  ; enum.jog:30:1
+  l0 code: i32 param
+  l1: i32
+  l2: bool
+  l3: bool
+b0 entry:
+  l2 = ge l0, i32 1  ; enum.jog:32:9
+  cond_br l2, b4 "when.range", b3 "when.arm"  ; enum.jog:32:9
+b1 "when.join":
+  ret l1  ; enum.jog:31:5
+b2 "when.arm":
+  l1 = copy i32 2  ; enum.jog:32:9
+  br b1 "when.join"  ; enum.jog:32:9
+b3 "when.arm":
+  l1 = copy i32 0  ; enum.jog:33:9
+  br b1 "when.join"  ; enum.jog:33:9
+b4 "when.range":
+  l3 = lt l0, i32 10  ; enum.jog:32:9
+  cond_br l3, b2 "when.arm", b3 "when.arm"  ; enum.jog:32:9
+
+fn f3 public jog_enums__forced "enums.forced": (i32?) -> i32  ; enum.jog:37:1
+  l0 p: i32? param
+  l1: i32
+b0 entry:
+  null_check l0  ; enum.jog:38:13
+  l1 = extract l0, 1  ; enum.jog:38:13
+  ret l1  ; enum.jog:38:5
+
+fn f4 public jog_enums__fallback "enums.fallback": (i32?) -> i32  ; enum.jog:41:1
+  l0 p: i32? param
+  l1: i32
+  l2: bool
+  l3: i32
+b0 entry:
+  l2 = extract l0, 0  ; enum.jog:42:14
+  cond_br l2, b1 "elvis.some", b2 "elvis.none"  ; enum.jog:42:14
+b1 "elvis.some":
+  l3 = extract l0, 1  ; enum.jog:42:14
+  l1 = copy l3  ; enum.jog:42:14
+  br b3 "elvis.join"  ; enum.jog:42:14
+b2 "elvis.none":
+  l1 = copy i32 0  ; enum.jog:42:14
+  br b3 "elvis.join"  ; enum.jog:42:14
+b3 "elvis.join":
+  ret l1  ; enum.jog:42:5
+
+fn f5 public jog_enums__read "enums.read": (Box?) -> i32?  ; enum.jog:45:1
+  l0 b: Box? param
+  l1: i32?
+  l2: bool
+  l3: Box
+  l4: i32
+b0 entry:
+  l2 = extract l0, 0  ; enum.jog:46:13
+  cond_br l2, b1 "safe.some", b2 "safe.none"  ; enum.jog:46:13
+b1 "safe.some":
+  l3 = extract l0, 1  ; enum.jog:46:13
+  l4 = extract l3, 0  ; enum.jog:46:13
+  l1 = aggregate (bool true, l4)  ; enum.jog:46:13
+  br b3 "safe.join"  ; enum.jog:46:13
+b2 "safe.none":
+  l1 = zero  ; enum.jog:46:13
+  br b3 "safe.join"  ; enum.jog:46:13
+b3 "safe.join":
+  ret l1  ; enum.jog:46:5
+
+fn f6 public jog_enums__empty "enums.empty": (Shape) -> bool  ; enum.jog:49:1
+  l0 s: Shape param
+  l1: u8
+  l2: bool
+b0 entry:
+  l1 = enum_tag l0  ; enum.jog:50:14
+  l2 = eq l1, u8 2  ; enum.jog:50:14
+  ret l2  ; enum.jog:50:5
+
+fn f7 public jog_enums__some_of "enums.some_of": (i32?) -> i32  ; enum.jog:53:1
+  l0 p: i32? param
+  l1: i32
+  l2: bool
+  l3: bool
+  l4: i32
+  l5 v: i32
+b0 entry:
+  l2 = extract l0, 0  ; enum.jog:55:9
+  cond_br l2, b2 "when.arm", b5 "when.next"  ; enum.jog:55:9
+b1 "when.join":
+  ret l1  ; enum.jog:54:5
+b2 "when.arm":
+  l4 = extract l0, 1  ; enum.jog:55:9
+  l5 = copy l4  ; enum.jog:55:14
+  l1 = copy l5  ; enum.jog:55:9
+  br b1 "when.join"  ; enum.jog:55:9
+b3 "when.arm":
+  l1 = copy i32 0  ; enum.jog:56:9
+  br b1 "when.join"  ; enum.jog:56:9
+b4 "when.miss":
+  unreachable  ; enum.jog:54:12
+b5 "when.next":
+  l3 = extract l0, 0  ; enum.jog:56:9
+  cond_br l3, b4 "when.miss", b3 "when.arm"  ; enum.jog:56:9
+
+fn f8 public jog_enums__main "enums.main": () -> ()  ; enum.jog:60:1
+  l0 c: Color
+  l1: Color
+  l2 s: Shape
+  l3: Shape
+  l4 e: Shape
+  l5: Shape
+  l6 q: i32?
+  l7: i32?
+  l8 box: Box?
+  l9: Box?
+  l10: bool
+  l11: u8
+  l12: bool
+  l13: i32
+  l14: i32
+  l15: bool
+  l16: i32
+  l17: i32
+  l18: bool
+  l19: i32
+  l20: i32
+  l21: bool
+  l22: i32?
+  l23: bool
+b0 entry:
+  l1 = aggregate () aux 1  ; enum.jog:61:18
+  l0 = copy l1  ; enum.jog:61:5
+  l3 = aggregate (i32 3)  ; enum.jog:62:18
+  l2 = copy l3  ; enum.jog:62:5
+  l5 = aggregate () aux 2  ; enum.jog:63:20
+  l4 = copy l5  ; enum.jog:63:5
+  l7 = zero  ; enum.jog:64:19
+  l6 = copy l7  ; enum.jog:64:5
+  l9 = zero  ; enum.jog:65:21
+  l8 = copy l9  ; enum.jog:65:5
+  l10 = call f6(l4)  ; enum.jog:66:8
+  cond_br l10, b1 "if.then", b2 "if.join"  ; enum.jog:66:5
+b1 "if.then":
+  ret  ; enum.jog:67:9
+b2 "if.join":
+  l11 = enum_tag l0  ; enum.jog:69:10
+  l12 = eq l11, u8 0  ; enum.jog:69:16
+  cond_br l12, b3 "if.then", b4 "if.join"  ; enum.jog:69:5
+b3 "if.then":
+  ret  ; enum.jog:70:9
+b4 "if.join":
+  l13 = call f0(l2)  ; enum.jog:72:8
+  l14 = call f1(i32 200)  ; enum.jog:72:19
+  l15 = eq l13, l14  ; enum.jog:72:16
+  cond_br l15, b5 "if.then", b6 "if.join"  ; enum.jog:72:5
+b5 "if.then":
+  ret  ; enum.jog:73:9
+b6 "if.join":
+  l16 = call f2(i32 3)  ; enum.jog:75:8
+  l17 = call f3(l6)  ; enum.jog:75:21
+  l18 = eq l16, l17  ; enum.jog:75:18
+  cond_br l18, b7 "if.then", b8 "if.join"  ; enum.jog:75:5
+b7 "if.then":
+  ret  ; enum.jog:76:9
+b8 "if.join":
+  l19 = call f4(l6)  ; enum.jog:78:8
+  l20 = call f7(l6)  ; enum.jog:78:23
+  l21 = eq l19, l20  ; enum.jog:78:20
+  cond_br l21, b9 "if.then", b10 "if.join"  ; enum.jog:78:5
+b9 "if.then":
+  ret  ; enum.jog:79:9
+b10 "if.join":
+  l22 = call f5(l8)  ; enum.jog:81:8
+  l23 = extract l22, 0  ; enum.jog:81:18
+  cond_br l23, b11 "if.then", b12 "if.join"  ; enum.jog:81:5
+b11 "if.then":
+  ret  ; enum.jog:82:9
+b12 "if.join":
+  ret  ; enum.jog:60:1

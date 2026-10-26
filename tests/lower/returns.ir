@@ -1,0 +1,214 @@
+main f1
+init none
+
+fn f0 public jog_returns__split "returns.split": (i32) -> (i32, i32)  ; returns.jog:8:1
+  l0 n: i32 param
+  l1: i32
+  l2: (i32, i32)
+b0 entry:
+  l1 = checked add l0, i32 1  ; returns.jog:9:17
+  l2 = aggregate (l0, l1)  ; returns.jog:9:5
+  ret l2  ; returns.jog:9:5
+
+fn f1 public jog_returns__main "returns.main": () -> ()  ; returns.jog:12:1
+  l0 t: (i32, i32) addr
+  l1: (i32, i32)
+  l2 p: *(i32, i32)
+  l3: *(i32, i32)
+  l4 a: i32 addr
+  l5 b: i32
+  l6 s: Pair addr
+  l7: Pair
+  l8 arr: [2]i32 addr
+  l9: [2]i32 addr
+  l10: *[2]i32
+  l11: *i32
+  l12: *i32
+  l13: *i32
+  l14 row: [](i32, i32)
+  l15: [1](i32, i32) addr
+  l16: *[1](i32, i32)
+  l17: *(i32, i32)
+  l18: (i32, i32)
+  l19: *(i32, i32)
+  l20: *[1](i32, i32)
+  l21: *(i32, i32)
+  l22: [](i32, i32)
+  l23 x: i32
+  l24: *i32
+  l25: i32
+  l26 y: i32
+  l27: (i32, i32)
+  l28: i32
+  l29: (i32, i32)
+  l30: (i32, i32)
+  l31: i32
+  l32: i32
+  l33: (i32, i32)
+  l34: (i32, i32)
+  l35: i32
+  l36: *Pair
+  l37: *i32
+  l38: i32
+  l39: *Pair
+  l40: *i32
+  l41: (i32, i32)
+  l42: (i32, i32)
+  l43: i32
+  l44: *[2]i32
+  l45: *i32
+  l46: *i32
+  l47: i32
+  l48: *[2]i32
+  l49: *i32
+  l50: *i32
+  l51: (i32, i32)
+  l52: (i32, i32)
+  l53: i32
+  l54: *(i32, i32)
+  l55: usize
+  l56: *(i32, i32)
+  l57: *i32
+  l58: i32
+  l59: *(i32, i32)
+  l60: usize
+  l61: *(i32, i32)
+  l62: *i32
+  l63: (i32, i32)
+  l64: (i32, i32)
+  l65: i32
+  l66: *i32
+  l67: i32
+  l68: (i32, i32)
+  l69: ((i32, i32), bool)
+  l70: ((i32, i32), bool)
+  l71: (i32, i32)
+  l72: i32
+  l73: i32
+  l74: (i32, i32)
+  l75: (i32, i32)
+  l76: i32
+  l77: *i32
+  l78: i32
+  l79: *i32
+  l80: (i32, i32)
+  l81: (i32, i32)
+  l82: i32
+  l83: *(i32, i32)
+  l84: *i32
+  l85: i32
+  l86: *(i32, i32)
+  l87: *i32
+b0 entry:
+  l1 = aggregate (i32 1, i32 2)  ; returns.jog:13:25
+  l0 = copy l1  ; returns.jog:13:5
+  l3 = addr l0  ; returns.jog:14:27
+  l2 = copy l3  ; returns.jog:14:5
+  l4 = copy i32 0  ; returns.jog:15:5
+  l5 = copy i32 0  ; returns.jog:16:5
+  l7 = aggregate (i32 0, i32 0)  ; returns.jog:17:13
+  l6 = copy l7  ; returns.jog:17:5
+  l9 = zero  ; returns.jog:18:15
+  l10 = addr l9  ; returns.jog:18:15
+  l11 = bitcast l10  ; returns.jog:18:15
+  l12 = elem_addr l11, usize 0  ; returns.jog:18:22
+  store l12, i32 0  ; returns.jog:18:22
+  l13 = elem_addr l11, usize 1  ; returns.jog:18:25
+  store l13, i32 0  ; returns.jog:18:25
+  l8 = copy l9  ; returns.jog:18:5
+  l15 = zero  ; returns.jog:19:15
+  l16 = addr l15  ; returns.jog:19:15
+  l17 = bitcast l16  ; returns.jog:19:15
+  l18 = aggregate (i32 9, i32 8)  ; returns.jog:19:28
+  l19 = elem_addr l17, usize 0  ; returns.jog:19:28
+  store l19, l18  ; returns.jog:19:28
+  l20 = addr l15  ; returns.jog:19:15
+  l21 = bitcast l20  ; returns.jog:19:15
+  l22 = aggregate (l21, usize 1)  ; returns.jog:19:15
+  l14 = copy l22  ; returns.jog:19:5
+  l24 = field_addr l2, 0  ; returns.jog:20:14
+  l25 = load l24  ; returns.jog:20:14
+  l23 = copy l25  ; returns.jog:20:5
+  l27 = load l2  ; returns.jog:21:14
+  l28 = extract l27, 1  ; returns.jog:21:17
+  l26 = copy l28  ; returns.jog:21:5
+  l29 = call f0(l23)  ; returns.jog:22:14
+  l30 = copy l29  ; returns.jog:22:12
+  l31 = extract l30, 0  ; returns.jog:22:6
+  l4 = copy l31  ; returns.jog:22:6
+  l32 = extract l30, 1  ; returns.jog:22:9
+  l5 = copy l32  ; returns.jog:22:9
+  l33 = aggregate (l23, l26)  ; returns.jog:23:20
+  l34 = copy l33  ; returns.jog:23:18
+  l35 = extract l34, 0  ; returns.jog:23:7
+  l36 = addr l6  ; returns.jog:23:7
+  l37 = field_addr l36, 0  ; returns.jog:23:7
+  store l37, l35  ; returns.jog:23:7
+  l38 = extract l34, 1  ; returns.jog:23:13
+  l39 = addr l6  ; returns.jog:23:13
+  l40 = field_addr l39, 1  ; returns.jog:23:13
+  store l40, l38  ; returns.jog:23:13
+  l41 = aggregate (l4, l5)  ; returns.jog:24:24
+  l42 = copy l41  ; returns.jog:24:22
+  l43 = extract l42, 0  ; returns.jog:24:9
+  l44 = addr l8  ; returns.jog:24:6
+  l45 = bitcast l44  ; returns.jog:24:9
+  bounds_check usize 0, usize 2  ; returns.jog:24:9
+  l46 = elem_addr l45, usize 0  ; returns.jog:24:9
+  store l46, l43  ; returns.jog:24:9
+  l47 = extract l42, 1  ; returns.jog:24:17
+  l48 = addr l8  ; returns.jog:24:14
+  l49 = bitcast l48  ; returns.jog:24:17
+  bounds_check usize 1, usize 2  ; returns.jog:24:17
+  l50 = elem_addr l49, usize 1  ; returns.jog:24:17
+  store l50, l47  ; returns.jog:24:17
+  l51 = aggregate (l4, l5)  ; returns.jog:25:28
+  l52 = copy l51  ; returns.jog:25:26
+  l53 = extract l52, 0  ; returns.jog:25:12
+  l54 = extract l14, 0  ; returns.jog:25:9
+  l55 = extract l14, 1  ; returns.jog:25:9
+  bounds_check usize 0, l55  ; returns.jog:25:9
+  l56 = elem_addr l54, usize 0  ; returns.jog:25:9
+  l57 = field_addr l56, 0  ; returns.jog:25:12
+  store l57, l53  ; returns.jog:25:12
+  l58 = extract l52, 1  ; returns.jog:25:22
+  l59 = extract l14, 0  ; returns.jog:25:19
+  l60 = extract l14, 1  ; returns.jog:25:19
+  bounds_check usize 0, l60  ; returns.jog:25:19
+  l61 = elem_addr l59, usize 0  ; returns.jog:25:19
+  l62 = field_addr l61, 1  ; returns.jog:25:22
+  store l62, l58  ; returns.jog:25:22
+  l63 = aggregate (i32 7, l26)  ; returns.jog:26:18
+  l64 = copy l63  ; returns.jog:26:16
+  l65 = extract l64, 0  ; returns.jog:26:6
+  l66 = addr l4  ; returns.jog:26:9
+  store l66, l65  ; returns.jog:26:6
+  l67 = extract l64, 1  ; returns.jog:26:13
+  l5 = copy l67  ; returns.jog:26:13
+  l68 = aggregate (l23, l26)  ; returns.jog:27:20
+  l69 = aggregate (l68, bool true)  ; returns.jog:27:19
+  l70 = copy l69  ; returns.jog:27:17
+  l71 = extract l70, 0  ; returns.jog:27:6
+  l72 = extract l71, 0  ; returns.jog:27:7
+  l4 = copy l72  ; returns.jog:27:7
+  l73 = extract l71, 1  ; returns.jog:27:10
+  l5 = copy l73  ; returns.jog:27:10
+  l74 = aggregate (l4, l5)  ; returns.jog:28:18
+  l75 = copy l74  ; returns.jog:28:16
+  l76 = extract l75, 0  ; returns.jog:28:7
+  l77 = field_addr l2, 0  ; returns.jog:28:7
+  store l77, l76  ; returns.jog:28:7
+  l78 = extract l75, 1  ; returns.jog:28:12
+  l79 = field_addr l2, 1  ; returns.jog:28:12
+  store l79, l78  ; returns.jog:28:12
+  l80 = aggregate (l4, l5)  ; returns.jog:29:18
+  l81 = copy l80  ; returns.jog:29:16
+  l82 = extract l81, 0  ; returns.jog:29:7
+  l83 = addr l0  ; returns.jog:29:6
+  l84 = field_addr l83, 0  ; returns.jog:29:7
+  store l84, l82  ; returns.jog:29:7
+  l85 = extract l81, 1  ; returns.jog:29:12
+  l86 = addr l0  ; returns.jog:29:11
+  l87 = field_addr l86, 1  ; returns.jog:29:12
+  store l87, l85  ; returns.jog:29:12
+  ret  ; returns.jog:12:1

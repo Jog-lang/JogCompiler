@@ -1,0 +1,7 @@
+fn kind(): str {
+    return "shapes"
+}
+
+fn banner_len(): usize {
+    return @embed("../data/banner.txt").len
+}

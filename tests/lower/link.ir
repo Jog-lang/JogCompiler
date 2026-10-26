@@ -1,0 +1,34 @@
+main f4
+init none
+
+fn f0 extern printf "app.printf": extern (...) -> i32  ; link.jog:4:5
+
+fn f1 export start "app.start": () -> i32  ; link.jog:8:1
+b0 entry:
+  ret i32 1  ; link.jog:9:5
+
+fn f2 export c_entry "app.entry": () -> i32  ; link.jog:13:1
+b0 entry:
+  ret i32 2  ; link.jog:14:5
+
+fn f3 internal jog_app__hidden "app.hidden": () -> i32  ; link.jog:17:9
+b0 entry:
+  ret i32 3  ; link.jog:18:5
+
+fn f4 public jog_app__main "app.main": () -> ()  ; link.jog:21:1
+  l0 a: i32
+  l1: i32
+  l2 b: i32
+  l3: i32
+  l4 c: i32
+  l5: i32
+  l6: i32
+b0 entry:
+  l1 = call f1()  ; link.jog:22:13
+  l0 = copy l1  ; link.jog:22:5
+  l3 = call f2()  ; link.jog:23:13
+  l2 = copy l3  ; link.jog:23:5
+  l5 = call f3()  ; link.jog:24:13
+  l4 = copy l5  ; link.jog:24:5
+  l6 = call f0(i64 1)  ; link.jog:25:5
+  ret  ; link.jog:21:1

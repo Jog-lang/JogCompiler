@@ -1,0 +1,44 @@
+main f0
+init none
+
+fn f0 public jog_app__main "app.main": () -> ()  ; generic_alias.jog:9:1
+  l0 p: (i32, bool)
+  l1: (i32, bool)
+  l2 q: (i32, bool)
+  l3: i32
+  l4: (i32, bool)
+  l5: bool
+  l6: i32
+  l7: i32
+  l8: bool
+  l9: bool
+b0 entry:
+  l1 = aggregate (i32 4, bool true)  ; generic_alias.jog:10:30
+  l0 = copy l1  ; generic_alias.jog:10:5
+  l3 = extract l0, 0  ; generic_alias.jog:11:19
+  l4 = call f1(l3)  ; generic_alias.jog:11:13
+  l2 = copy l4  ; generic_alias.jog:11:5
+  l6 = extract l0, 0  ; generic_alias.jog:12:9
+  l7 = extract l2, 0  ; generic_alias.jog:12:16
+  l8 = eq l6, l7  ; generic_alias.jog:12:12
+  cond_br l8, b1 "and.rhs", b2 "and.false"  ; generic_alias.jog:12:19
+b1 "and.rhs":
+  l9 = extract l0, 1  ; generic_alias.jog:12:23
+  l5 = copy l9  ; generic_alias.jog:12:19
+  br b3 "and.join"  ; generic_alias.jog:12:19
+b2 "and.false":
+  l5 = copy bool false  ; generic_alias.jog:12:19
+  br b3 "and.join"  ; generic_alias.jog:12:19
+b3 "and.join":
+  cond_br l5, b4 "if.then", b5 "if.join"  ; generic_alias.jog:12:5
+b4 "if.then":
+  ret  ; generic_alias.jog:13:9
+b5 "if.join":
+  ret  ; generic_alias.jog:9:1
+
+fn f1 public jog_app__make__i32 "app.make<i32>": (i32) -> (i32, bool)  ; generic_alias.jog:5:1
+  l0 x: i32 param
+  l1: (i32, bool)
+b0 entry:
+  l1 = aggregate (l0, bool true)  ; generic_alias.jog:6:12
+  ret l1  ; generic_alias.jog:6:5

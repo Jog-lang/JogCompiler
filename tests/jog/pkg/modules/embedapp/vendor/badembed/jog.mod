@@ -1,0 +1,2 @@
+module badembed
+kind library

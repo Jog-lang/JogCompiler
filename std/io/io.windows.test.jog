@@ -1,0 +1,18 @@
+// Windows text mode writes "\n" as "\r\n". The shared io tests cover
+// binary mode, end of input, and an empty buffer.
+
+import std.mem
+import std.proc
+import std.testing
+
+@test
+fn textStdout() with (t: testing.Testing) {
+    child_gate()
+    with (mem.heap()) {
+        val got = run_child("--io-text")
+        t.expect(got.ok)
+        t.expect(got.code == 0)
+        t.expectEq(got.stdout, "a\r\nb\r\n")
+        proc.free_output(got)
+    }
+}

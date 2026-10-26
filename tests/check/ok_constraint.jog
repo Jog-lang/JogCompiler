@@ -1,0 +1,130 @@
+enum Ordering: i8 {
+    Less = -1
+    Equal = 0
+    Greater = 1
+}
+
+interface Ordered {
+    fn op<=>(o: Ordered): Ordering
+}
+
+interface Named {
+    fn name(): i32
+}
+
+interface Other {
+    fn name(): i32
+}
+
+interface Signed {
+    ~i8 | ~i16 | ~i32 | ~i64 | ~isize
+}
+
+interface Integer {
+    Signed | ~u8 | ~u16 | ~u32 | ~u64 | ~usize
+}
+
+interface Nums {
+    ~i32 | ~i64 | ~f32 | ~f64
+}
+
+interface Exact {
+    i32
+}
+
+interface Approx {
+    ~i32
+}
+
+interface Mix {
+    bool | i32
+}
+
+interface Positioned {
+    var x: i32
+}
+
+type Meters: i32
+
+struct Point {
+    x: i32
+}
+
+struct Person {
+    n: i32
+}
+
+fn Person.name(): i32 {
+    return self.n
+}
+
+fn max<T: Ordered>(a: T, b: T): T {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn add<T: Integer>(a: T, b: T): T {
+    return a + b
+}
+
+fn add_signed<U: Signed>(a: U, b: U): U {
+    return add(a, b)
+}
+
+fn add_num<T: Nums>(a: T, b: T): T {
+    return a + b
+}
+
+fn add_m<T: Approx>(a: T, b: T): T {
+    return a + b
+}
+
+fn band<T: Approx>(a: T, b: T): T {
+    return a & b
+}
+
+fn same<T: Mix>(a: T, b: T): bool {
+    return a == b
+}
+
+fn id_exact<T: Exact>(x: T): T {
+    return x
+}
+
+fn call<T: Named>(x: T): i32 {
+    return x.name()
+}
+
+fn take<T: Other>(x: T): i32 {
+    return x.name()
+}
+
+fn pass<U: Named>(x: U): i32 {
+    return take(x)
+}
+
+fn bump<T: Positioned>(p: *T) {
+    p.x = p.x + 1
+}
+
+fn use() {
+    var a: i32 = 3
+    var b: i32 = 7
+    var m: Meters
+    var p = Point(x: 1)
+    var person = Person(n: 4)
+    max(a, b)
+    add(a, b)
+    add_signed(a, b)
+    add_num(a, b)
+    add_m(m, m)
+    band(a, a)
+    same(true, false)
+    same(a, b)
+    id_exact(a)
+    call(person)
+    pass(person)
+    bump(&p)
+}

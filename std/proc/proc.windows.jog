@@ -1,0 +1,273 @@
+// Windows run. CreateProcessA. The command line is quoted for
+// CommandLineToArgvW: an empty argument, or one that contains a space,
+// a tab, or a quote, is wrapped in double quotes. Backslashes before a
+// quote, and backslashes at the end of a quoted argument, are doubled,
+// the same rules as tools/proc.c. Arguments that do not need quotes are
+// left bare. Quoting every argument makes cmd.exe treat "/c" as a
+// program name. A command line longer than 32766 bytes is a failed start.
+//
+// stdout and stderr are separate temp files. GetTempFileNameA creates
+// them. NUL is stdin.
+
+import std.c
+import std.mem
+import std.strbuilder
+
+// Win32 x64. HANDLE is a pointer-sized integer so zero and -1 are
+// ordinary values. BOOL is a 4-byte int. Layout matches the MinGW
+// structs: Startup is 104 bytes, ProcessInfo and SecurityAttributes
+// are 24.
+private struct SecurityAttributes {
+    length: c.unsigned_long
+    descriptor: c.intptr_t
+    inherit: c.int
+}
+
+private struct Startup {
+    cb: c.unsigned_long
+    reserved: c.intptr_t
+    desktop: c.intptr_t
+    title: c.intptr_t
+    x: c.unsigned_long
+    y: c.unsigned_long
+    x_size: c.unsigned_long
+    y_size: c.unsigned_long
+    x_count: c.unsigned_long
+    y_count: c.unsigned_long
+    fill: c.unsigned_long
+    flags: c.unsigned_long
+    show: c.unsigned_short
+    reserved2_len: c.unsigned_short
+    reserved2: c.intptr_t
+    stdin_h: c.intptr_t
+    stdout_h: c.intptr_t
+    stderr_h: c.intptr_t
+}
+
+private struct ProcessInfo {
+    process: c.intptr_t
+    thread: c.intptr_t
+    pid: c.unsigned_long
+    tid: c.unsigned_long
+}
+
+private extern {
+    fn CreateProcessA(
+        app: *const c.char,
+        command: *c.char,
+        process_attr: *void?,
+        thread_attr: *void?,
+        inherit: c.int,
+        flags: c.unsigned_long,
+        env: *void?,
+        dir: *const c.char?,
+        startup: *Startup,
+        info: *ProcessInfo,
+    ): c.int
+    fn CreateFileA(
+        name: *const c.char,
+        access: c.unsigned_long,
+        share: c.unsigned_long,
+        security: *SecurityAttributes,
+        disposition: c.unsigned_long,
+        attrs: c.unsigned_long,
+        template: c.intptr_t,
+    ): c.intptr_t
+    fn GetTempFileNameA(dir: *const c.char, prefix: *const c.char, unique: c.unsigned_int, out: *c.char): c.unsigned_int
+    fn WaitForSingleObject(handle: c.intptr_t, ms: c.unsigned_long): c.unsigned_long
+    fn GetExitCodeProcess(process: c.intptr_t, code: *c.unsigned_long): c.int
+    fn CloseHandle(handle: c.intptr_t): c.int
+}
+
+// ASCII `"`. The word quote is a keyword, so this is a number.
+private val quote_mark: u8 = 34
+
+private fn needs_quote(text: str): bool {
+    if text.len == 0 {
+        return true
+    }
+    var i: usize = 0
+    for i < text.len {
+        val b = text.ptr[i]
+        if b == ' ' as u8 || b == '\t' as u8 || b == quote_mark {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+private fn append_slashes(sb: *strbuilder.StrBuilder, count: usize) with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < count {
+        sb.append_byte('\\' as u8)
+        i = i + 1
+    }
+}
+
+private fn quote_one(sb: *strbuilder.StrBuilder, arg: str) with (a: mem.Allocator) {
+    val wrap = needs_quote(arg)
+    if wrap {
+        sb.append_byte(quote_mark)
+    }
+    var slashes: usize = 0
+    var i: usize = 0
+    for i < arg.len {
+        val b = arg.ptr[i]
+        if b == '\\' as u8 {
+            slashes = slashes + 1
+            i = i + 1
+            continue
+        }
+        if b == quote_mark {
+            append_slashes(sb, slashes * 2 + 1)
+            sb.append_byte(quote_mark)
+            slashes = 0
+            i = i + 1
+            continue
+        }
+        if slashes > 0 {
+            append_slashes(sb, slashes)
+            slashes = 0
+        }
+        sb.append_byte(b)
+        i = i + 1
+    }
+    if wrap {
+        if slashes > 0 {
+            append_slashes(sb, slashes * 2)
+        }
+        sb.append_byte(quote_mark)
+    } else if slashes > 0 {
+        append_slashes(sb, slashes)
+    }
+}
+
+private fn build_command(sb: *strbuilder.StrBuilder, args: []str) with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < args.len {
+        if i > 0 {
+            sb.append_byte(' ' as u8)
+        }
+        quote_one(sb, args[i])
+        i = i + 1
+    }
+}
+
+private fn close_handle(h: c.intptr_t) {
+    if h != 0 && h != -1 {
+        CloseHandle(h)
+    }
+}
+
+private fn delete_made(path: *u8, made: bool) {
+    if made {
+        c.DeleteFileA(path as *const c.char)
+    }
+}
+
+// DWORD exit status as the two's complement int CreateProcess reports.
+private fn exit_code(status: c.unsigned_long): i32 {
+    val n = status as i64
+    if n > 2147483647 {
+        return (n - 4294967296) as i32
+    }
+    return n as i32
+}
+
+// GetTempFileNameA creates the file. false leaves dest unchanged.
+private fn make_temp(prefix: *const c.char, dest: *u8): bool {
+    var dir: [260]u8
+    val n = c.GetTempPathA(260, dir[..].ptr as *c.char)
+    if n == 0 || n >= 260 {
+        return false
+    }
+    return GetTempFileNameA(dir[..].ptr as *const c.char, prefix, 0, dest as *c.char) != 0
+}
+
+private fn open_file(path: *const c.char, access: c.unsigned_long, disposition: c.unsigned_long, sa: *SecurityAttributes): c.intptr_t {
+    return CreateFileA(path, access, 3, sa, disposition, 128, 0)
+}
+
+private fn spawn(app: *const c.char, command: *c.char): Output with (a: mem.Allocator) {
+    var out_path: [260]u8
+    var err_path: [260]u8
+    val out_made = make_temp(c"jpo", out_path[..].ptr)
+    val err_made = make_temp(c"jpe", err_path[..].ptr)
+    if !out_made || !err_made {
+        delete_made(out_path[..].ptr, out_made)
+        delete_made(err_path[..].ptr, err_made)
+        return Output()
+    }
+
+    var sa: SecurityAttributes
+    sa.length = size(SecurityAttributes) as c.unsigned_long
+    sa.inherit = 1
+    val nul_h = open_file(c"NUL", 0x80000000, 3, &sa)
+    val out_h = open_file(out_path[..].ptr as *const c.char, 0x40000000, 2, &sa)
+    val err_h = open_file(err_path[..].ptr as *const c.char, 0x40000000, 2, &sa)
+    if nul_h == -1 || out_h == -1 || err_h == -1 {
+        close_handle(nul_h)
+        close_handle(out_h)
+        close_handle(err_h)
+        delete_made(out_path[..].ptr, true)
+        delete_made(err_path[..].ptr, true)
+        return Output()
+    }
+
+    var startup: Startup
+    startup.cb = size(Startup) as c.unsigned_long
+    startup.flags = 0x100
+    startup.stdin_h = nul_h
+    startup.stdout_h = out_h
+    startup.stderr_h = err_h
+    var info: ProcessInfo
+    val created = CreateProcessA(app, command, null, null, 1, 0, null, null, &startup, &info)
+    close_handle(nul_h)
+    close_handle(out_h)
+    close_handle(err_h)
+    if created == 0 {
+        delete_made(out_path[..].ptr, true)
+        delete_made(err_path[..].ptr, true)
+        return Output()
+    }
+
+    val waited = WaitForSingleObject(info.process, 0xFFFFFFFF)
+    var status: c.unsigned_long = 0
+    val got = GetExitCodeProcess(info.process, &status)
+    close_handle(info.thread)
+    close_handle(info.process)
+    if waited != 0 || got == 0 {
+        delete_made(out_path[..].ptr, true)
+        delete_made(err_path[..].ptr, true)
+        return Output()
+    }
+
+    val out = read_captures(out_path[..].ptr, err_path[..].ptr, exit_code(status))
+    delete_made(out_path[..].ptr, true)
+    delete_made(err_path[..].ptr, true)
+    return out
+}
+
+// args[0] is the program. The call waits. ok is false when the program
+// cannot be started or the captures cannot be read.
+fn run(args: []str): Output with (a: mem.Allocator) {
+    if args.len == 0 {
+        panic("empty argument vector")
+    }
+    if !args_ok(args) {
+        return Output()
+    }
+    var command = strbuilder.empty()
+    build_command(&command, args)
+    if command.len > 32766 {
+        command.free()
+        return Output()
+    }
+    command.append_byte(0)
+    val app = c_string(args[0])
+    val out = spawn(app.ptr as *const c.char, command.ptr!! as *c.char)
+    command.free()
+    a.free(app)
+    return out
+}

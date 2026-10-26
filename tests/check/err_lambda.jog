@@ -1,0 +1,20 @@
+fn bare() {
+    val f = (x) -> { x }
+}
+
+fn read() {
+    var n = 1
+    val f = () -> { n }
+}
+
+fn write() {
+    var n = 1
+    val f = () -> { n = 2 }
+}
+
+fn early() {
+    val f = () -> { return 1 }
+}
+
+// error: lambda parameter needs a type
+// error: lambda result needs a type

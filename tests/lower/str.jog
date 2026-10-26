@@ -1,0 +1,7 @@
+// module: app
+
+fn main() {
+    val text = "ab"
+    val same = text == "ab"
+    val diff = text != ""
+}

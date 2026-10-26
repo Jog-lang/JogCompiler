@@ -1,0 +1,8 @@
+fn main() {
+    val n: u8 = 200 + 100 - 250
+    val lo: i8 = -128
+    val flag = 1 + 2 == 3
+    if flag && n > 0 && lo < 0 {
+        return
+    }
+}

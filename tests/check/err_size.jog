@@ -1,0 +1,8 @@
+fn main() {
+    var x: i32 = 1
+    val n = size(x)
+    val v = size(void)
+}
+
+// error: size expects a type
+// error: type 'void' has no size

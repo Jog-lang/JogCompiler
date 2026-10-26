@@ -1,0 +1,67 @@
+// expect: ok
+
+extern {
+    fn puts(s: *const c_char): c_int
+    fn printf(fmt: *const c_char, ...): c_int
+}
+
+type c_char = i8
+type c_int = i32
+
+struct Acc {
+    base: i32
+}
+
+fn n(...i32: args): usize {
+    return args.len
+}
+
+fn head(...i32: args): i32 {
+    return args[0]
+}
+
+fn at2(...i32: args): i32 {
+    return args[2]
+}
+
+fn take(xs: []i32): i32 {
+    if xs.len == 0 {
+        return 0
+    }
+    return xs[0]
+}
+
+fn pass(...i32: args): i32 {
+    return take(args)
+}
+
+fn labeled(prefix: str, ...i32: rest): usize {
+    return prefix.len + rest.len
+}
+
+fn count<T>(...T: args): usize {
+    return args.len
+}
+
+fn mix<T>(x: T, ...i32: rest): usize {
+    return rest.len
+}
+
+fn Acc.add(...i32: args): i32 {
+    if args.len == 0 {
+        return self.base
+    }
+    return self.base + args[0]
+}
+
+fn main() {
+    var acc = Acc(base: 10)
+    if n() == 0 && n(1) == 1 && n(1, 2, 3) == 3 && head(9) == 9 && head(1, 2, 3) == 1 &&
+       at2(1, 2, 8) == 8 && pass(4, 5) == 4 && labeled("ab") == 2 && labeled("ab", 1, 2) == 4 &&
+       count<i32>() == 0 && count<i32>(1, 2, 3) == 3 && count<bool>() == 0 && count<bool>(true, false) == 2 &&
+       mix<i32>(7, 1, 2) == 2 && mix<bool>(true) == 0 && acc.add() == 10 && acc.add(3) == 13 {
+        if puts(c"ok") < 0 {
+            return
+        }
+    }
+}

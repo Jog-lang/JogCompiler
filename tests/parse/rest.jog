@@ -1,0 +1,46 @@
+fn sample(code: i32, shape: Shape, event: Event): i32 {
+    val kind = when code {
+        200, 204 -> 1
+        in 300..400 -> 2
+        else -> 0
+    }
+    val area = when shape {
+        Circle(r) -> r
+        Rect(w: width, h) -> width
+        Empty -> 0
+        else -> { 1 }
+    }
+    val nested = when event {
+        Some(Click(Point(x: 0, y))) -> y
+        Some(_) -> 0
+        None -> 1
+    }
+    val cond = when {
+        code < 0 -> 1
+        else -> 0
+    }
+    val typed = when shape {
+        is Circle -> 1
+        is Rect -> 2
+        else -> 0
+    }
+    val double = (x: i32) -> { x * 2 }
+    val add = (a: i32, b: i32): i32 -> a + b
+    val noop = () -> {}
+    val paren = (a + b) * c
+    go fetch(url)
+    go { process(item) }
+    go with (logger) { handle(conn) }
+    go(stack: 1 << 20) { work() }
+    val xs = List<i32>()
+    val ys = List<List<i32>>()
+    val ch = Chan<i32>.init(16)
+    val n = max<f32>(1, 2.5)
+    val cmp = a < b
+    val call = a < b > (c)
+    val words = @comptime(makeCrcTable())
+    val blob = @embed("table.bin")
+    val sum = @add(self, o)
+    val p = Point(x: 1, y: 2)
+    return bytes()
+}

@@ -1,0 +1,17 @@
+// module: app
+
+struct Box<T> {
+    value: T
+}
+
+fn make<T>(x: T): Box<T> {
+    return Box<T>(value: x)
+}
+
+fn main() {
+    val a = Box<i32>(value: 4)
+    val b = make(a.value)
+    if a.value == b.value {
+        return
+    }
+}

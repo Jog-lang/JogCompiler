@@ -1,0 +1,135 @@
+// Package fs, same as fs.jog, so the tests see read_all, write_all,
+// join, list, free_str, and free_names with no import of std.fs.
+// read_all, join, list, free_str, and free_names need the allocator
+// context: with (mem.heap()). t.expect takes a bool. t.expectEq takes
+// two str values.
+//
+// A missing file or directory is false, not a panic. Out of memory
+// in copy_str, join, and push_copied is not an @test. scratch,
+// make_dir, and close_dir live in the per-OS test file. The scratch
+// directory is removed afterwards.
+
+import std.list as lists
+import std.mem
+import std.testing
+
+private fn free_bytes(data: bytes) with (a: mem.Allocator) {
+    a.free(data)
+}
+
+private fn text_bytes(text: str): bytes {
+    var data = bytes()
+    data.ptr = text.ptr as *u8
+    data.len = text.len
+    return data
+}
+
+private fn write_text(path: str, text: str): bool {
+    return write_all(path, text_bytes(text))
+}
+
+private fn expect_join(left: str, right: str, want: str) with (t: testing.Testing, a: mem.Allocator) {
+    val got = join(left, right)
+    t.expectEq(got, want)
+    free_str(got)
+}
+
+@test
+fn joinSeparators() with (t: testing.Testing) {
+    with (mem.heap()) {
+        expect_join("a", "b", "a/b")
+        expect_join("a/", "b", "a/b")
+        expect_join("a\\", "b", "a\\b")
+        expect_join("a", "/b", "a/b")
+        expect_join("a", "\\b", "a\\b")
+        expect_join("a/b", "c", "a/b/c")
+        expect_join("a\\b", "c", "a\\b/c")
+        expect_join("", "b\\c", "b\\c")
+        expect_join("a/", "", "a/")
+        expect_join("", "", "")
+    }
+}
+
+@test
+fn readAndWrite() with (t: testing.Testing) {
+    with (mem.heap()) {
+        val (missing, no) = read_all("")
+        t.expect(!no)
+        t.expect(missing.len == 0)
+        free_bytes(missing)
+        t.expect(!write_all("", text_bytes("x")))
+
+        val dir = scratch("jog-fs-io")
+        t.expect(make_dir(dir))
+        val slash = join(dir, "nul.bin")
+        val back = join(dir, "\\hello.txt")
+        t.expect(write_text(slash, "h\0i!"))
+        t.expect(write_text(back, "hello"))
+        val (got, ok) = read_all(slash)
+        t.expect(ok)
+        t.expectEq(got, "h\0i!")
+        free_bytes(got)
+        val (hello, ok2) = read_all(back)
+        t.expect(ok2)
+        t.expectEq(hello, "hello")
+        free_bytes(hello)
+        val absent = join(dir, "no-such/file.txt")
+        t.expect(!write_text(absent, "x"))
+        val (none, ok3) = read_all(absent)
+        t.expect(!ok3)
+        t.expect(none.len == 0)
+        free_bytes(none)
+        free_str(slash)
+        free_str(back)
+        free_str(absent)
+        close_dir(dir)
+    }
+}
+
+@test
+fn listSorted() with (t: testing.Testing) {
+    with (mem.heap()) {
+        var (nope, bad) = list("")
+        t.expect(!bad)
+        t.expect(nope.len == 0)
+        free_names(&nope)
+
+        val dir = scratch("jog-fs-list")
+        t.expect(make_dir(dir))
+        var (empty_names, empty_ok) = list(dir)
+        t.expect(empty_ok)
+        t.expect(empty_names.len == 0)
+        free_names(&empty_names)
+
+        t.expect(put(dir, "c", "c"))
+        t.expect(put(dir, "a", "a"))
+        t.expect(mkdir_at(dir, "m"))
+        t.expect(put(dir, "a2", "a2"))
+        t.expect(put(dir, "B", "B"))
+        t.expect(put(dir, ".hid", "h"))
+        var (names, ok) = list(dir)
+        t.expect(ok)
+        t.expect(names.len == 6)
+        if ok && names.len == 6 {
+            t.expectEq(names.get(0), ".hid")
+            t.expectEq(names.get(1), "B")
+            t.expectEq(names.get(2), "a")
+            t.expectEq(names.get(3), "a2")
+            t.expectEq(names.get(4), "c")
+            t.expectEq(names.get(5), "m")
+        }
+        val file = join(dir, "a")
+        var (as_dir, file_ok) = list(file)
+        t.expect(!file_ok)
+        t.expect(as_dir.len == 0)
+        free_names(&as_dir)
+        free_str(file)
+        val gone = join(dir, "missing")
+        var (miss, miss_ok) = list(gone)
+        t.expect(!miss_ok)
+        free_names(&miss)
+        free_str(gone)
+        free_names(&names)
+        close_dir(dir)
+    }
+}

@@ -1,0 +1,15 @@
+extern {
+    fn puts(s: *const i8): i32
+}
+
+context on: i64 = 1
+
+fn say(msg: *const i8) with (on: i64) {
+    if on == 1 {
+        puts(msg)
+    }
+}
+
+fn main() {
+    say(c"run")
+}

@@ -1,0 +1,46 @@
+// POSIX list. opendir/readdir/closedir. d_name is read through
+// jogrt_dirent_name so this file does not hard-code struct dirent.
+// An empty path, or one that does not fit in 4095 bytes plus NUL, is
+// false. A name is copied before the next readdir.
+
+import std.c
+import std.list as lists
+import std.mem
+
+private fn fill_path(dest: *u8, cap: usize, path: str): bool {
+    if path.len == 0 || path.len >= cap {
+        return false
+    }
+    c.memcpy(dest as *void, path.ptr as *const void, path.len)
+    dest[path.len] = 0
+    return true
+}
+
+// false means the directory could not be opened. The list is empty then.
+// Each kept name is its own block. free_names releases them.
+fn list(path: str): (lists.List<str>, bool) with (a: mem.Allocator) {
+    var names: lists.List<str>
+    var buf: [4096]u8
+    if !fill_path(buf[..].ptr, 4096, path) {
+        return names, false
+    }
+    val dir = c.opendir(buf[..].ptr as *const c.char)
+    if dir == null {
+        return names, false
+    }
+    for {
+        val ent = c.readdir(dir!!)
+        if ent == null {
+            break
+        }
+        val name = c.jogrt_dirent_name(ent!! as *const void?)
+        if name == null {
+            continue
+        }
+        val raw = name!! as *u8
+        push_copied(&names, raw, c.strlen(name!!))
+    }
+    c.closedir(dir!!)
+    sort_names(&names)
+    return names, true
+}

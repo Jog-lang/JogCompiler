@@ -1,0 +1,35 @@
+// expect: ok
+
+extern {
+    fn puts(s: *const c_char): c_int
+}
+
+type c_char = i8
+type c_int = i32
+
+fn len_of(name: str?): usize? {
+    return name?.len
+}
+
+fn ptr_of(name: str?): *const u8? {
+    return name?.ptr
+}
+
+fn main() {
+    val name: str? = null
+    val n = len_of(name)
+    val p = ptr_of(name)
+    val shown = when n {
+        Some(v) -> v
+        null -> 0
+    }
+    val missing = when p {
+        Some(v) -> 1
+        null -> 0
+    }
+    if shown == 0 && missing == 0 {
+        if puts(c"ok") < 0 {
+            return
+        }
+    }
+}

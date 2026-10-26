@@ -1,0 +1,167 @@
+// Package arena, same as arena.jog, so the tests see Arena and init
+// with no import of std.arena. alloc, resize, and free are the
+// Allocator methods. reset and release are called on the arena value.
+// t.expect takes a bool.
+//
+// Programmer-error panics are expectPanic tests at the bottom.
+// Out of memory in init and new_chunk is not an @test.
+
+import std.mem
+import std.testing
+
+fn through(a_size: usize): (bytes, error?) with (a: mem.Allocator) {
+    val (b, err) = a.alloc(a_size, 4)
+    if err != null {
+        return b, err
+    }
+    b.ptr[0] = 65
+    b.ptr[3] = 66
+    val (grown, err2) = a.resize(b, a_size + 2)
+    if err2 != null {
+        return grown, err2
+    }
+    a.free(b)
+    return grown, null
+}
+
+@test
+fn emptyChunkDefault() with (t: testing.Testing) {
+    var arena = init(0)
+    val (b, err) = arena.alloc(8, 8)
+    t.expect(err == null)
+    t.expect(b.len == 8)
+    arena.release()
+}
+
+@test
+fn alignment() with (t: testing.Testing) {
+    // The first block is 16-aligned. An offset that is a multiple of
+    // the request is then aligned to that request. 1 does not pad.
+    var arena = init(256)
+    val (b1, e1) = arena.alloc(1, 1)
+    val (b2, e2) = arena.alloc(1, 2)
+    val (b4, e4) = arena.alloc(1, 4)
+    val (b8, e8) = arena.alloc(1, 8)
+    val (b16, e16) = arena.alloc(1, 16)
+    val (tail, etail) = arena.alloc(1, 1)
+    t.expect(e1 == null)
+    t.expect(e2 == null)
+    t.expect(e4 == null)
+    t.expect(e8 == null)
+    t.expect(e16 == null)
+    t.expect(etail == null)
+    val base = b1.ptr
+    t.expect(b1.len == 1)
+    t.expect(b2.ptr - base == 2)
+    t.expect(b4.ptr - base == 4)
+    t.expect(b8.ptr - base == 8)
+    t.expect(b16.ptr - base == 16)
+    t.expect(tail.ptr - base == 17)
+    arena.release()
+}
+
+@test
+fn paddingStartsNewChunk() with (t: testing.Testing) {
+    var arena = init(8)
+    val (a, ea) = arena.alloc(1, 1)
+    val (b, eb) = arena.alloc(8, 8)
+    t.expect(ea == null)
+    t.expect(eb == null)
+    t.expect(a.ptr != b.ptr)
+    t.expect(b.len == 8)
+    arena.release()
+}
+
+@test
+fn largeSpansChunks() with (t: testing.Testing) {
+    // 96 is three default blocks. It comes back as one contiguous block.
+    var arena = init(32)
+    val (a, ea) = arena.alloc(32, 1)
+    val (b, eb) = arena.alloc(32, 1)
+    val (big, ebig) = arena.alloc(96, 1)
+    t.expect(ea == null)
+    t.expect(eb == null)
+    t.expect(ebig == null)
+    t.expect(a.len == 32)
+    t.expect(b.len == 32)
+    t.expect(big.len == 96)
+    t.expect(a.ptr != b.ptr)
+    t.expect(big.ptr != a.ptr)
+    t.expect(big.ptr != b.ptr)
+    big.ptr[0] = 7
+    big.ptr[95] = 9
+    t.expect(big.ptr[0] == 7)
+    t.expect(big.ptr[95] == 9)
+    arena.release()
+}
+
+@test
+fn resetReuses() with (t: testing.Testing) {
+    var arena = init(16)
+    val (a, _) = arena.alloc(16, 1)
+    val (b, _) = arena.alloc(16, 1)
+    arena.reset()
+    val (a2, ea) = arena.alloc(16, 1)
+    val (b2, eb) = arena.alloc(16, 1)
+    t.expect(ea == null)
+    t.expect(eb == null)
+    t.expect(a2.ptr == b.ptr)
+    t.expect(b2.ptr == a.ptr)
+    arena.release()
+}
+
+@test
+fn freeDoesNotRewind() with (t: testing.Testing) {
+    var arena = init(64)
+    val (a, _) = arena.alloc(4, 1)
+    arena.free(a)
+    val (b, _) = arena.alloc(4, 1)
+    t.expect(b.ptr != a.ptr)
+    arena.reset()
+    val (c, _) = arena.alloc(4, 1)
+    t.expect(c.ptr == a.ptr)
+    arena.release()
+}
+
+@test
+fn resizeCopies() with (t: testing.Testing) {
+    var arena = init(64)
+    val (b, err) = arena.alloc(4, 4)
+    t.expect(err == null)
+    b.ptr[0] = 11
+    b.ptr[3] = 22
+    val (grown, err2) = arena.resize(b, 8)
+    t.expect(err2 == null)
+    t.expect(grown.len == 8)
+    t.expect(grown.ptr[0] == 11)
+    t.expect(grown.ptr[3] == 22)
+    val (shrunk, err3) = arena.resize(grown, 2)
+    t.expect(err3 == null)
+    t.expect(shrunk.len == 2)
+    t.expect(shrunk.ptr[0] == 11)
+    arena.release()
+}
+
+@test
+fn asAllocator() with (t: testing.Testing) {
+    var arena = init(128)
+    with (&arena) {
+        val (b, err) = through(4)
+        t.expect(err == null)
+        t.expect(b.len == 6)
+        t.expect(b.ptr[0] == 65)
+        t.expect(b.ptr[3] == 66)
+    }
+    arena.release()
+    arena.release()
+}
+
+// Out of memory panics in init and new_chunk. Not an @test.
+
+@test
+fn panicAlloc() with (t: testing.Testing) {
+    var arena = init(32)
+    t.expectPanic(() -> { arena.alloc(1, 3) })
+    arena.release()
+    t.expectPanic() { arena.alloc(1, 1) }
+}

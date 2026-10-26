@@ -1,0 +1,77 @@
+struct Dup {
+    a: i32
+    a: i32
+}
+
+struct Point {
+    x: i32
+    y: i32
+}
+
+struct Node {
+    next: *Node
+}
+
+struct A {
+    x: i32
+}
+
+struct B {
+    x: i32
+}
+
+struct C {
+    A
+    B
+}
+
+struct Box {
+    private(scope) hidden: i32
+}
+
+fn Point.len(): i32 {
+    return 0
+}
+
+fn Point.len(scale: i32): i32 {
+    return scale
+}
+
+fn A.get(): i32 {
+    return 0
+}
+
+fn B.get(): i32 {
+    return 0
+}
+
+fn *Point.set(v: i32) {
+}
+
+fn Point.readonly() {
+    self.x = 1
+}
+
+fn main() {
+    val p = Point(1, 2)
+    p.set(3)
+    var c = C()
+    val x = c.x
+    val g = c.get()
+    val n = Node()
+    var b = Box()
+    val h = b.hidden
+    val extra = Point(1, 2, 3)
+    val named = Point(y: 1, 2)
+}
+
+// error: duplicate field 'a'
+// error: duplicate method 'len'
+// error: cannot call pointer method 'set' on this value
+// error: ambiguous field 'x'
+// error: ambiguous method 'get'
+// error: missing field 'next'
+// error: field 'hidden' is not visible
+// error: too many fields
+// error: positional field after a named field
+// error: cannot assign to field 'x'

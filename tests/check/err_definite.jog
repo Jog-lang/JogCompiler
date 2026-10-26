@@ -1,0 +1,16 @@
+extern {
+    fn get(): *i32
+}
+
+var raw: *i32
+
+fn f(c: bool) {
+    var p: *i32
+    if c {
+        p = get()
+    }
+    val q = p
+}
+
+// error: variable 'raw' must be initialized
+// error: variable 'p' is used before it is assigned

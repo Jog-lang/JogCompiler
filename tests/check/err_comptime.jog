@@ -1,0 +1,13 @@
+fn main() {
+    val missing = @embed("a.txt")
+    val escaped = @embed("../outside.txt")
+    val absolute = @embed("/nope")
+    val directory = @embed(".")
+    val bad = @comptime()
+}
+
+// error: cannot embed 'a.txt': file is missing
+// error: @embed path escapes the module
+// error: @embed path must be a relative file path
+// error: cannot embed '.': path is a directory
+// error: @comptime expects one argument

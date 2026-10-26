@@ -1,0 +1,7 @@
+private(file) fn secret(): i64 {
+    return 3
+}
+
+fn use_secret(): i64 {
+    return secret()
+}

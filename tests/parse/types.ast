@@ -1,0 +1,164 @@
+(FILE
+  (TYPE_DECL A
+    =
+      (TYPE_NAME i32)
+  )
+  (TYPE_DECL B
+    =
+      (TYPE_PTR const
+        (TYPE_NAME T)
+      )
+  )
+  (TYPE_DECL C
+    =
+      (TYPE_OPTION
+        (TYPE_PTR
+          (TYPE_NAME T)
+        )
+      )
+  )
+  (TYPE_DECL D
+    =
+      (TYPE_PTR
+        (TYPE_OPTION
+          (TYPE_NAME T)
+        )
+      )
+  )
+  (TYPE_DECL E
+    =
+      (TYPE_SLICE const
+        (TYPE_NAME u8)
+      )
+  )
+  (TYPE_DECL F
+    =
+      (TYPE_ARRAY
+        (INT_LIT 4)
+        (TYPE_NAME i32)
+      )
+  )
+  (TYPE_DECL G
+    =
+      (TYPE_ARRAY _
+        (TYPE_NAME T)
+      )
+  )
+  (TYPE_DECL H
+    =
+      (TYPE_BYTES)
+  )
+  (TYPE_DECL I
+    =
+      (TYPE_BYTES const)
+  )
+  (TYPE_DECL J
+    =
+      (TYPE_BYTES
+        (INT_LIT 4)
+      )
+  )
+  (TYPE_DECL K
+    =
+      (TYPE_BYTES const
+        (INT_LIT 8)
+      )
+  )
+  (TYPE_DECL L
+    =
+      (TYPE_TUPLE
+        (TYPE_NAME i32)
+        (TYPE_NAME str)
+      )
+  )
+  (TYPE_DECL M
+    =
+      (TYPE_UNIT)
+  )
+  (TYPE_DECL N
+    =
+      (TYPE_FN
+        (TYPE_NAME i32)
+        ->
+          (TYPE_NAME i32)
+      )
+  )
+  (TYPE_DECL O
+    =
+      (TYPE_FN
+        ->
+          (TYPE_UNIT)
+      )
+  )
+  (TYPE_DECL P
+    =
+      (TYPE_FN
+        (TYPE_NAME str)
+        ->
+          (TYPE_UNIT)
+        with
+          (TYPE_NAME Logger)
+      )
+  )
+  (TYPE_DECL Q
+    =
+      (TYPE_FN escaping
+        ->
+          (TYPE_UNIT)
+      )
+  )
+  (TYPE_DECL R
+    =
+      (TYPE_FN extern
+        (TYPE_NAME c.int)
+        ->
+          (TYPE_NAME c.int)
+      )
+  )
+  (TYPE_DECL S
+    =
+      (TYPE_NAME Map
+        (TYPE_NAME str)
+        (TYPE_NAME List
+          (TYPE_NAME i32)
+        )
+      )
+  )
+  (TYPE_DECL U
+    =
+      (TYPE_PTR const
+        (TYPE_NAME c.char)
+      )
+  )
+  (TYPE_DECL V
+    =
+      (TYPE_FN
+        (TYPE_NAME i32)
+        (TYPE_NAME i32)
+        ->
+          (TYPE_NAME bool)
+      )
+  )
+  (TYPE_DECL W
+    =
+      (TYPE_SLICE
+        (TYPE_OPTION
+          (TYPE_NAME T)
+        )
+      )
+  )
+  (TYPE_DECL X
+    =
+      (TYPE_NAME i32)
+  )
+  (TYPE_DECL Y
+    =
+      (TYPE_NAME F
+        (TYPE_NAME G
+          (TYPE_NAME H
+            (TYPE_NAME i32)
+          )
+        )
+      )
+  )
+)

@@ -1,0 +1,42 @@
+// Exit-code cases go through /bin/sh -c. printf does not add a newline
+// unless the script asks for one. child_gate is in proc.test.jog.
+
+import std.mem
+import std.testing
+
+@test
+fn exitZero() with (t: testing.Testing) {
+    child_gate()
+    with (mem.heap()) {
+        val got = run([]str("/bin/sh", "-c", "exit 0"))
+        t.expect(got.ok)
+        t.expect(got.code == 0)
+        t.expect(got.stdout.len == 0)
+        t.expect(got.stderr.len == 0)
+        free_output(got)
+    }
+}
+
+@test
+fn exitThree() with (t: testing.Testing) {
+    child_gate()
+    with (mem.heap()) {
+        val got = run([]str("/bin/sh", "-c", "exit 3"))
+        t.expect(got.ok)
+        t.expect(got.code == 3)
+        free_output(got)
+    }
+}
+
+@test
+fn captureStreams() with (t: testing.Testing) {
+    child_gate()
+    with (mem.heap()) {
+        val got = run([]str("/bin/sh", "-c", "printf out; printf err >&2"))
+        t.expect(got.ok)
+        t.expect(got.code == 0)
+        t.expectEq(got.stdout, "out")
+        t.expectEq(got.stderr, "err")
+        free_output(got)
+    }
+}

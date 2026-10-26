@@ -1,0 +1,64 @@
+// Package std.c. Bindings for the portable libc set and the runtime shims
+// in jogrt.h. Names match the C symbols, so no @extern rename is needed.
+// libc and the runtime are linked by the driver; this block has no @link.
+//
+// Aliases are the shared part of the V1 host data model. int is 32 bits
+// and pointers are 64 on every native target this tree builds. char is
+// signed, which is the x64 default. long and unsigned_long differ by ABI:
+// c.windows.jog uses the 32-bit LLP64 sizes, and c.posix.jog uses the
+// 64-bit LP64 sizes. The loader picks one of those files by its suffix.
+// *void is the language spelling of an untyped pointer.
+
+type char = i8
+type short = i16
+type int = i32
+type long_long = i64
+type unsigned_char = u8
+type unsigned_short = u16
+type unsigned_int = u32
+type unsigned_long_long = u64
+type float = f32
+type double = f64
+type size_t = usize
+type ptrdiff_t = isize
+type intptr_t = isize
+type uintptr_t = usize
+
+@opaque struct FILE
+
+extern {
+    fn malloc(size: size_t): *void?
+    fn free(ptr: *void?)
+    fn realloc(ptr: *void?, size: size_t): *void?
+    fn memcpy(dest: *void, src: *const void, n: size_t): *void
+    fn memset(dest: *void, byte: int, n: size_t): *void
+    fn strlen(s: *const char): size_t
+    fn exit(status: int)
+    fn fopen(path: *const char, mode: *const char): *FILE?
+    fn fread(ptr: *void, size: size_t, count: size_t, stream: *FILE): size_t
+    fn fwrite(ptr: *const void, size: size_t, count: size_t, stream: *FILE): size_t
+    fn fclose(stream: *FILE): int
+    fn getenv(name: *const char): *char?
+
+    fn jogrt_stdin(): *void?
+    fn jogrt_stdout(): *void?
+    fn jogrt_stderr(): *void?
+    fn jogrt_errno(): int
+    fn jogrt_write(fd: int, ptr: *const void?, len: size_t): bool
+    // Up to cap bytes from stdin, returning once any have arrived. 0 is
+    // end of input and -1 an error. See jogrt.h.
+    fn jogrt_stdin_read(buf: *void, cap: size_t): intptr_t
+    fn jogrt_stdio_binary(): bool
+    fn jogrt_exit(code: int)
+    fn jogrt_panic_call(body: *void): int
+    fn jogrt_alloc(size: size_t, align: size_t): *void?
+    fn jogrt_error_alloc(size: size_t, align: size_t): *void?
+    fn jogrt_realloc(ptr: *void?, old_size: size_t, new_size: size_t, align: size_t): *void?
+    fn jogrt_free(ptr: *void?, size: size_t, align: size_t)
+    fn jogrt_argc(): int
+    // Same bytes as jogrt_argv, or NULL when i is out of range. The
+    // pointer belongs to the runtime. jogrt_argv itself returns
+    // const char *, and *c.char is const int8_t *, so a generated
+    // redeclaration of jogrt_argv conflicts with jogrt.h.
+    fn jogrt_arg_ptr(i: int): *const char?
+}

@@ -1,0 +1,29 @@
+// expect: from top
+// expect: from with
+// expect: from binding
+
+extern {
+    fn puts(s: *const c_char): c_int
+}
+
+type c_char = i8
+type c_int = i32
+
+context on: i64 = 1
+
+fn say(msg: *const c_char) with (on: i64) {
+    if on == 1 {
+        if puts(msg) < 0 {
+            return
+        }
+    }
+}
+
+fn main() {
+    say(c"from top")
+    with (1) {
+        say(c"from with")
+    }
+    context on: i64 = 1
+    say(c"from binding")
+}

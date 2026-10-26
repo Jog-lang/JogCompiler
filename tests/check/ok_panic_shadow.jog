@@ -1,0 +1,10 @@
+fn panic(n: i32): i32 {
+    return n
+}
+
+fn main() {
+    val x = panic(1)
+    if x != 1 {
+        return
+    }
+}

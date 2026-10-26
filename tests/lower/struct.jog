@@ -1,0 +1,19 @@
+struct Point {
+    x: i32
+    y: i32
+}
+
+fn Point.sum(): i32 {
+    return self.x + self.y
+}
+
+fn *Point.set_x(v: i32) {
+    self.x = v
+}
+
+fn main() {
+    var p = Point(x: 1, y: 2)
+    p.x = 3
+    val s = p.sum()
+    p.set_x(s)
+}

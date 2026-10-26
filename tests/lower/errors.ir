@@ -1,0 +1,173 @@
+main f6
+init none
+
+fn f0 public jog_errors__close "errors.close": (i32) -> ()  ; errors.jog:3:1
+  l0 n: i32 param
+b0 entry:
+  ret  ; errors.jog:3:1
+
+fn f1 public jog_errors__open "errors.open": () -> (i32, error?)  ; errors.jog:5:1
+  l0: error?
+  l1: (i32, error?)
+b0 entry:
+  l0 = zero  ; errors.jog:6:15
+  l1 = aggregate (i32 1, l0)  ; errors.jog:6:5
+  ret l1  ; errors.jog:6:5
+
+fn f2 public jog_errors__pair "errors.pair": () -> (i32, i32)  ; errors.jog:9:1
+  l0 t: (i32, i32)
+  l1: (i32, i32)
+  l2: i32
+  l3: i32
+  l4: (i32, i32)
+b0 entry:
+  l1 = aggregate (i32 1, i32 2)  ; errors.jog:10:25
+  l0 = copy l1  ; errors.jog:10:5
+  l2 = extract l0, 0  ; errors.jog:11:13
+  l3 = extract l0, 1  ; errors.jog:11:18
+  l4 = aggregate (l2, l3)  ; errors.jog:11:5
+  ret l4  ; errors.jog:11:5
+
+fn f3 public jog_errors__maybe "errors.maybe": () -> *i32?  ; errors.jog:14:1
+b0 entry:
+  ret *i32? null  ; errors.jog:15:5
+
+fn f4 public jog_errors__process "errors.process": () -> error?  ; errors.jog:18:1
+  l0: (i32, error?)
+  l1: (i32, error?)
+  l2 n: i32
+  l3: i32
+  l4 err: error?
+  l5: error?
+  l6: bool
+  l7: (i32, error?)
+  l8: (i32, error?)
+  l9: i32
+  l10: error?
+  l11: bool
+  l12: error?
+  l13: bool
+  l14: error?
+  l15: error?
+  l16: bool
+b0 entry:
+  l0 = call f1()  ; errors.jog:19:20
+  l1 = copy l0  ; errors.jog:19:5
+  l3 = extract l1, 0  ; errors.jog:19:5
+  l2 = copy l3  ; errors.jog:19:5
+  l5 = extract l1, 1  ; errors.jog:19:5
+  l4 = copy l5  ; errors.jog:19:5
+  l6 = extract l4, 0  ; errors.jog:20:12
+  cond_br l6, b1 "if.then", b2 "if.join"  ; errors.jog:20:5
+b1 "if.then":
+  ret l4  ; errors.jog:21:9
+b2 "if.join":
+  l7 = call f1()  ; errors.jog:25:16
+  l8 = copy l7  ; errors.jog:25:14
+  l9 = extract l8, 0  ; errors.jog:25:6
+  l2 = copy l9  ; errors.jog:25:6
+  l10 = extract l8, 1  ; errors.jog:25:9
+  l4 = copy l10  ; errors.jog:25:9
+  l11 = extract l4, 0  ; errors.jog:26:12
+  cond_br l11, b3 "if.then", b4 "if.join"  ; errors.jog:26:5
+b3 "if.then":
+  l12 = copy l4  ; errors.jog:27:9
+  l13 = extract l12, 0  ; errors.jog:27:9
+  cond_br l13, b5 "cleanup.err", b6 "cleanup.ok"  ; errors.jog:27:9
+b4 "if.join":
+  l14 = zero  ; errors.jog:29:12
+  l15 = copy l14  ; errors.jog:29:5
+  l16 = extract l15, 0  ; errors.jog:29:5
+  cond_br l16, b11 "cleanup.err", b12 "cleanup.ok"  ; errors.jog:29:5
+b5 "cleanup.err":
+  br b8 cleanup  ; errors.jog:27:9
+b6 "cleanup.ok":
+  br b10 cleanup  ; errors.jog:27:9
+b7 ret:
+  ret l12  ; errors.jog:27:9
+b8 cleanup:
+  call f0(i32 0)  ; errors.jog:24:14
+  br b9 cleanup  ; errors.jog:27:9
+b9 cleanup:
+  call f0(l2)  ; errors.jog:23:11
+  br b7 ret  ; errors.jog:27:9
+b10 cleanup:
+  call f0(l2)  ; errors.jog:23:11
+  br b7 ret  ; errors.jog:27:9
+b11 "cleanup.err":
+  br b14 cleanup  ; errors.jog:29:5
+b12 "cleanup.ok":
+  br b16 cleanup  ; errors.jog:29:5
+b13 ret:
+  ret l15  ; errors.jog:29:5
+b14 cleanup:
+  call f0(i32 0)  ; errors.jog:24:14
+  br b15 cleanup  ; errors.jog:29:5
+b15 cleanup:
+  call f0(l2)  ; errors.jog:23:11
+  br b13 ret  ; errors.jog:29:5
+b16 cleanup:
+  call f0(l2)  ; errors.jog:23:11
+  br b13 ret  ; errors.jog:29:5
+
+fn f5 public jog_errors__loop_defer "errors.loop_defer": () -> ()  ; errors.jog:32:1
+b0 entry:
+  br b1 "for.head"  ; errors.jog:33:5
+b1 "for.head":
+  br b3 cleanup  ; errors.jog:35:9
+b2 "for.exit":
+  ret  ; errors.jog:32:1
+b3 cleanup:
+  call f0(i32 1)  ; errors.jog:34:15
+  br b2 "for.exit"  ; errors.jog:35:9
+
+fn f6 public jog_errors__main "errors.main": () -> ()  ; errors.jog:39:1
+  l0: (i32, error?)
+  l1: (i32, error?)
+  l2 n: i32
+  l3: i32
+  l4 err: error?
+  l5: error?
+  l6: bool
+  l7 a: i32
+  l8: bool
+  l9 p: *i32?
+  l10: *i32?
+  l11: bool
+b0 entry:
+  l0 = call f1()  ; errors.jog:40:20
+  l1 = copy l0  ; errors.jog:40:5
+  l3 = extract l1, 0  ; errors.jog:40:5
+  l2 = copy l3  ; errors.jog:40:5
+  l5 = extract l1, 1  ; errors.jog:40:5
+  l4 = copy l5  ; errors.jog:40:5
+  l6 = extract l4, 0  ; errors.jog:41:12
+  cond_br l6, b1 "if.then", b2 "if.join"  ; errors.jog:41:5
+b1 "if.then":
+  ret  ; errors.jog:42:9
+b2 "if.join":
+  l7 = copy l2  ; errors.jog:45:5
+  l8 = eq l7, i32 0  ; errors.jog:46:10
+  cond_br l8, b3 "if.then", b4 "if.join"  ; errors.jog:46:5
+b3 "if.then":
+  br b6 cleanup  ; errors.jog:47:9
+b4 "if.join":
+  l10 = call f3()  ; errors.jog:49:13
+  l9 = copy l10  ; errors.jog:49:5
+  l11 = eq l9, *i32? null  ; errors.jog:50:10
+  cond_br l11, b7 "if.then", b8 "if.join"  ; errors.jog:50:5
+b5 ret:
+  ret  ; errors.jog:47:9
+b6 cleanup:
+  call f0(l2)  ; errors.jog:44:11
+  br b5 ret  ; errors.jog:47:9
+b7 "if.then":
+  panic const bytes "boom"  ; errors.jog:51:9
+  unreachable  ; errors.jog:51:9
+b8 "if.join":
+  br b10 cleanup  ; errors.jog:39:11
+b9 "cleanup.next":
+  ret  ; errors.jog:39:1
+b10 cleanup:
+  call f0(l2)  ; errors.jog:44:11
+  br b9 "cleanup.next"  ; errors.jog:39:11

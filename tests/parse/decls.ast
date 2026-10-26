@@ -1,0 +1,258 @@
+(FILE
+  (IMPORT std.io)
+  (IMPORT vendor.sdl3 as sdl)
+  (STRUCT Header private(file)
+    (ATTRIBUTE packed)
+    (FIELD magic
+      (TYPE_BYTES
+        (INT_LIT 4)
+      )
+    )
+    (FIELD len
+      (TYPE_NAME u32)
+      =
+        (INT_LIT 0)
+    )
+  )
+  (STRUCT Point
+    (FIELD x
+      (TYPE_NAME f32)
+    )
+    (FIELD y
+      (TYPE_NAME f32)
+    )
+  )
+  (STRUCT Player
+    (EMBED
+      (TYPE_NAME Entity)
+    )
+    (FIELD name
+      (TYPE_NAME str)
+    )
+    (FIELD hp
+      (TYPE_NAME i32)
+    )
+  )
+  (TYPE_DECL Celsius
+    :
+      (TYPE_NAME f64)
+  )
+  (TYPE_DECL Handle
+    =
+      (TYPE_BYTES
+        (INT_LIT 8)
+      )
+  )
+  (TYPE_DECL Pair
+    (TYPE_PARAM A)
+    (TYPE_PARAM B)
+    =
+      (TYPE_TUPLE
+        (TYPE_NAME A)
+        (TYPE_NAME B)
+      )
+  )
+  (INTERFACE Signed
+    (TYPE_SET
+      ~
+        (TYPE_NAME i8)
+      ~
+        (TYPE_NAME i16)
+      ~
+        (TYPE_NAME i32)
+    )
+  )
+  (INTERFACE Shape
+    (EMBED
+      (TYPE_NAME Named)
+    )
+    (FIELD pos var
+      (TYPE_NAME Point)
+    )
+    (FN area
+      ->
+        (TYPE_NAME f64)
+    )
+    (FN move
+      recv *
+      (PARAM dx
+        (TYPE_NAME f32)
+      )
+      (PARAM dy
+        (TYPE_NAME f32)
+      )
+    )
+  )
+  (ENUM Ordering
+    :
+      (TYPE_NAME i8)
+    (VARIANT Less
+      =
+        (UNARY -
+          (INT_LIT 1)
+        )
+    )
+    (VARIANT Equal
+      =
+        (INT_LIT 0)
+    )
+    (VARIANT Greater
+      =
+        (INT_LIT 1)
+    )
+  )
+  (ENUM ShapeKind
+    (VARIANT Circle
+      (PARAM r
+        (TYPE_NAME f64)
+      )
+    )
+    (VARIANT Empty)
+  )
+  (FN square
+    (PARAM x
+      (TYPE_NAME i32)
+    )
+    ->
+      (TYPE_NAME i32)
+    =
+      (BINARY *
+        (IDENT x)
+        (IDENT x)
+      )
+  )
+  (FN len
+    recv
+      (TYPE_NAME Point)
+    ->
+      (TYPE_NAME f32)
+    =
+      (MEMBER
+        (IDENT self)
+        x
+      )
+  )
+  (FN translate
+    recv *
+      (TYPE_NAME Point)
+    (PARAM dx
+      (TYPE_NAME f32)
+    )
+    (PARAM dy
+      (TYPE_NAME f32)
+    )
+    (BLOCK
+      (ASSIGN =
+        (MEMBER
+          (IDENT self)
+          x
+        )
+        (BINARY +
+          (MEMBER
+            (IDENT self)
+            x
+          )
+          (IDENT dx)
+        )
+      )
+    )
+  )
+  (FN get
+    recv
+      (TYPE_NAME List
+        (TYPE_NAME T)
+      )
+    (PARAM i
+      (TYPE_NAME usize)
+    )
+    ->
+      (TYPE_OPTION
+        (TYPE_NAME T)
+      )
+    =
+      (NULL)
+  )
+  (FN log
+    (PARAM msg
+      (TYPE_NAME str)
+    )
+    with
+      (PARAM l
+        (TYPE_NAME Logger)
+      )
+    =
+      (CALL
+        (MEMBER
+          (IDENT l)
+          write
+        )
+        (ARG
+          (IDENT msg)
+        )
+      )
+  )
+  (FN connect
+    (PARAM host
+      (TYPE_NAME str)
+    )
+    (PARAM port
+      (TYPE_NAME u16)
+      =
+        (INT_LIT 80)
+    )
+    ->
+      (TYPE_NAME i32)
+    =
+      (IDENT port)
+  )
+  (EXTERN_BLOCK
+    (ATTRIBUTE link
+      (ARG
+        (STRING_LIT "SDL3")
+      )
+    )
+    (FN SDL_Quit extern)
+    (FN SDL_Log extern variadic
+      (PARAM fmt
+        (TYPE_PTR const
+          (TYPE_NAME c.char)
+        )
+      )
+    )
+  )
+  (STRUCT SDL_Window
+    (ATTRIBUTE opaque)
+  )
+  (VAL limit
+    =
+      (INT_LIT 10)
+  )
+  (VAL
+    names q r
+    =
+      (CALL
+        (IDENT divmod)
+        (ARG
+          (INT_LIT 7)
+        )
+        (ARG
+          (INT_LIT 2)
+        )
+      )
+  )
+  (VAR count
+    (TYPE_NAME i32)
+    =
+      (INT_LIT 0)
+  )
+  (CONTEXT alloc
+    =
+      (IDENT defaultAllocator)
+  )
+  (FN hidden private
+    ->
+      (TYPE_UNIT)
+    =
+      (INT_LIT 0)
+  )
+)

@@ -1,0 +1,37 @@
+// expect: ok
+
+extern {
+    fn puts(s: *const c_char): c_int
+}
+
+type c_char = i8
+type c_int = i32
+
+struct Box<T> {
+    value: T
+}
+
+fn id<T>(x: T): T {
+    return x
+}
+
+fn take<T>(b: Box<T>): T {
+    return b.value
+}
+
+fn make<T>(x: T): Box<T> {
+    return Box<T>(value: x)
+}
+
+fn main() {
+    var a = Box<i32>(value: 4)
+    var b = Box<bool>(value: true)
+    var made = make(9)
+    var again = id(a)
+    var flag = id(b)
+    if a.value == 4 && b.value && take(a) == 4 && made.value == 9 && again.value == 4 && flag.value {
+        if puts(c"ok") < 0 {
+            return
+        }
+    }
+}

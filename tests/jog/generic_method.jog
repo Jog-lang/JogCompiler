@@ -1,0 +1,44 @@
+// expect: ok
+
+extern {
+    fn puts(s: *const c_char): c_int
+}
+
+type c_char = i8
+type c_int = i32
+
+struct Box<T> {
+    value: T
+}
+
+fn Box<T>.get(): T {
+    return self.value
+}
+
+fn *Box<T>.set(x: T): T {
+    self.value = x
+    return self.value
+}
+
+fn Box<T>.map<R>(x: R): R {
+    return x
+}
+
+fn take<T>(b: Box<T>): T {
+    return b.get()
+}
+
+fn main() {
+    var a = Box<i32>(value: 1)
+    var b = Box<bool>(value: true)
+    a.set(4)
+    val n = a.get()
+    val flag = b.get()
+    val m = a.map<i32>(n)
+    val got = take(a)
+    if n == 4 && flag && m == 4 && got == 4 {
+        if puts(c"ok") < 0 {
+            return
+        }
+    }
+}

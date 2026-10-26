@@ -1,0 +1,56 @@
+type T = i32
+
+struct Box {
+    n: i32
+}
+
+fn id<T>(x: T): T {
+    var y: T = x
+    return y
+}
+
+fn wrap<T>(x: T): T {
+    return id(x)
+}
+
+fn pick<T, U>(a: T, b: U): T {
+    return a
+}
+
+fn first<T>(xs: []T): T {
+    return xs[0]
+}
+
+fn echo<T>(x: T): T with (k: i64) {
+    var y: T = x
+    if k == 1 {
+        return y
+    }
+    return x
+}
+
+fn shadow<T>(x: T): T {
+    return x
+}
+
+fn main() {
+    val n = wrap(1)
+    val flag = id(true)
+    val wide = id<i64>(3)
+    val chosen = pick(1, true)
+    var s = []i32(4, 5)
+    val head = first(s)
+    var box = Box(n: 1)
+    val boxed = id(box)
+    val field = boxed.n
+    val hidden = shadow(true)
+    var a: i64 = 0
+    with (1) {
+        a = echo(8)
+    }
+    var p: *i32 = &box.n
+    val q = id(p)
+    if n == 1 && flag && wide == 3 && chosen == 1 && head == 4 && field == 1 && hidden && a == 8 && *q == 1 {
+        return
+    }
+}

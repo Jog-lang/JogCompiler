@@ -1,0 +1,13 @@
+fn bad(...i32: args, extra: i32) {
+}
+
+fn take(...i32: args) {
+}
+
+fn main() {
+    var flag: bool = true
+    take(flag)
+}
+
+// error: a pack must be the last parameter
+// error: type mismatch: expected i32, got bool

@@ -1,0 +1,30 @@
+// expect: ok
+// bool's layout alignment is 1. Pad is u8 then i32: strictest field is i32, alignment 4.
+// Pointer alignment follows the target and is not asserted here.
+
+extern {
+    fn puts(s: *const c_char): c_int
+}
+
+type c_char = i8
+type c_int = i32
+
+struct Pad {
+    tag: u8
+    n: i32
+}
+
+fn align_of<T>(): usize {
+    return align(T)
+}
+
+fn main() {
+    var scratch: [align(i32)]u8
+    scratch[0] = 0
+    if align(u8) == 1 && align(i32) == 4 && align(bool) == 1 && align(Pad) == 4 &&
+       align_of<u8>() == 1 && align_of<i32>() == 4 && scratch[0] == 0 {
+        if puts(c"ok") < 0 {
+            return
+        }
+    }
+}

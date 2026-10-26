@@ -1,0 +1,228 @@
+// Package std.map. Map<K, V> is an open-addressed table. One block holds
+// the slots. The first block has 8 slots, then the capacity doubles.
+// The allocator is a with (a: mem.Allocator) context on insert, grow, and
+// free. It is not a field.
+//
+// K: cmp.Comparable, so keys compare with ==. A hash is an argument, not
+// computed from K's bytes: a str is a pointer and a length, and hashing
+// those bytes would miss equal text that lives at two addresses. Builtin
+// str cannot grow a hash method that satisfies a constraint, because that
+// method would be an extension. fnv1a hashes str bytes with 32-bit
+// FNV-1a. The product is computed in u64 and masked, because integer
+// multiply panics on overflow and there is no wrapping multiply yet.
+// Pass the same hash every time for a given key. A test can pass one
+// constant for every key; those keys all land in one probe chain.
+//
+// Load is (count + tombs) / cap. Insert grows before that would pass 3/4.
+// Remove leaves a tombstone so a later probe does not stop early. Tombs
+// count toward the load. Growth rehashes live slots and drops tombs.
+// Capacity stays a power of two, so the bucket is hash & (cap - 1).
+//
+// A key is stored by value. A str key is a view: the caller keeps the
+// bytes alive. free releases the slot block and does not walk the keys.
+//
+// Iteration is slot order. live(i) is true for a stored entry. key_at and
+// value_at read that entry. The same inserts, overwrites, and removes
+// produce the same occupied slots.
+
+import std.cmp
+import std.mem
+
+// Zeroed memory is an empty slot. alloc returns zeroed bytes.
+private val slot_empty: u8 = 0
+private val slot_live: u8 = 1
+private val slot_tomb: u8 = 2
+
+private struct Slot<K, V> {
+    key: K
+    value: V
+    hash: u32
+    state: u8
+}
+
+// ptr is null until the first insert. cap is the slot count, always 0 or
+// a power of two. count is live keys. tombs is deleted slots still in
+// the probe chains.
+struct Map<K: cmp.Comparable, V> {
+    ptr: *Slot<K, V>?
+    cap: usize
+    count: usize
+    tombs: usize
+}
+
+// 32-bit FNV-1a. h stays below 2^32, and the prime fits in 25 bits, so
+// the product fits in u64.
+fn fnv1a(key: str): u32 {
+    var h: u64 = 0x811c9dc5
+    for i in 0 as usize..key.len {
+        val b = key.ptr[i] as u64
+        h = (h ^ b) * 0x01000193
+        h = h & 0xFFFFFFFF
+    }
+    return h as u32
+}
+
+fn empty<K: cmp.Comparable, V>(): Map<K, V> {
+    return Map<K, V>()
+}
+
+// The index of a live match, or of the slot an insert should use.
+// found is false when the index is empty or a tombstone. cap 0 means
+// there is no table yet.
+private fn *Map<K, V>.find(key: K, hash: u32): (usize, bool) {
+    if self.cap == 0 {
+        return 0, false
+    }
+    val mask = self.cap - 1
+    var i = (hash as usize) & mask
+    var tomb = self.cap
+    val slots = self.ptr!!
+    var n: usize = 0
+    for n < self.cap {
+        val s = slots[i]
+        if s.state == slot_empty {
+            if tomb < self.cap {
+                return tomb, false
+            }
+            return i, false
+        }
+        if s.state == slot_tomb {
+            if tomb == self.cap {
+                tomb = i
+            }
+        } else if s.hash == hash && s.key == key {
+            return i, true
+        }
+        i = (i + 1) & mask
+        n = n + 1
+    }
+    if tomb < self.cap {
+        return tomb, false
+    }
+    panic("map is full")
+}
+
+private fn *Map<K, V>.grow() with (a: mem.Allocator) {
+    var new_cap: usize = 8
+    if self.cap != 0 {
+        new_cap = self.cap * 2
+    }
+    val (raw, err) = a.alloc(size(Slot<K, V>) * new_cap, align(Slot<K, V>))
+    if err != null {
+        panic("out of memory")
+    }
+    val fresh = raw.ptr as *Slot<K, V>
+    val old_ptr = self.ptr
+    val old_cap = self.cap
+    self.ptr = fresh as *Slot<K, V>?
+    self.cap = new_cap
+    self.count = 0
+    self.tombs = 0
+    if old_cap > 0 {
+        val old = old_ptr!!
+        for n in 0 as usize..old_cap {
+            val s = old[n]
+            if s.state == slot_live {
+                val (idx, _) = self.find(s.key, s.hash)
+                fresh[idx] = s
+                self.count = self.count + 1
+            }
+        }
+        var block = bytes()
+        block.ptr = old as *u8
+        block.len = size(Slot<K, V>) * old_cap
+        a.free(block)
+    }
+}
+
+// An existing key keeps its slot, its hash, and its stored key. The
+// value is replaced and count stays put.
+fn *Map<K, V>.insert(key: K, hash: u32, value: V) with (a: mem.Allocator) {
+    if (self.count + self.tombs + 1) * 4 > self.cap * 3 {
+        self.grow()
+    }
+    val (i, found) = self.find(key, hash)
+    val slots = self.ptr!!
+    if found {
+        val old = slots[i]
+        slots[i] = Slot<K, V>(key: old.key, value: value, hash: old.hash, state: slot_live)
+        return
+    }
+    val prev = slots[i]
+    if prev.state == slot_tomb {
+        self.tombs = self.tombs - 1
+    }
+    self.count = self.count + 1
+    slots[i] = Slot<K, V>(key: key, value: value, hash: hash, state: slot_live)
+}
+
+// Writes the value only when the key is present. A missing key leaves
+// out alone and returns false. V has no zero value inside the generic,
+// so the value comes back through the caller's slot.
+fn *Map<K, V>.get(key: K, hash: u32, out: *V): bool {
+    val (i, found) = self.find(key, hash)
+    if !found {
+        return false
+    }
+    val slots = self.ptr!!
+    val s = slots[i]
+    out[0] = s.value
+    return true
+}
+
+// Turns a live slot into a tombstone. Returns false when the key is
+// absent. Does not shrink the block.
+fn *Map<K, V>.remove(key: K, hash: u32): bool {
+    val (i, found) = self.find(key, hash)
+    if !found {
+        return false
+    }
+    val slots = self.ptr!!
+    val s = slots[i]
+    slots[i] = Slot<K, V>(key: s.key, value: s.value, hash: s.hash, state: slot_tomb)
+    self.count = self.count - 1
+    self.tombs = self.tombs + 1
+    return true
+}
+
+fn *Map<K, V>.free() with (a: mem.Allocator) {
+    if self.cap == 0 {
+        return
+    }
+    var block = bytes()
+    block.ptr = self.ptr!! as *u8
+    block.len = size(Slot<K, V>) * self.cap
+    a.free(block)
+    self.ptr = null
+    self.cap = 0
+    self.count = 0
+    self.tombs = 0
+}
+
+// i >= cap, an empty slot, and a tombstone are not live entries.
+fn *Map<K, V>.live(i: usize): bool {
+    if i >= self.cap {
+        return false
+    }
+    val slots = self.ptr!!
+    val s = slots[i]
+    return s.state == slot_live
+}
+
+fn *Map<K, V>.key_at(i: usize): K {
+    if i >= self.cap || !self.live(i) {
+        panic("index out of range")
+    }
+    val slots = self.ptr!!
+    val s = slots[i]
+    return s.key
+}
+
+fn *Map<K, V>.value_at(i: usize): V {
+    if i >= self.cap || !self.live(i) {
+        panic("index out of range")
+    }
+    val slots = self.ptr!!
+    val s = slots[i]
+    return s.value
+}

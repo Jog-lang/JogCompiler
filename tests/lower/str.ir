@@ -1,0 +1,100 @@
+main f0
+init none
+
+fn f0 public jog_app__main "app.main": () -> ()  ; str.jog:3:1
+  l0 text: const bytes
+  l1 same: bool
+  l2: const bytes
+  l3: bool
+  l4: usize
+  l5: usize
+  l6: *const u8
+  l7: usize
+  l8: *const u8
+  l9: bool
+  l10: bool
+  l11: *const u8
+  l12: *const u8
+  l13: u8
+  l14: u8
+  l15: bool
+  l16: usize
+  l17 diff: bool
+  l18: const bytes
+  l19: bool
+  l20: usize
+  l21: usize
+  l22: *const u8
+  l23: usize
+  l24: *const u8
+  l25: bool
+  l26: bool
+  l27: *const u8
+  l28: *const u8
+  l29: u8
+  l30: u8
+  l31: bool
+  l32: usize
+b0 entry:
+  l0 = copy const bytes "ab"  ; str.jog:4:5
+  l2 = copy const bytes "ab"  ; str.jog:5:21
+  l6 = extract l0, 0  ; str.jog:5:21
+  l5 = extract l0, 1  ; str.jog:5:21
+  l8 = extract l2, 0  ; str.jog:5:21
+  l7 = extract l2, 1  ; str.jog:5:21
+  l4 = copy usize 0  ; str.jog:5:21
+  l9 = eq l5, l7  ; str.jog:5:21
+  cond_br l9, b1 "eq.loop", b5 "eq.no"  ; str.jog:5:21
+b1 "eq.loop":
+  l10 = eq l4, l5  ; str.jog:5:21
+  cond_br l10, b4 "eq.yes", b2 "eq.cmp"  ; str.jog:5:21
+b2 "eq.cmp":
+  l11 = elem_addr l6, l4  ; str.jog:5:21
+  l12 = elem_addr l8, l4  ; str.jog:5:21
+  l13 = load l11  ; str.jog:5:21
+  l14 = load l12  ; str.jog:5:21
+  l15 = eq l13, l14  ; str.jog:5:21
+  cond_br l15, b3 "eq.step", b5 "eq.no"  ; str.jog:5:21
+b3 "eq.step":
+  l16 = checked add l4, usize 1  ; str.jog:5:21
+  l4 = copy l16  ; str.jog:5:21
+  br b1 "eq.loop"  ; str.jog:5:21
+b4 "eq.yes":
+  l3 = copy bool true  ; str.jog:5:21
+  br b6 "eq.join"  ; str.jog:5:21
+b5 "eq.no":
+  l3 = copy bool false  ; str.jog:5:21
+  br b6 "eq.join"  ; str.jog:5:21
+b6 "eq.join":
+  l1 = copy l3  ; str.jog:5:5
+  l18 = copy const bytes ""  ; str.jog:6:21
+  l22 = extract l0, 0  ; str.jog:6:21
+  l21 = extract l0, 1  ; str.jog:6:21
+  l24 = extract l18, 0  ; str.jog:6:21
+  l23 = extract l18, 1  ; str.jog:6:21
+  l20 = copy usize 0  ; str.jog:6:21
+  l25 = eq l21, l23  ; str.jog:6:21
+  cond_br l25, b7 "eq.loop", b11 "eq.no"  ; str.jog:6:21
+b7 "eq.loop":
+  l26 = eq l20, l21  ; str.jog:6:21
+  cond_br l26, b10 "eq.yes", b8 "eq.cmp"  ; str.jog:6:21
+b8 "eq.cmp":
+  l27 = elem_addr l22, l20  ; str.jog:6:21
+  l28 = elem_addr l24, l20  ; str.jog:6:21
+  l29 = load l27  ; str.jog:6:21
+  l30 = load l28  ; str.jog:6:21
+  l31 = eq l29, l30  ; str.jog:6:21
+  cond_br l31, b9 "eq.step", b11 "eq.no"  ; str.jog:6:21
+b9 "eq.step":
+  l32 = checked add l20, usize 1  ; str.jog:6:21
+  l20 = copy l32  ; str.jog:6:21
+  br b7 "eq.loop"  ; str.jog:6:21
+b10 "eq.yes":
+  l19 = copy bool false  ; str.jog:6:21
+  br b12 "eq.join"  ; str.jog:6:21
+b11 "eq.no":
+  l19 = copy bool true  ; str.jog:6:21
+  br b12 "eq.join"  ; str.jog:6:21
+b12 "eq.join":
+  l17 = copy l19  ; str.jog:6:5
+  ret  ; str.jog:3:1

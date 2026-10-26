@@ -1,0 +1,17 @@
+// module: app
+
+fn id<T>(x: T): T {
+    return x
+}
+
+fn wrap<T>(x: T): T {
+    return id(x)
+}
+
+fn main() {
+    val n = wrap(1)
+    val flag = id(true)
+    if n == 1 && flag {
+        return
+    }
+}

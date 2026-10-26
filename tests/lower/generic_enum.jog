@@ -1,0 +1,14 @@
+// module: generic_enum
+
+enum Result<T> {
+    Ok(value: T)
+    Err(code: i32)
+}
+
+fn make(x: i32): Result<i32> {
+    return Result<i32>.Ok(value: x)
+}
+
+fn main() {
+    var a = make(4)
+}

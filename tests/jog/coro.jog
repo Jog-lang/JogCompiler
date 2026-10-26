@@ -1,0 +1,24 @@
+// expect: 42
+
+import std.mem
+
+extern {
+    fn printf(fmt: *const c_char, ...): c_int
+}
+
+type c_char = i8
+type c_int = i32
+
+fn main() {
+    scope {
+        val ch = Chan<i32>.init(0) with (mem.heap())
+        go with (mem.heap()) { ch.send(42) }
+        val (v, err) = ch.recv()
+        if err != null {
+            return
+        }
+        if printf(c"%d\n", v) < 0 {
+            return
+        }
+    }
+}

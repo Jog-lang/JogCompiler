@@ -1,0 +1,15 @@
+// expect: still
+
+import std.testing
+
+extern {
+    fn puts(s: *const i8): i32
+}
+
+@test
+fn checks() with (t: testing.Testing) {
+    t.expect(false)
+    t.expectEq("a", "b")
+    t.fail("nope")
+    puts(c"still")
+}

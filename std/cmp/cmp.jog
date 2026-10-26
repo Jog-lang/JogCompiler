@@ -1,0 +1,51 @@
+// Package std.cmp. Ordering is the result of op<=>. Ordered and Comparable
+// are method constraints. Signed, Unsigned, Integer, Float, and Number are
+// type sets. A type set is only a constraint, never a value. ~T matches T
+// and every distinct type built on it.
+
+// Result of op<=>. Less (-1) means the receiver is before the other value,
+// Equal (0) means the same position, and Greater (1) means the receiver is
+// after it. <, <=, >, and >= are derived from this result. == is not.
+enum Ordering: i8 {
+    Less = -1
+    Equal = 0
+    Greater = 1
+}
+
+// Requires op<=> returning Ordering. That method is what <, <=, >, and >=
+// call. Defining it does not provide ==.
+interface Ordered {
+    fn op<=>(o: Ordered): Ordering
+}
+
+// Requires op== returning bool. != is derived from ==. op<=> does not
+// satisfy this interface.
+interface Comparable {
+    fn op==(o: Comparable): bool
+}
+
+// Constraint for i8, i16, i32, i64, isize, and distinct types built on them.
+interface Signed {
+    ~i8 | ~i16 | ~i32 | ~i64 | ~isize
+}
+
+// Constraint for u8, u16, u32, u64, usize, and distinct types built on them.
+interface Unsigned {
+    ~u8 | ~u16 | ~u32 | ~u64 | ~usize
+}
+
+// Constraint for Signed or Unsigned.
+interface Integer {
+    Signed | Unsigned
+}
+
+// Constraint for f32, f64, and distinct types built on them.
+interface Float {
+    ~f32 | ~f64
+}
+
+// Constraint for Integer or Float. A generic body may use only the
+// operations every member of the set has in common.
+interface Number {
+    Integer | Float
+}

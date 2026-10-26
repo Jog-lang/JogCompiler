@@ -1,0 +1,8 @@
+fn main() {
+    var x: i32 = 1
+    val n = align(x)
+    val v = align(void)
+}
+
+// error: align expects a type
+// error: type 'void' has no alignment

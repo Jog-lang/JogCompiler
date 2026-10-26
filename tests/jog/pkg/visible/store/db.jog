@@ -1,0 +1,19 @@
+fn open(): i64 {
+    return 1
+}
+
+private fn hidden(): i64 {
+    return 2
+}
+
+private(file) fn secret(): i64 {
+    return 3
+}
+
+fn use_hidden(): i64 {
+    return hidden()
+}
+
+fn use_secret(): i64 {
+    return secret()
+}

@@ -1,0 +1,16 @@
+// Sets JOG_OS_PROBE_251025 with setenv, then reads it back. setenv copies
+// the name and the value.
+
+import std.c
+import std.testing
+
+@test
+fn presentEnv() with (t: testing.Testing) {
+    t.expect(c.setenv(c"JOG_OS_PROBE_251025", c"jog-os-value", 1) == 0)
+    val (got, ok) = env("JOG_OS_PROBE_251025")
+    t.expect(ok)
+    t.expectEq(got, "jog-os-value")
+    val (again, ok2) = env("JOG_OS_PROBE_251025")
+    t.expect(ok2)
+    t.expectEq(again, "jog-os-value")
+}

@@ -1,0 +1,30 @@
+// expect: ok
+
+import std.mem
+
+extern {
+    fn puts(s: *const c_char): c_int
+}
+
+type c_char = i8
+type c_int = i32
+
+fn main() {
+    scope {
+        val ch = Chan<i32>.init(4) with (mem.heap())
+        go with (mem.heap()) {
+            ch.send(1)
+            ch.send(2)
+            ch.close()
+        }
+        var sum: i32 = 0
+        for v in ch {
+            sum = sum + v
+        }
+        if sum == 3 {
+            if puts(c"ok") < 0 {
+                return
+            }
+        }
+    }
+}

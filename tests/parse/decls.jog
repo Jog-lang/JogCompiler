@@ -1,0 +1,74 @@
+import std.io
+import vendor.sdl3 as sdl
+
+@packed
+private(file) struct Header {
+    magic: bytes[4]
+    len: u32 = 0
+}
+
+struct Point {
+    x: f32
+    y: f32
+}
+
+struct Player {
+    Entity
+    name: str
+    hp: i32
+}
+
+type Celsius: f64
+type Handle = bytes[8]
+type Pair<A, B> = (A, B)
+
+interface Signed {
+    ~i8 | ~i16 | ~i32
+}
+
+interface Shape {
+    Named
+    var pos: Point
+    fn area(): f64
+    fn *move(dx: f32, dy: f32)
+}
+
+enum Ordering: i8 {
+    Less = -1
+    Equal = 0
+    Greater = 1
+}
+
+enum ShapeKind {
+    Circle(r: f64)
+    Empty
+}
+
+fn square(x: i32): i32 = x * x
+
+fn Point.len(): f32 = self.x
+
+fn *Point.translate(dx: f32, dy: f32) {
+    self.x = self.x + dx
+}
+
+fn List<T>.get(i: usize): T? = null
+
+fn log(msg: str) with (l: Logger) = l.write(msg)
+
+fn connect(host: str, port: u16 = 80): i32 = port
+
+@link("SDL3")
+extern {
+    fn SDL_Quit()
+    fn SDL_Log(fmt: *const c.char, ...)
+}
+
+@opaque struct SDL_Window
+
+val limit = 10
+val (q, r) = divmod(7, 2)
+var count: i32 = 0
+context alloc = defaultAllocator
+
+private fn hidden(): () = 0

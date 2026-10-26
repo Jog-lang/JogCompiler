@@ -1,0 +1,9 @@
+import store
+
+fn main() {
+    var x: store.Secret = 1
+    val n = store.hidden()
+    val m = store.secret()
+    if x + n + m == 0 {
+    }
+}

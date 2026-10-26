@@ -1,0 +1,11 @@
+// expect: app util
+// expect: lib util
+import std.io
+import lib
+import util
+
+@test
+fn names() {
+    io.println(util.name())
+    io.println(lib.greet())
+}

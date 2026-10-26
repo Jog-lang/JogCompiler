@@ -1,0 +1,48 @@
+// module: app
+
+fn add(a: i32, b: i32): i32 {
+    return a + b
+}
+
+fn abs(x: i32): i32 {
+    if x < 0 {
+        return -x
+    }
+    return x
+}
+
+fn square(x: i32): i32 = x * x
+
+fn sh(x: u8): u8 {
+    return x << 3
+}
+
+fn mask(x: u8): u8 {
+    return x & 15
+}
+
+fn inv(x: i32): i32 {
+    return ~x
+}
+
+fn widen(x: i32): i64 {
+    return x as i64
+}
+
+fn pick(c: bool): i32 {
+    return if c { 1 } else { 2 }
+}
+
+fn main() {
+    val n = square(add(1, 2))
+    val w = widen(n)
+    val bits = sh(1)
+    val m = mask(bits)
+    val flipped = inv(n)
+    val chosen = pick(n > 0)
+    if chosen < 0 {
+        val z = abs(flipped)
+    } else {
+        val z = m as i32
+    }
+}

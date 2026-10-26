@@ -1,0 +1,74 @@
+struct Point {
+    x: i32
+    y: i32
+}
+
+struct Config {
+    name: str
+    retries: i32 = 3
+}
+
+struct Entity {
+    id: i32
+}
+
+struct Player {
+    Entity
+    hp: i32
+}
+
+struct Box {
+    private(scope) hidden: i32
+    n: i32
+}
+
+struct Link {
+    next: *Hold
+}
+
+struct Hold {
+    prev: *Link
+}
+
+fn Point.sum(): i32 {
+    return self.x + self.y
+}
+
+fn *Point.set_x(v: i32) {
+    self.x = v
+}
+
+fn Entity.ident(): i32 {
+    return self.id
+}
+
+fn i32.clamp(lo: i32, hi: i32): i32 {
+    if self < lo {
+        return lo
+    }
+    if self > hi {
+        return hi
+    }
+    return self
+}
+
+fn Box.peek(): i32 {
+    return self.hidden
+}
+
+fn main() {
+    var p = Point(x: 1, y: 2)
+    p.x = 3
+    val s = p.sum()
+    p.set_x(s)
+    val z = Point()
+    val c = Config(name: "srv")
+    var pl = Player(Entity: Entity(id: 1), hp: 2)
+    val id = pl.id
+    val who = pl.ident()
+    val n = s.clamp(0, 10)
+    var b = Box(n: 1)
+    val h = b.peek()
+    val explicit = Point.sum(p)
+    val same = z.x + c.retries + id + who + n + h + explicit
+}

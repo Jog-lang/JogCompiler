@@ -1,0 +1,5 @@
+import badembed
+
+fn main() {
+    val n = badembed.size()
+}

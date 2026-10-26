@@ -1,0 +1,45 @@
+main f0
+init none
+
+fn f0 public jog_app__main "app.main": () -> ()  ; generic_struct.jog:11:1
+  l0 a: Box<i32> addr
+  l1: Box<i32>
+  l2 b: Box<i32> addr
+  l3: *Box<i32>
+  l4: *i32
+  l5: i32
+  l6: Box<i32>
+  l7: *Box<i32>
+  l8: *i32
+  l9: i32
+  l10: *Box<i32>
+  l11: *i32
+  l12: i32
+  l13: bool
+b0 entry:
+  l1 = aggregate (i32 4)  ; generic_struct.jog:12:13
+  l0 = copy l1  ; generic_struct.jog:12:5
+  l3 = addr l0  ; generic_struct.jog:13:19
+  l4 = field_addr l3, 0  ; generic_struct.jog:13:19
+  l5 = load l4  ; generic_struct.jog:13:19
+  l6 = call f1(l5)  ; generic_struct.jog:13:13
+  l2 = copy l6  ; generic_struct.jog:13:5
+  l7 = addr l0  ; generic_struct.jog:14:9
+  l8 = field_addr l7, 0  ; generic_struct.jog:14:9
+  l9 = load l8  ; generic_struct.jog:14:9
+  l10 = addr l2  ; generic_struct.jog:14:20
+  l11 = field_addr l10, 0  ; generic_struct.jog:14:20
+  l12 = load l11  ; generic_struct.jog:14:20
+  l13 = eq l9, l12  ; generic_struct.jog:14:16
+  cond_br l13, b1 "if.then", b2 "if.join"  ; generic_struct.jog:14:5
+b1 "if.then":
+  ret  ; generic_struct.jog:15:9
+b2 "if.join":
+  ret  ; generic_struct.jog:11:1
+
+fn f1 public jog_app__make__i32 "app.make<i32>": (i32) -> Box<i32>  ; generic_struct.jog:7:1
+  l0 x: i32 param
+  l1: Box<i32>
+b0 entry:
+  l1 = aggregate (l0)  ; generic_struct.jog:8:12
+  ret l1  ; generic_struct.jog:8:5

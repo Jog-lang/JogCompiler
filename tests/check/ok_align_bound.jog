@@ -1,0 +1,7 @@
+fn align(n: i32): i32 {
+    return n
+}
+
+fn main() {
+    val x = align(1)
+}

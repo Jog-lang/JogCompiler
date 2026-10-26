@@ -1,0 +1,50 @@
+// expect: ok
+
+extern {
+    fn puts(s: *const c_char): c_int
+}
+
+type c_char = i8
+type c_int = i32
+
+struct Box {
+    n: i64
+}
+
+fn id<T>(x: T): T {
+    var y: T = x
+    return y
+}
+
+fn wrap<T>(x: T): T {
+    return id(x)
+}
+
+fn first<T>(xs: []T): T {
+    return xs[0]
+}
+
+fn echo<T>(x: T): T with (k: i64) {
+    if k == 1 {
+        return x
+    }
+    return x
+}
+
+fn main() {
+    var n = wrap(1)
+    var flag = id(true)
+    var s = []i64(7)
+    var head = first(s)
+    var box = Box(n: 3)
+    var boxed = id(box)
+    var heard: i64 = 0
+    with (1) {
+        heard = echo(4)
+    }
+    if n == 1 && flag && head == 7 && boxed.n == 3 && heard == 4 {
+        if puts(c"ok") < 0 {
+            return
+        }
+    }
+}
