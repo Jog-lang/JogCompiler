@@ -1263,6 +1263,7 @@ int main(void) {
     expect_diag(arena, diag, jog, root, "hidden", "undefined name 'secret'");
     expect_diag(arena, diag, jog, root, "filepriv", "undefined name 'secret'");
     expect_stdout(arena, diag, jog, root, "filelocal", "run", "ok\n");
+    expect_stdout(arena, diag, jog, root, "platform", "run", "ok\n");
     expect_stdout(arena, diag, jog, root, "testrun", "run", "run\n");
     expect_stdout(arena, diag, jog, root, "testrun", "test", "ok\n");
     expect_stdout(arena, diag, jog, root, "methoduse", "run", "ok\n");

@@ -1,0 +1,2 @@
+expect fn list(): i32
+// error: expect fn 'list' has 2 actuals for target 'linux' (list.linux.jog, list.posix.jog)

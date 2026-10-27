@@ -1,0 +1,3 @@
+expect fn list(): i32
+// error: expect fn 'list' has no actual for target 'linux'
+// error: expect fn 'list' has no actual for target 'macos'

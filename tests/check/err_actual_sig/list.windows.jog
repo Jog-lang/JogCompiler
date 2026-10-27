@@ -1,0 +1,2 @@
+actual fn list(path: str, data: str): i32 = 1
+// error: actual fn 'list' does not match its expect: parameter 2 is 'str', expected 'const bytes'

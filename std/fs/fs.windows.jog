@@ -54,7 +54,7 @@ private fn wide_path(path: str, dest: *u16, cap: usize): bool {
 
 // false means the directory could not be opened. The list is empty then.
 // Each kept name is its own block. free_names releases them.
-fn list(path: str): (lists.List<str>, bool) with (a: mem.Allocator) {
+actual fn list(path: str): (lists.List<str>, bool) with (a: mem.Allocator) {
     var names: lists.List<str>
     var pattern: [4096]u16
     if !fill_pattern(pattern[..].ptr, 4096, path) {
@@ -83,7 +83,7 @@ fn list(path: str): (lists.List<str>, bool) with (a: mem.Allocator) {
 }
 
 // flags 0: an existing target is left untouched and this returns false.
-fn rename(from: str, to: str): bool {
+actual fn rename(from: str, to: str): bool {
     var wide_from: [4096]u16
     var wide_to: [4096]u16
     if !wide_path(from, wide_from[..].ptr, 4096) || !wide_path(to, wide_to[..].ptr, 4096) {
@@ -93,7 +93,7 @@ fn rename(from: str, to: str): bool {
 }
 
 // false means the path is missing, not UTF-8, or does not fit.
-fn exists(path: str): bool {
+actual fn exists(path: str): bool {
     var wide: [4096]u16
     if !wide_path(path, wide[..].ptr, 4096) {
         return false
@@ -102,7 +102,7 @@ fn exists(path: str): bool {
 }
 
 // The current directory, as an owned UTF-8 str. false leaves it empty.
-fn cwd(): (str, bool) with (a: mem.Allocator) {
+actual fn cwd(): (str, bool) with (a: mem.Allocator) {
     var wide: [4096]u16
     val n = c.GetCurrentDirectoryW(4096, wide[..].ptr)
     if n == 0 || n >= 4096 {

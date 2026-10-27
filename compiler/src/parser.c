@@ -30,12 +30,16 @@
    '@opaque struct Name' matches the C interop examples. '?' after a pointer
    wraps the pointer ('*T?' is '(*T)?') because the pointee is a non-null
    type; a slice or array element uses a full type, so '[]T?' is a slice
-   of 'T?'. */
+   of 'T?'. `expect` and `actual` are identifiers except immediately
+   before `fn` at the top level, where they mark an expect or actual
+   function. */
 
 typedef enum FnMode {
     FN_REGULAR = 0,
     FN_EXTERN,
-    FN_INTERFACE
+    FN_INTERFACE,
+    FN_EXPECT,
+    FN_ACTUAL
 } FnMode;
 
 typedef struct Parser {
@@ -2832,6 +2836,8 @@ static JogNode *parse_fn(Parser *p, JogList attrs, JogVisibility vis, FnMode mod
     node->attrs = attrs;
     node->visibility = vis;
     node->as.fn.is_extern = mode == FN_EXTERN;
+    node->as.fn.is_expect = mode == FN_EXPECT;
+    node->as.fn.is_actual = mode == FN_ACTUAL;
     node->as.fn.op = JOG_TOK_EOF;
 
     if (mode == FN_INTERFACE) {
@@ -2879,7 +2885,7 @@ static JogNode *parse_fn(Parser *p, JogList attrs, JogVisibility vis, FnMode mod
         expect(p, JOG_TOK_LPAREN, "'('");
     }
     if (!give_up(p)) {
-        bool defaults = mode == FN_REGULAR || mode == FN_INTERFACE;
+        bool defaults = mode == FN_REGULAR || mode == FN_INTERFACE || mode == FN_EXPECT || mode == FN_ACTUAL;
         const char *pack_reject = NULL;
         if (mode == FN_EXTERN) {
             pack_reject = "an extern function cannot have a pack parameter";
@@ -2902,7 +2908,7 @@ static JogNode *parse_fn(Parser *p, JogList attrs, JogVisibility vis, FnMode mod
     if (give_up(p)) {
         return node;
     }
-    if (mode == FN_REGULAR) {
+    if (mode == FN_REGULAR || mode == FN_ACTUAL) {
         if (eat(p, JOG_TOK_ASSIGN)) {
             node->as.fn.expr_body = true;
             node->as.fn.body = parse_expr(p);
@@ -2912,7 +2918,11 @@ static JogNode *parse_fn(Parser *p, JogList attrs, JogVisibility vis, FnMode mod
             error_here(p, "expected a function body");
         }
     } else if (check(p, JOG_TOK_ASSIGN) || check(p, JOG_TOK_LBRACE)) {
-        error_here(p, "this function cannot have a body");
+        if (mode == FN_EXPECT) {
+            error_here(p, "an expect function cannot have a body");
+        } else {
+            error_here(p, "this function cannot have a body");
+        }
     }
     return node;
 }
@@ -3230,9 +3240,35 @@ static JogNode *parse_extern_block(Parser *p, JogList attrs, JogVisibility vis) 
     return node;
 }
 
+static bool ident_word(const Parser *p, const char *word) {
+    const JogToken *t;
+    if (!check(p, JOG_TOK_IDENT) || !word) {
+        return false;
+    }
+    t = cur(p);
+    return t && t->value && strcmp(t->value, word) == 0;
+}
+
 static JogNode *parse_top(Parser *p) {
     JogList attrs = parse_attributes(p);
+    bool saw_private = check(p, JOG_TOK_KW_PRIVATE);
     JogVisibility vis = parse_visibility(p);
+    /* expect and actual are identifiers except immediately before fn. */
+    if ((ident_word(p, "expect") || ident_word(p, "actual")) && peek_n(p, 1) == JOG_TOK_KW_FN) {
+        int actual = ident_word(p, "actual");
+        JogPos kw = here(p);
+        JogNode *node;
+        if (actual && saw_private) {
+            complain(p, "an actual function cannot have a visibility modifier");
+            vis = JOG_VIS_PUBLIC;
+        }
+        advance(p);
+        node = parse_fn(p, attrs, vis, actual ? FN_ACTUAL : FN_EXPECT);
+        if (node) {
+            node->pos = kw;
+        }
+        return node;
+    }
     switch (peek_kind(p)) {
     case JOG_TOK_KW_IMPORT:
         return parse_import(p, attrs, vis);

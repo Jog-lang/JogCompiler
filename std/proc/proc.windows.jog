@@ -337,14 +337,14 @@ private fn start(args: []str, capture: bool): Output with (a: mem.Allocator) {
 
 // args[0] is the program. The call waits. ok is false when the program
 // cannot be started or the captures cannot be read.
-fn run(args: []str): Output with (a: mem.Allocator) {
+actual fn run(args: []str): Output with (a: mem.Allocator) {
     return start(args, true)
 }
 
 // Same start and wait as run. The child keeps the parent's stdout and
 // stderr, so its writes show up as it makes them. The result has no
 // captured bytes.
-fn run_inherit(args: []str): (i32, bool) with (a: mem.Allocator) {
+actual fn run_inherit(args: []str): (i32, bool) with (a: mem.Allocator) {
     val out = start(args, false)
     return out.code, out.ok
 }

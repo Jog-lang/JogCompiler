@@ -1,0 +1,18 @@
+struct Probe {
+    n: i32
+}
+
+fn Probe.expect(value: bool): bool {
+    return value
+}
+
+fn expect(value: bool): bool {
+    return value
+}
+
+fn main() {
+    var t = Probe()
+    if t.expect(true) && expect(true) {
+        return
+    }
+}

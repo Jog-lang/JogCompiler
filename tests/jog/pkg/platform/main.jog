@@ -1,0 +1,11 @@
+extern {
+    fn puts(s: *const i8): i32
+}
+
+expect fn marker(): i32
+
+fn main() {
+    if marker() == 7 {
+        puts(c"ok")
+    }
+}

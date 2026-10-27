@@ -1,3 +1,7 @@
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "const_eval.h"
 #include "lexer.h"
 #include "phases.h"
@@ -12,7 +16,12 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 
 static int g_failures = 0;
 
@@ -2283,10 +2292,29 @@ static void check_one_file(const char *path) {
         return;
     }
     root = jog_parse(f.arena, f.diag, f.intern, &src, &tokens);
-    if (!root || ct_diag_error_count(f.diag) != 0) {
+    nexpect = collect_expected(f.arena, src.data, expected, 32);
+    CHECK(nexpect <= 32);
+    if (!root || (ct_diag_error_count(f.diag) != 0 && nexpect == 0)) {
         fprintf(stderr, "parse errors in %s\n", path);
         ct_diag_print(f.diag, stderr);
         CHECK(0);
+        ct_da_free(&tokens);
+        fix_end(&f);
+        return;
+    }
+    if (ct_diag_error_count(f.diag) != 0) {
+        diag_text(f.diag, text, sizeof(text));
+        if (ct_diag_error_count(f.diag) != nexpect) {
+            fprintf(stderr, "error count %zu, expected %zu, in %s\n%s\n", ct_diag_error_count(f.diag), nexpect, path,
+                    text);
+            CHECK(0);
+        }
+        for (i = 0; i < nexpect && i < 32; i++) {
+            if (!strstr(text, expected[i])) {
+                fprintf(stderr, "missing '%s' in %s\n%s\n", expected[i], path, text);
+                CHECK(0);
+            }
+        }
         ct_da_free(&tokens);
         fix_end(&f);
         return;
@@ -2295,8 +2323,6 @@ static void check_one_file(const char *path) {
     files[0] = &file;
     prep_pkg(&pkg, "app", files, 1);
     pkgs[0] = &pkg;
-    nexpect = collect_expected(f.arena, src.data, expected, 32);
-    CHECK(nexpect <= 32);
     ok = run_pkgs(&f, pkgs, 1);
     diag_text(f.diag, text, sizeof(text));
     if (nexpect == 0) {
@@ -2321,6 +2347,198 @@ static void check_one_file(const char *path) {
         }
     }
     ct_da_free(&tokens);
+    fix_end(&f);
+}
+
+static char *save_env(const char *value) {
+    size_t n = strlen(value);
+    char *copy = malloc(n + 1);
+    if (!copy) {
+        return NULL;
+    }
+    memcpy(copy, value, n + 1);
+    return copy;
+}
+
+static int env_set(const char *value) {
+#if defined(_WIN32)
+    return _putenv_s("JOG_ROOT", value ? value : "") == 0;
+#else
+    if (!value || value[0] == '\0') {
+        unsetenv("JOG_ROOT");
+        return 1;
+    }
+    return setenv("JOG_ROOT", value, 1) == 0;
+#endif
+}
+
+static void free_pkg_tokens(JogPackage *pkg) {
+    size_t i;
+    if (!pkg) {
+        return;
+    }
+    for (i = 0; i < pkg->file_count; i++) {
+        if (pkg->files && pkg->files[i]) {
+            ct_da_free(&pkg->files[i]->tokens);
+        }
+    }
+    for (i = 0; i < pkg->platform_file_count; i++) {
+        if (pkg->platform_files && pkg->platform_files[i]) {
+            ct_da_free(&pkg->platform_files[i]->tokens);
+        }
+    }
+}
+
+static void free_program_tokens(JogProgram *program) {
+    size_t i;
+    if (!program) {
+        return;
+    }
+    for (i = 0; i < program->package_count; i++) {
+        free_pkg_tokens(program->packages ? program->packages[i] : NULL);
+    }
+    free_pkg_tokens(program->root);
+}
+
+static JogNode *fn_flagged(JogPackage *pkg, const char *name, int want_expect) {
+    size_t f;
+    size_t d;
+    if (!pkg || !pkg->files) {
+        return NULL;
+    }
+    for (f = 0; f < pkg->file_count; f++) {
+        JogNode *file = pkg->files[f] ? pkg->files[f]->ast : NULL;
+        if (!file || file->kind != JOG_NODE_FILE) {
+            continue;
+        }
+        for (d = 0; d < file->as.file.decls.count; d++) {
+            JogNode *decl = file->as.file.decls.items ? file->as.file.decls.items[d] : NULL;
+            if (!decl || decl->kind != JOG_NODE_FN || !decl->as.fn.name || strcmp(decl->as.fn.name, name) != 0) {
+                continue;
+            }
+            if (want_expect && decl->as.fn.is_expect) {
+                return decl;
+            }
+            if (!want_expect && decl->as.fn.is_actual) {
+                return decl;
+            }
+        }
+    }
+    return NULL;
+}
+
+static void assert_ok_expect(JogPackage *pkg) {
+    JogNode *expect = fn_flagged(pkg, "hidden", 1);
+    JogNode *actual = fn_flagged(pkg, "hidden", 0);
+    CHECK(expect && expect->as.fn.is_expect && !expect->symbol);
+    CHECK(actual && actual->symbol && actual->symbol->decl == actual);
+    CHECK(actual && actual->visibility == JOG_VIS_PACKAGE);
+    CHECK(actual && actual->as.fn.body);
+    expect = fn_flagged(pkg, "answer", 1);
+    actual = fn_flagged(pkg, "answer", 0);
+    CHECK(expect && !expect->symbol);
+    CHECK(actual && actual->symbol && actual->symbol->decl == actual);
+    CHECK(actual && actual->visibility == JOG_VIS_PUBLIC);
+    CHECK(actual && actual->as.fn.body);
+}
+
+static size_t collect_dir_expected(Fix *f, const char *dir, const char **out, size_t cap) {
+    CtDa names;
+    size_t i;
+    size_t n = 0;
+    if (!ct_da_init(&names, sizeof(const char *))) {
+        return cap + 1;
+    }
+    if (!ct_fs_list(f->arena, f->diag, dir, CT_FS_FILES, ".jog", &names)) {
+        ct_da_free(&names);
+        return cap + 1;
+    }
+    for (i = 0; i < names.count && n <= cap; i++) {
+        const char *name = *(const char **)ct_da_at(&names, i);
+        const char *path = name ? ct_path_join(f->arena, dir, name) : NULL;
+        CtFile src;
+        size_t got;
+        memset(&src, 0, sizeof(src));
+        if (!path || !ct_file_read(f->arena, f->diag, path, &src) || !src.data) {
+            n = cap + 1;
+            break;
+        }
+        got = collect_expected(f->arena, src.data, out + n, cap - n);
+        if (got > cap - n) {
+            n = cap + 1;
+            break;
+        }
+        n += got;
+    }
+    ct_da_free(&names);
+    return n;
+}
+
+static void check_one_dir(const char *path) {
+    Fix f;
+    const char *saved = NULL;
+    int had = 0;
+    const char *expected[32];
+    size_t nexpect;
+    size_t i;
+    int loaded;
+    int ok;
+    char text[8192];
+    const char *env = getenv("JOG_ROOT");
+    if (!fix_begin(&f)) {
+        CHECK(0);
+        return;
+    }
+    if (env && env[0] != '\0') {
+        had = 1;
+        saved = save_env(env);
+        if (!saved) {
+            CHECK(0);
+            fix_end(&f);
+            return;
+        }
+    }
+    if (!env_set(CT_SOURCE_DIR)) {
+        CHECK(0);
+        free((void *)saved);
+        fix_end(&f);
+        return;
+    }
+    f.program.options.ptr_size = 8;
+    loaded = jog_load(&f.program, path);
+    ok = loaded && jog_check(&f.program);
+    nexpect = collect_dir_expected(&f, path, expected, 32);
+    diag_text(f.diag, text, sizeof(text));
+    if (nexpect > 32) {
+        fprintf(stderr, "too many expected errors in %s\n", path);
+        CHECK(0);
+    } else if (nexpect == 0) {
+        if (!ok || ct_diag_error_count(f.diag) != 0) {
+            fprintf(stderr, "unexpected errors in %s\n%s\n", path, text);
+            CHECK(0);
+        } else if (strstr(path, "ok_expect")) {
+            assert_ok_expect(f.program.root);
+        }
+    } else {
+        if (ok || ct_diag_error_count(f.diag) != nexpect) {
+            fprintf(stderr, "error count %zu, expected %zu, in %s\n%s\n", ct_diag_error_count(f.diag), nexpect, path,
+                    text);
+            CHECK(0);
+        }
+        for (i = 0; i < nexpect; i++) {
+            if (!strstr(text, expected[i])) {
+                fprintf(stderr, "missing '%s' in %s\n%s\n", expected[i], path, text);
+                CHECK(0);
+            }
+        }
+    }
+    free_program_tokens(&f.program);
+    if (had) {
+        env_set(saved);
+    } else {
+        env_set(NULL);
+    }
+    free((void *)saved);
     fix_end(&f);
 }
 
@@ -2356,6 +2574,26 @@ static void test_check_sources(void) {
         CHECK(path != NULL);
         if (path) {
             check_one_file(path);
+        }
+    }
+    ct_da_free(&names);
+    if (!ct_da_init(&names, sizeof(const char *))) {
+        ct_arena_destroy(arena);
+        return;
+    }
+    if (!ct_fs_list(arena, diag, dir, CT_FS_DIRS, NULL, &names)) {
+        fprintf(stderr, "cannot list directories in %s\n", dir);
+        CHECK(0);
+        ct_da_free(&names);
+        ct_arena_destroy(arena);
+        return;
+    }
+    for (i = 0; i < names.count; i++) {
+        const char *name = *(const char **)ct_da_at(&names, i);
+        const char *path = ct_path_join(arena, dir, name);
+        CHECK(path != NULL);
+        if (path) {
+            check_one_dir(path);
         }
     }
     ct_da_free(&names);

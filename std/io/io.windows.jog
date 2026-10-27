@@ -3,7 +3,7 @@
 
 import std.c
 
-fn open_c_file(path: str, mode: *const c.char): *c.FILE? {
+actual fn open_c_file(path: str, mode: *const c.char): *c.FILE? {
     var wide_path: [4096]u16
     if path.len >= 4096 || !c.utf8_to_wide(path, wide_path[..].ptr, 4096) {
         return null

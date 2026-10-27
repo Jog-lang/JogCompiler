@@ -1,0 +1,7 @@
+private fn seven(): i32 {
+    return 7
+}
+
+actual fn marker(): i32 {
+    return seven()
+}

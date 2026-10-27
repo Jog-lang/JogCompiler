@@ -72,6 +72,11 @@ static void free_package_tokens(JogPackage *pkg) {
             ct_da_free(&pkg->files[i]->tokens);
         }
     }
+    for (i = 0; i < pkg->platform_file_count; i++) {
+        if (pkg->platform_files && pkg->platform_files[i]) {
+            ct_da_free(&pkg->platform_files[i]->tokens);
+        }
+    }
 }
 
 static void close_harness(Harness *h) {
@@ -1014,6 +1019,13 @@ static void test_manifest_v2(void) {
         {"module m\nlink \"my lib\"\n", "jog.mod:2:6: error: jog.mod: quoted words are reserved for a later version"},
         {"module std\n", "jog.mod:1:8: error: jog.mod: module name 'std' is reserved for the standard library"},
         {"module m\nuse x\n", "jog.mod:2:1: error: jog.mod: unknown declaration 'use'"},
+        {"module m\ntargets haiku\n",
+         "jog.mod:2:9: error: jog.mod: unknown target 'haiku'; expected windows, linux, macos, or wasm"},
+        {"module m\ntargets posix\n",
+         "jog.mod:2:9: error: jog.mod: unknown target 'posix'; expected windows, linux, macos, or wasm"},
+        {"module m\ntargets\n", "jog.mod:2:1: error: jog.mod: missing target name"},
+        {"module m\ntargets windows\ntargets linux\n", "jog.mod:3:1: error: jog.mod: duplicate targets declaration"},
+        {"module m\ntargets windows windows\n", "jog.mod:2:17: error: jog.mod: target 'windows' is listed twice"},
     };
     Harness h;
     size_t i = 0;
@@ -1114,6 +1126,7 @@ static void test_per_os_files(void) {
     path = pkg_fixture(&h, "peros");
     CHECK(path && jog_load(&h.program, path));
     CHECK(files_are(h.program.root, host_src, sizeof host_src / sizeof host_src[0]));
+    CHECK(h.program.root->target_count == 0 && !h.program.root->target_sources);
     CHECK(ct_diag_error_count(h.diag) == 0);
     close_harness(&h);
 
@@ -1154,6 +1167,103 @@ static void test_per_os_files(void) {
     close_harness(&h);
 }
 
+static int group_is(const JogPackage *pkg, const char *os, const char *const *names, size_t count) {
+    size_t i = 0;
+    const JogTargetSources *group = NULL;
+    if (!pkg) {
+        return 0;
+    }
+    for (i = 0; i < pkg->target_count; i++) {
+        if (pkg->target_sources && pkg->target_sources[i].os && strcmp(pkg->target_sources[i].os, os) == 0) {
+            group = &pkg->target_sources[i];
+            break;
+        }
+    }
+    if (!group || group->file_count != count) {
+        fprintf(stderr, "target %s file count %zu, expected %zu\n", os, group ? group->file_count : 0, count);
+        return 0;
+    }
+    for (i = 0; i < count; i++) {
+        const char *path = group->files && group->files[i] && group->files[i]->file.path ? group->files[i]->file.path
+                                                                                          : "(null)";
+        if (!group->files || !file_named(group->files[i], names[i])) {
+            fprintf(stderr, "target %s file[%zu] is '%s', expected to end with '%s'\n", os, i, path, names[i]);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static JogSourceFile *group_file(const JogPackage *pkg, const char *os, const char *name) {
+    size_t i = 0;
+    size_t f = 0;
+    if (!pkg) {
+        return NULL;
+    }
+    for (i = 0; i < pkg->target_count; i++) {
+        const JogTargetSources *group = pkg->target_sources ? &pkg->target_sources[i] : NULL;
+        if (!group || !group->os || strcmp(group->os, os) != 0) {
+            continue;
+        }
+        for (f = 0; f < group->file_count; f++) {
+            if (group->files && file_named(group->files[f], name)) {
+                return group->files[f];
+            }
+        }
+    }
+    return NULL;
+}
+
+/* targets lists every OS file for each name, on any host. The current
+   target's files stay in pkg->files. posix is one parse shared by linux
+   and macos. */
+static void test_target_lists(void) {
+    Harness h;
+    const char *windows_files[] = {"a.windows.jog"};
+    const char *linux_files[] = {"a.linux.jog", "a.posix.jog"};
+    const char *macos_files[] = {"a.macos.jog", "a.posix.jog"};
+    const char *wasm_files[] = {"a.wasm.jog"};
+#if defined(_WIN32)
+    const char *host_src[] = {"a.windows.jog", "main.jog", "note.b.jog"};
+#elif defined(__APPLE__)
+    const char *host_src[] = {"a.macos.jog", "a.posix.jog", "main.jog", "note.b.jog"};
+#else
+    const char *host_src[] = {"a.linux.jog", "a.posix.jog", "main.jog", "note.b.jog"};
+#endif
+    const char *path = NULL;
+    JogSourceFile *posix_linux = NULL;
+    JogSourceFile *posix_macos = NULL;
+
+    CHECK(open_harness(&h));
+    CHECK(load_manifest(&h, 200, "module m\ntargets windows linux macos wasm\n", 0));
+    CHECK(h.program.root && h.program.root->target_count == 4);
+    CHECK(h.program.root->targets && strcmp(h.program.root->targets[0], "windows") == 0);
+    CHECK(strcmp(h.program.root->targets[3], "wasm") == 0);
+    CHECK(h.program.root->target_sources && h.program.root->target_sources[0].file_count == 0);
+    close_harness(&h);
+
+    CHECK(open_harness(&h));
+    h.program.options.ptr_size = 4;
+    CHECK(!load_manifest(&h, 201, "module m\ntargets windows linux macos\n", 0));
+    expect_fragment(h.diag, "module 'm' does not support target 'wasm'");
+    close_harness(&h);
+
+    CHECK(open_harness(&h));
+    path = pkg_fixture(&h, "targets");
+    CHECK(path && jog_load(&h.program, path));
+    CHECK(ct_diag_error_count(h.diag) == 0);
+    CHECK(files_are(h.program.root, host_src, sizeof host_src / sizeof host_src[0]));
+    CHECK(h.program.root->target_count == 4);
+    CHECK(group_is(h.program.root, "windows", windows_files, 1));
+    CHECK(group_is(h.program.root, "linux", linux_files, 2));
+    CHECK(group_is(h.program.root, "macos", macos_files, 2));
+    CHECK(group_is(h.program.root, "wasm", wasm_files, 1));
+    posix_linux = group_file(h.program.root, "linux", "a.posix.jog");
+    posix_macos = group_file(h.program.root, "macos", "a.posix.jog");
+    CHECK(posix_linux && posix_linux == posix_macos);
+    close_harness(&h);
+}
+
 int main(void) {
     test_module_mapping();
     test_module_errors();
@@ -1169,6 +1279,7 @@ int main(void) {
     test_manifest_errors();
     test_exe_relative_roots();
     test_per_os_files();
+    test_target_lists();
     if (g_failures != 0) {
         fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;

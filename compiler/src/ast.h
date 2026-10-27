@@ -180,6 +180,10 @@ struct JogNode {
             bool expr_body;
             bool is_extern;           /* declared inside an extern block */
             bool variadic;            /* extern only: trailing ... */
+            /* expect fn has no body. actual fn has the body and takes
+               visibility from its expect. No existing field changed meaning. */
+            bool is_expect;
+            bool is_actual;
         } fn;
         struct {
             JogNames names;  /* one name, or several for val (a, b) = ... */

@@ -1,0 +1,2 @@
+private actual fn planned(): i32 = 1
+// error: an actual function cannot have a visibility modifier

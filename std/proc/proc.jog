@@ -30,6 +30,9 @@ struct Output {
     stderr: bytes
 }
 
+expect fn run(args: []str): Output with (a: mem.Allocator)
+expect fn run_inherit(args: []str): (i32, bool) with (a: mem.Allocator)
+
 // Releases both captured blocks. An empty block frees nothing.
 fn free_output(out: Output) with (a: mem.Allocator) {
     a.free(out.stdout)

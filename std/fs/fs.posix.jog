@@ -18,7 +18,7 @@ private fn fill_path(dest: *u8, cap: usize, path: str): bool {
 
 // false means the directory could not be opened. The list is empty then.
 // Each kept name is its own block. free_names releases them.
-fn list(path: str): (lists.List<str>, bool) with (a: mem.Allocator) {
+actual fn list(path: str): (lists.List<str>, bool) with (a: mem.Allocator) {
     var names: lists.List<str>
     var buf: [4096]u8
     if !fill_path(buf[..].ptr, 4096, path) {
@@ -45,7 +45,7 @@ fn list(path: str): (lists.List<str>, bool) with (a: mem.Allocator) {
     return names, true
 }
 
-fn rename(from: str, to: str): bool {
+actual fn rename(from: str, to: str): bool {
     var left: [4096]u8
     var right: [4096]u8
     if !fill_path(left[..].ptr, 4096, from) || !fill_path(right[..].ptr, 4096, to) {
@@ -54,7 +54,7 @@ fn rename(from: str, to: str): bool {
     return c.rename(left[..].ptr as *const c.char, right[..].ptr as *const c.char) == 0
 }
 
-fn exists(path: str): bool {
+actual fn exists(path: str): bool {
     var buf: [4096]u8
     if !fill_path(buf[..].ptr, 4096, path) {
         return false
@@ -67,7 +67,7 @@ fn exists(path: str): bool {
     return true
 }
 
-fn cwd(): (str, bool) with (a: mem.Allocator) {
+actual fn cwd(): (str, bool) with (a: mem.Allocator) {
     var buf: [4096]u8
     val p = c.getcwd(buf[..].ptr as *c.char, 4096)
     if p == null {

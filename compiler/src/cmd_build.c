@@ -476,6 +476,11 @@ static void free_package_tokens(JogPackage *pkg) {
             ct_da_free(&pkg->files[i]->tokens);
         }
     }
+    for (i = 0; i < pkg->platform_file_count; i++) {
+        if (pkg->platform_files && pkg->platform_files[i]) {
+            ct_da_free(&pkg->platform_files[i]->tokens);
+        }
+    }
 }
 
 static void free_program_tokens(JogProgram *program) {

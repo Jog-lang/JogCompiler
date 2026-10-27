@@ -9,6 +9,8 @@
 import std.c
 import std.mem
 
+private(package) expect fn open_c_file(path: str, mode: *const c.char): *c.FILE?
+
 private fn write_fd(fd: c.int, text: str): bool {
     return c.jogrt_write(fd, text.ptr as *const void?, text.len)
 }

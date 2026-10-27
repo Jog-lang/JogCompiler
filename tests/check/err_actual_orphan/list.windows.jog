@@ -1,0 +1,2 @@
+actual fn list(): i32 = 1
+// error: actual fn 'list' has no expect fn

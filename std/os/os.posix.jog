@@ -11,7 +11,7 @@ private fn fill_name(name: str, dest: *u8): bool {
     return true
 }
 
-fn env(name: str): (str, bool) {
+actual fn env(name: str): (str, bool) {
     var buf: bytes[4096]
     val dest = buf[..].ptr
     if !fill_name(name, dest) {

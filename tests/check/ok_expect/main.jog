@@ -1,0 +1,9 @@
+private(package) expect fn hidden(): i32
+
+expect fn answer(): i32
+
+fn main() {
+    if hidden() == 7 && answer() == 3 {
+        return
+    }
+}

@@ -29,6 +29,15 @@ typedef struct JogSourceFile {
     bool is_test;  /* *.test.jog */
 } JogSourceFile;
 
+/* OS-suffixed sources for one name on a jog.mod `targets` line.
+   The current target's files are also in JogPackage.files and are checked.
+   Every other target is parsed only. No existing field changed meaning. */
+typedef struct JogTargetSources {
+    const char *os; /* windows, linux, macos, or wasm */
+    JogSourceFile **files;
+    size_t file_count;
+} JogTargetSources;
+
 struct JogPackage {
     const char *path;      /* canonical import path, e.g. "net.http"; "" for the root package;
                               "<module>" and "<module>.<rest>" for a --module dependency */
@@ -42,6 +51,15 @@ struct JogPackage {
     void *scope;           /* the resolver's package scope; opaque to everyone else */
     const char *module_name; /* owning module: the root's name, a --module name, or "std" */
     const char *module_root; /* that module's folder; @embed stays inside it */
+    /* From the owning module's `targets` line. NULL when the line is absent;
+       then only the current target is checked. No existing field changed meaning. */
+    const char **targets;
+    size_t target_count;
+    JogTargetSources *target_sources; /* one group per targets entry; NULL when absent */
+    /* Other-target OS files owned here so their tokens can be freed once.
+       target_sources aliases these and the current target's files. */
+    JogSourceFile **platform_files;
+    size_t platform_file_count;
 };
 
 /* One --module <name>=<dir>. dir is the module's source folder. */

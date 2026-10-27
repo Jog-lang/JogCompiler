@@ -255,4 +255,20 @@
     =
       (INT_LIT 0)
   )
+  (FN planned private expect
+    (PARAM path
+      (TYPE_NAME str)
+    )
+    ->
+      (TYPE_NAME bool)
+  )
+  (FN planned actual
+    (PARAM path
+      (TYPE_NAME str)
+    )
+    ->
+      (TYPE_NAME bool)
+    =
+      (BOOL true)
+  )
 )

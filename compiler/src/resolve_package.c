@@ -1,5 +1,7 @@
 #include "resolve_package.h"
 
+#include "os_suffix.h"
+
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -320,6 +322,11 @@ static void bind_decl(Resolve *r, JogPackage *pkg, size_t file_index, JogNode *n
         bind_extern(r, pkg, file_index, node, package_pass);
         return;
     case JOG_NODE_FN:
+        /* A free expect and its actual share one symbol, bound after both
+           passes. The actual keeps the body; the expect keeps the visibility. */
+        if ((node->as.fn.is_expect || node->as.fn.is_actual) && !node->as.fn.receiver) {
+            return;
+        }
         if (package_visible(node->visibility) != package_pass) {
             return;
         }
@@ -394,6 +401,86 @@ static void bind_file(Resolve *r, JogPackage *pkg, size_t file_index, bool packa
     }
 }
 
+static int source_matches_target(const JogSourceFile *source, const char *target) {
+    const char *tag = NULL;
+    size_t tag_len = 0;
+    if (!source || !source->file.path) {
+        return 0;
+    }
+    if (!jog_file_os_tag(jog_path_base(source->file.path), &tag, &tag_len, NULL)) {
+        return 0;
+    }
+    return jog_os_tag_matches(tag, tag_len, target);
+}
+
+/* NULL when this target has no actual, or more than one. */
+static JogNode *one_actual(JogPackage *pkg, const char *target, const char *name) {
+    JogNode *found = NULL;
+    size_t f;
+    size_t d;
+    if (!pkg->files || !name) {
+        return NULL;
+    }
+    for (f = 0; f < pkg->file_count; f++) {
+        JogSourceFile *source = pkg->files[f];
+        JogNode *file;
+        if (!source_matches_target(source, target) || !source->ast || source->ast->kind != JOG_NODE_FILE) {
+            continue;
+        }
+        file = source->ast;
+        for (d = 0; d < file->as.file.decls.count; d++) {
+            JogNode *decl = list_at(file->as.file.decls, d);
+            if (!decl || decl->kind != JOG_NODE_FN || !decl->as.fn.is_actual || decl->as.fn.receiver) {
+                continue;
+            }
+            if (!decl->as.fn.name || strcmp(decl->as.fn.name, name) != 0) {
+                continue;
+            }
+            if (found) {
+                return NULL;
+            }
+            found = decl;
+        }
+    }
+    return found;
+}
+
+static void bind_platform(Resolve *r, JogPackage *pkg) {
+    const char *target = jog_target_os(r->program->options.ptr_size);
+    size_t f;
+    size_t d;
+    if (!pkg->files) {
+        return;
+    }
+    for (f = 0; f < pkg->file_count; f++) {
+        JogSourceFile *source = pkg->files[f];
+        JogNode *file;
+        if (!source || !source->ast || source->ast->kind != JOG_NODE_FILE || !source->file.path) {
+            continue;
+        }
+        if (jog_file_os_tag(jog_path_base(source->file.path), NULL, NULL, NULL)) {
+            continue;
+        }
+        file = source->ast;
+        for (d = 0; d < file->as.file.decls.count; d++) {
+            JogNode *expect = list_at(file->as.file.decls, d);
+            JogNode *actual;
+            if (!expect || expect->kind != JOG_NODE_FN || !expect->as.fn.is_expect || expect->as.fn.receiver) {
+                continue;
+            }
+            if (!expect->as.fn.name || expect->as.fn.name[0] == '\0') {
+                continue;
+            }
+            actual = one_actual(pkg, target, expect->as.fn.name);
+            if (!actual) {
+                continue;
+            }
+            actual->visibility = expect->visibility;
+            bind_named(r, pkg, f, actual, actual->as.fn.name, JOG_SYM_FUNCTION, expect->visibility);
+        }
+    }
+}
+
 static void build_package(Resolve *r, JogPackage *pkg) {
     JogPackageScope *scope;
     size_t i;
@@ -435,6 +522,7 @@ static void build_package(Resolve *r, JogPackage *pkg) {
     for (i = 0; i < pkg->file_count; i++) {
         bind_file(r, pkg, i, false);
     }
+    bind_platform(r, pkg);
 }
 
 bool jog_resolve_packages(JogProgram *program, const JogPackageScope *universe) {

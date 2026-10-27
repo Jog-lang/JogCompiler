@@ -170,7 +170,7 @@ private fn spawn(args: []str): Output with (a: mem.Allocator) {
 
 // args[0] is the program. The call waits. ok is false when the program
 // cannot be started or the captures cannot be read.
-fn run(args: []str): Output with (a: mem.Allocator) {
+actual fn run(args: []str): Output with (a: mem.Allocator) {
     if args.len == 0 {
         panic("empty argument vector")
     }
@@ -182,7 +182,7 @@ fn run(args: []str): Output with (a: mem.Allocator) {
 
 // Same start and wait as run, with no file actions, so the child keeps
 // the parent's stdout and stderr. The result has no captured bytes.
-fn run_inherit(args: []str): (i32, bool) with (a: mem.Allocator) {
+actual fn run_inherit(args: []str): (i32, bool) with (a: mem.Allocator) {
     if args.len == 0 {
         panic("empty argument vector")
     }

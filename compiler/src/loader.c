@@ -9,6 +9,7 @@
 #include "phases.h"
 
 #include "lexer.h"
+#include "os_suffix.h"
 
 #include "version.h"
 
@@ -33,8 +34,8 @@
 
    jog.mod is found by walking parents of start, which may be a file or a
    directory. The manifest is jog.mod v2 (docs/design/Packages.md): a module
-   line, then version, kind, jog, require, export, link, and link.<os>
-   lines. A V1 file (module and link lines) is a valid v2 file. Each
+   line, then version, kind, jog, require, export, link, link.<os>, and
+   targets lines. A V1 file (module and link lines) is a valid v2 file. Each
    --module <name>=<dir> names a library whose jog.mod is <dir>/jog.mod.
 
    The first segment of an import in module M is, in order: std, the
@@ -52,7 +53,9 @@
    loaded only when <os> is the target: windows, linux, macos, wasm, or
    posix (linux or macos). The target is the host, or wasm when ptr_size
    is 4. A dotted name whose last segment is not one of those, such as
-   a.b.jog, is an ordinary file. Packages are ordered so each one comes
+   a.b.jog, is an ordinary file. A `targets` line makes the loader also
+   parse the other listed targets' OS-suffixed files, without checking
+   them. Packages are ordered so each one comes
    after the packages it imports. An import that reaches a package already
    on the load stack is a cycle; the diagnostic names the path chain, and
    that back-edge is not recorded. */
@@ -87,6 +90,9 @@ typedef struct Module {
     CtDa requires; /* ModLine */
     CtDa exports;  /* ModLine */
     CtDa links;    /* const char *, the link lines for this target */
+    CtDa targets;  /* const char *, jog.mod `targets` names; empty when absent */
+    bool has_targets;
+    CtPos targets_pos;
 } Module;
 
 typedef struct PkgState {
@@ -530,7 +536,7 @@ static int word_in(const char *text, size_t len, const char *const *words, size_
 
 static const char *const g_reserved_words[] = {"libdir",  "source",  "replace",  "config",
                                                "include", "exclude", "provides", "needs"};
-static const char *const g_known_words[] = {"module", "version", "kind", "jog", "require", "export", "link"};
+static const char *const g_known_words[] = {"module", "version", "kind", "jog", "require", "export", "link", "targets"};
 
 static int is_reserved_directive(Tok tok) {
     size_t base = 0;
@@ -544,14 +550,6 @@ static int is_reserved_directive(Tok tok) {
     return base < tok.len &&
            word_in(tok.ptr, base, g_known_words, sizeof g_known_words / sizeof g_known_words[0]);
 }
-
-#if defined(_WIN32)
-#define JOG_HOST_OS "windows"
-#elif defined(__APPLE__)
-#define JOG_HOST_OS "macos"
-#else
-#define JOG_HOST_OS "linux"
-#endif
 
 static const ModLine *find_line(const CtDa *lines, const char *text, size_t len) {
     size_t i = 0;
@@ -607,7 +605,7 @@ static bool parse_manifest(Loader *loader, const CtFile *file, Module *mod) {
         size_t line_start = at;
         size_t line_len = 0;
         size_t cursor = 0;
-        Tok toks[4];
+        Tok toks[8];
         size_t n = 0;
         size_t i = 0;
         Tok first;
@@ -625,7 +623,7 @@ static bool parse_manifest(Loader *loader, const CtFile *file, Module *mod) {
         }
 
         memset(toks, 0, sizeof toks);
-        while (n < 4 && next_tok(data + line_start, line_len, &cursor, &toks[n])) {
+        while (n < 8 && next_tok(data + line_start, line_len, &cursor, &toks[n])) {
             n++;
         }
         if (n == 0) {
@@ -709,7 +707,7 @@ static bool parse_manifest(Loader *loader, const CtFile *file, Module *mod) {
                     continue;
                 }
                 /* wasm32 links no C libraries of its own. */
-                keep = loader->program->options.ptr_size != 4 && tok_is(target, JOG_HOST_OS);
+                keep = loader->program->options.ptr_size != 4 && tok_is(target, jog_host_os());
             }
             if (!one_word(loader, file, line_no, toks, n, "library name")) {
                 ok = 0;
@@ -718,6 +716,49 @@ static bool parse_manifest(Loader *loader, const CtFile *file, Module *mod) {
                 if (!lib || !ct_da_push(&mod->links, &lib)) {
                     LOAD_ERROR(loader, pos, "out of memory");
                     ok = 0;
+                }
+            }
+        } else if (tok_is(first, "targets")) {
+            size_t t = 0;
+            if (mod->has_targets) {
+                LOAD_ERROR(loader, pos, "jog.mod: duplicate targets declaration");
+                ok = 0;
+            } else if (n < 2) {
+                LOAD_ERROR(loader, pos, "jog.mod: missing target name");
+                ok = 0;
+            } else {
+                mod->has_targets = true;
+                mod->targets_pos = pos;
+                for (t = 1; t < n; t++) {
+                    const char *name = NULL;
+                    size_t prev = 0;
+                    int listed = 0;
+                    if (!jog_os_target_name(toks[t].ptr, toks[t].len)) {
+                        LOAD_ERROR(loader, manifest_pos(file, line_no, toks[t].column),
+                                   "jog.mod: unknown target '%.*s'; expected windows, linux, macos, or wasm",
+                                   (int)toks[t].len, toks[t].ptr);
+                        ok = 0;
+                        continue;
+                    }
+                    for (prev = 0; prev < mod->targets.count; prev++) {
+                        const char *got = *(const char **)ct_da_at(&mod->targets, prev);
+                        if (got && strlen(got) == toks[t].len && memcmp(got, toks[t].ptr, toks[t].len) == 0) {
+                            listed = 1;
+                            break;
+                        }
+                    }
+                    if (listed) {
+                        LOAD_ERROR(loader, manifest_pos(file, line_no, toks[t].column),
+                                   "jog.mod: target '%.*s' is listed twice", (int)toks[t].len, toks[t].ptr);
+                        ok = 0;
+                        continue;
+                    }
+                    name = intern_tok(loader, toks[t]);
+                    if (!name || !ct_da_push(&mod->targets, &name)) {
+                        LOAD_ERROR(loader, pos, "out of memory");
+                        ok = 0;
+                        break;
+                    }
                 }
             }
         } else if (tok_is(first, "version")) {
@@ -843,16 +884,33 @@ static bool parse_manifest(Loader *loader, const CtFile *file, Module *mod) {
         LOAD_ERROR(loader, first_export, "jog.mod: only a library can export packages; add 'kind library'");
         ok = 0;
     }
+    if (mod->has_targets && mod->targets.count > 0 && mod->name) {
+        const char *os = jog_target_os(loader->program->options.ptr_size);
+        size_t t = 0;
+        int supported = 0;
+        for (t = 0; t < mod->targets.count; t++) {
+            const char *name = *(const char **)ct_da_at(&mod->targets, t);
+            if (name && strcmp(name, os) == 0) {
+                supported = 1;
+                break;
+            }
+        }
+        if (!supported) {
+            LOAD_ERROR(loader, mod->targets_pos, "module '%s' does not support target '%s'", mod->name, os);
+            ok = 0;
+        }
+    }
     return ok != 0 && mod->name != NULL;
 }
 
 static bool module_init(Module *mod) {
     memset(mod, 0, sizeof *mod);
     if (!ct_da_init(&mod->requires, sizeof(ModLine)) || !ct_da_init(&mod->exports, sizeof(ModLine)) ||
-        !ct_da_init(&mod->links, sizeof(const char *))) {
+        !ct_da_init(&mod->links, sizeof(const char *)) || !ct_da_init(&mod->targets, sizeof(const char *))) {
         ct_da_free(&mod->requires);
         ct_da_free(&mod->exports);
         ct_da_free(&mod->links);
+        ct_da_free(&mod->targets);
         return false;
     }
     return true;
@@ -862,6 +920,7 @@ static void module_free(Module *mod) {
     ct_da_free(&mod->requires);
     ct_da_free(&mod->exports);
     ct_da_free(&mod->links);
+    ct_da_free(&mod->targets);
 }
 
 static void loader_free(Loader *loader) {
@@ -1501,30 +1560,8 @@ static void collect_imports(Loader *loader, PkgState *state) {
     }
 }
 
-static int os_name_is(const char *text, size_t len, const char *word) {
-    size_t n = strlen(word);
-    return n == len && memcmp(text, word, len) == 0;
-}
-
-static int os_tag_is_known(const char *text, size_t len) {
-    return os_name_is(text, len, "windows") || os_name_is(text, len, "linux") || os_name_is(text, len, "macos") ||
-           os_name_is(text, len, "wasm") || os_name_is(text, len, "posix");
-}
-
-/* wasm32 is ptr_size 4, the same choice link.<os> makes. Anything else
-   is the host the compiler itself was built for. */
 static const char *load_target_os(const Loader *loader) {
-    if (loader->program->options.ptr_size == 4) {
-        return "wasm";
-    }
-    return JOG_HOST_OS;
-}
-
-static int os_tag_matches(const char *tag, size_t len, const char *target) {
-    if (os_name_is(tag, len, "posix")) {
-        return strcmp(target, "linux") == 0 || strcmp(target, "macos") == 0;
-    }
-    return os_name_is(tag, len, target);
+    return jog_target_os(loader->program->options.ptr_size);
 }
 
 /* 1 when name is loaded for target, before the *.test.jog filter.
@@ -1557,10 +1594,196 @@ static int file_os_kept(const char *name, const char *target, int *is_test) {
     }
     tag = dot + 1;
     tag_len = (size_t)(stem_end - tag);
-    if (!os_tag_is_known(tag, tag_len)) {
+    if (!jog_os_tag_is_known(tag, tag_len)) {
         return 1;
     }
-    return os_tag_matches(tag, tag_len, target);
+    return jog_os_tag_matches(tag, tag_len, target);
+}
+
+/* NULL on a hard failure. A lex or parse diagnostic still returns the file
+   and sets loader->failed, matching the files kept for the current target. */
+static JogSourceFile *load_one_source(Loader *loader, const char *dir, const char *name, int is_test, CtPos pos) {
+    const char *full = ct_path_join(loader->program->arena, dir, name);
+    JogSourceFile *source = ct_arena_alloc(loader->program->arena, sizeof(*source), _Alignof(JogSourceFile));
+    size_t errors_before = 0;
+    int lex_ok = 0;
+    if (!full || !source) {
+        LOAD_ERROR(loader, pos, "out of memory");
+        return NULL;
+    }
+    memset(source, 0, sizeof(*source));
+    source->is_test = is_test != 0;
+    if (!ct_da_init(&source->tokens, sizeof(JogToken))) {
+        LOAD_ERROR(loader, pos, "out of memory");
+        return NULL;
+    }
+    if (!ct_file_read(loader->program->arena, loader->program->diag, full, &source->file)) {
+        loader->failed = true;
+        ct_da_free(&source->tokens);
+        return NULL;
+    }
+    errors_before = ct_diag_error_count(loader->program->diag);
+    lex_ok = jog_lex(loader->program->arena, loader->program->diag, loader->program->intern, &source->file,
+                     &source->tokens);
+    if (!lex_ok && ct_diag_error_count(loader->program->diag) == errors_before) {
+        LOAD_ERROR(loader, pos, "out of memory");
+        ct_da_free(&source->tokens);
+        return NULL;
+    }
+    source->ast = jog_parse(loader->program->arena, loader->program->diag, loader->program->intern, &source->file,
+                            &source->tokens);
+    if (!source->ast) {
+        LOAD_ERROR(loader, pos, "out of memory");
+        ct_da_free(&source->tokens);
+        return NULL;
+    }
+    if (!lex_ok || ct_diag_error_count(loader->program->diag) != errors_before) {
+        loader->failed = true;
+    }
+    return source;
+}
+
+static JogSourceFile *source_named(CtDa *sources, const char *name) {
+    size_t i = 0;
+    for (i = 0; i < sources->count; i++) {
+        JogSourceFile *source = *(JogSourceFile **)ct_da_at(sources, i);
+        if (source && strcmp(jog_path_base(source->file.path), name) == 0) {
+            return source;
+        }
+    }
+    return NULL;
+}
+
+static JogSourceFile **freeze_sources(Loader *loader, CtDa *sources, size_t *count, CtPos pos) {
+    JogSourceFile **copied = NULL;
+    *count = sources->count;
+    if (sources->count == 0) {
+        return NULL;
+    }
+    copied = ct_arena_alloc(loader->program->arena, sources->count * sizeof(JogSourceFile *), _Alignof(JogSourceFile *));
+    if (!copied) {
+        LOAD_ERROR(loader, pos, "out of memory");
+        return NULL;
+    }
+    memcpy(copied, sources->data, sources->count * sizeof(JogSourceFile *));
+    return copied;
+}
+
+/* Parse OS-suffixed files for every listed target. The current target's
+   files are the ones already in pkg->files. Others are parsed only. */
+static int attach_target_lists(Loader *loader, PkgState *state, CtDa *names, CtPos pos) {
+    Module *mod = state->mod;
+    JogPackage *pkg = state->pkg;
+    int tests = loader->program->options.include_tests && mod && mod->is_root;
+    CtDa loaded;
+    CtDa extra;
+    JogTargetSources *groups = NULL;
+    size_t g = 0;
+    int loaded_ready = 0;
+    int extra_ready = 0;
+    int ok = 1;
+    if (!mod || !mod->has_targets) {
+        return 1;
+    }
+    loaded_ready = ct_da_init(&loaded, sizeof(JogSourceFile *));
+    extra_ready = ct_da_init(&extra, sizeof(JogSourceFile *));
+    if (!loaded_ready || !extra_ready) {
+        LOAD_ERROR(loader, pos, "out of memory");
+        ct_da_free(&loaded);
+        ct_da_free(&extra);
+        return 0;
+    }
+    if (pkg->files && pkg->file_count > 0) {
+        size_t f = 0;
+        for (f = 0; ok && f < pkg->file_count; f++) {
+            if (!ct_da_push(&loaded, &pkg->files[f])) {
+                LOAD_ERROR(loader, pos, "out of memory");
+                ok = 0;
+            }
+        }
+    }
+    if (ok && mod->targets.count > 0) {
+        const char **copied = ct_arena_alloc(loader->program->arena, mod->targets.count * sizeof(const char *),
+                                              _Alignof(const char *));
+        groups = ct_arena_alloc(loader->program->arena, mod->targets.count * sizeof(JogTargetSources),
+                                _Alignof(JogTargetSources));
+        if (!copied || !groups) {
+            LOAD_ERROR(loader, pos, "out of memory");
+            ok = 0;
+        } else {
+            memcpy(copied, mod->targets.data, mod->targets.count * sizeof(const char *));
+            memset(groups, 0, mod->targets.count * sizeof(JogTargetSources));
+            pkg->targets = copied;
+            pkg->target_count = mod->targets.count;
+            pkg->target_sources = groups;
+        }
+    }
+    for (g = 0; ok && g < mod->targets.count; g++) {
+        const char *os = *(const char **)ct_da_at(&mod->targets, g);
+        CtDa list;
+        size_t n = 0;
+        int list_ready = ct_da_init(&list, sizeof(JogSourceFile *));
+        if (!list_ready) {
+            LOAD_ERROR(loader, pos, "out of memory");
+            ok = 0;
+            break;
+        }
+        for (n = 0; ok && n < names->count; n++) {
+            const char *name = *(const char **)ct_da_at(names, n);
+            const char *tag = NULL;
+            size_t tag_len = 0;
+            int is_test = 0;
+            JogSourceFile *source = NULL;
+            if (!name || !jog_file_os_tag(name, &tag, &tag_len, &is_test)) {
+                continue;
+            }
+            if (is_test && !tests) {
+                continue;
+            }
+            if (!jog_os_tag_matches(tag, tag_len, os)) {
+                continue;
+            }
+            source = source_named(&loaded, name);
+            if (!source) {
+                source = load_one_source(loader, pkg->dir, name, is_test, pos);
+                if (!source) {
+                    ok = 0;
+                    break;
+                }
+                if (!ct_da_push(&loaded, &source) || !ct_da_push(&extra, &source)) {
+                    LOAD_ERROR(loader, pos, "out of memory");
+                    ct_da_free(&source->tokens);
+                    ok = 0;
+                    break;
+                }
+            }
+            if (!ct_da_push(&list, &source)) {
+                LOAD_ERROR(loader, pos, "out of memory");
+                ok = 0;
+                break;
+            }
+        }
+        if (ok && groups) {
+            groups[g].os = os;
+            groups[g].files = freeze_sources(loader, &list, &groups[g].file_count, pos);
+            if (list.count > 0 && !groups[g].files) {
+                ok = 0;
+            }
+        }
+        ct_da_free(&list);
+    }
+    if (ok && extra.count > 0) {
+        pkg->platform_files = freeze_sources(loader, &extra, &pkg->platform_file_count, pos);
+        if (!pkg->platform_files) {
+            ok = 0;
+        }
+    }
+    if (!ok) {
+        free_source_tokens(&extra);
+    }
+    ct_da_free(&loaded);
+    ct_da_free(&extra);
+    return ok;
 }
 
 /* Returns false when the folder contributes no source files, the directory
@@ -1593,10 +1816,7 @@ static int load_files(Loader *loader, PkgState *state, CtPos pos) {
     for (i = 0; i < names.count; i++) {
         const char *name = *(const char **)ct_da_at(&names, i);
         int is_test = 0;
-        const char *full = NULL;
         JogSourceFile *source = NULL;
-        size_t errors_before = 0;
-        int lex_ok = 0;
         if (!name) {
             continue;
         }
@@ -1606,45 +1826,10 @@ static int load_files(Loader *loader, PkgState *state, CtPos pos) {
         if (is_test && !tests) {
             continue;
         }
-        full = ct_path_join(loader->program->arena, pkg->dir, name);
-        source = ct_arena_alloc(loader->program->arena, sizeof(*source), _Alignof(JogSourceFile));
-        if (!full || !source) {
-            LOAD_ERROR(loader, pos, "out of memory");
+        source = load_one_source(loader, pkg->dir, name, is_test, pos);
+        if (!source) {
             ok = 0;
             break;
-        }
-        memset(source, 0, sizeof(*source));
-        source->is_test = is_test;
-        if (!ct_da_init(&source->tokens, sizeof(JogToken))) {
-            LOAD_ERROR(loader, pos, "out of memory");
-            ok = 0;
-            break;
-        }
-        if (!ct_file_read(loader->program->arena, loader->program->diag, full, &source->file)) {
-            loader->failed = true;
-            ct_da_free(&source->tokens);
-            ok = 0;
-            break;
-        }
-        errors_before = ct_diag_error_count(loader->program->diag);
-        lex_ok = jog_lex(loader->program->arena, loader->program->diag, loader->program->intern, &source->file,
-                         &source->tokens);
-        if (!lex_ok && ct_diag_error_count(loader->program->diag) == errors_before) {
-            LOAD_ERROR(loader, pos, "out of memory");
-            ct_da_free(&source->tokens);
-            ok = 0;
-            break;
-        }
-        source->ast = jog_parse(loader->program->arena, loader->program->diag, loader->program->intern, &source->file,
-                                &source->tokens);
-        if (!source->ast) {
-            LOAD_ERROR(loader, pos, "out of memory");
-            ct_da_free(&source->tokens);
-            ok = 0;
-            break;
-        }
-        if (!lex_ok || ct_diag_error_count(loader->program->diag) != errors_before) {
-            loader->failed = true;
         }
         if (!ct_da_push(&files, &source)) {
             LOAD_ERROR(loader, pos, "out of memory");
@@ -1690,6 +1875,11 @@ static int load_files(Loader *loader, PkgState *state, CtPos pos) {
         memcpy(copied, files.data, files.count * sizeof(JogSourceFile *));
         pkg->files = copied;
         pkg->file_count = files.count;
+    }
+    if (!attach_target_lists(loader, state, &names, pos)) {
+        ct_da_free(&names);
+        ct_da_free(&files);
+        return 0;
     }
     ct_da_free(&names);
     ct_da_free(&files);

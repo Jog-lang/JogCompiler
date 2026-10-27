@@ -1,0 +1,4 @@
+expect fn planned(): i32 {
+    return 1
+}
+// error: an expect function cannot have a body

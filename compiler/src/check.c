@@ -1,6 +1,7 @@
 #include "phases.h"
 
 #include "check_body.h"
+#include "check_platform.h"
 #include "check_constraint.h"
 #include "check_context.h"
 #include "check_enum.h"
@@ -1753,6 +1754,9 @@ bool jog_check(JogProgram *program) {
         return false;
     }
     if (!jog_resolve_packages(program, universe)) {
+        return false;
+    }
+    if (!jog_check_platform(program)) {
         return false;
     }
     memset(&ck, 0, sizeof(ck));

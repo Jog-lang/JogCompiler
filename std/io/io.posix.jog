@@ -2,7 +2,7 @@
 
 import std.c
 
-fn open_c_file(path: str, mode: *const c.char): *c.FILE? {
+actual fn open_c_file(path: str, mode: *const c.char): *c.FILE? {
     var buf: bytes[4096]
     if path.len >= 4096 {
         return null

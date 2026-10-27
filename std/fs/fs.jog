@@ -17,6 +17,11 @@ import std.list as lists
 import std.mem
 import std.text
 
+expect fn list(path: str): (lists.List<str>, bool) with (a: mem.Allocator)
+expect fn rename(from: str, to: str): bool
+expect fn exists(path: str): bool
+expect fn cwd(): (str, bool) with (a: mem.Allocator)
+
 fn read_all(path: str): (bytes, bool) with (a: mem.Allocator) {
     val (data, ok) = io.read_all(path)
     return data, ok

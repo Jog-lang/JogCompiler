@@ -72,3 +72,7 @@ var count: i32 = 0
 context alloc = defaultAllocator
 
 private fn hidden(): () = 0
+
+private(package) expect fn planned(path: str): bool
+
+actual fn planned(path: str): bool = true

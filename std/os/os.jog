@@ -12,6 +12,8 @@
 
 import std.c
 
+expect fn env(name: str): (str, bool)
+
 fn argc(): i64 {
     return c.jogrt_argc() as i64
 }

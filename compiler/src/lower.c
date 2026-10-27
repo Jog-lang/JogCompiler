@@ -3489,6 +3489,9 @@ static void declare_decl(Lower *L, const JogPackage *pkg, JogNode *decl) {
     }
     switch (decl->kind) {
     case JOG_NODE_FN:
+        if (decl->as.fn.is_expect) {
+            return;
+        }
         (void)declare_fn(L, pkg, decl);
         return;
     case JOG_NODE_EXTERN_BLOCK:
@@ -4068,7 +4071,7 @@ static void lower_decl_body(Lower *L, JogNode *decl) {
         }
         return;
     }
-    if (decl->kind != JOG_NODE_FN || decl->as.fn.is_extern) {
+    if (decl->kind != JOG_NODE_FN || decl->as.fn.is_extern || decl->as.fn.is_expect) {
         return;
     }
     if (decl->symbol && decl->symbol->type_param_count > 0) {

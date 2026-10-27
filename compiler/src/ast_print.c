@@ -121,6 +121,12 @@ static void print_fn(const JogNode *node, CtSb *out, int ind) {
     if (node->as.fn.is_extern) {
         ct_sb_append_cstr(out, " extern");
     }
+    if (node->as.fn.is_expect) {
+        ct_sb_append_cstr(out, " expect");
+    }
+    if (node->as.fn.is_actual) {
+        ct_sb_append_cstr(out, " actual");
+    }
     if (node->as.fn.variadic) {
         ct_sb_append_cstr(out, " variadic");
     }

@@ -1268,26 +1268,51 @@ static void note_scrub(CtSb *out, const char *body, size_t len) {
     }
 }
 
-static int note_is_fn_line(const char *s, const char *end) {
+/* Past an optional private or private(...). expect fn has no body, so a
+   note must not invent one. actual fn does, like an ordinary fn. */
+static const char *note_skip_private(const char *s, const char *end) {
     s = note_skip_ws(s, end);
-    if (note_starts_word(s, end, "private")) {
-        s += 7;
-        s = note_skip_ws(s, end);
-        if (s < end && *s == '(') {
-            int depth = 0;
-            for (; s < end; s++) {
-                if (*s == '(') {
-                    depth++;
-                } else if (*s == ')') {
-                    depth--;
-                    if (depth == 0) {
-                        s++;
-                        break;
-                    }
+    if (!note_starts_word(s, end, "private")) {
+        return s;
+    }
+    s += 7;
+    s = note_skip_ws(s, end);
+    if (s < end && *s == '(') {
+        int depth = 0;
+        for (; s < end; s++) {
+            if (*s == '(') {
+                depth++;
+            } else if (*s == ')') {
+                depth--;
+                if (depth == 0) {
+                    s++;
+                    break;
                 }
             }
-            s = note_skip_ws(s, end);
         }
+        s = note_skip_ws(s, end);
+    }
+    return s;
+}
+
+static int note_is_platform_fn(const char *s, const char *end) {
+    s = note_skip_private(s, end);
+    if (note_starts_word(s, end, "expect") || note_starts_word(s, end, "actual")) {
+        s += 6;
+        s = note_skip_ws(s, end);
+        return note_starts_word(s, end, "fn");
+    }
+    return 0;
+}
+
+static int note_is_fn_line(const char *s, const char *end) {
+    s = note_skip_private(s, end);
+    if (note_starts_word(s, end, "expect")) {
+        return 0;
+    }
+    if (note_starts_word(s, end, "actual")) {
+        s += 6;
+        s = note_skip_ws(s, end);
     }
     return note_starts_word(s, end, "fn");
 }
@@ -1295,6 +1320,9 @@ static int note_is_fn_line(const char *s, const char *end) {
 static int note_is_decl_line(const char *s, const char *end) {
     static const char *words[] = {"import", "fn",    "var",    "val",     "type",   "struct",
                                   "interface", "enum", "extern", "context", "private", NULL};
+    if (note_is_platform_fn(s, end)) {
+        return 1;
+    }
     s = note_skip_ws(s, end);
     for (int i = 0; words[i]; i++) {
         if (note_starts_word(s, end, words[i])) {
@@ -1387,6 +1415,10 @@ static int note_directory(const char *body) {
 
 static int note_nonsource(const char *body) {
     if (strstr(body, "fn ptr") || strstr(body, "ITable for") || note_directory(body)) {
+        return 1;
+    }
+    /* Diagnostic text in a fence, not a declaration. */
+    if (strstr(body, "has no actual") || strstr(body, "does not match its expect") || strstr(body, "has no expect fn")) {
         return 1;
     }
     return !strstr(body, "(") && !strstr(body, ")") && !strstr(body, "{") && !strstr(body, "}") && !strstr(body, "=") &&
