@@ -173,4 +173,8 @@ void jogrt_spawn_actions_free(void *actions);
 /* WEXITSTATUS when the child exited normally, otherwise -1. */
 int jogrt_wexitstatus(int status);
 
+/* The process environment, for posix_spawnp's envp. NULL on Windows.
+   const int8_t ** matches Jog *(*const c.char?)?. */
+const int8_t **jogrt_environ(void);
+
 #endif

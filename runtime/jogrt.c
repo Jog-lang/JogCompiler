@@ -658,3 +658,12 @@ int jogrt_wexitstatus(int status) {
     return WEXITSTATUS(status);
 #endif
 }
+
+const int8_t **jogrt_environ(void) {
+#if defined(_WIN32)
+    return NULL;
+#else
+    extern char **environ;
+    return (const int8_t **)environ;
+#endif
+}

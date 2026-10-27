@@ -41,4 +41,5 @@ extern {
     fn jogrt_spawn_actions_adddup2(actions: *void, fd: int, new_fd: int): int
     fn jogrt_spawn_actions_free(actions: *void?)
     fn jogrt_wexitstatus(status: int): int
+    fn jogrt_environ(): *(*const char?)?
 }

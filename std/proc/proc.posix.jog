@@ -4,7 +4,9 @@
 // actions are opaque, so jogrt_spawn_actions_* owns that struct.
 // A name with no slash is searched on PATH, which is what posix_spawnp
 // does. Arguments are an argv array, not a quoted command line, so a
-// space needs no extra quoting. An empty argument vector is ErrIO.
+// space needs no extra quoting. The child inherits this process's
+// environment; a null envp would leave PATH unset. An empty argument
+// vector is ErrIO.
 // A failed argv allocation is ErrOutOfMemory. posix_spawnp returning
 // 2 (ENOENT) is ErrNotFound. Any other failed start is ErrIO.
 
@@ -156,7 +158,7 @@ private fn spawn(args: []str): (Output, error?) with (a: mem.Allocator) {
     }
     var pid: c.int = 0
     val slots = argv.vector.ptr as *(*const c.char?)
-    val spawned = c.posix_spawnp(&pid, slots[0]!!, actions as *const void?, null, slots, null)
+    val spawned = c.posix_spawnp(&pid, slots[0]!!, actions as *const void?, null, slots, c.jogrt_environ())
     c.jogrt_spawn_actions_free(actions)
     close_fd(nul_fd)
     close_fd(out_fd)
@@ -214,7 +216,7 @@ actual fn run_inherit(args: []str): (i32, error?) with (a: mem.Allocator) {
     }
     var pid: c.int = 0
     val slots = argv.vector.ptr as *(*const c.char?)
-    val spawned = c.posix_spawnp(&pid, slots[0]!!, null, null, slots, null)
+    val spawned = c.posix_spawnp(&pid, slots[0]!!, null, null, slots, c.jogrt_environ())
     if spawned != 0 {
         free_argv(&argv)
         if spawned == 2 {
