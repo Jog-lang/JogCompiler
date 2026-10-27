@@ -1,3 +1,3 @@
-96b37a5024abb69a71c8aca0c139d2ada6eb2a2e
+011a7852b1c1fdbd401dd722b19d21ce9e7fe771
 Rebuild from that commit: cmake -S . -B build -G Ninja && cmake --build build
-This copy was rebuilt on p3/jogc after loader.c: the repository's own std directory is not a shadow, and bootstrap/stage0 looks one directory higher for std.
+This copy is build/jog.exe from the dirty p3/jogc tree after check: OK (when-on-str, enum .name, error?, arena block), on top of the commit above. bootstrap/stage0 looks one directory higher for std.

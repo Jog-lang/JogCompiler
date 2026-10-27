@@ -247,6 +247,39 @@ fn structElements() with (t: testing.Testing) {
 }
 
 @test
+fn itemsWalksLivePrefix() with (t: testing.Testing) {
+    var xs = empty<i32>()
+    var n: i32 = 0
+    var sum: i32 = 0
+    for x in xs.items() {
+        n = n + 1
+        sum = sum + x
+    }
+    t.expect(n == 0)
+    t.expect(sum == 0)
+    with (mem.heap()) {
+        xs.push(1)
+        xs.push(2)
+        xs.push(3)
+        for x in xs.items() {
+            n = n + 1
+            sum = sum + x
+        }
+        t.expect(n == 3)
+        t.expect(sum == 6)
+        var view = xs.items()
+        t.expect(view.len == xs.len)
+        t.expect(view.len != xs.cap)
+        view[0] = 9
+        t.expect(xs.get(0) == 9)
+        xs.clear()
+        var gone = xs.items()
+        t.expect(gone.len == 0)
+        xs.free()
+    }
+}
+
+@test
 fn atMutates() with (t: testing.Testing) {
     var xs = empty<Item>()
     with (mem.heap()) {

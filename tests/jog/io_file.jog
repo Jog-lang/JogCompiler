@@ -9,12 +9,14 @@ fn main() {
     *(p + 1) = 2
     *(p + 2) = 3
     val view = raw[..]
-    if !io.write_all("io_file.bin", view) {
+    if io.write_all("io_file.bin", view) != null {
         return
     }
-    val (got, ok) = io.read_all("io_file.bin")
-    if !ok || got.len != view.len || *got.ptr != 1 || *(got.ptr + 1) != 2 || *(got.ptr + 2) != 3 {
+    val (got, err) = io.read_all("io_file.bin")
+    if err != null || got.len != view.len || *got.ptr != 1 || *(got.ptr + 1) != 2 || *(got.ptr + 2) != 3 {
         return
     }
-    io.println("ok")
+    if io.println("ok") != null {
+        return
+    }
 }

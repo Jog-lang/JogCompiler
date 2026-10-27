@@ -1,11 +1,1806 @@
-// Lexer. Checked against compiler/src/lexer.c.
-// Study note: JogDocs bootstrap/study/Lexing.
-
+import std.arena
+import std.error as errs
+import std.fs
 import std.io
+import std.list
+import std.mem
+import std.strbuilder
+import std.text
 
-fn run(command: str): i32 {
-    io.eprint("jogc: ")
-    io.eprint(command)
-    io.eprintln(" is not implemented")
-    return 1
+struct Token {
+    kind: TokenKind
+    line: i64
+    column: i64
+    text: str
+    value: str // decoded bytes of a string or char; empty for every other kind
+}
+
+enum TokenKind {
+    EOF // end of the file; printed with no lexeme
+    IDENT // a name, such as `foo` or `bar_1`
+    INT // integer literal, `1_000` or `0xFF`
+    FLOAT // float literal, `3.14` or `1e-9`
+    STRING // string literal, decoded, then printed in quotes
+    STR_HEAD // text before the first `${` in an interpolated string
+    STR_MID // text between two `${` splices
+    STR_TAIL // text after the last splice, through the closing quote
+    CHAR // one code point, `a` or `\n`, printed in quotes
+    CSTRING // C string, `c"hi"`
+    HEXBLOB // hex blob, `x"de ad"`
+    ATTR // attribute, `@test`. The lexeme includes the `@`
+    SEP // statement break inserted at a newline, or an explicit `;`; printed with no lexeme
+    LPAREN // `(`
+    RPAREN // `)`
+    LBRACE // `{`
+    RBRACE // `}`
+    LBRACKET // `[`
+    RBRACKET // `]`
+    DOT // `.`
+    DOTDOT // `..`
+    ELLIPSIS // `...`
+    QDOT // `?.`
+    ELVIS // `?:`
+    QUESTION // a `?` that is not part of `?.` or `?:`
+    COMMA // `,`
+    COLON // `:`
+    TILDE // `~`
+    BANG // `!`
+    BANGBANG // `!!`
+    NEQ // `!=`
+    MINUS // `-`
+    ARROW // `->`
+    MINUS_ASSIGN // `-=`
+    ASSIGN // `=`
+    EQ // `==`
+    LT // `<`
+    LE // `<=`
+    CMP3 // `<=>`
+    SHL // `<<`
+    SHL_ASSIGN // `<<=`
+    GT // `>`
+    GE // `>=`
+    SHR // `>>`
+    SHR_ASSIGN // `>>=`
+    PLUS // `+`
+    PLUS_ASSIGN // `+=`
+    STAR // `*`
+    STAR_ASSIGN // `*=`
+    SLASH // `/`
+    SLASH_ASSIGN // `/=`
+    PERCENT // `%`
+    PERCENT_ASSIGN // `%=`
+    AMP // `&`
+    AMPAMP // `&&`
+    AMP_ASSIGN // `&=`
+    PIPE // `|`
+    PIPEPIPE // `||`
+    PIPE_ASSIGN // `|=`
+    CARET // `^`
+    CARET_ASSIGN // `^=`
+    KW_FN // keyword `fn`
+    KW_VAR // keyword `var`
+    KW_VAL // keyword `val`
+    KW_TYPE // keyword `type`
+    KW_STRUCT // keyword `struct`
+    KW_INTERFACE // keyword `interface`
+    KW_ENUM // keyword `enum`
+    KW_IF // keyword `if`
+    KW_ELSE // keyword `else`
+    KW_WHEN // keyword `when`
+    KW_FOR // keyword `for`
+    KW_IN // keyword `in`
+    KW_BREAK // keyword `break`
+    KW_CONTINUE // keyword `continue`
+    KW_RETURN // keyword `return`
+    KW_DEFER // keyword `defer`
+    KW_ERRDEFER // keyword `errdefer`
+    KW_GO // keyword `go`
+    KW_WITH // keyword `with`
+    KW_CONTEXT // keyword `context`
+    KW_PRIVATE // keyword `private`
+    KW_IMPORT // keyword `import`
+    KW_AS // keyword `as`
+    KW_IS // keyword `is`
+    KW_NULL // keyword `null`
+    KW_TRUE // keyword `true`
+    KW_FALSE // keyword `false`
+    KW_BYTES // keyword `bytes`
+    KW_ESCAPING // keyword `escaping`
+    KW_CONST // keyword `const`
+    KW_EXTERN // keyword `extern`
+    KW_QUOTE // keyword `quote`
+    AS_Q // `as?` as one token; `as?.` is not this
+}
+
+/**
+ * True when `b` can start an identifier.
+ * @param b source byte
+ * @return true for `A`-`Z`, `a`-`z`, or `_`
+ */
+fn is_ident_start(b: u8): bool {
+    return (b >= 'a' as u8 && b <= 'z' as u8) || (b >= 'A' as u8 && b <= 'Z' as u8) || b == '_' as u8
+}
+
+/**
+ * True when `b` can continue an identifier.
+ * @param b source byte
+ * @return true when `b` can start an identifier, or `b` is a digit
+ */
+fn is_ident_char(b: u8): bool {
+    return is_ident_start(b) || text.is_digit(b)
+}
+
+/**
+ * Name printed by `jog lex` for this kind.
+ * @param k token kind
+ * @return the variant source name, such as `IDENT`. That is the jog lex spelling
+ */
+fn kind_name(k: TokenKind): str {
+    // Variant source names are the jog lex spellings: IDENT, KW_FN, and so on.
+    return k.name
+}
+
+/**
+ * Append `n` copies of a space.
+ * @param b builder to append to
+ * @param n how many spaces
+ * @context a allocator used by the builder
+ */
+fn append_spaces(b: *strbuilder.StrBuilder, n: usize) with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < n {
+        b.append_byte(' ' as u8)
+        i = i + 1
+    }
+}
+
+/**
+ * Append `n` in decimal, padded with spaces out to `width`.
+ * @param b builder to append to
+ * @param n value to print
+ * @param width field width in characters
+ * @param left true pads on the right (column and name). False pads on the left (line number)
+ * @context a allocator for the temporary digit buffer
+ */
+fn append_num(b: *strbuilder.StrBuilder, n: i64, width: usize, left: bool) with (a: mem.Allocator) {
+    var digits = strbuilder.empty()
+    defer digits.free()
+    digits.append_int(n, 10)
+    val text = digits.str()
+    var pad: usize = 0
+    if text.len < width {
+        pad = width - text.len
+    }
+    if !left {
+        append_spaces(b, pad)
+    }
+    b.append(text)
+    if left {
+        append_spaces(b, pad)
+    }
+}
+
+/**
+ * Print one token in the `jog lex` layout.
+ * The line is 4 wide and right aligned, the column is 4 wide and left
+ * aligned, and the name is 14 wide and left aligned. SEP and EOF have an
+ * empty lexeme, so nothing follows the name. A string, char, C string, or
+ * hex blob prints its decoded bytes in quotes, with control bytes escaped.
+ * @param tok token to print
+ * @context a allocator for the line buffer
+ */
+fn print_token(tok: Token) with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    defer b.free()
+    append_num(&b, tok.line, 4, false)
+    b.append_byte(':' as u8)
+    append_num(&b, tok.column, 4, true)
+    b.append_byte(' ' as u8)
+    val name = kind_name(tok.kind)
+    b.append(name)
+    var pad: usize = 0
+    if name.len < 14 {
+        pad = 14 - name.len
+    }
+    append_spaces(&b, pad)
+    if tok.kind == TokenKind.STRING || tok.kind == TokenKind.STR_HEAD || tok.kind == TokenKind.STR_MID || tok.kind == TokenKind.STR_TAIL || tok.kind == TokenKind.CHAR || tok.kind == TokenKind.CSTRING || tok.kind == TokenKind.HEXBLOB {
+        b.append_byte('"' as u8)
+        append_escaped(&b, tok.value)
+        b.append_byte('"' as u8)
+    } else if tok.text.len > 0 {
+        b.append(tok.text)
+    }
+    io.println(b.str())
+}
+
+/**
+ * Append `s` the way `jog lex` prints a decoded literal.
+ * Newline, tab, CR, backslash, and quote get a short escape. Any other
+ * byte below space, and DEL, is `\x` plus two uppercase hex digits.
+ * @param b builder to append to
+ * @param s decoded bytes
+ * @context a allocator used by the builder
+ */
+fn append_escaped(b: *strbuilder.StrBuilder, s: str) with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < s.len {
+        val c = s.ptr[i]
+        if c == '\n' as u8 {
+            b.append("\\n")
+        } else if c == '\t' as u8 {
+            b.append("\\t")
+        } else if c == '\r' as u8 {
+            b.append("\\r")
+        } else if c == '\\' as u8 {
+            b.append("\\\\")
+        } else if c == '"' as u8 {
+            b.append("\\\"")
+        } else if c < 0x20 as u8 || c == 0x7F as u8 {
+            b.append("\\x")
+            append_hex2(b, c)
+        } else {
+            b.append_byte(c)
+        }
+        i = i + 1
+    }
+}
+
+/**
+ * Append `byte` as two uppercase hex digits.
+ * @param b builder to append to
+ * @param byte value to print
+ * @context a allocator used by the builder
+ */
+fn append_hex2(b: *strbuilder.StrBuilder, byte: u8) with (a: mem.Allocator) {
+    val n = byte as i64
+    b.append_byte(hex_digit(n >> 4))
+    b.append_byte(hex_digit(n & 15))
+}
+
+/**
+ * One uppercase hex digit for `n` in 0..15.
+ * @param n digit value
+ * @return `0`-`9` or `A`-`F`
+ */
+fn hex_digit(n: i64): u8 {
+    if n < 10 {
+        return (('0' as i64) + n) as u8
+    }
+    return (('A' as i64) + n - 10) as u8
+}
+
+/**
+ * Append a SEP or EOF. Those tokens carry no lexeme.
+ * @param tokens output list
+ * @param kind `SEP` or `EOF`
+ * @param line 1-based line of the token
+ * @param column 1-based byte column of the token
+ * @context a allocator for the list
+ */
+fn push_end(tokens: *list.List<Token>, kind: TokenKind, line: i64, column: i64) with (a: mem.Allocator) {
+    var tok: Token
+    tok.kind = kind
+    tok.line = line
+    tok.column = column
+    tok.text = ""
+    tokens.push(tok)
+}
+
+/**
+ * Column of the byte at `index`.
+ * @param index byte offset in the file
+ * @param line_start byte offset of the first byte on that line
+ * @return 1-based column
+ */
+fn column_at(index: usize, line_start: usize): i64 {
+    return ((index - line_start) + 1) as i64
+}
+
+/**
+ * One opener on the bracket stack. `kind` is `(`, `[`, `{`, or `$`.
+ * `$` is the `${` of a string splice. Line and column are where it opened.
+ */
+struct Open {
+    kind: u8
+    line: i64
+    column: i64
+}
+
+/**
+ * Whether a newline at this bracket depth inserts SEP.
+ * Inside `(` or `[` it does not. Inside `{` it does, even when that brace
+ * is nested in parentheses. A `$` from `${` hides newlines the same way
+ * `(` does. An empty stack inserts SEP too.
+ * @param stack open brackets
+ * @return true when a newline is a statement break
+ */
+fn newline_separates(stack: list.List<Open>): bool {
+    // No open bracket, so the newline is at statement level.
+    if stack.len == 0 {
+        return true
+    }
+    return stack.get(stack.len - 1).kind == '{' as u8
+}
+
+/**
+ * The opener a closer is trying to match.
+ * @param close `)`, `]`, or `}`
+ * @return `(`, `[`, or `{`
+ */
+fn opener_for(close: u8): u8 {
+    if close == ']' as u8 { return '[' as u8 }
+    if close == '}' as u8 { return '{' as u8 }
+    return '(' as u8
+}
+
+/**
+ * Push an opener and remember where it is, so a later mismatch or EOF can name it.
+ * @param stack open brackets
+ * @param kind `(`, `[`, `{`, or `$`
+ * @param line line of the opener
+ * @param column column of the opener
+ * @context a allocator for the stack
+ */
+fn push_open(stack: *list.List<Open>, kind: u8, line: i64, column: i64) with (a: mem.Allocator) {
+    var o: Open
+    o.kind = kind
+    o.line = line
+    o.column = column
+    stack.push(o)
+}
+
+/**
+ * `')' has no matching '('`.
+ * @param close the closer that found an empty stack
+ * @param open the opener it wanted
+ * @context a allocator for the message
+ * @return owned message
+ */
+fn no_match_message(close: u8, open: u8): str with (a: mem.Allocator) {
+    var close_b: [1]u8
+    var open_b: [1]u8
+    close_b[0] = close
+    open_b[0] = open
+    var close_view = bytes()
+    var open_view = bytes()
+    close_view.ptr = &close_b[0]
+    close_view.len = 1
+    open_view.ptr = &open_b[0]
+    open_view.len = 1
+    val close_s: str = close_view
+    val open_s: str = open_view
+    return "'${close_s}' has no matching '${open_s}'"
+}
+
+/**
+ * `']' does not match '(' opened at 1:1`. A `$` opener is written `${`.
+ * @param close the closer
+ * @param top the opener that is actually on top
+ * @context a allocator for the message
+ * @return owned message
+ */
+fn mismatch_message(close: u8, top: Open): str with (a: mem.Allocator) {
+    var close_b: [1]u8
+    close_b[0] = close
+    var open_b: [2]u8
+    open_b[0] = top.kind
+    var open_n: usize = 1
+    // The stack stores `$`, but the diagnostic names the two bytes that opened the splice.
+    if top.kind == '$' as u8 {
+        open_b[1] = '{' as u8
+        open_n = 2
+    }
+    var close_view = bytes()
+    close_view.ptr = &close_b[0]
+    close_view.len = 1
+    var open_view = bytes()
+    open_view.ptr = &open_b[0]
+    open_view.len = open_n
+    val close_s: str = close_view
+    val open_s: str = open_view
+    return "'${close_s}' does not match '${open_s}' opened at ${top.line}:${top.column}"
+}
+
+/**
+ * `'(' is never closed`.
+ * @param kind the opener still on top at EOF
+ * @context a allocator for the message
+ * @return owned message
+ */
+fn never_closed_message(kind: u8): str with (a: mem.Allocator) {
+    var kind_b: [1]u8
+    kind_b[0] = kind
+    var kind_view = bytes()
+    kind_view.ptr = &kind_b[0]
+    kind_view.len = 1
+    val kind_s: str = kind_view
+    return "'${kind_s}' is never closed"
+}
+
+/**
+ * Pop the opener that matches `close`, and only when it is on top.
+ * A mismatch is left on the stack so the opener that is actually open
+ * can still be closed later. An empty stack, or a different top, is an error
+ * at the closer.
+ * @param stack open brackets
+ * @param close `)`, `]`, or `}`
+ * @param line line of the closer
+ * @param column column of the closer
+ * @param errors diagnostics
+ * @context a allocator for the message
+ */
+fn close_bracket(stack: *list.List<Open>, close: u8, line: i64, column: i64, errors: *list.List<LexError>) with (a: mem.Allocator) {
+    val open = opener_for(close)
+    if stack.len == 0 {
+        push_error(errors, line, column, no_match_message(close, open))
+        return
+    }
+    val top = stack.get(stack.len - 1)
+    // Pop only a real match. `}` does not close `(`.
+    if top.kind == open {
+        stack.pop()
+        return
+    }
+    push_error(errors, line, column, mismatch_message(close, top))
+}
+
+/**
+ * Token kind of one bracket byte.
+ * @param c one of `(` `)` `[` `]` `{` `}`
+ * @return the matching kind. Any other byte is reported as `RBRACE`
+ */
+fn bracket_kind(c: u8): TokenKind {
+    if c == '(' as u8 { return TokenKind.LPAREN }
+    if c == ')' as u8 { return TokenKind.RPAREN }
+    if c == '[' as u8 { return TokenKind.LBRACKET }
+    if c == ']' as u8 { return TokenKind.RBRACKET }
+    if c == '{' as u8 { return TokenKind.LBRACE }
+    return TokenKind.RBRACE
+}
+
+/**
+ * Whether the text after a newline continues the previous line.
+ * Spaces, tabs, CR, LF, `//` comments, and nested block comments are
+ * skipped. The line continues only when the next token is `.`, `?.`, or `?:`.
+ * @param data file bytes
+ * @param at index of the first byte after the newline
+ * @return true when SEP must not be inserted for that newline
+ */
+fn continues_line(data: bytes, at: usize): bool {
+    var q = at
+    for q < data.len {
+        val c = data.ptr[q]
+        // Blank lines are not tokens. Keep looking.
+        if c == ' ' as u8 || c == '\t' as u8 || c == '\r' as u8 || c == '\n' as u8 {
+            q = q + 1
+            continue
+        }
+        // Stop at the newline, but do not consume it. It is not part of the comment.
+        if c == '/' as u8 && q + 1 < data.len && data.ptr[q + 1] == '/' as u8 {
+            for q < data.len && data.ptr[q] != '\n' as u8 {
+                q = q + 1
+            }
+            continue
+        }
+        // A block comment can contain another one. Skip the whole nest.
+        if c == '/' as u8 && q + 1 < data.len && data.ptr[q + 1] == '*' as u8 {
+            var depth: i64 = 1
+            q = q + 2
+            for q < data.len && depth > 0 {
+                // `/*` inside the comment opens another level.
+                if data.ptr[q] == '/' as u8 && q + 1 < data.len && data.ptr[q + 1] == '*' as u8 {
+                    depth = depth + 1
+                    q = q + 2
+                    continue
+                }
+                // `*/` closes one level. Depth 0 means the comment we entered is over.
+                if data.ptr[q] == '*' as u8 && q + 1 < data.len && data.ptr[q + 1] == '/' as u8 {
+                    depth = depth - 1
+                    q = q + 2
+                    continue
+                }
+                q = q + 1
+            }
+            continue
+        }
+        // `foo` then a newline then `.bar` is one call, so this newline is not SEP.
+        if c == '.' as u8 {
+            return true
+        }
+        // `?.` and `?:` continue the line. A lone `?` does not.
+        if c == '?' as u8 && q + 1 < data.len {
+            val n = data.ptr[q + 1]
+            return n == '.' as u8 || n == ':' as u8
+        }
+        return false
+    }
+    return false
+}
+
+struct Punct {
+    kind: TokenKind
+    len: usize
+    ok: bool
+}
+
+/**
+ * Byte at `i`, or 0 when `i` is past the end.
+ * Reading past the end as 0 matches the trailing NUL the C lexer sees.
+ * @param data file bytes
+ * @param i index to read
+ * @return the byte, or 0
+ */
+fn peek(data: bytes, i: usize): u8 {
+    if i >= data.len {
+        return 0
+    }
+    return data.ptr[i]
+}
+
+/**
+ * Whether this punctuation can end a statement.
+ * A following newline inserts SEP only for these kinds.
+ * @param k punctuation kind
+ * @return true for `?`, `!!`, `>`, and `>>`
+ */
+fn punct_ends(k: TokenKind): bool {
+    return k == TokenKind.QUESTION || k == TokenKind.BANGBANG || k == TokenKind.GT || k == TokenKind.SHR
+}
+
+/**
+ * If the next byte is `c1`, record a two-byte token and say so.
+ * @param m match to update
+ * @param n1 byte immediately after the operator's first byte
+ * @param c1 byte that extends the token, such as `=` in `+=`
+ * @param kind kind to store when the bytes match
+ * @return true when the match was extended to two bytes
+ */
+fn take2(m: *Punct, n1: u8, c1: u8, kind: TokenKind): bool {
+    if n1 == c1 {
+        m.kind = kind
+        m.len = 2
+        return true
+    }
+    return false
+}
+
+/**
+ * Longest punctuation match starting at `i`.
+ * One byte is not enough: `<` may be `<`, `<=`, `<<`, `<<=`, or `<=>`.
+ * The longer spelling is tried first, so `<=>` is not `<=` followed by `>`.
+ * @param data file bytes
+ * @param i index of the first byte
+ * @return `ok` is false when the byte starts no token. `len` is how many bytes the token covers
+ */
+fn match_punct(data: bytes, i: usize): Punct {
+    var m: Punct
+    m.ok = false
+    m.len = 1
+    m.kind = TokenKind.EOF
+    if i >= data.len {
+        return m
+    }
+    val c = data.ptr[i]
+    val n1 = peek(data, i + 1)
+    val n2 = peek(data, i + 2)
+    m.ok = true
+    if c == ',' as u8 { m.kind = TokenKind.COMMA; return m }
+    if c == ':' as u8 { m.kind = TokenKind.COLON; return m }
+    if c == '~' as u8 { m.kind = TokenKind.TILDE; return m }
+    if c == '.' as u8 {
+        m.kind = TokenKind.DOT
+        // `...` before `..`, so three dots are not `..` plus a leftover `.`.
+        if n1 == '.' as u8 {
+            m.kind = TokenKind.DOTDOT
+            m.len = 2
+            if n2 == '.' as u8 {
+                m.kind = TokenKind.ELLIPSIS
+                m.len = 3
+            }
+        }
+        return m
+    }
+    if c == '?' as u8 {
+        m.kind = TokenKind.QUESTION
+        // `?.` and `?:` before a lone `?`.
+        if n1 == '.' as u8 { m.kind = TokenKind.QDOT; m.len = 2 }
+        else if n1 == ':' as u8 { m.kind = TokenKind.ELVIS; m.len = 2 }
+        return m
+    }
+    if c == '!' as u8 {
+        m.kind = TokenKind.BANG
+        // `!!` before `!=`.
+        if take2(&m, n1, '!' as u8, TokenKind.BANGBANG) { return m }
+        take2(&m, n1, '=' as u8, TokenKind.NEQ)
+        return m
+    }
+    if c == '-' as u8 {
+        m.kind = TokenKind.MINUS
+        // `->` before `-=`.
+        if take2(&m, n1, '>' as u8, TokenKind.ARROW) { return m }
+        take2(&m, n1, '=' as u8, TokenKind.MINUS_ASSIGN)
+        return m
+    }
+    if c == '=' as u8 {
+        m.kind = TokenKind.ASSIGN
+        take2(&m, n1, '=' as u8, TokenKind.EQ)
+        return m
+    }
+    if c == '<' as u8 {
+        m.kind = TokenKind.LT
+        // `<=>` before `<=`, and `<<=` before `<<`.
+        if n1 == '=' as u8 && n2 == '>' as u8 {
+            m.kind = TokenKind.CMP3
+            m.len = 3
+        } else if n1 == '<' as u8 && n2 == '=' as u8 {
+            m.kind = TokenKind.SHL_ASSIGN
+            m.len = 3
+        } else if n1 == '<' as u8 {
+            m.kind = TokenKind.SHL
+            m.len = 2
+        } else if n1 == '=' as u8 {
+            m.kind = TokenKind.LE
+            m.len = 2
+        }
+        return m
+    }
+    if c == '>' as u8 {
+        m.kind = TokenKind.GT
+        // `>>=` before `>>`. `>` and `>>` end a statement; `>=` and `>>=` do not.
+        if n1 == '>' as u8 && n2 == '=' as u8 {
+            m.kind = TokenKind.SHR_ASSIGN
+            m.len = 3
+        } else if n1 == '>' as u8 {
+            m.kind = TokenKind.SHR
+            m.len = 2
+        } else if n1 == '=' as u8 {
+            m.kind = TokenKind.GE
+            m.len = 2
+        }
+        return m
+    }
+    if c == '+' as u8 {
+        m.kind = TokenKind.PLUS
+        take2(&m, n1, '=' as u8, TokenKind.PLUS_ASSIGN)
+        return m
+    }
+    if c == '*' as u8 {
+        m.kind = TokenKind.STAR
+        take2(&m, n1, '=' as u8, TokenKind.STAR_ASSIGN)
+        return m
+    }
+    if c == '/' as u8 {
+        m.kind = TokenKind.SLASH
+        take2(&m, n1, '=' as u8, TokenKind.SLASH_ASSIGN)
+        return m
+    }
+    if c == '%' as u8 {
+        m.kind = TokenKind.PERCENT
+        take2(&m, n1, '=' as u8, TokenKind.PERCENT_ASSIGN)
+        return m
+    }
+    if c == '&' as u8 {
+        m.kind = TokenKind.AMP
+        // `&&` before `&=`.
+        if take2(&m, n1, '&' as u8, TokenKind.AMPAMP) { return m }
+        take2(&m, n1, '=' as u8, TokenKind.AMP_ASSIGN)
+        return m
+    }
+    if c == '|' as u8 {
+        m.kind = TokenKind.PIPE
+        // `||` before `|=`.
+        if take2(&m, n1, '|' as u8, TokenKind.PIPEPIPE) { return m }
+        take2(&m, n1, '=' as u8, TokenKind.PIPE_ASSIGN)
+        return m
+    }
+    if c == '^' as u8 {
+        m.kind = TokenKind.CARET
+        take2(&m, n1, '=' as u8, TokenKind.CARET_ASSIGN)
+        return m
+    }
+    m.ok = false
+    return m
+}
+
+/**
+ * Keyword kind for an identifier spelling.
+ * The comparison is the same byte compare as `==`, so `fnfoo` is not `fn`.
+ * `op` is absent on purpose: it is an identifier everywhere except at the
+ * start of an operator method name, which the lexer does not decide.
+ * @param text identifier bytes
+ * @return the keyword kind, or `IDENT` when the spelling is not a keyword
+ */
+fn keyword_kind(text: str): TokenKind {
+    // `when` compares the bytes, the same way `==` does, not the string headers.
+    return when text {
+        "fn" -> TokenKind.KW_FN
+        "var" -> TokenKind.KW_VAR
+        "val" -> TokenKind.KW_VAL
+        "type" -> TokenKind.KW_TYPE
+        "struct" -> TokenKind.KW_STRUCT
+        "interface" -> TokenKind.KW_INTERFACE
+        "enum" -> TokenKind.KW_ENUM
+        "if" -> TokenKind.KW_IF
+        "else" -> TokenKind.KW_ELSE
+        "when" -> TokenKind.KW_WHEN
+        "for" -> TokenKind.KW_FOR
+        "in" -> TokenKind.KW_IN
+        "break" -> TokenKind.KW_BREAK
+        "continue" -> TokenKind.KW_CONTINUE
+        "return" -> TokenKind.KW_RETURN
+        "defer" -> TokenKind.KW_DEFER
+        "errdefer" -> TokenKind.KW_ERRDEFER
+        "go" -> TokenKind.KW_GO
+        "with" -> TokenKind.KW_WITH
+        "context" -> TokenKind.KW_CONTEXT
+        "private" -> TokenKind.KW_PRIVATE
+        "import" -> TokenKind.KW_IMPORT
+        "as" -> TokenKind.KW_AS
+        "is" -> TokenKind.KW_IS
+        "null" -> TokenKind.KW_NULL
+        "true" -> TokenKind.KW_TRUE
+        "false" -> TokenKind.KW_FALSE
+        "bytes" -> TokenKind.KW_BYTES
+        "escaping" -> TokenKind.KW_ESCAPING
+        "const" -> TokenKind.KW_CONST
+        "extern" -> TokenKind.KW_EXTERN
+        "quote" -> TokenKind.KW_QUOTE
+        else -> TokenKind.IDENT
+    }
+}
+
+/**
+ * Whether this keyword can end a statement.
+ * `return`, `break`, `continue`, `true`, `false`, `null`, and `bytes` can.
+ * `fn` and the other keywords cannot. An identifier can.
+ * @param k kind returned by `keyword_kind`, or `IDENT`
+ * @return true when a following newline inserts SEP
+ */
+fn keyword_ends(k: TokenKind): bool {
+    return k == TokenKind.IDENT || k == TokenKind.KW_RETURN || k == TokenKind.KW_BREAK || k == TokenKind.KW_CONTINUE || k == TokenKind.KW_TRUE || k == TokenKind.KW_FALSE || k == TokenKind.KW_NULL || k == TokenKind.KW_BYTES
+}
+
+struct LexError {
+    line: i64
+    column: i64
+    message: str
+}
+
+struct Num {
+    kind: TokenKind
+    end: usize
+}
+
+/**
+ * ASCII lowercase. Used so `0X` reports `0x`.
+ * @param b source byte
+ * @return `b` shifted to lowercase when it is `A`-`Z`
+ */
+fn ascii_lower(b: u8): u8 {
+    if b >= 'A' as u8 && b <= 'Z' as u8 {
+        return ((b as i64) + 32) as u8
+    }
+    return b
+}
+
+/**
+ * True when the token just emitted is `.`.
+ * A digit after that dot is an integer field (`pair.0`), not a fraction.
+ * @param tokens tokens emitted so far
+ * @return true when the last token is `DOT`
+ */
+fn last_is_dot(tokens: list.List<Token>): bool {
+    if tokens.len == 0 {
+        return false
+    }
+    return tokens.get(tokens.len - 1).kind == TokenKind.DOT
+}
+
+/**
+ * Record one lexer error. `message` is an owned string. The caller frees it.
+ * @param errors error list
+ * @param line 1-based line
+ * @param column 1-based byte column
+ * @param message owned diagnostic text
+ * @context a allocator for the list
+ */
+fn push_error(errors: *list.List<LexError>, line: i64, column: i64, message: str) with (a: mem.Allocator) {
+    var e: LexError
+    e.line = line
+    e.column = column
+    e.message = message
+    errors.push(e)
+}
+
+/**
+ * `expected digits after '0x'`, with `base` already lowercase.
+ * @param base `x`, `b`, or `o`
+ * @context a allocator for the message
+ * @return owned message
+ */
+fn expected_digits(base: u8): str with (a: mem.Allocator) {
+    var base_b: [1]u8
+    base_b[0] = base
+    var base_view = bytes()
+    base_view.ptr = &base_b[0]
+    base_view.len = 1
+    val base_s: str = base_view
+    return "expected digits after '0${base_s}'"
+}
+
+/**
+ * `invalid character 'c' in number literal`.
+ * @param c the rejected byte
+ * @context a allocator for the message
+ * @return owned message
+ */
+fn invalid_number_char(c: u8): str with (a: mem.Allocator) {
+    var char_b: [1]u8
+    char_b[0] = c
+    var char_view = bytes()
+    char_view.ptr = &char_b[0]
+    char_view.len = 1
+    val char_s: str = char_view
+    return "invalid character '${char_s}' in number literal"
+}
+
+/**
+ * Scan one number starting at `at`.
+ * `0x`, `0b`, and `0o` (any case) take that base. `_` is a separator and
+ * counts as a digit, so `0x_` is a number and `0x` with nothing after it
+ * is an error. A decimal number is a float when it has a fraction (`3.14`)
+ * or an exponent (`1e-9`). The dot is not a fraction when the previous
+ * token is already `.`, and `.5` is never a float because a number starts
+ * with a digit. A bad trailing character (`1abc`, `0b102`) is reported
+ * and swallowed into the same token.
+ * @param data file bytes
+ * @param at index of the first digit
+ * @param line 1-based line of that digit
+ * @param line_start byte offset of the line
+ * @param after_dot true when the previous token is `.`
+ * @param errors diagnostics. Scanning continues after an error
+ * @context a allocator for the diagnostic text
+ * @return the kind and the index just past the token
+ */
+fn scan_number(data: bytes, at: usize, line: i64, line_start: usize, after_dot: bool, errors: *list.List<LexError>): Num with (a: mem.Allocator) {
+    var p = at
+    var is_float = false
+    val n1 = peek(data, p + 1)
+    // A prefixed form is `0` plus one base letter. Anything else is decimal.
+    if data.ptr[p] == '0' as u8 && (n1 == 'x' as u8 || n1 == 'X' as u8 || n1 == 'b' as u8 || n1 == 'B' as u8 || n1 == 'o' as u8 || n1 == 'O' as u8) {
+        val base = ascii_lower(n1)
+        p = p + 2
+        val digits = p
+        for {
+            val c = peek(data, p)
+            var take = c == '_' as u8
+            if !take {
+                if base == 'x' as u8 {
+                    take = text.is_hex_digit(c)
+                } else if base == 'b' as u8 {
+                    take = c == '0' as u8 || c == '1' as u8
+                } else {
+                    take = c >= '0' as u8 && c <= '7' as u8
+                }
+            }
+            if !take {
+                break
+            }
+            p = p + 1
+        }
+        // The error points at the `0`, and the message spells the base in lowercase.
+        if p == digits {
+            push_error(errors, line, column_at(at, line_start), expected_digits(base))
+        }
+    } else {
+        for {
+            val c = peek(data, p)
+            if !text.is_digit(c) && c != '_' as u8 {
+                break
+            }
+            p = p + 1
+        }
+        val c0 = peek(data, p)
+        val c1 = peek(data, p + 1)
+        // `3.14` is one float. `pair.0` is not: that dot is already a token.
+        if c0 == '.' as u8 && text.is_digit(c1) && !after_dot {
+            is_float = true
+            p = p + 1
+            for {
+                val c = peek(data, p)
+                if !text.is_digit(c) && c != '_' as u8 {
+                    break
+                }
+                p = p + 1
+            }
+        }
+        val e0 = peek(data, p)
+        val e1 = peek(data, p + 1)
+        val e2 = peek(data, p + 2)
+        // `1e-9` and `2.5E+3`. `1e` is not an exponent: the sign needs a digit.
+        if !after_dot && (e0 == 'e' as u8 || e0 == 'E' as u8) && (text.is_digit(e1) || ((e1 == '+' as u8 || e1 == '-' as u8) && text.is_digit(e2))) {
+            is_float = true
+            if e1 == '+' as u8 || e1 == '-' as u8 {
+                p = p + 2
+            } else {
+                p = p + 1
+            }
+            for {
+                val c = peek(data, p)
+                if !text.is_digit(c) && c != '_' as u8 {
+                    break
+                }
+                p = p + 1
+            }
+        }
+    }
+    val bad = peek(data, p)
+    // One report at the first bad byte, then the rest of the word stays in this token.
+    if is_ident_char(bad) {
+        push_error(errors, line, column_at(p, line_start), invalid_number_char(bad))
+        for {
+            if !is_ident_char(peek(data, p)) {
+                break
+            }
+            p = p + 1
+        }
+    }
+    var n: Num
+    n.end = p
+    n.kind = TokenKind.INT
+    if is_float {
+        n.kind = TokenKind.FLOAT
+    }
+    return n
+}
+
+struct BlockSkip {
+    end: usize
+    line: i64
+    line_start: usize
+    saw_newline: bool
+    closed: bool
+}
+
+/**
+ * Skip a block comment that starts at `at`, honoring nesting.
+ * Newlines inside the comment advance `line`. One such newline is enough
+ * for the caller to apply the newline rule once, at the opening slash-star.
+ * @param data file bytes
+ * @param at index of the opening slash
+ * @param line_in line of that slash
+ * @param line_start_in byte offset of that line
+ * @return where the comment ended, and whether it was closed
+ */
+fn skip_block(data: bytes, at: usize, line_in: i64, line_start_in: usize): BlockSkip {
+    var p = at
+    var line = line_in
+    var line_start = line_start_in
+    var depth: i64 = 0
+    var saw = false
+    var closed = false
+    for p < data.len {
+        val c = data.ptr[p]
+        val n = peek(data, p + 1)
+        if c == '/' as u8 && n == '*' as u8 {
+            depth = depth + 1
+            p = p + 2
+            continue
+        }
+        if c == '*' as u8 && n == '/' as u8 {
+            depth = depth - 1
+            p = p + 2
+            // Depth 0 is the comment we entered.
+            if depth == 0 {
+                closed = true
+                break
+            }
+            continue
+        }
+        p = p + 1
+        if c == '\n' as u8 {
+            saw = true
+            line = line + 1
+            line_start = p
+        }
+    }
+    var b: BlockSkip
+    b.end = p
+    b.line = line
+    b.line_start = line_start
+    b.saw_newline = saw
+    b.closed = closed
+    return b
+}
+
+struct Lit {
+    end: usize
+    line: i64
+    line_start: usize
+    kind: TokenKind
+    value: str
+    splice: bool
+}
+
+/**
+ * Value of one hex digit.
+ * @param b a hex digit
+ * @return 0..15. A byte that is not a hex digit is treated as `A`-`F`
+ */
+fn hex_value(b: u8): i64 {
+    if text.is_digit(b) {
+        return (b as i64) - ('0' as i64)
+    }
+    if b >= 'a' as u8 && b <= 'f' as u8 {
+        return (b as i64) - ('a' as i64) + 10
+    }
+    return (b as i64) - ('A' as i64) + 10
+}
+
+/**
+ * Byte length of the UTF-8 sequence at `at`, or 0 when it is malformed.
+ * @param data file bytes
+ * @param at index of the lead byte
+ * @return 1..4, or 0
+ */
+fn utf8_length(data: bytes, at: usize): usize {
+    if at >= data.len {
+        return 0
+    }
+    val lead = data.ptr[at]
+    var n: usize = 1
+    if lead < 0x80 as u8 {
+        return 1
+    }
+    if (lead & 0xE0 as u8) == 0xC0 as u8 {
+        n = 2
+    } else if (lead & 0xF0 as u8) == 0xE0 as u8 {
+        n = 3
+    } else if (lead & 0xF8 as u8) == 0xF0 as u8 {
+        n = 4
+    } else {
+        return 0
+    }
+    if at + n > data.len {
+        return 0
+    }
+    var i: usize = 1
+    for i < n {
+        if (data.ptr[at + i] & 0xC0 as u8) != 0x80 as u8 {
+            return 0
+        }
+        i = i + 1
+    }
+    return n
+}
+
+/**
+ * Append `n` in uppercase hex with no leading zeros.
+ * @param b builder to append to
+ * @param n value, zero or positive
+ * @context a allocator used by the builder
+ */
+fn append_hex_upper(b: *strbuilder.StrBuilder, n: i64) with (a: mem.Allocator) {
+    if n == 0 {
+        b.append_byte('0' as u8)
+        return
+    }
+    var digits: [16]u8
+    var count: usize = 0
+    var mag = n
+    for mag != 0 {
+        val d = mag & 15
+        var ch = ('0' as i64) + d
+        if d >= 10 {
+            ch = ('A' as i64) + d - 10
+        }
+        digits[count] = ch as u8
+        count = count + 1
+        mag = mag >> 4
+    }
+    for count != 0 {
+        count = count - 1
+        b.append_byte(digits[count])
+    }
+}
+
+/**
+ * Owned `'\u{N}' is not a Unicode scalar value`, with `cp` in uppercase hex.
+ * @param cp rejected code point
+ * @context a allocator for the message
+ * @return owned message
+ */
+fn scalar_message(cp: i64): str with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    defer b.free()
+    append_hex_upper(&b, cp)
+    return "'\\u{${b.str()}}' is not a Unicode scalar value"
+}
+
+/**
+ * Owned `unknown escape sequence '\c'`.
+ * @param c the rejected byte
+ * @context a allocator for the message
+ * @return owned message
+ */
+fn unknown_escape(c: u8): str with (a: mem.Allocator) {
+    var char_b: [1]u8
+    char_b[0] = c
+    var char_view = bytes()
+    char_view.ptr = &char_b[0]
+    char_view.len = 1
+    val char_s: str = char_view
+    return "unknown escape sequence '\\${char_s}'"
+}
+
+/**
+ * Owned `'c' is not a hex digit`.
+ * @param c the rejected byte
+ * @context a allocator for the message
+ * @return owned message
+ */
+fn not_hex_digit(c: u8): str with (a: mem.Allocator) {
+    var char_b: [1]u8
+    char_b[0] = c
+    var char_view = bytes()
+    char_view.ptr = &char_b[0]
+    char_view.len = 1
+    val char_s: str = char_view
+    return "'${char_s}' is not a hex digit"
+}
+
+/**
+ * Decode one escape starting at the backslash and append its bytes.
+ * A trailing backslash, or a backslash at the end of the line, is
+ * unfinished and the newline stays put. `\x` wants two hex digits.
+ * `\u{...}` wants 1 to 6 hex digits. A surrogate or a value past
+ * U+10FFFF is reported and adds nothing.
+ * @param data file bytes
+ * @param at index of the backslash
+ * @param line line of the literal, for the diagnostic
+ * @param line_start byte offset of that line
+ * @param buf decoded bytes
+ * @param errors diagnostics
+ * @context a allocator for the messages and the buffer
+ * @return index just past the escape
+ */
+fn decode_escape(data: bytes, at: usize, line: i64, line_start: usize, buf: *strbuilder.StrBuilder, errors: *list.List<LexError>): usize with (a: mem.Allocator) {
+    val column = column_at(at, line_start)
+    var p = at + 1
+    if p >= data.len {
+        push_error(errors, line, column, text.clone("unfinished escape sequence"))
+        return p
+    }
+    val c = data.ptr[p]
+    if c == 'n' as u8 { buf.append_byte('\n' as u8); return p + 1 }
+    if c == 't' as u8 { buf.append_byte('\t' as u8); return p + 1 }
+    if c == 'r' as u8 { buf.append_byte('\r' as u8); return p + 1 }
+    if c == '0' as u8 { buf.append_byte(0); return p + 1 }
+    if c == '\\' as u8 { buf.append_byte('\\' as u8); return p + 1 }
+    if c == '"' as u8 { buf.append_byte('"' as u8); return p + 1 }
+    if c == '\'' as u8 { buf.append_byte('\'' as u8); return p + 1 }
+    if c == '$' as u8 { buf.append_byte('$' as u8); return p + 1 }
+    if c == 'x' as u8 {
+        val d1 = peek(data, p + 1)
+        val d2 = peek(data, p + 2)
+        if text.is_hex_digit(d1) && text.is_hex_digit(d2) {
+            buf.append_byte((hex_value(d1) * 16 + hex_value(d2)) as u8)
+            return p + 3
+        }
+        push_error(errors, line, column, text.clone("'\\x' needs exactly two hex digits"))
+        return p + 1
+    }
+    if c == 'u' as u8 {
+        if peek(data, p + 1) != '{' as u8 {
+            push_error(errors, line, column, text.clone("'\\u' must be followed by '{hex digits}'"))
+            return p + 1
+        }
+        var q = p + 2
+        var cp: i64 = 0
+        var digits: i64 = 0
+        for text.is_hex_digit(peek(data, q)) && digits < 7 {
+            cp = cp * 16 + hex_value(data.ptr[q])
+            q = q + 1
+            digits = digits + 1
+        }
+        if peek(data, q) != '}' as u8 || digits == 0 || digits > 6 {
+            push_error(errors, line, column, text.clone("'\\u{...}' needs 1 to 6 hex digits and a closing '}'"))
+            for text.is_hex_digit(peek(data, q)) {
+                q = q + 1
+            }
+            if peek(data, q) == '}' as u8 {
+                q = q + 1
+            }
+            return q
+        }
+        q = q + 1
+        if cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF) {
+            push_error(errors, line, column, scalar_message(cp))
+            return q
+        }
+        buf.append_char(cp)
+        return q
+    }
+    if c == '\n' as u8 {
+        push_error(errors, line, column, text.clone("unfinished escape sequence"))
+        return p
+    }
+    push_error(errors, line, column, unknown_escape(c))
+    return p + 1
+}
+
+/**
+ * Copy `buf` into an owned str. The builder is freed on the way out.
+ * @param buf decoded bytes
+ * @context a allocator for the copy
+ * @return owned bytes. Empty when `buf` is empty
+ */
+fn take_buf(buf: *strbuilder.StrBuilder): str with (a: mem.Allocator) {
+    defer buf.free()
+    return text.clone(buf.str())
+}
+
+/**
+ * Scan a `"` string, a `c"` string, or the tail of an interpolation.
+ * The token starts at `at`. A newline or the end of the file ends it
+ * without consuming the newline. In a Jog string, `${` ends this piece
+ * and opens a splice. A C string has no splices. `continuation` is the
+ * piece that starts at the `}` which closed the previous splice.
+ * @param data file bytes
+ * @param at index of `"`, of the `c` before it, or of the closing `}`
+ * @param line line of `at`
+ * @param line_start byte offset of that line
+ * @param errors diagnostics
+ * @param cstring true for a C string
+ * @param continuation true when `at` is the `}` of a splice
+ * @context a allocator for the value and the messages
+ * @return the token kind, its decoded bytes, and whether a splice was opened
+ */
+fn scan_quoted(data: bytes, at: usize, line: i64, line_start: usize, errors: *list.List<LexError>, cstring: bool, continuation: bool): Lit with (a: mem.Allocator) {
+    var p = at + 1
+    if cstring {
+        p = at + 2
+    }
+    var buf = strbuilder.empty()
+    var splice = false
+    for {
+        if p >= data.len || (p < data.len && data.ptr[p] == '\n' as u8) {
+            var msg = "unterminated string literal"
+            if cstring {
+                msg = "unterminated C string literal"
+            }
+            push_error(errors, line, column_at(at, line_start), text.clone(msg))
+            break
+        }
+        val c = data.ptr[p]
+        if c == '"' as u8 {
+            p = p + 1
+            break
+        }
+        // `${` is the splice. The two bytes belong to this token's span, not to its value.
+        if !cstring && c == '$' as u8 && peek(data, p + 1) == '{' as u8 {
+            p = p + 2
+            splice = true
+            break
+        }
+        if c == '\\' as u8 {
+            p = decode_escape(data, p, line, line_start, &buf, errors)
+            continue
+        }
+        buf.append_byte(c)
+        p = p + 1
+    }
+    var lit: Lit
+    lit.end = p
+    lit.line = line
+    lit.line_start = line_start
+    lit.splice = splice
+    if splice {
+        lit.kind = TokenKind.STR_HEAD
+        if continuation {
+            lit.kind = TokenKind.STR_MID
+        }
+    } else if continuation {
+        lit.kind = TokenKind.STR_TAIL
+    } else if cstring {
+        lit.kind = TokenKind.CSTRING
+    } else {
+        lit.kind = TokenKind.STRING
+    }
+    lit.value = take_buf(&buf)
+    return lit
+}
+
+/**
+ * Whether this literal can end a statement.
+ * `STR_HEAD` and `STR_MID` cannot: the splice is still open.
+ * @param k literal kind
+ * @return true for a finished string, a char, a C string, or a hex blob
+ */
+fn literal_ends(k: TokenKind): bool {
+    return k == TokenKind.STRING || k == TokenKind.STR_TAIL || k == TokenKind.CHAR || k == TokenKind.CSTRING || k == TokenKind.HEXBLOB
+}
+
+/**
+ * Scan a raw string starting at the opening backtick.
+ * Escapes are not decoded. A newline inside the text advances the line
+ * and is part of the value. The kind is still `STRING`.
+ * @param data file bytes
+ * @param at index of the opening backtick
+ * @param line_in line of that backtick
+ * @param line_start_in byte offset of that line
+ * @param errors diagnostics
+ * @context a allocator for the value
+ * @return the decoded bytes and where the cursor stopped
+ */
+fn scan_raw(data: bytes, at: usize, line_in: i64, line_start_in: usize, errors: *list.List<LexError>): Lit with (a: mem.Allocator) {
+    var p = at + 1
+    var line = line_in
+    var line_start = line_start_in
+    val text_at = p
+    for p < data.len && data.ptr[p] != '`' as u8 {
+        if data.ptr[p] == '\n' as u8 {
+            line = line + 1
+            line_start = p + 1
+        }
+        p = p + 1
+    }
+    val src = data as str
+    val body = text.slice(src, text_at, p)
+    if p < data.len {
+        p = p + 1
+    } else {
+        push_error(errors, line_in, column_at(at, line_start_in), text.clone("unterminated raw string literal"))
+    }
+    var lit: Lit
+    lit.end = p
+    lit.line = line
+    lit.line_start = line_start
+    lit.kind = TokenKind.STRING
+    lit.splice = false
+    lit.value = text.clone(body)
+    return lit
+}
+
+/**
+ * Scan a hex blob starting at the `x` of `x"..."`.
+ * Spaces, tabs, and CR are ignored. A newline advances the line.
+ * Digits form bytes in pairs. An odd count is an error, and the last
+ * leftover nibble is not a byte.
+ * @param data file bytes
+ * @param at index of `x`
+ * @param line_in line of `x`
+ * @param line_start_in byte offset of that line
+ * @param errors diagnostics
+ * @context a allocator for the value and the messages
+ * @return the decoded bytes and where the cursor stopped
+ */
+fn scan_hex(data: bytes, at: usize, line_in: i64, line_start_in: usize, errors: *list.List<LexError>): Lit with (a: mem.Allocator) {
+    var p = at + 2
+    var line = line_in
+    var line_start = line_start_in
+    var buf = strbuilder.empty()
+    var high: i64 = -1
+    var digits: i64 = 0
+    var closed = false
+    for p < data.len {
+        val c = data.ptr[p]
+        if c == '"' as u8 {
+            p = p + 1
+            closed = true
+            break
+        }
+        if text.is_hex_digit(c) {
+            digits = digits + 1
+            if high < 0 {
+                high = hex_value(c)
+            } else {
+                buf.append_byte((high * 16 + hex_value(c)) as u8)
+                high = -1
+            }
+        } else if c == '\n' as u8 {
+            line = line + 1
+            line_start = p + 1
+        } else if c != ' ' as u8 && c != '\t' as u8 && c != '\r' as u8 {
+            push_error(errors, line, column_at(p, line_start), not_hex_digit(c))
+        }
+        p = p + 1
+    }
+    if !closed {
+        push_error(errors, line_in, column_at(at, line_start_in), text.clone("unterminated hex blob literal"))
+    } else if digits % 2 != 0 {
+        push_error(errors, line_in, column_at(at, line_start_in), text.clone("hex blob has an odd number of digits; each byte needs two"))
+    }
+    var lit: Lit
+    lit.end = p
+    lit.line = line
+    lit.line_start = line_start
+    lit.kind = TokenKind.HEXBLOB
+    lit.splice = false
+    lit.value = take_buf(&buf)
+    return lit
+}
+
+/**
+ * Scan a char literal starting at the opening quote.
+ * The body is one escape or one UTF-8 code point. `''` is empty.
+ * Extra bytes before the closer are reported, and scanning stops at
+ * the closer or at a newline, which is left in place.
+ * @param data file bytes
+ * @param at index of the opening quote
+ * @param line line of that quote
+ * @param line_start byte offset of that line
+ * @param errors diagnostics
+ * @context a allocator for the value and the messages
+ * @return the decoded bytes and where the cursor stopped
+ */
+fn scan_char(data: bytes, at: usize, line: i64, line_start: usize, errors: *list.List<LexError>): Lit with (a: mem.Allocator) {
+    var p = at + 1
+    var buf = strbuilder.empty()
+    val column = column_at(at, line_start)
+    if p >= data.len || (p < data.len && (data.ptr[p] == '\n' as u8 || data.ptr[p] == '\'' as u8)) {
+        var msg = "unterminated char literal"
+        if p < data.len && data.ptr[p] == '\'' as u8 {
+            msg = "empty char literal"
+            p = p + 1
+        }
+        push_error(errors, line, column, text.clone(msg))
+    } else {
+        if data.ptr[p] == '\\' as u8 {
+            p = decode_escape(data, p, line, line_start, &buf, errors)
+        } else {
+            var n = utf8_length(data, p)
+            if n == 0 {
+                push_error(errors, line, column, text.clone("char literal is not valid UTF-8"))
+                n = 1
+            }
+            var k: usize = 0
+            for k < n {
+                buf.append_byte(data.ptr[p + k])
+                k = k + 1
+            }
+            p = p + n
+        }
+        if p < data.len && data.ptr[p] == '\'' as u8 {
+            p = p + 1
+        } else {
+            push_error(errors, line, column, text.clone("char literal must hold exactly one code point"))
+            for p < data.len && data.ptr[p] != '\'' as u8 && data.ptr[p] != '\n' as u8 {
+                p = p + 1
+            }
+            if p < data.len && data.ptr[p] == '\'' as u8 {
+                p = p + 1
+            }
+        }
+    }
+    var lit: Lit
+    lit.end = p
+    lit.line = line
+    lit.line_start = line_start
+    lit.kind = TokenKind.CHAR
+    lit.splice = false
+    lit.value = take_buf(&buf)
+    return lit
+}
+
+/**
+ * Append one literal token. `value` is owned decoded bytes.
+ * @param tokens output list
+ * @param kind string, char, C string, or hex blob
+ * @param line line of the first byte
+ * @param column column of the first byte
+ * @param text source slice, not what is printed
+ * @param value decoded bytes
+ * @context a allocator for the list
+ */
+fn push_value(tokens: *list.List<Token>, kind: TokenKind, line: i64, column: i64, text: str, value: str) with (a: mem.Allocator) {
+    var tok: Token
+    tok.kind = kind
+    tok.line = line
+    tok.column = column
+    tok.text = text
+    tok.value = value
+    tokens.push(tok)
+}
+
+/**
+ * Scan `data` into tokens, including the SEP tokens inserted for newlines.
+ * Number errors are appended to `errors` and scanning continues.
+ * @param data file bytes. Token text is a view into this buffer
+ * @param errors diagnostics. Each message is owned
+ * @context a allocator for the token list, the bracket stack, and the messages
+ * @return the tokens. The caller frees the list
+ */
+fn lex(data: bytes, errors: *list.List<LexError>): list.List<Token> with (a: mem.Allocator) {
+    var tokens: list.List<Token>
+    var stack: list.List<Open>
+    defer stack.free()
+    var i: usize = 0
+    var line: i64 = 1
+    var line_start: usize = 0
+    var ends = false
+    val src = data as str
+    for i < data.len {
+        val c = data.ptr[i]
+        if c == ' ' as u8 || c == '\t' as u8 || c == '\r' as u8 {
+            i = i + 1
+            continue
+        }
+        if c == '\n' as u8 {
+            val col = column_at(i, line_start)
+            i = i + 1
+            line = line + 1
+            line_start = i
+            // SEP only when the previous token can end a statement, the
+            // stack allows it, and the next line is not `.` / `?.` / `?:`.
+            if ends && newline_separates(stack) && !continues_line(data, i) {
+                push_end(&tokens, TokenKind.SEP, line - 1, col)
+                ends = false
+            }
+            continue
+        }
+        // A `}` whose opener is `$` is not a RBRACE. It resumes the string.
+        // A `{` inside the splice sits above that `$`, so it still closes as RBRACE.
+        if c == '}' as u8 && stack.len > 0 && stack.get(stack.len - 1).kind == '$' as u8 {
+            val start = i
+            val start_line = line
+            val start_col = column_at(i, line_start)
+            stack.pop()
+            val lit = scan_quoted(data, i, line, line_start, errors, false, true)
+            i = lit.end
+            push_value(&tokens, lit.kind, start_line, start_col, text.slice(src, start, i), lit.value)
+            // The next splice's `$` is two bytes before the cursor.
+            if lit.splice {
+                push_open(&stack, '$' as u8, line, column_at(lit.end - 2, line_start))
+            }
+            ends = literal_ends(lit.kind)
+            continue
+        }
+        if c == '(' as u8 || c == '[' as u8 || c == '{' as u8 || c == ')' as u8 || c == ']' as u8 || c == '}' as u8 {
+            val kind = bracket_kind(c)
+            val start = i
+            i = i + 1
+            var tok: Token
+            tok.kind = kind
+            tok.line = line
+            tok.column = column_at(start, line_start)
+            tok.text = text.slice(src, start, i)
+            tokens.push(tok)
+            // An opener hides later newlines and does not end a statement.
+            // A closer does end a statement.
+            if c == '(' as u8 || c == '[' as u8 || c == '{' as u8 {
+                push_open(&stack, c, tok.line, tok.column)
+                ends = false
+            } else {
+                close_bracket(&stack, c, tok.line, tok.column, errors)
+                ends = true
+            }
+            continue
+        }
+        // A line comment stops before the newline, so the rule above still sees it.
+        if c == '/' as u8 && i + 1 < data.len && data.ptr[i + 1] == '/' as u8 {
+            i = i + 1
+            for i < data.len && data.ptr[i] != '\n' as u8 {
+                i = i + 1
+            }
+            continue
+        }
+        // A block comment that contains a newline is one SEP, placed at the
+        // opening `/*`. The look-ahead starts after the comment, so `/* \n */ .b`
+        // continues the line. A comment that stays on one line is not a SEP.
+        if c == '/' as u8 && i + 1 < data.len && data.ptr[i + 1] == '*' as u8 {
+            val start_line = line
+            val start_col = column_at(i, line_start)
+            val b = skip_block(data, i, line, line_start)
+            i = b.end
+            line = b.line
+            line_start = b.line_start
+            if !b.closed {
+                push_error(errors, start_line, start_col, text.clone("unterminated block comment"))
+            }
+            if b.saw_newline && ends && newline_separates(stack) && !continues_line(data, i) {
+                push_end(&tokens, TokenKind.SEP, start_line, start_col)
+                ends = false
+            }
+            continue
+        }
+        val m = match_punct(data, i)
+        if m.ok {
+            val start = i
+            i = i + m.len
+            var tok: Token
+            tok.kind = m.kind
+            tok.line = line
+            tok.column = column_at(start, line_start)
+            tok.text = text.slice(src, start, i)
+            tokens.push(tok)
+            ends = punct_ends(m.kind)
+            continue
+        }
+        // `c"..."` and `x"..."` are literals, so they are not the names `c` and `x`.
+        if (c == 'c' as u8 || c == 'x' as u8) && i + 1 < data.len && data.ptr[i + 1] == '"' as u8 {
+            val start = i
+            val start_line = line
+            val start_col = column_at(i, line_start)
+            var lit: Lit
+            if c == 'c' as u8 {
+                lit = scan_quoted(data, i, line, line_start, errors, true, false)
+            } else {
+                lit = scan_hex(data, i, line, line_start, errors)
+            }
+            i = lit.end
+            line = lit.line
+            line_start = lit.line_start
+            push_value(&tokens, lit.kind, start_line, start_col, text.slice(src, start, i), lit.value)
+            ends = true
+            continue
+        }
+        if is_ident_start(c) {
+            val start = i
+            i = i + 1
+            for i < data.len && is_ident_char(data.ptr[i]) {
+                i = i + 1
+            }
+            var kind = keyword_kind(text.slice(src, start, i))
+            var ends_tok = keyword_ends(kind)
+            // `as?` is one token. `as?.` and `as?:` are not: that `?` starts `?.` or `?:`.
+            if kind == TokenKind.KW_AS && i < data.len && data.ptr[i] == '?' as u8 && peek(data, i + 1) != '.' as u8 && peek(data, i + 1) != ':' as u8 {
+                i = i + 1
+                kind = TokenKind.AS_Q
+                ends_tok = false
+            }
+            var tok: Token
+            tok.kind = kind
+            tok.line = line
+            tok.column = column_at(start, line_start)
+            tok.text = text.slice(src, start, i)
+            tokens.push(tok)
+            ends = ends_tok
+            continue
+        }
+        if text.is_digit(c) {
+            val start = i
+            val n = scan_number(data, i, line, line_start, last_is_dot(tokens), errors)
+            i = n.end
+            var tok: Token
+            tok.kind = n.kind
+            tok.line = line
+            tok.column = column_at(start, line_start)
+            tok.text = text.slice(src, start, i)
+            tokens.push(tok)
+            ends = true
+            continue
+        }
+        if c == '"' as u8 || c == '`' as u8 || c == '\'' as u8 {
+            val start = i
+            val start_line = line
+            val start_col = column_at(i, line_start)
+            var lit: Lit
+            if c == '"' as u8 {
+                lit = scan_quoted(data, i, line, line_start, errors, false, false)
+            } else if c == '`' as u8 {
+                lit = scan_raw(data, i, line, line_start, errors)
+            } else {
+                lit = scan_char(data, i, line, line_start, errors)
+            }
+            i = lit.end
+            line = lit.line
+            line_start = lit.line_start
+            push_value(&tokens, lit.kind, start_line, start_col, text.slice(src, start, i), lit.value)
+            if lit.splice {
+                push_open(&stack, '$' as u8, line, column_at(lit.end - 2, line_start))
+            }
+            ends = literal_ends(lit.kind)
+            continue
+        }
+        // `;` is a SEP by itself. It does not end a statement, so a newline after it stays quiet.
+        if c == ';' as u8 {
+            push_end(&tokens, TokenKind.SEP, line, column_at(i, line_start))
+            i = i + 1
+            ends = false
+            continue
+        }
+        // `@name` is one attribute. The lexeme keeps the `@`. A bare `@` is an error and no token.
+        if c == '@' as u8 {
+            val start = i
+            val col = column_at(i, line_start)
+            i = i + 1
+            if i >= data.len || !is_ident_start(data.ptr[i]) {
+                push_error(errors, line, col, text.clone("expected an attribute name after '@'"))
+                continue
+            }
+            i = i + 1
+            for i < data.len && is_ident_char(data.ptr[i]) {
+                i = i + 1
+            }
+            var tok: Token
+            tok.kind = TokenKind.ATTR
+            tok.line = line
+            tok.column = col
+            tok.text = text.slice(src, start, i)
+            tokens.push(tok)
+            ends = false
+            continue
+        }
+        i = i + 1
+    }
+    val column = column_at(i, line_start)
+    // End of file inserts SEP on its own. It does not consult the stack or the next line.
+    // A trailing newline already inserted SEP and cleared `ends`, so this stays quiet.
+    // Only the top opener is reported. `$` means the splice never closed.
+    if stack.len > 0 {
+        val top = stack.get(stack.len - 1)
+        if top.kind == '$' as u8 {
+            push_error(errors, top.line, top.column, text.clone("unterminated string interpolation"))
+        } else {
+            push_error(errors, top.line, top.column, never_closed_message(top.kind))
+        }
+    }
+    if ends {
+        push_end(&tokens, TokenKind.SEP, line, column)
+    }
+    push_end(&tokens, TokenKind.EOF, line, column)
+    return tokens
+}
+
+/**
+ * Print one diagnostic the way `jog lex` does: `path:line:column: error: message`.
+ * @param path source path, as it was passed in
+ * @param e diagnostic to print
+ * @context a allocator for the line buffer
+ */
+fn print_error(path: str, e: LexError) with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    defer b.free()
+    b.append(path)
+    b.append(":")
+    b.append_int(e.line, 10)
+    b.append(":")
+    b.append_int(e.column, 10)
+    b.append(": error: ")
+    b.append(e.message)
+    io.eprintln(b.str())
+}
+
+/**
+ * Read `path`, scan it, and print every token, then any diagnostics.
+ * The scan and the printing run in an arena, released after those lines.
+ * Token text is a view of the file bytes. Those bytes are freed when
+ * this function returns, after the arena releases.
+ * @param path source path. The path must be under 4096 bytes; that limit is the path length, not the size of the file
+ * @context a allocator for the file bytes
+ * @return 0 when the file scanned cleanly, 1 when it cannot be read or a token is ill-formed
+ */
+fn run(path: str): i32 with (a: mem.Allocator) {
+    var (data, err) = fs.read_all(path)
+    if err != null {
+        if io.eprint("jogc: failed to read ") != null {
+            return 1
+        }
+        if io.eprint(path) != null {
+            return 1
+        }
+        if err == errs.ErrNotFound {
+            if io.eprintln(": file not found") != null {
+                return 1
+            }
+        } else if io.eprintln(": io error") != null {
+            return 1
+        }
+        return 1
+    }
+    defer a.free(data)
+    var status: i32 = 0
+    arena.arena(4096) {
+        var errors: list.List<LexError>
+        var tokens = lex(data, &errors)
+        for tok in tokens.items() {
+            print_token(tok)
+        }
+        for e in errors.items() {
+            print_error(path, e)
+            status = 1
+        }
+    }
+    return status
 }

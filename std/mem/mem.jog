@@ -2,6 +2,10 @@
 // process heap: its methods call jogrt_alloc, jogrt_realloc, and jogrt_free.
 // ErrorArena is the root error arena. Out of memory panics; these methods
 // do not return an error value.
+//
+// slice(p, n) is a []T view of n elements at p. It allocates nothing.
+// n == 0 is an empty slice, including when p is null. n > 0 and a null
+// pointer panics. Indexing the slice is bounds-checked.
 
 import std.c
 
@@ -119,6 +123,23 @@ fn ErrorArena.resize(b: bytes, size: usize): (bytes, error?) {
 // Does nothing. The block, null or not, is not released. The arena drops
 // its storage at process exit, not per call.
 fn ErrorArena.free(b: bytes) {
+}
+
+// A slice of n elements at p. The header is that pointer and n.
+// n == 0 returns an empty slice, and p may be null. n > 0 and a null
+// pointer panics. The slice does not own the memory.
+fn slice<T>(p: *T, n: usize): []T {
+    var s: []T
+    if n == 0 {
+        return s
+    }
+    val raw = p as *void?
+    if raw == null {
+        panic("null slice pointer")
+    }
+    s.ptr = p
+    s.len = n
+    return s
 }
 
 // n elements, zeroed. An empty count allocates nothing. The pointer is

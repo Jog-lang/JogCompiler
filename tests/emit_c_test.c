@@ -1221,7 +1221,7 @@ static void test_emit_kinds(void) {
                                  "typedef int32_t (*jt40)(jt39, ...); /* extern (*const u8, ...) -> i32 */\n"
                                  "\n"
                                  "struct jt41 { /* escaping (i32) -> () with const bytes */\n"
-                                 "    void (*code)(int32_t, void *env);\n"
+                                 "    void (*code)(int32_t, jt15, void *env);\n"
                                  "    void *env;\n"
                                  "};\n"
                                  "\n"

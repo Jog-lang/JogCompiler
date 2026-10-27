@@ -1,9 +1,13 @@
 // Windows list, rename, exists, and cwd. WIN32_FIND_DATAW is 592 bytes
 // on this host. cFileName is WCHAR[260] at byte 44. Paths are UTF-16.
 // list rejects a path that does not leave room for a separator, '*',
-// and NUL in a 4096-character buffer.
+// and NUL in a 4096-character buffer. rename returns error?. A missing
+// source is ErrNotFound. GetLastError 2 is ERROR_FILE_NOT_FOUND and 3
+// is ERROR_PATH_NOT_FOUND. Every other rename failure is ErrIO.
+// exists stays bool.
 
 import std.c
+import std.error as errors
 import std.list as lists
 import std.mem
 
@@ -82,14 +86,23 @@ actual fn list(path: str): (lists.List<str>, bool) with (a: mem.Allocator) {
     return names, true
 }
 
-// flags 0: an existing target is left untouched and this returns false.
-actual fn rename(from: str, to: str): bool {
+// flags 0: an existing target is left untouched and this returns ErrIO.
+// A missing source is ErrNotFound. A path that is empty, not UTF-8, or
+// too long is ErrIO.
+actual fn rename(from: str, to: str): error? {
     var wide_from: [4096]u16
     var wide_to: [4096]u16
     if !wide_path(from, wide_from[..].ptr, 4096) || !wide_path(to, wide_to[..].ptr, 4096) {
-        return false
+        return errors.ErrIO
     }
-    return c.MoveFileExW(wide_from[..].ptr, wide_to[..].ptr, 0) != 0
+    if c.MoveFileExW(wide_from[..].ptr, wide_to[..].ptr, 0) != 0 {
+        return null
+    }
+    val code = c.GetLastError()
+    if code == 2 || code == 3 {
+        return errors.ErrNotFound
+    }
+    return errors.ErrIO
 }
 
 // false means the path is missing, not UTF-8, or does not fit.

@@ -1,7 +1,8 @@
-// Package arena, same as arena.jog, so the tests see Arena and init
-// with no import of std.arena. alloc, resize, and free are the
-// Allocator methods. reset and release are called on the arena value.
-// t.expect takes a bool.
+// Package arena, same as arena.jog, so the tests see Arena, init, and
+// arena(chunk) { ... } with no import of std.arena. alloc, resize, and
+// free are the Allocator methods. reset and release are called on the
+// arena value. t.expect takes a bool. The block helper installs the
+// arena as the Allocator context and release()s when the block returns.
 //
 // Programmer-error panics are expectPanic tests at the bottom.
 // Out of memory in init and new_chunk is not an @test.
@@ -154,6 +155,41 @@ fn asAllocator() with (t: testing.Testing) {
     }
     arena.release()
     arena.release()
+}
+
+fn borrow(n: usize): bytes with (a: mem.Allocator) {
+    val (b, err) = a.alloc(n, 1)
+    if err != null {
+        panic("out of memory")
+    }
+    return b
+}
+
+@test
+fn arenaBlock() with (t: testing.Testing) {
+    // The block's Allocator is the arena. The byte written inside is
+    // still visible in `seen` after the call. A second block allocates
+    // again after the first arena has been released.
+    var seen: i32 = 0
+    arena(64) {
+        val b = borrow(4)
+        b.ptr[0] = 9
+        b.ptr[3] = 8
+        seen = b.ptr[0] as i32
+    }
+    t.expect(seen == 9)
+    var again: i32 = 0
+    arena(32) {
+        val b = borrow(2)
+        b.ptr[0] = 3
+        b.ptr[1] = 4
+        again = b.ptr[1] as i32
+    }
+    t.expect(again == 4)
+    arena(16) {
+        val b = borrow(1)
+        b.ptr[0] = 1
+    }
 }
 
 // Out of memory panics in init and new_chunk. Not an @test.

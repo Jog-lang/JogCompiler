@@ -1343,6 +1343,176 @@ JogType *jog_check_enum_safe(Check *ck, CheckJob *job, JogBlockScope *scope, Jog
     return result;
 }
 
+static bool is_arith_tok(JogTokenKind op) {
+    switch (op) {
+    case JOG_TOK_PLUS:
+    case JOG_TOK_MINUS:
+    case JOG_TOK_STAR:
+    case JOG_TOK_SLASH:
+    case JOG_TOK_PERCENT:
+    case JOG_TOK_AMP:
+    case JOG_TOK_PIPE:
+    case JOG_TOK_CARET:
+    case JOG_TOK_SHL:
+    case JOG_TOK_SHR:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool int_lit_tree(const JogNode *node) {
+    if (!node) {
+        return false;
+    }
+    if (node->kind == JOG_NODE_INT_LIT) {
+        return true;
+    }
+    if (node->kind == JOG_NODE_UNARY) {
+        JogTokenKind op = node->as.unary.op;
+        return (op == JOG_TOK_MINUS || op == JOG_TOK_TILDE) && int_lit_tree(node->as.unary.operand);
+    }
+    if (node->kind != JOG_NODE_BINARY || !is_arith_tok(node->as.binary.op)) {
+        return false;
+    }
+    return int_lit_tree(node->as.binary.lhs) && int_lit_tree(node->as.binary.rhs);
+}
+
+static bool field_is_unit(const JogType *type) {
+    const JogType *underlying;
+    if (!type) {
+        return false;
+    }
+    underlying = jog_type_underlying((JogType *)type);
+    return underlying && underlying->kind == JOG_TY_UNIT;
+}
+
+/* Every variant is only a tag. A unit field is not a payload. */
+static bool enum_payload_free(const JogType *en) {
+    size_t i;
+    if (!en || en->kind != JOG_TY_ENUM || !en->as.nominal.base || !en->as.nominal.variants || en->as.nominal.variant_count == 0) {
+        return false;
+    }
+    for (i = 0; i < en->as.nominal.variant_count; i++) {
+        const JogVariant *variant = &en->as.nominal.variants[i];
+        size_t f;
+        if (variant->field_count > 0 && !variant->fields) {
+            return false;
+        }
+        for (f = 0; f < variant->field_count; f++) {
+            if (!field_is_unit(variant->fields[f].type)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool enum_has_field(const JogType *en, const char *name) {
+    size_t i;
+    size_t f;
+    if (!en || en->kind != JOG_TY_ENUM || !name || !en->as.nominal.variants) {
+        return false;
+    }
+    for (i = 0; i < en->as.nominal.variant_count; i++) {
+        const JogVariant *variant = &en->as.nominal.variants[i];
+        for (f = 0; f < variant->field_count; f++) {
+            const char *field = variant->fields ? variant->fields[f].name : NULL;
+            if (field && strcmp(field, name) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static int variant_by_tag(const JogType *en, uint64_t bits) {
+    size_t i;
+    if (!en || !en->as.nominal.variants) {
+        return -1;
+    }
+    for (i = 0; i < en->as.nominal.variant_count; i++) {
+        if ((uint64_t)en->as.nominal.variants[i].tag == bits) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+/* Integer to a payload-free enum. 0 when this cast is not that. */
+static int check_tag_cast(Check *ck, CheckJob *job, JogNode *node, JogType *got, JogType *dest, JogType **out) {
+    JogType *en;
+    JogType *src;
+    JogType *error;
+    if (!got || is_error(got)) {
+        return 0;
+    }
+    en = enum_from_expr_type(ck, job, dest);
+    if (ck->stop) {
+        return -1;
+    }
+    if (!en || !enum_payload_free(en)) {
+        return 0;
+    }
+    src = peel(got);
+    if (!src || (src->kind != JOG_TY_INT && src->kind != JOG_TY_UNTYPED_INT)) {
+        return 0;
+    }
+    error = error_type(ck);
+    if (int_lit_tree(node->as.cast.expr)) {
+        JogConst value;
+        memset(&value, 0, sizeof(value));
+        if (!jog_const_eval(ck->program->arena, ck->program->diag, ck->program->types, node->as.cast.expr,
+                            en->as.nominal.base, &value) ||
+            value.kind != JOG_CONST_INT) {
+            ck->failed = true;
+            node->type = error;
+            if (out) {
+                *out = error;
+            }
+            return 1;
+        }
+        if (variant_by_tag(en, value.bits) < 0) {
+            jog_check_fail(ck, node->pos, "constant does not fit");
+            node->type = error;
+            if (out) {
+                *out = error;
+            }
+            return 1;
+        }
+    } else if (src->kind != JOG_TY_INT) {
+        return 0;
+    }
+    node->type = dest;
+    if (out) {
+        *out = dest;
+    }
+    return 1;
+}
+
+int jog_check_enum_name(Check *ck, JogNode *member, JogType *outer) {
+    JogType *en;
+    JogType *str;
+    if (!ck || !member || member->kind != JOG_NODE_MEMBER || !member->as.member.name || strcmp(member->as.member.name, "name") != 0) {
+        return 0;
+    }
+    en = peel(outer);
+    if (en && en->kind == JOG_TY_PTR) {
+        en = peel(en->as.elem.elem);
+    }
+    if (!en || en->kind != JOG_TY_ENUM || enum_has_field(en, "name")) {
+        return 0;
+    }
+    str = jog_type_builtin(ck->program->types, JOG_BUILTIN_CONST_BYTES);
+    if (!str) {
+        jog_check_oom(ck);
+        return -1;
+    }
+    member->symbol = NULL;
+    member->type = str;
+    return 1;
+}
+
 int jog_check_enum_cast(Check *ck, CheckJob *job, JogBlockScope *scope, JogNode *node, JogType **out) {
     JogType *dest;
     JogType *got;
@@ -1377,7 +1547,7 @@ int jog_check_enum_cast(Check *ck, CheckJob *job, JogBlockScope *scope, JogNode 
         return -1;
     }
     if (!en) {
-        return 0;
+        return check_tag_cast(ck, job, node, got, dest, out);
     }
     if (en->as.nominal.base && same_type(dest, en->as.nominal.base)) {
         node->type = dest;

@@ -1,37 +1,47 @@
 // Package std.proc. run starts args[0], waits until it exits, and returns
-// the exit code together with the bytes the child wrote to stdout and
-// stderr. An empty argument vector is a programmer error and panics.
-// A missing program, an empty program name, or any other failed start
-// is ok == false. That is not exit code 0 by itself: code is meaningful
-// only when ok is true.
+// (Output, error?). Output.code is the process exit code when the error
+// is null, including a non-zero exit. stdout and stderr are the bytes the
+// child wrote. An empty argument vector is ErrIO. An allocation that
+// fails while spawning is ErrOutOfMemory. A missing program is
+// ErrNotFound. Any other failed start, including a capture that cannot
+// be read, is ErrIO. Those failures return a zero Output and an error,
+// not a fake exit code. run_inherit is the same start and wait, and
+// returns (i32, error?), with the child's stdout and stderr left on the
+// parent's streams. It does not yield the bytes as they are written.
 //
 // proc.windows.jog calls CreateProcessW. args[0] is the module, so PATH
 // is not searched, and the command line is quoted. proc.posix.jog calls
 // posix_spawnp and passes the arguments as an argv array. Both send
 // stdout and stderr to temporary files, inherited by the child. Pipes
 // are not used, so a chatty child cannot fill a buffer and stall while
-// the parent waits. run_inherit is the same start and wait, with the
-// child's stdout and stderr left on the parent's streams. It does not
-// yield the bytes as they are written. free_output releases both blocks
-// from run. The allocator is a with (a: mem.Allocator) context. It is
-// not stored.
+// the parent waits. free_output releases both blocks from run. The
+// allocator is a with (a: mem.Allocator) context. It is not stored.
+// Building the Windows command line still goes through strbuilder, which
+// panics if it cannot grow. The explicit spawn allocations return
+// ErrOutOfMemory instead.
 
 import std.c
+import std.error as errors
 import std.io
 import std.mem
 
-// code is the process exit code when ok is true. stdout and stderr are
-// empty when ok is false, and otherwise the captured bytes. The caller
-// owns those blocks.
+// code is the process exit code when the error from run is null. stdout
+// and stderr are the captured bytes. The caller owns those blocks. A
+// failed start leaves both empty, and code is not a status.
 struct Output {
     code: i32
-    ok: bool
     stdout: bytes
     stderr: bytes
 }
 
-expect fn run(args: []str): Output with (a: mem.Allocator)
-expect fn run_inherit(args: []str): (i32, bool) with (a: mem.Allocator)
+// Starts args[0] and waits. The error is null when the process ran.
+// Output.code is then the exit code. See the package comment for which
+// sentinel a failed start returns.
+expect fn run(args: []str): (Output, error?) with (a: mem.Allocator)
+
+// Same start and wait as run, without captured bytes. The i32 is the
+// exit code when the error is null.
+expect fn run_inherit(args: []str): (i32, error?) with (a: mem.Allocator)
 
 // Releases both captured blocks. An empty block frees nothing.
 fn free_output(out: Output) with (a: mem.Allocator) {
@@ -51,7 +61,8 @@ private fn contains_nul(text: str): bool {
 }
 
 // false means the program name is empty or some argument contains a NUL.
-// The command line and each argv slot are C strings, so a NUL cannot be passed.
+// The caller returns ErrIO. The command line and each argv slot are C
+// strings, so a NUL cannot be passed.
 fn args_ok(args: []str): bool {
     if args[0].len == 0 {
         return false
@@ -67,16 +78,17 @@ fn args_ok(args: []str): bool {
 }
 
 // len + 1 bytes, trailing NUL. The caller frees the block.
-private fn c_string(text: str): bytes with (a: mem.Allocator) {
+// ErrOutOfMemory means the block was not allocated.
+private fn c_string(text: str): (bytes, error?) with (a: mem.Allocator) {
     val (raw, err) = a.alloc(text.len + 1, align(u8))
     if err != null {
-        panic("out of memory")
+        return bytes(), errors.ErrOutOfMemory
     }
     if text.len > 0 {
         c.memcpy(raw.ptr as *void, text.ptr as *const void, text.len)
     }
     raw.ptr[text.len] = 0
-    return raw
+    return raw, null
 }
 
 private fn path_view(path: *u8): str {
@@ -93,22 +105,24 @@ private fn path_view(path: *u8): str {
     return view
 }
 
-fn read_captures(out_path: *u8, err_path: *u8, code: i32): Output with (a: mem.Allocator) {
-    val (stdout_bytes, stdout_ok) = io.read_all(path_view(out_path))
-    val (stderr_bytes, stderr_ok) = io.read_all(path_view(err_path))
-    if !stdout_ok || !stderr_ok {
-        if stdout_ok {
+// Reads the two capture files. A null error means both reads succeeded
+// and code is the child's exit code. A capture that cannot be read is
+// ErrIO, and any bytes already read are freed.
+fn read_captures(out_path: *u8, err_path: *u8, code: i32): (Output, error?) with (a: mem.Allocator) {
+    val (stdout_bytes, stdout_err) = io.read_all(path_view(out_path))
+    val (stderr_bytes, stderr_err) = io.read_all(path_view(err_path))
+    if stdout_err != null || stderr_err != null {
+        if stdout_err == null {
             a.free(stdout_bytes)
         }
-        if stderr_ok {
+        if stderr_err == null {
             a.free(stderr_bytes)
         }
-        return Output()
+        return Output(), errors.ErrIO
     }
     var out: Output
     out.code = code
-    out.ok = true
     out.stdout = stdout_bytes
     out.stderr = stderr_bytes
-    return out
+    return out, null
 }

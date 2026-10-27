@@ -48,7 +48,7 @@ fn child_gate() {
     }
 }
 
-fn run_child(flag: str): proc.Output with (a: mem.Allocator) {
+fn run_child(flag: str): (proc.Output, error?) with (a: mem.Allocator) {
     return proc.run([]str(os.argv(0), flag))
 }
 
@@ -56,8 +56,8 @@ fn run_child(flag: str): proc.Output with (a: mem.Allocator) {
 fn binaryStdout() with (t: testing.Testing) {
     child_gate()
     with (mem.heap()) {
-        val got = run_child("--io-binary")
-        t.expect(got.ok)
+        val (got, err) = run_child("--io-binary")
+        t.expect(err == null)
         t.expect(got.code == 0)
         t.expectEq(got.stdout, "a\nb\n")
         proc.free_output(got)
@@ -68,8 +68,8 @@ fn binaryStdout() with (t: testing.Testing) {
 fn readSomeEof() with (t: testing.Testing) {
     child_gate()
     with (mem.heap()) {
-        val got = run_child("--io-eof")
-        t.expect(got.ok)
+        val (got, err) = run_child("--io-eof")
+        t.expect(err == null)
         t.expect(got.code == 0)
         t.expectEq(got.stdout, "eof")
         proc.free_output(got)

@@ -84,7 +84,7 @@ fn put(dir: str, name: str, text: str): bool with (a: mem.Allocator) {
     data.len = text.len
     val wrote = write_all(path, data)
     free_str(path)
-    return wrote
+    return wrote == null
 }
 
 fn mkdir_at(dir: str, name: str): bool with (a: mem.Allocator) {

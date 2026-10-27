@@ -152,4 +152,10 @@ bool jog_lower_lambda_addr(Lower *L, const JogSymbol *symbol, JirOperand *out);
 /* Assign through a capture. False when the target is not one. */
 bool jog_lower_lambda_store(Lower *L, JogNode *node);
 
+/* Same compare as == on str and bytes. negate selects !=. */
+JirOperand jog_lower_bytes_cmp(Lower *L, JirOperand lhs, JirOperand rhs, bool negate, JogPos pos);
+
+/* Same compare as == on an enum. negate selects !=. */
+JirOperand jog_lower_enum_eq(Lower *L, JirOperand lhs, JirOperand rhs, bool negate, JogPos pos);
+
 #endif

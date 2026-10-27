@@ -41,7 +41,7 @@ fn usage(to_err: bool) {
     say(to_err, "  jogc help                show this message")
 }
 
-fn dispatch(): i32 {
+fn dispatch(): i32 with (a: mem.Allocator) {
     if os.argc() < 2 {
         usage(true)
         return 2
@@ -56,7 +56,11 @@ fn dispatch(): i32 {
         return 0
     }
     if command == "lex" {
-        return lex.run(command)
+        if os.argc() < 3 {
+            io.eprintln("usage: jog lex <file>")
+            return 2
+        }
+        return lex.run(os.argv(2))
     }
     if command == "parse" {
         return parse.run(command)

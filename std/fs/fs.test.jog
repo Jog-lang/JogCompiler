@@ -4,11 +4,13 @@
 // context: with (mem.heap()). t.expect takes a bool. t.expectEq takes
 // two str values.
 //
-// A missing file or directory is false, not a panic. Out of memory
-// in copy_str, join, and push_copied is not an @test. scratch,
+// A missing file is ErrNotFound, not a panic. An empty path is ErrIO.
+// list still uses bool. Out of memory in copy_str, join, and
+// push_copied is not an @test. scratch,
 // make_dir, and close_dir live in the per-OS test file. The scratch
 // directory is removed afterwards.
 
+import std.error as errors
 import std.mem
 import std.testing
 
@@ -24,7 +26,7 @@ private fn text_bytes(text: str): bytes {
 }
 
 private fn write_text(path: str, text: str): bool {
-    return write_all(path, text_bytes(text))
+    return write_all(path, text_bytes(text)) == null
 }
 
 private fn expect_join(left: str, right: str, want: str) with (t: testing.Testing, a: mem.Allocator) {
@@ -53,10 +55,10 @@ fn joinSeparators() with (t: testing.Testing) {
 fn readAndWrite() with (t: testing.Testing) {
     with (mem.heap()) {
         val (missing, no) = read_all("")
-        t.expect(!no)
+        t.expect(no == errors.ErrIO)
         t.expect(missing.len == 0)
         free_bytes(missing)
-        t.expect(!write_all("", text_bytes("x")))
+        t.expect(write_all("", text_bytes("x")) == errors.ErrIO)
 
         val dir = scratch("jog-fs-io")
         t.expect(make_dir(dir))
@@ -65,17 +67,17 @@ fn readAndWrite() with (t: testing.Testing) {
         t.expect(write_text(slash, "h\0i!"))
         t.expect(write_text(back, "hello"))
         val (got, ok) = read_all(slash)
-        t.expect(ok)
+        t.expect(ok == null)
         t.expectEq(got, "h\0i!")
         free_bytes(got)
         val (hello, ok2) = read_all(back)
-        t.expect(ok2)
+        t.expect(ok2 == null)
         t.expectEq(hello, "hello")
         free_bytes(hello)
         val absent = join(dir, "no-such/file.txt")
-        t.expect(!write_text(absent, "x"))
+        t.expect(write_all(absent, text_bytes("x")) == errors.ErrNotFound)
         val (none, ok3) = read_all(absent)
-        t.expect(!ok3)
+        t.expect(ok3 == errors.ErrNotFound)
         t.expect(none.len == 0)
         free_bytes(none)
         free_str(slash)
@@ -143,9 +145,10 @@ fn renameAndExists() with (t: testing.Testing) {
         val from = join(dir, "old.txt")
         val to = join(dir, "new.txt")
         t.expect(exists(from))
-        t.expect(rename(from, to))
+        t.expect(rename(from, to) == null)
         t.expect(!exists(from))
         t.expect(exists(to))
+        t.expect(rename(from, to) == errors.ErrNotFound)
         val (here, ok) = cwd()
         t.expect(ok)
         t.expect(here.len > 0)

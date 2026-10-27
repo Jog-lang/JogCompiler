@@ -14,8 +14,15 @@
 // free of one allocation does nothing. The bytes stay until reset or
 // release. reset sets every block's cursor to 0 and keeps the memory.
 // release frees every block and the header.
+//
+// arena(chunk) { ... } inits an arena of that chunk size, installs it as
+// the Allocator context for the block, and release()s when the block
+// returns. alloc panics when out of memory, matching mem.alloc. The
+// (bytes, error?) result stays, and the error is always null: a concrete
+// out-of-memory error cannot be built without allocating.
 
 import std.c
+import std.mem
 
 // One jogrt block. used is the bump cursor. block_align is the alignment
 // jogrt_alloc was given, so an offset that is a multiple of a smaller
@@ -139,6 +146,9 @@ fn init(chunk_size: usize): Arena {
     return arena
 }
 
+// Bumps the arena. A missing arena, or an alignment that is not a power
+// of two, panics. Out of memory panics too, matching mem.alloc. The
+// error is always null.
 fn Arena.alloc(size: usize, align: usize): (bytes, error?) {
     if self.state == null {
         panic("arena is not initialized")
@@ -182,6 +192,18 @@ fn *Arena.reset() {
         val chunk = at!!
         chunk.used = 0
         at = chunk.next
+    }
+}
+
+// chunk_size 0 means 4096, the same as init. The arena is the Allocator
+// for body. release runs when body returns, including by return from the
+// lambda. alloc inside body still panics when out of memory, and the
+// error it returns is always null.
+fn arena(chunk_size: usize, body: () -> () with mem.Allocator) {
+    var a = init(chunk_size)
+    defer a.release()
+    with (&a) {
+        body()
     }
 }
 

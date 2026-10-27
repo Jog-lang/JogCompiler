@@ -33,8 +33,12 @@ JogType *jog_check_enum_force(Check *ck, CheckJob *job, JogBlockScope *scope, Jo
 JogType *jog_check_enum_elvis(Check *ck, CheckJob *job, JogBlockScope *scope, JogNode *node);
 JogType *jog_check_enum_safe(Check *ck, CheckJob *job, JogBlockScope *scope, JogNode *node);
 
-/* 1 when cast reads an enum's tag. 0 when it is not that cast.
-   -1 when the checker has stopped. */
+/* 1 when cast reads an enum's tag, or builds a payload-free enum from an
+   integer tag. 0 when it is not that cast. -1 when the checker has stopped. */
 int jog_check_enum_cast(Check *ck, CheckJob *job, JogBlockScope *scope, JogNode *node, JogType **out);
+
+/* 1 when member is the generated variant name. 0 when it is not, including
+   when a payload field is already called name. -1 when stopped. */
+int jog_check_enum_name(Check *ck, JogNode *member, JogType *outer);
 
 #endif

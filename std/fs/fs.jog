@@ -1,15 +1,20 @@
-// Package std.fs. read_all and write_all are std.io: a missing file is
-// false, not a panic, and the bytes come from the Allocator context.
-// list names the directory. The Windows file uses FindFirstFileW and
-// the POSIX file uses opendir. "." and ".." are dropped. The names are
-// then sorted here, by unsigned byte value, so the order does not follow
-// the file system. join copies one path. '/' and '\\' are both separators.
-// An empty side is a copy of the other. free_str releases one block from
-// join or from a listed name. free_names releases every name and the list
-// buffer.
+// Package std.fs. read_all returns (bytes, error?). write_all and rename
+// return error?. A missing file, a missing parent of a write, or a missing
+// rename source is ErrNotFound. Any other read, write, or rename failure
+// is ErrIO. exists stays bool: false is missing, not UTF-8, or not a fit,
+// and that is not an error value. list names the directory and still
+// returns bool. The Windows file uses FindFirstFileW and the POSIX file
+// uses opendir. "." and ".." are dropped. The names are then sorted here,
+// by unsigned byte value, so the order does not follow the file system.
+// join copies one path. '/' and '\\' are both separators. An empty side
+// is a copy of the other. free_str releases one block from join or from
+// a listed name. free_names releases every name and the list buffer.
 //
 // The allocator is a with (a: mem.Allocator) context. It is not stored.
-// read_all and write_all use io's limit of 4096 bytes. Out of memory panics.
+// The path must be under 4096 bytes. That limit is the path length, not
+// the file size. Reads use a 4096-byte chunk. Out of memory in join and
+// list still panics. A resize error reported by the allocator while
+// reading is returned. The std heap panics instead of reporting one.
 
 import std.c
 import std.io
@@ -18,16 +23,25 @@ import std.mem
 import std.text
 
 expect fn list(path: str): (lists.List<str>, bool) with (a: mem.Allocator)
-expect fn rename(from: str, to: str): bool
+
+// ErrNotFound means from is missing. ErrIO means the path does not fit,
+// the target already exists, or the OS refused.
+expect fn rename(from: str, to: str): error?
+
 expect fn exists(path: str): bool
 expect fn cwd(): (str, bool) with (a: mem.Allocator)
 
-fn read_all(path: str): (bytes, bool) with (a: mem.Allocator) {
-    val (data, ok) = io.read_all(path)
-    return data, ok
+// The whole file, from io.read_all. ErrNotFound means the path is missing.
+// ErrIO means another read failed. The bytes come from the Allocator
+// context. The caller frees them. A null error with empty bytes is an
+// empty file.
+fn read_all(path: str): (bytes, error?) with (a: mem.Allocator) {
+    return io.read_all(path)
 }
 
-fn write_all(path: str, data: bytes): bool {
+// Creates or replaces the file, through io.write_all. ErrNotFound means
+// a parent path is missing. ErrIO means another write failed.
+fn write_all(path: str, data: bytes): error? {
     return io.write_all(path, data)
 }
 

@@ -2251,6 +2251,15 @@ static JirOperand lower_enum_eq(Lower *L, JirOperand lhs, JirOperand rhs, bool n
     return operand_local(L, result);
 }
 
+/* when value arms call these. == above stays on the static functions. */
+JirOperand jog_lower_bytes_cmp(Lower *L, JirOperand lhs, JirOperand rhs, bool negate, JogPos pos) {
+    return lower_bytes_cmp(L, lhs, rhs, negate, pos);
+}
+
+JirOperand jog_lower_enum_eq(Lower *L, JirOperand lhs, JirOperand rhs, bool negate, JogPos pos) {
+    return lower_enum_eq(L, lhs, rhs, negate, pos);
+}
+
 static JirOperand lower_expr_raw(Lower *L, JogNode *node) {
     JirOperand folded;
     JirOperand lhs;
@@ -2300,6 +2309,9 @@ static JirOperand lower_expr_raw(Lower *L, JogNode *node) {
                 return en;
             }
             if (jog_lower_enum_member(L, node, &en)) {
+                return L->failed ? value_none() : en;
+            }
+            if (jog_lower_enum_name(L, node, &en)) {
                 return L->failed ? value_none() : en;
             }
         }
@@ -3800,6 +3812,38 @@ static JirOperand lower_lambda(Lower *L, JogNode *node) {
         return value_none();
     }
     func->pos = node->pos;
+    /* Context parameters are real parameters, ahead of the capture env.
+       The closure code pointer lists them in the same order. */
+    if (type->as.fn.context_count > 0) {
+        size_t ci;
+        if (node->context_symbol_count != type->as.fn.context_count || !node->context_symbols ||
+            !type->as.fn.contexts) {
+            fail_at(L, node->pos, "missing lambda context parameter");
+            free(prep.caps);
+            return value_none();
+        }
+        for (ci = 0; ci < type->as.fn.context_count; ci++) {
+            size_t before = func->locals.count;
+            JogType *cty = type->as.fn.contexts[ci];
+            JirLocal *slot;
+            if (!cty) {
+                fail_at(L, node->pos, "missing lambda context parameter");
+                free(prep.caps);
+                return value_none();
+            }
+            (void)jir_local_add(func, "ctx", cty);
+            if (func->locals.count == before) {
+                oom(L);
+                free(prep.caps);
+                return value_none();
+            }
+            func->param_count += 1;
+            slot = jir_local_at(func, (uint32_t)before);
+            if (slot) {
+                slot->is_param = true;
+            }
+        }
+    }
     if (prep.count > 0) {
         size_t before = func->locals.count;
         JirLocal *slot;
@@ -3858,6 +3902,16 @@ static JirOperand lower_lambda(Lower *L, JogNode *node) {
                 continue;
             }
             if (!bind_local(L, param->symbol, (uint32_t)i)) {
+                failed = 1;
+                goto restore;
+            }
+        }
+    }
+    {
+        size_t base = type->as.fn.param_count;
+        size_t ci;
+        for (ci = 0; ci < node->context_symbol_count; ci++) {
+            if (!bind_local(L, node->context_symbols[ci], (uint32_t)(base + ci))) {
                 failed = 1;
                 goto restore;
             }

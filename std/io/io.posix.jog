@@ -1,16 +1,23 @@
-// POSIX open. fopen takes a trailing NUL.
+// POSIX open. fopen takes a trailing NUL. A missing file is ErrNotFound.
+// An empty path, a path that does not fit in 4095 bytes plus NUL, or
+// any other open failure is ErrIO.
 
 import std.c
+import std.error as errors
 
-actual fn open_c_file(path: str, mode: *const c.char): *c.FILE? {
+actual fn open_c_file(path: str, mode: *const c.char): (*c.FILE?, error?) {
     var buf: bytes[4096]
-    if path.len >= 4096 {
-        return null
+    if path.len == 0 || path.len >= 4096 {
+        return null, errors.ErrIO
     }
     val dest = buf[..].ptr
     if path.len > 0 {
         c.memcpy(dest as *void, path.ptr as *const void, path.len)
     }
     *(dest + path.len) = 0
-    return c.fopen(dest as *const c.char, mode)
+    val file = c.fopen(dest as *const c.char, mode)
+    if file == null {
+        return null, open_failed(c.jogrt_errno())
+    }
+    return file, null
 }

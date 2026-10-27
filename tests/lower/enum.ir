@@ -187,6 +187,63 @@ fn f8 public jog_enums__main "enums.main": () -> ()  ; enum.jog:60:1
   l21: bool
   l22: i32?
   l23: bool
+  l24: bool
+  l25: Color
+  l26: u8
+  l27: bool
+  l28: Color
+  l29: u8
+  l30: bool
+  l31: bool
+  l32: bool
+  l33: const bytes
+  l34: const bytes
+  l35: bool
+  l36: usize
+  l37: usize
+  l38: *const u8
+  l39: usize
+  l40: *const u8
+  l41: bool
+  l42: bool
+  l43: *const u8
+  l44: *const u8
+  l45: u8
+  l46: u8
+  l47: bool
+  l48: usize
+  l49: const bytes
+  l50: const bytes
+  l51: bool
+  l52: usize
+  l53: usize
+  l54: *const u8
+  l55: usize
+  l56: *const u8
+  l57: bool
+  l58: bool
+  l59: *const u8
+  l60: *const u8
+  l61: u8
+  l62: u8
+  l63: bool
+  l64: usize
+  l65: const bytes
+  l66: const bytes
+  l67: bool
+  l68: usize
+  l69: usize
+  l70: *const u8
+  l71: usize
+  l72: *const u8
+  l73: bool
+  l74: bool
+  l75: *const u8
+  l76: *const u8
+  l77: u8
+  l78: u8
+  l79: bool
+  l80: usize
 b0 entry:
   l1 = aggregate () aux 1  ; enum.jog:61:18
   l0 = copy l1  ; enum.jog:61:5
@@ -236,4 +293,237 @@ b10 "if.join":
 b11 "if.then":
   ret  ; enum.jog:82:9
 b12 "if.join":
+  l25 = call f10()  ; enum.jog:84:9
+  l26 = enum_tag l25  ; enum.jog:84:19
+  l27 = ne l26, u8 2  ; enum.jog:84:26
+  cond_br l27, b14 "or.true", b13 "or.rhs"  ; enum.jog:84:31
+b13 "or.rhs":
+  l28 = call f9(u8 2)  ; enum.jog:84:35
+  l29 = enum_tag l28  ; enum.jog:84:47
+  l30 = ne l29, u8 2  ; enum.jog:84:54
+  l24 = copy l30  ; enum.jog:84:31
+  br b15 "or.join"  ; enum.jog:84:31
+b14 "or.true":
+  l24 = copy bool true  ; enum.jog:84:31
+  br b15 "or.join"  ; enum.jog:84:31
+b15 "or.join":
+  cond_br l24, b16 "if.then", b17 "if.join"  ; enum.jog:84:5
+b16 "if.then":
+  ret  ; enum.jog:85:9
+b17 "if.join":
+  l33 = call f11(l0)  ; enum.jog:87:8
+  l34 = copy const bytes "Green"  ; enum.jog:87:22
+  l38 = extract l33, 0  ; enum.jog:87:22
+  l37 = extract l33, 1  ; enum.jog:87:22
+  l40 = extract l34, 0  ; enum.jog:87:22
+  l39 = extract l34, 1  ; enum.jog:87:22
+  l36 = copy usize 0  ; enum.jog:87:22
+  l41 = eq l37, l39  ; enum.jog:87:22
+  cond_br l41, b18 "eq.loop", b22 "eq.no"  ; enum.jog:87:22
+b18 "eq.loop":
+  l42 = eq l36, l37  ; enum.jog:87:22
+  cond_br l42, b21 "eq.yes", b19 "eq.cmp"  ; enum.jog:87:22
+b19 "eq.cmp":
+  l43 = elem_addr l38, l36  ; enum.jog:87:22
+  l44 = elem_addr l40, l36  ; enum.jog:87:22
+  l45 = load l43  ; enum.jog:87:22
+  l46 = load l44  ; enum.jog:87:22
+  l47 = eq l45, l46  ; enum.jog:87:22
+  cond_br l47, b20 "eq.step", b22 "eq.no"  ; enum.jog:87:22
+b20 "eq.step":
+  l48 = checked add l36, usize 1  ; enum.jog:87:22
+  l36 = copy l48  ; enum.jog:87:22
+  br b18 "eq.loop"  ; enum.jog:87:22
+b21 "eq.yes":
+  l35 = copy bool false  ; enum.jog:87:22
+  br b23 "eq.join"  ; enum.jog:87:22
+b22 "eq.no":
+  l35 = copy bool true  ; enum.jog:87:22
+  br b23 "eq.join"  ; enum.jog:87:22
+b23 "eq.join":
+  cond_br l35, b25 "or.true", b24 "or.rhs"  ; enum.jog:87:33
+b24 "or.rhs":
+  l49 = call f12(l2)  ; enum.jog:87:36
+  l50 = copy const bytes "Circle"  ; enum.jog:87:50
+  l54 = extract l49, 0  ; enum.jog:87:50
+  l53 = extract l49, 1  ; enum.jog:87:50
+  l56 = extract l50, 0  ; enum.jog:87:50
+  l55 = extract l50, 1  ; enum.jog:87:50
+  l52 = copy usize 0  ; enum.jog:87:50
+  l57 = eq l53, l55  ; enum.jog:87:50
+  cond_br l57, b27 "eq.loop", b31 "eq.no"  ; enum.jog:87:50
+b25 "or.true":
+  l32 = copy bool true  ; enum.jog:87:33
+  br b26 "or.join"  ; enum.jog:87:33
+b26 "or.join":
+  cond_br l32, b34 "or.true", b33 "or.rhs"  ; enum.jog:87:62
+b27 "eq.loop":
+  l58 = eq l52, l53  ; enum.jog:87:50
+  cond_br l58, b30 "eq.yes", b28 "eq.cmp"  ; enum.jog:87:50
+b28 "eq.cmp":
+  l59 = elem_addr l54, l52  ; enum.jog:87:50
+  l60 = elem_addr l56, l52  ; enum.jog:87:50
+  l61 = load l59  ; enum.jog:87:50
+  l62 = load l60  ; enum.jog:87:50
+  l63 = eq l61, l62  ; enum.jog:87:50
+  cond_br l63, b29 "eq.step", b31 "eq.no"  ; enum.jog:87:50
+b29 "eq.step":
+  l64 = checked add l52, usize 1  ; enum.jog:87:50
+  l52 = copy l64  ; enum.jog:87:50
+  br b27 "eq.loop"  ; enum.jog:87:50
+b30 "eq.yes":
+  l51 = copy bool false  ; enum.jog:87:50
+  br b32 "eq.join"  ; enum.jog:87:50
+b31 "eq.no":
+  l51 = copy bool true  ; enum.jog:87:50
+  br b32 "eq.join"  ; enum.jog:87:50
+b32 "eq.join":
+  l32 = copy l51  ; enum.jog:87:33
+  br b26 "or.join"  ; enum.jog:87:33
+b33 "or.rhs":
+  l65 = call f12(l4)  ; enum.jog:87:65
+  l66 = copy const bytes "Empty"  ; enum.jog:87:79
+  l70 = extract l65, 0  ; enum.jog:87:79
+  l69 = extract l65, 1  ; enum.jog:87:79
+  l72 = extract l66, 0  ; enum.jog:87:79
+  l71 = extract l66, 1  ; enum.jog:87:79
+  l68 = copy usize 0  ; enum.jog:87:79
+  l73 = eq l69, l71  ; enum.jog:87:79
+  cond_br l73, b36 "eq.loop", b40 "eq.no"  ; enum.jog:87:79
+b34 "or.true":
+  l31 = copy bool true  ; enum.jog:87:62
+  br b35 "or.join"  ; enum.jog:87:62
+b35 "or.join":
+  cond_br l31, b42 "if.then", b43 "if.join"  ; enum.jog:87:5
+b36 "eq.loop":
+  l74 = eq l68, l69  ; enum.jog:87:79
+  cond_br l74, b39 "eq.yes", b37 "eq.cmp"  ; enum.jog:87:79
+b37 "eq.cmp":
+  l75 = elem_addr l70, l68  ; enum.jog:87:79
+  l76 = elem_addr l72, l68  ; enum.jog:87:79
+  l77 = load l75  ; enum.jog:87:79
+  l78 = load l76  ; enum.jog:87:79
+  l79 = eq l77, l78  ; enum.jog:87:79
+  cond_br l79, b38 "eq.step", b40 "eq.no"  ; enum.jog:87:79
+b38 "eq.step":
+  l80 = checked add l68, usize 1  ; enum.jog:87:79
+  l68 = copy l80  ; enum.jog:87:79
+  br b36 "eq.loop"  ; enum.jog:87:79
+b39 "eq.yes":
+  l67 = copy bool false  ; enum.jog:87:79
+  br b41 "eq.join"  ; enum.jog:87:79
+b40 "eq.no":
+  l67 = copy bool true  ; enum.jog:87:79
+  br b41 "eq.join"  ; enum.jog:87:79
+b41 "eq.join":
+  l31 = copy l67  ; enum.jog:87:62
+  br b35 "or.join"  ; enum.jog:87:62
+b42 "if.then":
+  ret  ; enum.jog:88:9
+b43 "if.join":
   ret  ; enum.jog:60:1
+
+fn f9 public jog_enums__from_tag "enums.from_tag": (u8) -> Color  ; enum.jog:92:1
+  l0 n: u8 param
+  l1: Color
+  l2: Color
+  l3: Color
+  l4: Color
+b0 entry:
+  switch l0, b2 "tag.miss"  ; enum.jog:93:14
+    1 -> b3 "tag.arm"
+    2 -> b4 "tag.arm"
+    3 -> b5 "tag.arm"
+b1 "cast.join":
+  ret l1  ; enum.jog:93:5
+b2 "tag.miss":
+  panic const bytes "value out of range"  ; enum.jog:93:14
+  unreachable  ; enum.jog:93:14
+b3 "tag.arm":
+  l2 = aggregate ()  ; enum.jog:93:14
+  l1 = copy l2  ; enum.jog:93:14
+  br b1 "cast.join"  ; enum.jog:93:14
+b4 "tag.arm":
+  l3 = aggregate () aux 1  ; enum.jog:93:14
+  l1 = copy l3  ; enum.jog:93:14
+  br b1 "cast.join"  ; enum.jog:93:14
+b5 "tag.arm":
+  l4 = aggregate () aux 2  ; enum.jog:93:14
+  l1 = copy l4  ; enum.jog:93:14
+  br b1 "cast.join"  ; enum.jog:93:14
+
+fn f10 public jog_enums__painted "enums.painted": () -> Color  ; enum.jog:96:1
+  l0: Color
+  l1: Color
+  l2: Color
+  l3: Color
+b0 entry:
+  switch u8 2, b2 "tag.miss"  ; enum.jog:97:14
+    1 -> b3 "tag.arm"
+    2 -> b4 "tag.arm"
+    3 -> b5 "tag.arm"
+b1 "cast.join":
+  ret l0  ; enum.jog:97:5
+b2 "tag.miss":
+  panic const bytes "value out of range"  ; enum.jog:97:14
+  unreachable  ; enum.jog:97:14
+b3 "tag.arm":
+  l1 = aggregate ()  ; enum.jog:97:14
+  l0 = copy l1  ; enum.jog:97:14
+  br b1 "cast.join"  ; enum.jog:97:14
+b4 "tag.arm":
+  l2 = aggregate () aux 1  ; enum.jog:97:14
+  l0 = copy l2  ; enum.jog:97:14
+  br b1 "cast.join"  ; enum.jog:97:14
+b5 "tag.arm":
+  l3 = aggregate () aux 2  ; enum.jog:97:14
+  l0 = copy l3  ; enum.jog:97:14
+  br b1 "cast.join"  ; enum.jog:97:14
+
+fn f11 public jog_enums__color_name "enums.color_name": (Color) -> const bytes  ; enum.jog:100:1
+  l0 c: Color param
+  l1: const bytes
+  l2: u8
+b0 entry:
+  l2 = enum_tag l0  ; enum.jog:101:13
+  switch l2, b2 "tag.miss"  ; enum.jog:101:13
+    1 -> b3 "tag.arm"
+    2 -> b4 "tag.arm"
+    3 -> b5 "tag.arm"
+b1 "name.join":
+  ret l1  ; enum.jog:101:5
+b2 "tag.miss":
+  unreachable  ; enum.jog:101:13
+b3 "tag.arm":
+  l1 = copy const bytes "Red"  ; enum.jog:101:13
+  br b1 "name.join"  ; enum.jog:101:13
+b4 "tag.arm":
+  l1 = copy const bytes "Green"  ; enum.jog:101:13
+  br b1 "name.join"  ; enum.jog:101:13
+b5 "tag.arm":
+  l1 = copy const bytes "Blue"  ; enum.jog:101:13
+  br b1 "name.join"  ; enum.jog:101:13
+
+fn f12 public jog_enums__shape_name "enums.shape_name": (Shape) -> const bytes  ; enum.jog:104:1
+  l0 s: Shape param
+  l1: const bytes
+  l2: u8
+b0 entry:
+  l2 = enum_tag l0  ; enum.jog:105:13
+  switch l2, b2 "tag.miss"  ; enum.jog:105:13
+    0 -> b3 "tag.arm"
+    1 -> b4 "tag.arm"
+    2 -> b5 "tag.arm"
+b1 "name.join":
+  ret l1  ; enum.jog:105:5
+b2 "tag.miss":
+  unreachable  ; enum.jog:105:13
+b3 "tag.arm":
+  l1 = copy const bytes "Circle"  ; enum.jog:105:13
+  br b1 "name.join"  ; enum.jog:105:13
+b4 "tag.arm":
+  l1 = copy const bytes "Rect"  ; enum.jog:105:13
+  br b1 "name.join"  ; enum.jog:105:13
+b5 "tag.arm":
+  l1 = copy const bytes "Empty"  ; enum.jog:105:13
+  br b1 "name.join"  ; enum.jog:105:13

@@ -1,9 +1,12 @@
-// POSIX list. opendir/readdir/closedir. d_name is read through
-// jogrt_dirent_name so this file does not hard-code struct dirent.
-// An empty path, or one that does not fit in 4095 bytes plus NUL, is
-// false. A name is copied before the next readdir.
+// POSIX list, rename, exists, and cwd. opendir/readdir/closedir.
+// d_name is read through jogrt_dirent_name so this file does not
+// hard-code struct dirent. An empty path, or one that does not fit in
+// 4095 bytes plus NUL, is false for list and exists. rename returns
+// error?. A missing source is ErrNotFound (errno 2, ENOENT). Every
+// other rename failure is ErrIO. A name is copied before the next readdir.
 
 import std.c
+import std.error as errors
 import std.list as lists
 import std.mem
 
@@ -45,13 +48,21 @@ actual fn list(path: str): (lists.List<str>, bool) with (a: mem.Allocator) {
     return names, true
 }
 
-actual fn rename(from: str, to: str): bool {
+// ErrNotFound means the source is missing. ErrIO means the path does
+// not fit or the OS refused, including a target that already exists.
+actual fn rename(from: str, to: str): error? {
     var left: [4096]u8
     var right: [4096]u8
     if !fill_path(left[..].ptr, 4096, from) || !fill_path(right[..].ptr, 4096, to) {
-        return false
+        return errors.ErrIO
     }
-    return c.rename(left[..].ptr as *const c.char, right[..].ptr as *const c.char) == 0
+    if c.rename(left[..].ptr as *const c.char, right[..].ptr as *const c.char) == 0 {
+        return null
+    }
+    if c.jogrt_errno() == 2 {
+        return errors.ErrNotFound
+    }
+    return errors.ErrIO
 }
 
 actual fn exists(path: str): bool {

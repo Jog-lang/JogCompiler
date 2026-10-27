@@ -3,14 +3,16 @@
 import std.io
 
 fn main() {
-    if !io.print("Hello") {
+    if io.print("Hello") != null {
         return
     }
-    if !io.eprint("") {
+    if io.eprint("") != null {
         return
     }
-    if !io.eprintln("") {
+    if io.eprintln("") != null {
         return
     }
-    io.println(" from io")
+    if io.println(" from io") != null {
+        return
+    }
 }

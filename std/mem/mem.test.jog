@@ -1,5 +1,6 @@
 // newSlice zero-fills. freeSlice releases the block. An empty count
-// allocates nothing.
+// allocates nothing. slice is a view: n == 0 is empty, including a
+// null pointer, and n > 0 with a null pointer panics.
 
 import std.testing
 
@@ -19,5 +20,27 @@ fn zeroedSlice() with (t: testing.Testing) {
         var none = newSlice<Slot>(0)
         t.expect(none.len == 0)
         freeSlice(none)
+    }
+}
+
+@test
+fn sliceFromPointer() with (t: testing.Testing) {
+    with (heap()) {
+        var slots = newSlice<Slot>(2)
+        slots[0].n = 3
+        slots[1].n = 4
+        var view = slice(slots.ptr, slots.len)
+        t.expect(view.len == 2)
+        t.expect(view[0].n == 3)
+        view[1].n = 8
+        t.expect(slots[1].n == 8)
+        var none = slice(slots.ptr, 0)
+        t.expect(none.len == 0)
+        var opt: *Slot? = null
+        val missing = opt as *Slot
+        var emptyNull = slice(missing, 0)
+        t.expect(emptyNull.len == 0)
+        t.expectPanic() { slice(missing, 1) }
+        freeSlice(slots)
     }
 }

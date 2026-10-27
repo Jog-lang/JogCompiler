@@ -1,4 +1,5 @@
 // slice, starts_with, ends_with, and index_of are views. clone owns a copy.
+// is_digit and is_hex_digit classify one ASCII byte.
 
 import std.mem
 import std.testing
@@ -31,4 +32,23 @@ fn viewsAndCopy() with (t: testing.Testing) {
         t.expectEq(owned, "hello")
         drop(owned)
     }
+}
+
+@test
+fn digits() with (t: testing.Testing) {
+    t.expect(is_digit('0' as u8))
+    t.expect(is_digit('5' as u8))
+    t.expect(is_digit('9' as u8))
+    t.expect(!is_digit('/' as u8))
+    t.expect(!is_digit(':' as u8))
+    t.expect(!is_digit('a' as u8))
+    t.expect(is_hex_digit('0' as u8))
+    t.expect(is_hex_digit('9' as u8))
+    t.expect(is_hex_digit('a' as u8))
+    t.expect(is_hex_digit('f' as u8))
+    t.expect(is_hex_digit('A' as u8))
+    t.expect(is_hex_digit('F' as u8))
+    t.expect(!is_hex_digit('g' as u8))
+    t.expect(!is_hex_digit('G' as u8))
+    t.expect(!is_hex_digit('/' as u8))
 }

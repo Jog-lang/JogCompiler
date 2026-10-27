@@ -3,13 +3,14 @@
 // allocator context: with (mem.heap()). t.expect takes a bool.
 // t.expectEq takes two str values; captured bytes convert to str.
 //
-// A missing program is ok == false, not a panic. An empty argument
-// vector is expectPanic. The exit-code cases are per OS: cmd.exe through
+// A missing program is ErrNotFound, not a panic. An empty argument
+// vector and an empty program name are ErrIO. The exit-code cases are per OS: cmd.exe through
 // COMSPEC on Windows, /bin/sh on POSIX. The space case starts this test
 // executable again with one argument that contains a space. child_gate
 // sees that argument and exits before any test can start another process.
 
 import std.c
+import std.error as errors
 import std.mem
 import std.os
 import std.testing
@@ -31,8 +32,8 @@ fn child_gate() {
 fn missingProgram() with (t: testing.Testing) {
     child_gate()
     with (mem.heap()) {
-        val got = run([]str("no/such/jog-missing-proc-251025.exe"))
-        t.expect(!got.ok)
+        val (got, err) = run([]str("no/such/jog-missing-proc-251025.exe"))
+        t.expect(err == errors.ErrNotFound)
         t.expect(got.stdout.len == 0)
         t.expect(got.stderr.len == 0)
         free_output(got)
@@ -43,8 +44,8 @@ fn missingProgram() with (t: testing.Testing) {
 fn emptyProgram() with (t: testing.Testing) {
     child_gate()
     with (mem.heap()) {
-        val got = run([]str(""))
-        t.expect(!got.ok)
+        val (got, err) = run([]str(""))
+        t.expect(err == errors.ErrIO)
         free_output(got)
     }
 }
@@ -53,7 +54,10 @@ fn emptyProgram() with (t: testing.Testing) {
 fn emptyArgs() with (t: testing.Testing) {
     child_gate()
     with (mem.heap()) {
-        t.expectPanic() { run([]str()) }
+        val (got, err) = run([]str())
+        t.expect(err == errors.ErrIO)
+        t.expect(got.stdout.len == 0)
+        free_output(got)
     }
 }
 
@@ -62,8 +66,8 @@ fn spaceArg() with (t: testing.Testing) {
     child_gate()
     with (mem.heap()) {
         val self = os.argv(0)
-        val got = run([]str(self, "--proc-space", "hello world"))
-        t.expect(got.ok)
+        val (got, err) = run([]str(self, "--proc-space", "hello world"))
+        t.expect(err == null)
         t.expect(got.code == 0)
         free_output(got)
     }
@@ -74,8 +78,8 @@ fn inheritWaits() with (t: testing.Testing) {
     child_gate()
     with (mem.heap()) {
         val self = os.argv(0)
-        val (code, ok) = run_inherit([]str(self, "--proc-space", "hello world"))
-        t.expect(ok)
+        val (code, err) = run_inherit([]str(self, "--proc-space", "hello world"))
+        t.expect(err == null)
         t.expect(code == 0)
     }
 }

@@ -1,0 +1,58 @@
+// expect: ok
+// when on str and bytes uses the same compare as ==.
+// "let" does not match "fn". "no" matches neither arm.
+// same and hit hold the same bytes in different buffers.
+// A bare name in a pattern binds, so the bytes arms are fields.
+
+extern {
+    fn puts(s: *const i8): i32
+}
+
+struct Arms {
+    miss: bytes
+    hit: bytes
+}
+
+fn word(text: str): i32 {
+    return when text {
+        "let" -> 2
+        "fn" -> 1
+        else -> 0
+    }
+}
+
+fn raw(view: bytes, arms: Arms): i32 {
+    return when view {
+        arms.miss -> 0
+        arms.hit -> 1
+        else -> 2
+    }
+}
+
+fn main() {
+    var hit_buf: [2]u8
+    var miss_buf: [2]u8
+    var same_buf: [2]u8
+    var hit = bytes()
+    var miss = bytes()
+    var same = bytes()
+    var empty = bytes()
+    var arms: Arms
+    hit_buf[0] = 97
+    hit_buf[1] = 98
+    hit.ptr = &hit_buf[0]
+    hit.len = 2
+    miss_buf[0] = 99
+    miss_buf[1] = 100
+    miss.ptr = &miss_buf[0]
+    miss.len = 2
+    same_buf[0] = 97
+    same_buf[1] = 98
+    same.ptr = &same_buf[0]
+    same.len = 2
+    arms.miss = miss
+    arms.hit = hit
+    if word("fn") == 1 && word("no") == 0 && word("f") == 0 && raw(same, arms) == 1 && raw(miss, arms) == 0 && raw(empty, arms) == 2 {
+        puts(c"ok")
+    }
+}

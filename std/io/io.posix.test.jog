@@ -9,8 +9,8 @@ import std.testing
 fn textStdout() with (t: testing.Testing) {
     child_gate()
     with (mem.heap()) {
-        val got = run_child("--io-text")
-        t.expect(got.ok)
+        val (got, err) = run_child("--io-text")
+        t.expect(err == null)
         t.expect(got.code == 0)
         t.expectEq(got.stdout, "a\nb\n")
         proc.free_output(got)

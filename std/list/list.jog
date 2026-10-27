@@ -8,6 +8,11 @@
 // capacity uses the request. empty is the zero value: len 0, cap 0,
 // ptr null, no block. pop and clear do not free the block or the
 // elements. If a T owns memory of its own, the caller frees that.
+//
+// items() is a []T of the live prefix: ptr and len, not cap. It copies
+// nothing. An empty list, including one whose buffer is still allocated,
+// returns an empty slice. for x in xs.items() walks that slice. A later
+// growth moves the buffer and invalidates the slice.
 
 import std.mem
 
@@ -174,13 +179,17 @@ fn *List<T>.free() with (a: mem.Allocator) {
 }
 
 // Live elements as []T, length len, not capacity. No copy.
-// A later growth moves the block and invalidates this slice.
-fn List<T>.slice_view(): []T {
-    var view: []T
+// An empty list is an empty slice. A later growth moves the block and
+// invalidates this slice. for x in xs.items() walks it.
+fn List<T>.items(): []T {
     if self.len == 0 {
-        return view
+        var none: []T
+        return none
     }
-    view.ptr = self.ptr!!
-    view.len = self.len
-    return view
+    return mem.slice(self.ptr!!, self.len)
+}
+
+// The same view as items().
+fn List<T>.slice_view(): []T {
+    return self.items()
 }

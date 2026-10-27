@@ -9,6 +9,8 @@
    in declaration order. A when on an enum reads JIR_ENUM_TAG and switches.
    Refutable payloads are compare chains in that variant's block. Integer
    literal arms switch on the value. Anything else is a compare chain.
+   A value pattern uses the same compare as ==. .name is a tag-indexed
+   table of the variant source names.
    !! is JIR_NULL_CHECK plus the option value. ?: and ?. branch on the
    same has-value test as T? == null. */
 
@@ -807,6 +809,23 @@ static bool fold_int(Lower *L, JogNode *expr, uint64_t *bits) {
     return true;
 }
 
+/* A value arm uses the same compare as ==: str and bytes by length then
+   bytes, enums by tag and payload, integers and bools by JIR_EQ. */
+static bool value_eq(Lower *L, JirOperand subject, JirOperand rhs, JogPos pos, JirOperand *out) {
+    if (subject.type && subject.type->kind == JOG_TY_BYTES) {
+        *out = jog_lower_bytes_cmp(L, subject, rhs, false, pos);
+        return !L->failed && out->kind != JIR_OPND_NONE;
+    }
+    if (subject.type) {
+        JogType *under = jog_type_underlying(subject.type);
+        if (under && under->kind == JOG_TY_ENUM) {
+            *out = jog_lower_enum_eq(L, subject, rhs, false, pos);
+            return !L->failed && out->kind != JIR_OPND_NONE;
+        }
+    }
+    return emit_cmp(L, JIR_EQ, subject, rhs, pos, out);
+}
+
 static void test_pat(Lower *L, JirOperand subject, bool has_subject, JogNode *pat, uint32_t yes, uint32_t no) {
     JogType *type;
     JogPos pos;
@@ -866,7 +885,7 @@ static void test_pat(Lower *L, JirOperand subject, bool has_subject, JogNode *pa
         if (L->failed || L->terminated) {
             return;
         }
-        if (!emit_cmp(L, JIR_EQ, subject, rhs, pos, &cmp)) {
+        if (!value_eq(L, subject, rhs, pos, &cmp)) {
             return;
         }
         emit_cond(L, cmp, yes, no, pos);
@@ -1504,14 +1523,245 @@ JirOperand jog_lower_enum_dot(Lower *L, JogNode *node) {
     return make_enum(L, node->type, (uint32_t)index, NULL, 0, node->pos);
 }
 
+static bool enum_payload_free(const JogType *en) {
+    size_t i;
+    if (!en || en->kind != JOG_TY_ENUM || !en->as.nominal.base || !en->as.nominal.variants || en->as.nominal.variant_count == 0) {
+        return false;
+    }
+    for (i = 0; i < en->as.nominal.variant_count; i++) {
+        if (!payload_free(&en->as.nominal.variants[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool enum_has_field(const JogType *en, const char *name) {
+    size_t i;
+    size_t f;
+    if (!en || en->kind != JOG_TY_ENUM || !name || !en->as.nominal.variants) {
+        return false;
+    }
+    for (i = 0; i < en->as.nominal.variant_count; i++) {
+        const JogVariant *variant = &en->as.nominal.variants[i];
+        for (f = 0; f < variant->field_count; f++) {
+            const char *field = variant->fields ? variant->fields[f].name : NULL;
+            if (field && strcmp(field, name) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/* One block per variant, in declaration order. The current block switches
+   on the tag. *miss is the default. */
+static bool open_tag_switch(Lower *L, JirOperand tag, const JogType *en, JogPos pos, uint32_t **arms, uint32_t *miss) {
+    size_t n;
+    size_t i;
+    JirCase *cases;
+    uint32_t *blocks;
+    if (!en || !en->as.nominal.variants || en->as.nominal.variant_count == 0) {
+        jog_lower_fail(L, pos, "enum has no variants");
+        return false;
+    }
+    n = en->as.nominal.variant_count;
+    cases = ct_arena_alloc(L->program->arena, n * sizeof(JirCase), _Alignof(JirCase));
+    blocks = ct_arena_alloc(L->program->arena, n * sizeof(uint32_t), _Alignof(uint32_t));
+    if (!cases || !blocks) {
+        jog_lower_fail(L, pos, "out of memory");
+        return false;
+    }
+    if (!new_block(L, "tag.miss", miss)) {
+        return false;
+    }
+    for (i = 0; i < n; i++) {
+        if (!new_block(L, "tag.arm", &blocks[i])) {
+            return false;
+        }
+        cases[i].value = (uint64_t)en->as.nominal.variants[i].tag;
+        cases[i].target = blocks[i];
+    }
+    emit_switch(L, tag, *miss, cases, n, pos);
+    *arms = blocks;
+    return !L->failed;
+}
+
+static void panic_range(Lower *L, JogPos pos) {
+    JogType *str;
+    JirInst *inst;
+    const char *msg = "value out of range";
+    str = jog_type_builtin(L->program->types, JOG_BUILTIN_CONST_BYTES);
+    inst = jog_lower_emit(L, JIR_PANIC, -1, pos);
+    if (inst && str) {
+        inst->a = jir_string(str, msg, strlen(msg));
+    }
+    emit_unreachable(L, pos);
+}
+
+static bool convert_checked(Lower *L, JirOperand src, JogType *dest, JogPos pos, JirOperand *out) {
+    uint32_t dst;
+    JirInst *inst;
+    if (!dest) {
+        jog_lower_fail(L, pos, "enum is missing a tag type");
+        return false;
+    }
+    if (src.type == dest) {
+        *out = src;
+        return true;
+    }
+    if (!jog_lower_new_local(L, NULL, dest, &dst)) {
+        return false;
+    }
+    inst = jog_lower_emit(L, JIR_CONVERT, (int32_t)dst, pos);
+    if (!inst) {
+        return false;
+    }
+    inst->checked = true;
+    inst->a = src;
+    *out = jog_lower_local_op(L, dst);
+    return true;
+}
+
+static JogType *enum_of_value(JogType *type) {
+    type = peel(type);
+    if (type && type->kind == JOG_TY_PTR) {
+        type = peel(type->as.elem.elem);
+    }
+    if (!type || type->kind != JOG_TY_ENUM) {
+        return NULL;
+    }
+    return type;
+}
+
+/* .name is a tag-indexed table: each variant tag selects that variant's
+   source name, stored as a string literal. */
+bool jog_lower_enum_name(Lower *L, JogNode *node, JirOperand *out) {
+    JogNode *base_node;
+    JogType *en;
+    JogType *str;
+    JirOperand base;
+    JirOperand value;
+    JirOperand tag;
+    uint32_t *arms = NULL;
+    uint32_t miss = 0;
+    uint32_t join = 0;
+    uint32_t result = 0;
+    size_t i;
+    if (!L || !node || !out || node->kind != JOG_NODE_MEMBER || L->failed) {
+        return false;
+    }
+    if (node->as.member.safe || !node->as.member.name || strcmp(node->as.member.name, "name") != 0) {
+        return false;
+    }
+    if (node->symbol && node->symbol->kind == JOG_SYM_FIELD) {
+        return false;
+    }
+    base_node = node->as.member.base;
+    en = enum_of_value(base_node ? base_node->type : NULL);
+    if (!en || enum_has_field(en, "name")) {
+        return false;
+    }
+    str = node->type ? node->type : jog_type_builtin(L->program->types, JOG_BUILTIN_CONST_BYTES);
+    if (!str || !jog_lower_new_local(L, NULL, str, &result)) {
+        *out = jir_none();
+        return true;
+    }
+    base = jog_lower_as_local(L, jog_lower_expr(L, base_node), node->pos);
+    if (L->failed || L->terminated) {
+        *out = jir_none();
+        return true;
+    }
+    if (peel(base.type) && peel(base.type)->kind == JOG_TY_PTR) {
+        JogType *elem = peel(peel(base.type)->as.elem.elem);
+        uint32_t loaded;
+        JirInst *inst;
+        if (!elem || !jog_lower_new_local(L, NULL, elem, &loaded)) {
+            *out = jir_none();
+            return true;
+        }
+        inst = jog_lower_emit(L, JIR_LOAD, (int32_t)loaded, node->pos);
+        if (!inst) {
+            *out = jir_none();
+            return true;
+        }
+        inst->a = base;
+        value = jog_lower_local_op(L, loaded);
+    } else {
+        value = base;
+    }
+    if (!enum_tag_of(L, value, en, node->pos, &tag) || !new_block(L, "name.join", &join) ||
+        !open_tag_switch(L, tag, en, node->pos, &arms, &miss)) {
+        *out = jir_none();
+        return true;
+    }
+    for (i = 0; i < en->as.nominal.variant_count && !L->failed; i++) {
+        const char *name = en->as.nominal.variants[i].name ? en->as.nominal.variants[i].name : "";
+        use_block(L, arms[i]);
+        jog_lower_copy(L, result, jir_string(str, name, strlen(name)), node->pos);
+        emit_br(L, join, node->pos);
+    }
+    use_block(L, miss);
+    emit_unreachable(L, node->pos);
+    use_block(L, join);
+    *out = jog_lower_local_op(L, result);
+    return true;
+}
+
+static bool lower_tag_to_enum(Lower *L, JogNode *node, JogType *en, JirOperand *out) {
+    JirOperand raw;
+    JirOperand tag;
+    JirOperand built = jir_none();
+    uint32_t *arms = NULL;
+    uint32_t miss = 0;
+    uint32_t join = 0;
+    uint32_t result = 0;
+    size_t i;
+    if (!node->type || !jog_lower_new_local(L, NULL, node->type, &result)) {
+        *out = jir_none();
+        return true;
+    }
+    raw = jog_lower_expr(L, node->as.cast.expr);
+    if (L->failed || L->terminated || !convert_checked(L, raw, en->as.nominal.base, node->pos, &tag)) {
+        *out = jir_none();
+        return true;
+    }
+    if (!new_block(L, "cast.join", &join) || !open_tag_switch(L, tag, en, node->pos, &arms, &miss)) {
+        *out = jir_none();
+        return true;
+    }
+    for (i = 0; i < en->as.nominal.variant_count && !L->failed; i++) {
+        use_block(L, arms[i]);
+        built = make_enum(L, node->type, (uint32_t)i, NULL, 0, node->pos);
+        if (L->failed || built.kind == JIR_OPND_NONE) {
+            *out = jir_none();
+            return true;
+        }
+        jog_lower_copy(L, result, built, node->pos);
+        emit_br(L, join, node->pos);
+    }
+    use_block(L, miss);
+    panic_range(L, node->pos);
+    use_block(L, join);
+    *out = jog_lower_local_op(L, result);
+    return true;
+}
+
 bool jog_lower_enum_cast(Lower *L, JogNode *node, JirOperand *out) {
     JogType *en;
+    JogType *src;
+    JogType *dest;
     JirOperand value;
     JirOperand tag;
     if (!L || !node || !out || node->kind != JOG_NODE_CAST || node->as.cast.op != JOG_TOK_KW_AS || L->failed) {
         return false;
     }
-    en = node->as.cast.expr ? peel(node->as.cast.expr->type) : NULL;
+    src = node->as.cast.expr ? peel(node->as.cast.expr->type) : NULL;
+    dest = peel(node->type);
+    if (dest && dest->kind == JOG_TY_ENUM && enum_payload_free(dest) && src && src->kind == JOG_TY_INT) {
+        return lower_tag_to_enum(L, node, dest, out);
+    }
+    en = src;
     if (!en || en->kind != JOG_TY_ENUM) {
         return false;
     }

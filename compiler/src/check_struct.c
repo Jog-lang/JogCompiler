@@ -1,5 +1,6 @@
 #include "check_struct.h"
 
+#include "check_enum.h"
 #include "check_constraint.h"
 #include "check_context.h"
 #include "check_error.h"
@@ -1771,6 +1772,16 @@ int jog_check_struct_member(Check *ck, CheckJob *job, JogBlockScope *scope, JogN
         member->type = field.field->type;
         *out = member->type ? member->type : error;
         return 1;
+    }
+    {
+        int named = jog_check_enum_name(ck, member, outer);
+        if (named < 0) {
+            return -1;
+        }
+        if (named > 0) {
+            *out = member->type;
+            return 1;
+        }
     }
     found = lookup_method(ck, job, outer, member->as.member.name, &hit, &ambiguous);
     if (found < 0) {

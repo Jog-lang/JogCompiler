@@ -35,7 +35,7 @@
    interface             struct { void *ptr; void *vtable; }
    distinct              typedef of its base
    extern fn             function pointer; variadic ends in ...
-   other fn              struct { Ret (*code)(params, void *env); void *env; }
+   other fn              struct { Ret (*code)(params, contexts, void *env); void *env; }
 
    That closure struct is the type of a function value. A Jog function
    definition uses the JIR function's parameters and does not take void *env.
@@ -77,9 +77,10 @@
    Structural names are jt<id>. Nominal generic instances append __ and the
    type-argument ids. Struct and tuple fields are f_<name> or f_<index>.
    Definitions follow value dependencies: a pointer or slice does not require
-   the pointee body, so a struct may contain a pointer to itself. Context
-   parameters are not added here; lowering puts them on the function type
-   (see ir.h). */
+   the pointee body, so a struct may contain a pointer to itself. A named
+   function's context parameters are already ordinary parameters on its JIR
+   type. A lambda value keeps them on the Jog function type, and the closure
+   code pointer lists them before void *env. */
 
 typedef struct Emit {
     const JirModule *module;
@@ -939,6 +940,9 @@ static void append_fn_params(Emit *e, const JogType *type) {
     bool any = false;
     for (size_t i = 0; i < type->as.fn.param_count; i++) {
         any = append_kept_param(e, type->as.fn.params ? type->as.fn.params[i] : NULL, any);
+    }
+    for (size_t i = 0; i < type->as.fn.context_count; i++) {
+        any = append_kept_param(e, type->as.fn.contexts ? type->as.fn.contexts[i] : NULL, any);
     }
     if (!type->as.fn.is_extern) {
         if (any) {
@@ -3472,7 +3476,9 @@ static int func_is_closure_code(const JirFunc *func) {
         func->linkage == JIR_LINK_EXTERN) {
         return 0;
     }
-    declared = func->type->as.fn.param_count;
+    /* Context parameters sit ahead of the capture env, same as the closure
+       code pointer. A capturing lambda is declared params + contexts + env. */
+    declared = func->type->as.fn.param_count + func->type->as.fn.context_count;
     return func->param_count == (uint32_t)declared + 1;
 }
 

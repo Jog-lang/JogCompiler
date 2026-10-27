@@ -1,5 +1,6 @@
 // Package std.text. slice, starts_with, ends_with, and index_of are views:
 // they allocate nothing. clone copies into the Allocator context.
+// is_digit and is_hex_digit classify one ASCII byte and allocate nothing.
 // A range that does not fit the string panics. An empty needle is a match
 // at the start. index_of returns the byte offset and false when the needle
 // is absent.
@@ -69,6 +70,23 @@ fn index_of(s: str, needle: str): (usize, bool) {
         i = i + 1
     }
     return 0, false
+}
+
+// True for an ASCII byte from '0' through '9'.
+fn is_digit(c: u8): bool {
+    return c >= '0' as u8 && c <= '9' as u8
+}
+
+// True for an ASCII byte from '0' through '9', 'a' through 'f', or
+// 'A' through 'F'.
+fn is_hex_digit(c: u8): bool {
+    if is_digit(c) {
+        return true
+    }
+    if c >= 'a' as u8 && c <= 'f' as u8 {
+        return true
+    }
+    return c >= 'A' as u8 && c <= 'F' as u8
 }
 
 // An owned copy. An empty str allocates nothing. The caller frees it

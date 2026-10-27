@@ -4,12 +4,16 @@
 // quote, and backslashes at the end of a quoted argument, are doubled,
 // the same rules as tools/proc.c. Arguments that do not need quotes are
 // left bare. Quoting every argument makes cmd.exe treat "/c" as a
-// program name. A command line longer than 32766 bytes is a failed start.
+// program name. A command line longer than 32766 bytes is ErrIO.
+// An empty argument vector is ErrIO. A failed wide-string allocation is
+// ErrOutOfMemory. CreateProcessW failing with GetLastError 2 or 3 is
+// ErrNotFound. Any other failed start is ErrIO.
 //
 // stdout and stderr are separate temp files. GetTempFileNameW creates
 // them. NUL is stdin. Paths are UTF-16.
 
 import std.c
+import std.error as errors
 import std.mem
 import std.strbuilder
 
@@ -221,7 +225,7 @@ private fn fill_nul(dest: *u16) {
     dest[3] = 0
 }
 
-private fn spawn(app: *u16, command: *u16, capture: bool): Output with (a: mem.Allocator) {
+private fn spawn(app: *u16, command: *u16, capture: bool): (Output, error?) with (a: mem.Allocator) {
     var out_path: [260]u16
     var err_path: [260]u16
     var startup: Startup
@@ -233,7 +237,7 @@ private fn spawn(app: *u16, command: *u16, capture: bool): Output with (a: mem.A
         if !out_made || !err_made {
             delete_made(out_path[..].ptr, out_made)
             delete_made(err_path[..].ptr, err_made)
-            return Output()
+            return Output(), errors.ErrIO
         }
         var sa: SecurityAttributes
         sa.length = size(SecurityAttributes) as c.unsigned_long
@@ -249,25 +253,36 @@ private fn spawn(app: *u16, command: *u16, capture: bool): Output with (a: mem.A
             close_handle(err_h)
             delete_made(out_path[..].ptr, true)
             delete_made(err_path[..].ptr, true)
-            return Output()
+            return Output(), errors.ErrIO
         }
         startup.flags = 0x100
         startup.stdin_h = nul_h
         startup.stdout_h = out_h
         startup.stderr_h = err_h
         val created = CreateProcessW(app, command, null, null, 1, 0, null, null, &startup, &info)
+        var code: c.unsigned_long = 0
+        if created == 0 {
+            code = c.GetLastError()
+        }
         close_handle(nul_h)
         close_handle(out_h)
         close_handle(err_h)
         if created == 0 {
             delete_made(out_path[..].ptr, true)
             delete_made(err_path[..].ptr, true)
-            return Output()
+            if code == 2 || code == 3 {
+                return Output(), errors.ErrNotFound
+            }
+            return Output(), errors.ErrIO
         }
     } else {
         val created = CreateProcessW(app, command, null, null, 0, 0, null, null, &startup, &info)
         if created == 0 {
-            return Output()
+            val code = c.GetLastError()
+            if code == 2 || code == 3 {
+                return Output(), errors.ErrNotFound
+            }
+            return Output(), errors.ErrIO
         }
     }
 
@@ -281,13 +296,12 @@ private fn spawn(app: *u16, command: *u16, capture: bool): Output with (a: mem.A
             delete_made(out_path[..].ptr, true)
             delete_made(err_path[..].ptr, true)
         }
-        return Output()
+        return Output(), errors.ErrIO
     }
     if !capture {
         var out: Output
         out.code = exit_code(status)
-        out.ok = true
-        return out
+        return out, null
     }
 
     var out_utf: [1024]u8
@@ -295,56 +309,56 @@ private fn spawn(app: *u16, command: *u16, capture: bool): Output with (a: mem.A
     if !wide_utf8(out_path[..].ptr, out_utf[..].ptr, 1024) || !wide_utf8(err_path[..].ptr, err_utf[..].ptr, 1024) {
         delete_made(out_path[..].ptr, true)
         delete_made(err_path[..].ptr, true)
-        return Output()
+        return Output(), errors.ErrIO
     }
-    val out = read_captures(out_utf[..].ptr, err_utf[..].ptr, exit_code(status))
+    val (out, err) = read_captures(out_utf[..].ptr, err_utf[..].ptr, exit_code(status))
     delete_made(out_path[..].ptr, true)
     delete_made(err_path[..].ptr, true)
-    return out
+    return out, err
 }
 
-private fn start(args: []str, capture: bool): Output with (a: mem.Allocator) {
+private fn start(args: []str, capture: bool): (Output, error?) with (a: mem.Allocator) {
     if args.len == 0 {
-        panic("empty argument vector")
+        return Output(), errors.ErrIO
     }
     if !args_ok(args) {
-        return Output()
+        return Output(), errors.ErrIO
     }
     var command = strbuilder.empty()
     build_command(&command, args)
     if command.len > 32766 {
         command.free()
-        return Output()
+        return Output(), errors.ErrIO
     }
     val text = command.str()
     val slots = text.len + 1
     val (wide, err) = a.alloc(slots * 2, align(u16))
     if err != null {
         command.free()
-        panic("out of memory")
+        return Output(), errors.ErrOutOfMemory
     }
     var wide_app: [4096]u16
     if !c.utf8_to_wide(text, wide.ptr as *u16, slots) || !c.utf8_to_wide(args[0], wide_app[..].ptr, 4096) {
         command.free()
         a.free(wide)
-        return Output()
+        return Output(), errors.ErrIO
     }
-    val out = spawn(wide_app[..].ptr, wide.ptr as *u16, capture)
+    val (out, spawn_err) = spawn(wide_app[..].ptr, wide.ptr as *u16, capture)
     command.free()
     a.free(wide)
-    return out
+    return out, spawn_err
 }
 
-// args[0] is the program. The call waits. ok is false when the program
-// cannot be started or the captures cannot be read.
-actual fn run(args: []str): Output with (a: mem.Allocator) {
+// args[0] is the program. The call waits. A null error means the process
+// ran and Output.code is its exit code.
+actual fn run(args: []str): (Output, error?) with (a: mem.Allocator) {
     return start(args, true)
 }
 
 // Same start and wait as run. The child keeps the parent's stdout and
-// stderr, so its writes show up as it makes them. The result has no
-// captured bytes.
-actual fn run_inherit(args: []str): (i32, bool) with (a: mem.Allocator) {
-    val out = start(args, false)
-    return out.code, out.ok
+// stderr, so its writes show up as it makes them. The i32 is the exit
+// code when the error is null. There are no captured bytes.
+actual fn run_inherit(args: []str): (i32, error?) with (a: mem.Allocator) {
+    val (out, err) = start(args, false)
+    return out.code, err
 }

@@ -16,6 +16,7 @@
 #include "const_eval.h"
 #include "float_lit.h"
 #include "resolve_package.h"
+#include "str.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -32,6 +33,8 @@
    A lambda checks where it is written. A named function may be used as a
    value. A non-escaping lambda may name an outer local; it is captured
    by reference. A unit lambda discards a non-unit tail.
+   A lambda matched to a function type with context parameters takes those
+   parameters itself. Calls in its body resolve them before outer contexts.
    Struct fields, literals, and methods are checked in check_struct.c.
    Pointers, arrays, slices, and bytes are checked in check_memory.c.
    Tuples, error?, defer, and panic are checked in check_error.c.
@@ -74,6 +77,7 @@ static void check_stmt_raw(Env *env, JogNode *stmt);
 static void check_block(Env *env, JogNode *block);
 static JogType *check_if(Env *env, JogNode *node, JogType *target, bool as_value);
 static JogType *check_lambda(Env *env, JogNode *node, JogType *target);
+static int push_lambda_contexts(Env *env, JogNode *node, JogType *fn_target);
 
 /* Pin the active body so jog_check_expr reuses its definite-assignment set. */
 static JogType *check_expr(Env *env, JogNode *node, JogType *target) {
@@ -3177,6 +3181,66 @@ static bool node_has_return(const JogNode *node) {
     }
 }
 
+/* The target function type's context parameters become this lambda's own.
+   Calls in the body resolve them before the enclosing function's contexts.
+   The symbols stay on the node so lowering can bind the parameter locals. */
+static int push_lambda_contexts(Env *env, JogNode *node, JogType *fn_target) {
+    size_t n;
+    size_t i;
+    JogSymbol **symbols;
+    JogType **types;
+    JogPackage *package;
+    if (!fn_target || fn_target->as.fn.context_count == 0) {
+        return 1;
+    }
+    if (!env->job) {
+        jog_check_fail(env->ck, node->pos, "a lambda cannot take a context parameter yet");
+        return 0;
+    }
+    n = fn_target->as.fn.context_count;
+    if (!fn_target->as.fn.contexts) {
+        jog_check_fail(env->ck, node->pos, "missing context parameter");
+        return 0;
+    }
+    symbols = ct_arena_alloc(env->ck->program->arena, n * sizeof(*symbols), _Alignof(JogSymbol *));
+    types = ct_arena_alloc(env->ck->program->arena, n * sizeof(*types), _Alignof(JogType *));
+    if (!symbols || !types) {
+        jog_check_oom(env->ck);
+        return 0;
+    }
+    memset(symbols, 0, n * sizeof(*symbols));
+    memset(types, 0, n * sizeof(*types));
+    package = env->job->package;
+    for (i = 0; i < n && !env->ck->stop; i++) {
+        char buf[32];
+        const char *name;
+        JogType *ty = fn_target->as.fn.contexts[i];
+        if (!ty || is_error(ty)) {
+            jog_check_fail(env->ck, node->pos, "missing context parameter");
+            return 0;
+        }
+        snprintf(buf, sizeof(buf), "ctx%zu", i);
+        name = ct_intern_cstr(env->ck->program->intern, buf);
+        if (!name) {
+            jog_check_oom(env->ck);
+            return 0;
+        }
+        symbols[i] = jog_symbol_new(env->ck->program->arena, JOG_SYM_CONTEXT, name, node, ty, package);
+        if (!symbols[i]) {
+            jog_check_oom(env->ck);
+            return 0;
+        }
+        types[i] = ty;
+    }
+    if (env->ck->stop) {
+        return 0;
+    }
+    node->context_symbols = symbols;
+    node->context_symbol_count = n;
+    jog_check_context_push_params(env->ck, env->job, symbols, types, n);
+    return !env->ck->stop;
+}
+
 /* The block value is the last expression. A unit lambda discards that
    tail, so () -> { xs.pop() } has type () -> (). return leaves this
    lambda only. */
@@ -3200,11 +3264,6 @@ static JogType *check_lambda(Env *env, JogNode *node, JogType *target) {
     error = jog_check_error_type(env->ck);
     if (target && !is_error(target) && target->kind == JOG_TY_FN) {
         fn_target = target;
-    }
-    if (fn_target && fn_target->as.fn.context_count > 0) {
-        jog_check_fail(env->ck, node->pos, "a lambda cannot take a context parameter yet");
-        node->type = error;
-        return error;
     }
     if (fn_target && fn_target->as.fn.variadic) {
         jog_check_fail(env->ck, node->pos, "a lambda cannot be variadic yet");
@@ -3326,6 +3385,19 @@ static JogType *check_lambda(Env *env, JogNode *node, JogType *target) {
         saved_go = env->job->in_go;
         env->job->in_go = false;
         mark = jog_check_context_mark(env->job);
+        if (!push_lambda_contexts(env, node, fn_target)) {
+            jog_check_context_reset(env->job, mark);
+            env->job->in_go = saved_go;
+            if (env->ck->stop) {
+                return NULL;
+            }
+            node->type = error;
+            return error;
+        }
+    } else if (fn_target && fn_target->as.fn.context_count > 0) {
+        jog_check_fail(env->ck, node->pos, "a lambda cannot take a context parameter yet");
+        node->type = error;
+        return error;
     }
     if (node->as.lambda.expr_body) {
         if (ret && !is_error(ret) && ret->kind == JOG_TY_UNIT) {
@@ -3377,7 +3449,9 @@ static JogType *check_lambda(Env *env, JogNode *node, JogType *target) {
         node->type = error;
         return error;
     }
-    built = jog_type_fn(env->ck->program->types, params, nparam, ret, NULL, 0, false,
+    built = jog_type_fn(env->ck->program->types, params, nparam, ret,
+                        fn_target ? fn_target->as.fn.contexts : NULL,
+                        fn_target ? fn_target->as.fn.context_count : 0, false,
                         fn_target && fn_target->as.fn.escaping, false);
     if (!built) {
         jog_check_oom(env->ck);

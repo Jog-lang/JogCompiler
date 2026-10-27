@@ -138,6 +138,22 @@ fn ranged_some(p: i32?): i32 {
     }
 }
 
+fn from_tag(n: u8): Color {
+    return n as Color
+}
+
+fn painted(): Color {
+    return 2 as Color
+}
+
+fn color_name(c: Color): str {
+    return c.name
+}
+
+fn shape_name(s: Shape): str {
+    return s.name
+}
+
 fn main() {
     val c = Color.Green
     val s = Shape.Circle(r: 3)
@@ -175,6 +191,12 @@ fn main() {
         return
     }
     if !same(f, Flag.On) || same_shape(s, e) {
+        return
+    }
+    if (painted() as u8) != 2 || (from_tag(2) as u8) != 2 || (3 as Color) as u8 != 3 {
+        return
+    }
+    if color_name(c) != "Green" || color_name(3 as Color) != "Blue" || shape_name(s) != "Circle" || shape_name(e) != "Empty" {
         return
     }
     sign(n)

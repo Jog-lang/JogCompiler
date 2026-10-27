@@ -1,12 +1,15 @@
 // Windows open. _wfopen takes UTF-16, so a path outside the ANSI code
-// page still opens. The mode is a short ASCII string.
+// page still opens. The mode is a short ASCII string. A missing file is
+// ErrNotFound. A path that is empty, does not fit, is not UTF-8, or
+// fails for another reason is ErrIO.
 
 import std.c
+import std.error as errors
 
-actual fn open_c_file(path: str, mode: *const c.char): *c.FILE? {
+actual fn open_c_file(path: str, mode: *const c.char): (*c.FILE?, error?) {
     var wide_path: [4096]u16
-    if path.len >= 4096 || !c.utf8_to_wide(path, wide_path[..].ptr, 4096) {
-        return null
+    if path.len == 0 || path.len >= 4096 || !c.utf8_to_wide(path, wide_path[..].ptr, 4096) {
+        return null, errors.ErrIO
     }
     var wide_mode: [8]u16
     var i: usize = 0
@@ -15,9 +18,13 @@ actual fn open_c_file(path: str, mode: *const c.char): *c.FILE? {
         val b = raw[i]
         wide_mode[i] = b as u16
         if b == 0 {
-            return c._wfopen(wide_path[..].ptr, wide_mode[..].ptr)
+            val file = c._wfopen(wide_path[..].ptr, wide_mode[..].ptr)
+            if file == null {
+                return null, open_failed(c.jogrt_errno())
+            }
+            return file, null
         }
         i = i + 1
     }
-    return null
+    return null, errors.ErrIO
 }

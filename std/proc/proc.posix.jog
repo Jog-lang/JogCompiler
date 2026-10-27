@@ -4,9 +4,12 @@
 // actions are opaque, so jogrt_spawn_actions_* owns that struct.
 // A name with no slash is searched on PATH, which is what posix_spawnp
 // does. Arguments are an argv array, not a quoted command line, so a
-// space needs no extra quoting.
+// space needs no extra quoting. An empty argument vector is ErrIO.
+// A failed argv allocation is ErrOutOfMemory. posix_spawnp returning
+// 2 (ENOENT) is ErrNotFound. Any other failed start is ErrIO.
 
 import std.c
+import std.error as errors
 import std.mem
 
 private fn copy_at(dest: *u8, at: usize, text: str): usize {
@@ -46,15 +49,17 @@ private fn unlink_made(path: *u8, made: bool) {
 // LP64 x86-64. size(*u8) is not accepted: size() only takes a named type.
 private val ptr_bytes: usize = 8
 
+// vector is the NULL-terminated pointer table. blob is the packed
+// argument text. Both are bytes so a failed build can return Argv().
 private struct Argv {
-    slots: *(*const c.char?)
     vector: bytes
     blob: bytes
 }
 
 // One packed NUL-terminated copy per argument, then a NULL-terminated
 // pointer vector into that block. Both blocks belong to the caller.
-private fn build_argv(args: []str): Argv with (a: mem.Allocator) {
+// ErrOutOfMemory means neither block is live.
+private fn build_argv(args: []str): (Argv, error?) with (a: mem.Allocator) {
     var total: usize = 0
     var i: usize = 0
     for i < args.len {
@@ -63,18 +68,19 @@ private fn build_argv(args: []str): Argv with (a: mem.Allocator) {
     }
     val (blob, blob_err) = a.alloc(total, align(u8))
     if blob_err != null {
-        panic("out of memory")
+        return Argv(), errors.ErrOutOfMemory
     }
     val count = args.len + 1
     val (raw, err) = a.alloc(ptr_bytes * count, ptr_bytes)
     if err != null {
-        panic("out of memory")
+        a.free(blob)
+        return Argv(), errors.ErrOutOfMemory
     }
     var built = Argv(
-        slots: raw.ptr as *(*const c.char?),
         vector: raw,
         blob: blob,
     )
+    val slots = raw.ptr as *(*const c.char?)
     var at: usize = 0
     i = 0
     for i < args.len {
@@ -83,12 +89,12 @@ private fn build_argv(args: []str): Argv with (a: mem.Allocator) {
             c.memcpy((blob.ptr + at) as *void, args[i].ptr as *const void, n)
         }
         blob.ptr[at + n] = 0
-        built.slots[i] = (blob.ptr + at) as *const c.char?
+        slots[i] = (blob.ptr + at) as *const c.char?
         at = at + n + 1
         i = i + 1
     }
-    built.slots[args.len] = null
-    return built
+    slots[args.len] = null
+    return built, null
 }
 
 private fn free_argv(built: *Argv) with (a: mem.Allocator) {
@@ -101,7 +107,7 @@ private fn cleanup_temps(out_path: *u8, err_path: *u8) {
     unlink_made(err_path, true)
 }
 
-private fn spawn(args: []str): Output with (a: mem.Allocator) {
+private fn spawn(args: []str): (Output, error?) with (a: mem.Allocator) {
     var out_path: [64]u8
     var err_path: [64]u8
     val out_fd = make_temp("jpo", out_path[..].ptr, 64)
@@ -111,14 +117,14 @@ private fn spawn(args: []str): Output with (a: mem.Allocator) {
         close_fd(err_fd)
         unlink_made(out_path[..].ptr, out_fd >= 0)
         unlink_made(err_path[..].ptr, err_fd >= 0)
-        return Output()
+        return Output(), errors.ErrIO
     }
     val nul_fd = c.open(c"/dev/null", 0)
     if nul_fd < 0 {
         close_fd(out_fd)
         close_fd(err_fd)
         cleanup_temps(out_path[..].ptr, err_path[..].ptr)
-        return Output()
+        return Output(), errors.ErrIO
     }
     val actions = c.jogrt_spawn_actions_new()
     if actions == null {
@@ -126,7 +132,7 @@ private fn spawn(args: []str): Output with (a: mem.Allocator) {
         close_fd(out_fd)
         close_fd(err_fd)
         cleanup_temps(out_path[..].ptr, err_path[..].ptr)
-        return Output()
+        return Output(), errors.ErrIO
     }
     val dup_ok = c.jogrt_spawn_actions_adddup2(actions!!, nul_fd, 0) == 0 &&
         c.jogrt_spawn_actions_adddup2(actions!!, out_fd, 1) == 0 &&
@@ -137,11 +143,20 @@ private fn spawn(args: []str): Output with (a: mem.Allocator) {
         close_fd(out_fd)
         close_fd(err_fd)
         cleanup_temps(out_path[..].ptr, err_path[..].ptr)
-        return Output()
+        return Output(), errors.ErrIO
     }
-    var argv = build_argv(args)
+    var (argv, argv_err) = build_argv(args)
+    if argv_err != null {
+        c.jogrt_spawn_actions_free(actions)
+        close_fd(nul_fd)
+        close_fd(out_fd)
+        close_fd(err_fd)
+        cleanup_temps(out_path[..].ptr, err_path[..].ptr)
+        return Output(), argv_err
+    }
     var pid: c.int = 0
-    val spawned = c.posix_spawnp(&pid, argv.slots[0]!!, actions as *const void?, null, argv.slots, null)
+    val slots = argv.vector.ptr as *(*const c.char?)
+    val spawned = c.posix_spawnp(&pid, slots[0]!!, actions as *const void?, null, slots, null)
     c.jogrt_spawn_actions_free(actions)
     close_fd(nul_fd)
     close_fd(out_fd)
@@ -149,62 +164,73 @@ private fn spawn(args: []str): Output with (a: mem.Allocator) {
     if spawned != 0 {
         free_argv(&argv)
         cleanup_temps(out_path[..].ptr, err_path[..].ptr)
-        return Output()
+        if spawned == 2 {
+            return Output(), errors.ErrNotFound
+        }
+        return Output(), errors.ErrIO
     }
     var status: c.int = 0
     val waited = c.waitpid(pid, &status, 0)
     free_argv(&argv)
     if waited != pid {
         cleanup_temps(out_path[..].ptr, err_path[..].ptr)
-        return Output()
+        return Output(), errors.ErrIO
     }
     val code = c.jogrt_wexitstatus(status)
     if code < 0 {
         cleanup_temps(out_path[..].ptr, err_path[..].ptr)
-        return Output()
+        return Output(), errors.ErrIO
     }
-    val out = read_captures(out_path[..].ptr, err_path[..].ptr, code)
+    val (out, err) = read_captures(out_path[..].ptr, err_path[..].ptr, code)
     cleanup_temps(out_path[..].ptr, err_path[..].ptr)
-    return out
+    return out, err
 }
 
-// args[0] is the program. The call waits. ok is false when the program
-// cannot be started or the captures cannot be read.
-actual fn run(args: []str): Output with (a: mem.Allocator) {
+// args[0] is the program. The call waits. A null error means the process
+// ran and Output.code is its exit code.
+actual fn run(args: []str): (Output, error?) with (a: mem.Allocator) {
     if args.len == 0 {
-        panic("empty argument vector")
+        return Output(), errors.ErrIO
     }
     if !args_ok(args) {
-        return Output()
+        return Output(), errors.ErrIO
     }
     return spawn(args)
 }
 
 // Same start and wait as run, with no file actions, so the child keeps
-// the parent's stdout and stderr. The result has no captured bytes.
-actual fn run_inherit(args: []str): (i32, bool) with (a: mem.Allocator) {
+// the parent's stdout and stderr. The i32 is the exit code when the
+// error is null. There are no captured bytes.
+actual fn run_inherit(args: []str): (i32, error?) with (a: mem.Allocator) {
     if args.len == 0 {
-        panic("empty argument vector")
+        return 0, errors.ErrIO
     }
     if !args_ok(args) {
-        return 0, false
+        return 0, errors.ErrIO
     }
-    var argv = build_argv(args)
+    var (argv, argv_err) = build_argv(args)
+    if argv_err != null {
+        return 0, argv_err
+    }
     var pid: c.int = 0
-    val spawned = c.posix_spawnp(&pid, argv.slots[0]!!, null, null, argv.slots, null)
+    val slots = argv.vector.ptr as *(*const c.char?)
+    val spawned = c.posix_spawnp(&pid, slots[0]!!, null, null, slots, null)
     if spawned != 0 {
         free_argv(&argv)
-        return 0, false
+        if spawned == 2 {
+            return 0, errors.ErrNotFound
+        }
+        return 0, errors.ErrIO
     }
     var status: c.int = 0
     val waited = c.waitpid(pid, &status, 0)
     free_argv(&argv)
     if waited != pid {
-        return 0, false
+        return 0, errors.ErrIO
     }
     val code = c.jogrt_wexitstatus(status)
     if code < 0 {
-        return 0, false
+        return 0, errors.ErrIO
     }
-    return code, true
+    return code, null
 }

@@ -81,4 +81,26 @@ fn main() {
     if read(box) != null {
         return
     }
+    if (painted() as u8) != 2 || (from_tag(2) as u8) != 2 {
+        return
+    }
+    if color_name(c) != "Green" || shape_name(s) != "Circle" || shape_name(e) != "Empty" {
+        return
+    }
+}
+
+fn from_tag(n: u8): Color {
+    return n as Color
+}
+
+fn painted(): Color {
+    return 2 as Color
+}
+
+fn color_name(c: Color): str {
+    return c.name
+}
+
+fn shape_name(s: Shape): str {
+    return s.name
 }
