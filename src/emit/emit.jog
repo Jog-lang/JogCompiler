@@ -1,0 +1,12 @@
+// C emitter and driver. Checked against compiler/src/emit_c.c and
+// compiler/src/cc.c.
+// Study note: JogDocs bootstrap/study/CodeGen.
+
+import std.io
+
+fn run(command: str): i32 {
+    io.eprint("jogc: ")
+    io.eprint(command)
+    io.eprintln(" is not implemented")
+    return 1
+}

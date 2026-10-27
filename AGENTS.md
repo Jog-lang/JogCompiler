@@ -5,3 +5,5 @@
 - Log friction (anything in the language, compiler, std, or tooling that got in the way) in JogDocs `bootstrap/Friction.md`.
 - A change is done only when the check command prints `check: OK`. On Windows that is `pwsh scripts/check.ps1`. On Linux that is `scripts/check.sh`.
 - C17, warning-free on gcc and clang. Prefixes: `ct_` tools, `jog_` compiler, `jir_` IR, `jogrt_` runtime.
+
+P3 writes the self-hosted compiler `jogc` on branch `p3/jogc`. Do not implement a stage unless asked. `scripts/diff_stage.ps1` is how a stage is judged. The C `jog` on `c-seed-compiler` remains the reference, and stage 0 is the binary at `bootstrap/stage0/jog.exe`.

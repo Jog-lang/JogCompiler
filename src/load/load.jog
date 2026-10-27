@@ -1,0 +1,12 @@
+// Loader and resolver. Checked against compiler/src/loader.c,
+// compiler/src/resolve_package.c, and compiler/src/resolve_universe.c.
+// Study note: JogDocs bootstrap/study/NameResolution.
+
+import std.io
+
+fn run(command: str): i32 {
+    io.eprint("jogc: ")
+    io.eprint(command)
+    io.eprintln(" is not implemented")
+    return 1
+}

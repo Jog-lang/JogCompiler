@@ -1,0 +1,11 @@
+// Checker. Checked against compiler/src/check.c.
+// Study note: JogDocs bootstrap/study/TypeChecking.
+
+import std.io
+
+fn run(command: str): i32 {
+    io.eprint("jogc: ")
+    io.eprint(command)
+    io.eprintln(" is not implemented")
+    return 1
+}

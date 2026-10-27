@@ -1,0 +1,12 @@
+// Parser and AST printer. Checked against compiler/src/parser.c and
+// compiler/src/ast_print.c.
+// Study note: JogDocs bootstrap/study/Parsing.
+
+import std.io
+
+fn run(command: str): i32 {
+    io.eprint("jogc: ")
+    io.eprint(command)
+    io.eprintln(" is not implemented")
+    return 1
+}

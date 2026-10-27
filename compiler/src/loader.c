@@ -983,6 +983,20 @@ static bool locate_roots(Loader *loader) {
         LOAD_ERROR(loader, pos, "out of memory");
         return false;
     }
+    /* build/jog.exe finds <exe>/../std. bootstrap/stage0/jog.exe is one
+       directory deeper, so try the parent once before giving up. JOG_ROOT
+       stays exact: a missing library there is an error, not a search. */
+    if ((!env || env[0] == '\0') && !ct_fs_is_dir(std_dir)) {
+        const char *up = parent_dir(arena, base);
+        const char *alt_std = up ? ct_path_join(arena, up, "std") : NULL;
+        const char *alt_rt = up ? ct_path_join(arena, up, "runtime") : NULL;
+        if (alt_std && ct_fs_is_dir(alt_std)) {
+            std_dir = alt_std;
+            if (alt_rt && ct_fs_is_dir(alt_rt)) {
+                runtime_dir = alt_rt;
+            }
+        }
+    }
     if (ct_fs_is_dir(std_dir)) {
         loader->program->std_root = std_dir;
     }
@@ -1016,6 +1030,45 @@ static const char *find_manifest(Loader *loader, const char *dir, const char **r
         current = parent;
     }
     return NULL;
+}
+
+/* True when both paths name one directory. A missing path is not a match,
+   so a user folder called std still shadows a library that was not found. */
+static int same_directory(CtArena *arena, const char *left, const char *right) {
+    char *a = NULL;
+    char *b = NULL;
+    size_t i = 0;
+    if (!left || !right || left[0] == '\0' || right[0] == '\0') {
+        return 0;
+    }
+    a = absolute_path(arena, left);
+    b = absolute_path(arena, right);
+    if (!a || !b) {
+        return 0;
+    }
+    while (a[i] != '\0' && b[i] != '\0') {
+        unsigned char ca = (unsigned char)a[i];
+        unsigned char cb = (unsigned char)b[i];
+        if (is_sep((char)ca)) {
+            ca = '/';
+        }
+        if (is_sep((char)cb)) {
+            cb = '/';
+        }
+#if defined(_WIN32)
+        if (ca >= 'A' && ca <= 'Z') {
+            ca = (unsigned char)(ca - 'A' + 'a');
+        }
+        if (cb >= 'A' && cb <= 'Z') {
+            cb = (unsigned char)(cb - 'A' + 'a');
+        }
+#endif
+        if (ca != cb) {
+            return 0;
+        }
+        i++;
+    }
+    return a[i] == '\0' && b[i] == '\0';
 }
 
 static bool open_module(Loader *loader, const char *start) {
@@ -1073,7 +1126,10 @@ static bool open_module(Loader *loader, const char *start) {
         LOAD_ERROR(loader, loader->module_pos, "out of memory");
         return false;
     }
-    if (ct_fs_is_dir(local_std)) {
+    /* This repository is both the module and the standard library. A
+       folder named std is a shadow only when it is some other directory.
+       Imports of std still resolve through program->std_root. */
+    if (ct_fs_is_dir(local_std) && !same_directory(arena, local_std, loader->program->std_root)) {
         LOAD_ERROR(loader, loader->module_pos, "folder 'std' shadows the standard library");
     }
     return true;

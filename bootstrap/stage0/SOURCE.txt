@@ -1,0 +1,3 @@
+96b37a5024abb69a71c8aca0c139d2ada6eb2a2e
+Rebuild from that commit: cmake -S . -B build -G Ninja && cmake --build build
+This copy was rebuilt on p3/jogc after loader.c: the repository's own std directory is not a shadow, and bootstrap/stage0 looks one directory higher for std.

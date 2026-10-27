@@ -1,0 +1,11 @@
+// Lexer. Checked against compiler/src/lexer.c.
+// Study note: JogDocs bootstrap/study/Lexing.
+
+import std.io
+
+fn run(command: str): i32 {
+    io.eprint("jogc: ")
+    io.eprint(command)
+    io.eprintln(" is not implemented")
+    return 1
+}

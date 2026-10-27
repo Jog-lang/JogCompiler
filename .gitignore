@@ -3,6 +3,8 @@ build-linux/
 build-linux-*/
 out/
 *.exe
+# Stage 0 is a local binary. bootstrap/stage0/SOURCE.txt records the commit.
+bootstrap/stage0/*.exe
 *.o
 *.obj
 *.ilk

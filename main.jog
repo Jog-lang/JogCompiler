@@ -1,0 +1,90 @@
+// jogc: the self-hosted compiler. main reads os.argv, dispatches one
+// command, and exits with that command's code. std.os has no exit, so
+// the code goes through c.jogrt_exit, as in Jog-build.
+//
+// lex, parse, and emit-ir call that stage. check calls the loader, then
+// the checker. emit-c, build, run, and test call the C emitter. Each
+// stage function is a stub until that stage is written.
+
+import src.check
+import src.emit
+import src.lex
+import src.load
+import src.lower
+import src.parse
+import std.c
+import std.io
+import std.mem
+import std.os
+
+fn say(to_err: bool, text: str) {
+    if to_err {
+        io.eprintln(text)
+    } else {
+        io.println(text)
+    }
+}
+
+fn usage(to_err: bool) {
+    say(to_err, "usage: jogc <command> [arguments]")
+    say(to_err, "")
+    say(to_err, "commands:")
+    say(to_err, "  jogc lex <file>          print the tokens of a file")
+    say(to_err, "  jogc parse <file>        print the AST of a file")
+    say(to_err, "  jogc check [package]     run the frontend only")
+    say(to_err, "  jogc emit-ir [package]   print the IR")
+    say(to_err, "  jogc emit-c [package]    print the generated C")
+    say(to_err, "  jogc build [package]     compile to an executable")
+    say(to_err, "  jogc run [package]       build and run")
+    say(to_err, "  jogc test [package]      run *.test.jog tests")
+    say(to_err, "  jogc version             print the compiler version")
+    say(to_err, "  jogc help                show this message")
+}
+
+fn dispatch(): i32 {
+    if os.argc() < 2 {
+        usage(true)
+        return 2
+    }
+    val command = os.argv(1)
+    if command == "help" {
+        usage(false)
+        return 0
+    }
+    if command == "version" {
+        io.println("jogc 0.1.0")
+        return 0
+    }
+    if command == "lex" {
+        return lex.run(command)
+    }
+    if command == "parse" {
+        return parse.run(command)
+    }
+    if command == "check" {
+        val loaded = load.run(command)
+        if loaded != 0 {
+            return loaded
+        }
+        return check.run(command)
+    }
+    if command == "emit-ir" {
+        return lower.run(command)
+    }
+    if command == "emit-c" || command == "build" || command == "run" || command == "test" {
+        return emit.run(command)
+    }
+    io.eprint("jogc: unknown command '")
+    io.eprint(command)
+    io.eprintln("'")
+    usage(true)
+    return 2
+}
+
+fn main() {
+    var code: i32 = 0
+    with (mem.heap()) {
+        code = dispatch()
+    }
+    c.jogrt_exit(code)
+}
