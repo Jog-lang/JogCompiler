@@ -9,6 +9,30 @@ struct Slot {
 }
 
 @test
+fn byteIterPull() with (t: testing.Testing) {
+    val text = "a\0b"
+    var src = bytes()
+    src.ptr = text.ptr as *u8
+    src.len = text.len
+    var cur = byte_iter(src)
+    val (a, aok) = cur.next()
+    t.expect(aok)
+    t.expect(a == 'a' as u8)
+    val (z, zok) = cur.next()
+    t.expect(zok)
+    t.expect(z == 0)
+    val (b, bok) = cur.next()
+    t.expect(bok)
+    t.expect(b == 'b' as u8)
+    val (_, more) = cur.next()
+    t.expect(!more)
+    var empty = byte_iter(bytes())
+    val (none, nok) = empty.next()
+    t.expect(!nok)
+    t.expect(none == 0)
+}
+
+@test
 fn zeroedSlice() with (t: testing.Testing) {
     with (heap()) {
         var slots = newSlice<Slot>(2)

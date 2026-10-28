@@ -172,3 +172,38 @@ fn freeSlice<T>(s: []T) with (a: Allocator) {
     block.len = size(T) * s.len
     a.free(block)
 }
+
+/**
+ * A pull cursor over bytes. index is the next byte offset. bytes itself
+ * is not a cursor.
+ */
+struct ByteIter {
+    src: bytes
+    index: usize
+}
+
+/**
+ * A cursor at the first byte of src. The caller owns it.
+ * @param src bytes to walk
+ * @return the cursor
+ */
+fn byte_iter(src: bytes): ByteIter {
+    var it = ByteIter()
+    it.src = src
+    it.index = 0
+    return it
+}
+
+/**
+ * The next byte. A finished cursor stays finished.
+ * @self the cursor
+ * @return the byte and true, or 0 and false when index is past src
+ */
+fn *ByteIter.next(): (u8, bool) {
+    if self.index >= self.src.len {
+        return 0, false
+    }
+    val b = self.src.ptr[self.index]
+    self.index = self.index + 1
+    return b, true
+}

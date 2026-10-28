@@ -1,5 +1,6 @@
-// slice, starts_with, ends_with, and index_of are views. clone owns a copy.
-// is_digit and is_hex_digit classify one ASCII byte.
+// slice, starts_with, ends_with, index_of, contains, count, and trim are
+// views. clone, to_lower, to_upper, and replace own a copy. split and
+// runes own a list. is_digit and is_hex_digit classify one ASCII byte.
 
 import std.mem
 import std.testing
@@ -12,6 +13,26 @@ private fn drop(s: str) with (a: mem.Allocator) {
     block.ptr = s.ptr as *u8
     block.len = s.len
     a.free(block)
+}
+
+@test
+fn runeIterPull() with (t: testing.Testing) {
+    var cur = rune_iter("A\u{E9}\xFF")
+    val (a, aok) = cur.next()
+    t.expect(aok)
+    t.expect(a == 'A' as rune)
+    val (e, eok) = cur.next()
+    t.expect(eok)
+    t.expect(e == 0xE9 as rune)
+    val (bad, bok) = cur.next()
+    t.expect(bok)
+    t.expect(bad == 0xFFFD as rune)
+    val (_, more) = cur.next()
+    t.expect(!more)
+    var empty = rune_iter("")
+    val (none, nok) = empty.next()
+    t.expect(!nok)
+    t.expect(none == 0)
 }
 
 @test
@@ -51,4 +72,144 @@ fn digits() with (t: testing.Testing) {
     t.expect(!is_hex_digit('g' as u8))
     t.expect(!is_hex_digit('G' as u8))
     t.expect(!is_hex_digit('/' as u8))
+}
+
+@test
+fn containsAndCount() with (t: testing.Testing) {
+    t.expect(contains("hello", "ell"))
+    t.expect(!contains("hello", "x"))
+    t.expect(contains("hello", ""))
+    t.expect(contains("", ""))
+    t.expect(!contains("", "a"))
+    t.expect(count("aaa", "aa") == 1)
+    t.expect(count("aaaa", "aa") == 2)
+    t.expect(count("abababa", "aba") == 2)
+    t.expect(count("abc", "x") == 0)
+    t.expect(count("", "a") == 0)
+    t.expect(count("", "") == 1)
+    t.expect(count("ab", "") == 3)
+}
+
+@test
+fn trimAscii() with (t: testing.Testing) {
+    t.expectEq(trim(""), "")
+    t.expectEq(trim(" \t\r\n"), "")
+    t.expectEq(trim("hi"), "hi")
+    t.expectEq(trim(" \t\r\nhi \t\r\n"), "hi")
+    t.expectEq(trim_start(" \t\r\nhi "), "hi ")
+    t.expectEq(trim_end(" hi \t\r\n"), " hi")
+}
+
+@test
+fn asciiCase() with (t: testing.Testing) {
+    with (mem.heap()) {
+        val empty_lower = to_lower("")
+        t.expectEq(empty_lower, "")
+        drop(empty_lower)
+        val empty_upper = to_upper("")
+        t.expectEq(empty_upper, "")
+        drop(empty_upper)
+        val lower = to_lower("AbC1")
+        t.expectEq(lower, "abc1")
+        drop(lower)
+        val upper = to_upper("AbC1")
+        t.expectEq(upper, "ABC1")
+        drop(upper)
+        val kept = to_lower("\u{E9}A")
+        t.expectEq(kept, "\u{E9}a")
+        drop(kept)
+        val kept_up = to_upper("\u{E9}a")
+        t.expectEq(kept_up, "\u{E9}A")
+        drop(kept_up)
+    }
+}
+
+@test
+fn replaceText() with (t: testing.Testing) {
+    with (mem.heap()) {
+        val none = replace("", "a", "b")
+        t.expectEq(none, "")
+        drop(none)
+        val same = replace("abc", "x", "y")
+        t.expectEq(same, "abc")
+        drop(same)
+        val swapped = replace("a-b-a", "-", "+")
+        t.expectEq(swapped, "a+b+a")
+        drop(swapped)
+        val once = replace("aaa", "aa", "b")
+        t.expectEq(once, "ba")
+        drop(once)
+        val gone = replace("a-b-a", "-", "")
+        t.expectEq(gone, "aba")
+        drop(gone)
+        val cleared = replace("a", "a", "")
+        t.expectEq(cleared, "")
+        drop(cleared)
+    }
+}
+
+@test
+fn splitViews() with (t: testing.Testing) {
+    val s = "a,b"
+    val holes = ",a,"
+    val raw = "ab"
+    with (mem.heap()) {
+        var parts = split(s, ",")
+        t.expect(parts.len == 2)
+        t.expectEq(parts.get(0), "a")
+        t.expectEq(parts.get(1), "b")
+        t.expect(parts.get(0).ptr == s.ptr)
+        t.expect(parts.get(1).ptr == s.ptr + (2 as usize))
+        parts.free()
+        var more = split(holes, ",")
+        t.expect(more.len == 3)
+        t.expectEq(more.get(0), "")
+        t.expectEq(more.get(1), "a")
+        t.expectEq(more.get(2), "")
+        t.expect(more.get(1).ptr == holes.ptr + (1 as usize))
+        more.free()
+        var blank = split("", ",")
+        t.expect(blank.len == 1)
+        t.expectEq(blank.get(0), "")
+        blank.free()
+        var pieces = split(raw, "")
+        t.expect(pieces.len == 2)
+        t.expectEq(pieces.get(0), "a")
+        t.expectEq(pieces.get(1), "b")
+        t.expect(pieces.get(0).ptr == raw.ptr)
+        t.expect(pieces.get(1).ptr == raw.ptr + (1 as usize))
+        pieces.free()
+    }
+}
+
+@test
+fn runesOf() with (t: testing.Testing) {
+    var nbytes: usize = 0
+    for _ in "\u{E9}" {
+        nbytes = nbytes + 1
+    }
+    t.expect(nbytes == 2)
+    with (mem.heap()) {
+        var none = runes("")
+        t.expect(none.len == 0)
+        none.free()
+        var ascii = runes("Ab")
+        t.expect(ascii.len == 2)
+        t.expect(ascii.get(0) == 'A' as rune)
+        t.expect(ascii.get(1) == 'b' as rune)
+        ascii.free()
+        var multi = runes("\u{E9}")
+        t.expect(multi.len == 1)
+        t.expect(multi.get(0) == 0xE9 as rune)
+        multi.free()
+        var wide = runes("\u{1F600}")
+        t.expect(wide.len == 1)
+        t.expect(wide.get(0) == 0x1F600 as rune)
+        wide.free()
+        var bad = runes("\xFFb")
+        t.expect(bad.len == 2)
+        t.expect(bad.get(0) == 0xFFFD as rune)
+        t.expect(bad.get(1) == 'b' as rune)
+        bad.free()
+    }
 }

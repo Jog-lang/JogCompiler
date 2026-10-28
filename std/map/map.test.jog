@@ -3,8 +3,10 @@
 // allocator context: with (mem.heap()). t.expect takes a bool.
 //
 // The hash is an argument. fnv1a covers str. A constant hash forces
-// every key into one probe chain. Programmer-error panics are
-// expectPanic tests at the bottom. Out of memory in grow is not an @test.
+// every key into one probe chain. each, contains, keys, and values walk
+// live slots. keys and values allocate lists, and those lists are freed.
+// Programmer-error panics are expectPanic tests at the bottom. Out of
+// memory in grow is not an @test.
 
 import std.mem
 import std.testing
@@ -305,6 +307,206 @@ fn structKey() with (t: testing.Testing) {
         t.expect(m.remove(Id(n: 2), 2))
         t.expect(!m.get(Id(n: 2), 2, &got))
         t.expect(m.count == 1)
+        m.free()
+    }
+}
+
+@test
+fn helpersEmpty() with (t: testing.Testing) {
+    var m = empty<i32, i32>()
+    with (mem.heap()) {
+        var n: i32 = 0
+        m.each((k, v) -> {
+            n = n + k + v
+        })
+        t.expect(n == 0)
+        t.expect(!m.contains(0, hash_i32(0)))
+        var ks = m.keys()
+        var vs = m.values()
+        t.expect(ks.len == 0)
+        t.expect(vs.len == 0)
+        t.expect(ks.cap == 0)
+        t.expect(vs.cap == 0)
+        ks.free()
+        vs.free()
+        m.insert(1, hash_i32(1), 10)
+        t.expect(m.remove(1, hash_i32(1)))
+        t.expect(m.cap != 0)
+        t.expect(m.tombs == 1)
+        n = 0
+        m.each((k, v) -> {
+            n = n + k + v
+        })
+        t.expect(n == 0)
+        t.expect(!m.contains(1, hash_i32(1)))
+        ks = m.keys()
+        vs = m.values()
+        t.expect(ks.len == 0)
+        t.expect(vs.len == 0)
+        ks.free()
+        vs.free()
+        m.free()
+    }
+}
+
+@test
+fn helpersLiveSlots() with (t: testing.Testing) {
+    // Hash 0 puts every key in one probe chain. Slot order is the chain,
+    // and a removed key is a tombstone that each, keys, and values skip.
+    var m = empty<i32, i32>()
+    with (mem.heap()) {
+        var n: i32 = 0
+        for _ in 0 as usize..6 {
+            m.insert(n, 0, n + 10)
+            n = n + 1
+        }
+        m.insert(2, 0, 99)
+        t.expect(m.count == 6)
+        t.expect(m.remove(1, 0))
+        t.expect(m.remove(4, 0))
+        t.expect(m.count == 4)
+        t.expect(m.tombs == 2)
+        t.expect(m.contains(0, 0))
+        t.expect(m.contains(2, 0))
+        t.expect(m.contains(3, 0))
+        t.expect(m.contains(5, 0))
+        t.expect(!m.contains(1, 0))
+        t.expect(!m.contains(4, 0))
+        t.expect(!m.contains(9, 0))
+        var ks = m.keys()
+        var vs = m.values()
+        t.expect(ks.len == 4)
+        t.expect(vs.len == 4)
+        var k0: i32 = 0
+        var k1: i32 = 0
+        var k2: i32 = 0
+        var k3: i32 = 0
+        var v0: i32 = 0
+        var v1: i32 = 0
+        var v2: i32 = 0
+        var v3: i32 = 0
+        var seen: i32 = 0
+        m.each((k, v) -> {
+            if seen == 0 {
+                k0 = k
+                v0 = v
+            } else if seen == 1 {
+                k1 = k
+                v1 = v
+            } else if seen == 2 {
+                k2 = k
+                v2 = v
+            } else {
+                k3 = k
+                v3 = v
+            }
+            seen = seen + 1
+        })
+        t.expect(seen == 4)
+        var slot: usize = 0
+        var i: usize = 0
+        for slot < m.cap {
+            if m.live(slot) {
+                var want_k = m.key_at(slot)
+                var want_v = m.value_at(slot)
+                if i == 0 {
+                    t.expect(k0 == want_k)
+                    t.expect(v0 == want_v)
+                } else if i == 1 {
+                    t.expect(k1 == want_k)
+                    t.expect(v1 == want_v)
+                } else if i == 2 {
+                    t.expect(k2 == want_k)
+                    t.expect(v2 == want_v)
+                } else {
+                    t.expect(k3 == want_k)
+                    t.expect(v3 == want_v)
+                }
+                t.expect(ks.get(i) == want_k)
+                t.expect(vs.get(i) == want_v)
+                t.expect(want_k != 1)
+                t.expect(want_k != 4)
+                if want_k == 2 {
+                    t.expect(want_v == 99)
+                } else {
+                    t.expect(want_v == want_k + 10)
+                }
+                i = i + 1
+            }
+            slot = slot + 1
+        }
+        t.expect(i == 4)
+        ks.free()
+        vs.free()
+        m.free()
+    }
+}
+
+@test
+fn helpersStr() with (t: testing.Testing) {
+    var m = empty<str, i32>()
+    with (mem.heap()) {
+        m.insert("a", fnv1a("a"), 1)
+        m.insert("b", fnv1a("b"), 2)
+        m.insert("c", fnv1a("c"), 3)
+        m.insert("a", fnv1a("a"), 9)
+        t.expect(m.remove("b", fnv1a("b")))
+        t.expect(m.contains("a", fnv1a("a")))
+        t.expect(m.contains("c", fnv1a("c")))
+        t.expect(!m.contains("b", fnv1a("b")))
+        t.expect(!m.contains("z", fnv1a("z")))
+        t.expect(!m.contains("", fnv1a("")))
+        var ks = m.keys()
+        var vs = m.values()
+        t.expect(ks.len == 2)
+        t.expect(vs.len == 2)
+        var ka: str = ""
+        var kb: str = ""
+        var va: i32 = 0
+        var vb: i32 = 0
+        var n: usize = 0
+        m.each((k, v) -> {
+            if n == 0 {
+                ka = k
+                va = v
+            } else {
+                kb = k
+                vb = v
+            }
+            n = n + 1
+        })
+        t.expect(n == 2)
+        var seen: usize = 0
+        for i in 0 as usize..m.cap {
+            if m.live(i) {
+                if seen == 0 {
+                    t.expect(ka == m.key_at(i))
+                    t.expect(va == m.value_at(i))
+                    t.expect(ks.get(0) == m.key_at(i))
+                    t.expect(vs.get(0) == m.value_at(i))
+                } else {
+                    t.expect(kb == m.key_at(i))
+                    t.expect(vb == m.value_at(i))
+                    t.expect(ks.get(1) == m.key_at(i))
+                    t.expect(vs.get(1) == m.value_at(i))
+                }
+                seen = seen + 1
+            }
+        }
+        t.expect(seen == 2)
+        var found_a = false
+        var j: usize = 0
+        for j < ks.len {
+            if ks.get(j) == "a" {
+                found_a = true
+                t.expect(vs.get(j) == 9)
+            }
+            t.expect(ks.get(j) != "b")
+            j = j + 1
+        }
+        t.expect(found_a)
+        ks.free()
+        vs.free()
         m.free()
     }
 }

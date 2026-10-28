@@ -1,0 +1,22 @@
+// abs, min, max, and sqrt. t.expect takes a bool.
+
+import std.testing
+
+@test
+fn absMinMaxSqrt() with (t: testing.Testing) {
+    val neg: i64 = -5
+    val pos: i64 = 5
+    t.expect(neg.abs() == 5)
+    t.expect(pos.abs() == 5)
+    val negf: f64 = -4.0
+    t.expect(negf.abs() == 4.0)
+    t.expectPanic() {
+        val n: i64 = -9223372036854775808
+        n.abs()
+    }
+    t.expect(min(2, 5) == 2)
+    t.expect(min(5, 2) == 2)
+    t.expect(max(2, 5) == 5)
+    t.expect(max(5, 2) == 5)
+    t.expect(sqrt(4.0) == 2.0)
+}

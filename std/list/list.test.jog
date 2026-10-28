@@ -1,6 +1,8 @@
 // Package list, same as list.jog, so the tests see List and empty with
 // no import of std.list. push, reserve, insert, new, and free need the
 // allocator context: with (mem.heap()). t.expect takes a bool.
+// A method does not take a trailing lambda as an argument, so each
+// callback is passed in parentheses. map and fold name R.
 //
 // Programmer-error panics are expectPanic tests at the bottom.
 // Out of memory in grow is not an @test.
@@ -11,6 +13,32 @@ import std.testing
 struct Item {
     tag: u8
     n: i32
+}
+
+@test
+fn listIterPull() with (t: testing.Testing) {
+    var xs = empty<i32>()
+    with (mem.heap()) {
+        xs.push(10, 20, 30)
+        var cur = xs.iter()
+        val (a, aok) = cur.next()
+        t.expect(aok)
+        t.expect(a == 10)
+        val (b, bok) = cur.next()
+        t.expect(bok)
+        t.expect(b == 20)
+        val (c, cok) = cur.next()
+        t.expect(cok)
+        t.expect(c == 30)
+        val (extra, more) = cur.next()
+        t.expect(!more)
+        t.expect(extra == 0)
+        xs.free()
+    }
+    var none = empty<i32>().iter()
+    val (missing, nok) = none.next()
+    t.expect(!nok)
+    t.expect(missing == 0)
 }
 
 @test
@@ -289,6 +317,187 @@ fn atMutates() with (t: testing.Testing) {
         val p = xs.at(0)
         p.n = 9
         t.expect(xs.get(0).n == 9)
+        xs.free()
+    }
+}
+
+@test
+fn helpersOnEmpty() with (t: testing.Testing) {
+    var xs = empty<i32>()
+    var n: i32 = 0
+    xs.each((it) -> { n = n + 1 })
+    t.expect(n == 0)
+    var indexed: i32 = 0
+    xs.each_index((item, index) -> {
+        if index == 0 {
+            indexed = item
+        }
+    })
+    t.expect(indexed == 0)
+    val anyEmpty = xs.any((it) -> it == 1)
+    t.expect(anyEmpty == false)
+    val allEmpty = xs.all((it) -> it == 1)
+    t.expect(allEmpty)
+    val folded = xs.fold<i32>(4 as i32, (acc, x) -> acc + x)
+    t.expect(folded == 4)
+    val (_, found) = xs.find((it) -> it == 1)
+    t.expect(found == false)
+    xs.reverse()
+    t.expect(xs.len == 0)
+    with (mem.heap()) {
+        var mapped = xs.map<i32>((it) -> it + 1)
+        t.expect(mapped.len == 0)
+        t.expect(mapped.cap == 0)
+        var kept = xs.filter((it) -> it > 0)
+        t.expect(kept.len == 0)
+        t.expect(kept.cap == 0)
+        var copied = xs.clone()
+        t.expect(copied.len == 0)
+        t.expect(copied.cap == 0)
+        mapped.free()
+        kept.free()
+        copied.free()
+        xs.free()
+    }
+}
+
+@test
+fn mapAddsOne() with (t: testing.Testing) {
+    var xs = empty<i32>()
+    with (mem.heap()) {
+        xs.push(1, 2, 3)
+        var ys = xs.map<i32>((it) -> it + 1)
+        t.expect(ys.len == 3)
+        t.expect(ys.get(0) == 2)
+        t.expect(ys.get(1) == 3)
+        t.expect(ys.get(2) == 4)
+        t.expect(xs.get(0) == 1)
+        ys.free()
+        xs.free()
+    }
+}
+
+@test
+fn filterKeepsMatches() with (t: testing.Testing) {
+    var xs = empty<i32>()
+    with (mem.heap()) {
+        xs.push(1, 2, 3, 4)
+        var ys = xs.filter((it) -> it > 2)
+        t.expect(ys.len == 2)
+        t.expect(ys.get(0) == 3)
+        t.expect(ys.get(1) == 4)
+        t.expect(xs.len == 4)
+        ys.free()
+        xs.free()
+    }
+}
+
+@test
+fn foldFromLeft() with (t: testing.Testing) {
+    var xs = empty<i32>()
+    with (mem.heap()) {
+        xs.push(1, 2, 3)
+        val sum = xs.fold<i32>(0 as i32, (acc, x) -> acc + x)
+        t.expect(sum == 6)
+        val order = xs.fold<i32>(0 as i32, (acc, x) -> acc * 10 + x)
+        t.expect(order == 123)
+        xs.free()
+    }
+}
+
+@test
+fn eachIndexOrder() with (t: testing.Testing) {
+    var xs = empty<i32>()
+    with (mem.heap()) {
+        xs.push(10, 20, 30)
+        var walk: i32 = 0
+        xs.each((it) -> { walk = walk * 10 + it })
+        t.expect(walk == 1230)
+        var at0: i32 = -1
+        var at1: i32 = -1
+        var at2: i32 = -1
+        xs.each_index((item, index) -> {
+            if index == 0 {
+                at0 = item
+            }
+            if index == 1 {
+                at1 = item
+            }
+            if index == 2 {
+                at2 = item
+            }
+        })
+        t.expect(at0 == 10)
+        t.expect(at1 == 20)
+        t.expect(at2 == 30)
+        val has = xs.any((it) -> it == 20)
+        t.expect(has)
+        val every = xs.all((it) -> it > 0)
+        t.expect(every)
+        val none = xs.any((it) -> it == 7)
+        t.expect(none == false)
+        val notAll = xs.all((it) -> it == 10)
+        t.expect(notAll == false)
+        xs.free()
+    }
+}
+
+@test
+fn findMissing() with (t: testing.Testing) {
+    var xs = empty<i32>()
+    val (emptyHit, emptyOk) = xs.find((it) -> it == 1)
+    t.expect(emptyOk == false)
+    t.expect(emptyHit == 0)
+    with (mem.heap()) {
+        xs.push(1, 2, 2)
+        val (hit, ok) = xs.find((it) -> it == 2)
+        t.expect(ok)
+        t.expect(hit == 2)
+        val (missed, miss) = xs.find((it) -> it == 9)
+        t.expect(miss == false)
+        t.expect(missed == 0)
+        xs.free()
+    }
+}
+
+@test
+fn cloneCopiesPrefix() with (t: testing.Testing) {
+    var xs = empty<i32>()
+    with (mem.heap()) {
+        xs.push(1, 2)
+        var ys = xs.clone()
+        t.expect(ys.len == 2)
+        t.expect(ys.get(0) == 1)
+        t.expect(ys.get(1) == 2)
+        ys.set(0, 9)
+        t.expect(xs.get(0) == 1)
+        xs.push(3)
+        t.expect(ys.len == 2)
+        ys.free()
+        xs.free()
+    }
+}
+
+@test
+fn reverseInPlace() with (t: testing.Testing) {
+    var xs = empty<i32>()
+    with (mem.heap()) {
+        xs.push(5)
+        xs.reverse()
+        t.expect(xs.get(0) == 5)
+        t.expect(xs.len == 1)
+        xs.free()
+        xs.push(1, 2, 3)
+        val cap = xs.cap
+        xs.reverse()
+        t.expect(xs.len == 3)
+        t.expect(xs.cap == cap)
+        t.expect(xs.get(0) == 3)
+        t.expect(xs.get(1) == 2)
+        t.expect(xs.get(2) == 1)
+        xs.reverse()
+        t.expect(xs.get(0) == 1)
+        t.expect(xs.get(2) == 3)
         xs.free()
     }
 }

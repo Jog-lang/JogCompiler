@@ -22,10 +22,12 @@
 // bytes alive. free releases the slot block and does not walk the keys.
 //
 // Iteration is slot order. live(i) is true for a stored entry. key_at and
-// value_at read that entry. The same inserts, overwrites, and removes
-// produce the same occupied slots.
+// value_at read that entry. each, keys, and values walk those live slots
+// in the same order. contains asks whether a key is stored. The same
+// inserts, overwrites, and removes produce the same occupied slots.
 
 import std.cmp
+import std.list
 import std.mem
 
 // Zeroed memory is an empty slot. alloc returns zeroed bytes.
@@ -225,4 +227,82 @@ fn *Map<K, V>.value_at(i: usize): V {
     val slots = self.ptr!!
     val s = slots[i]
     return s.value
+}
+
+/**
+ * Calls body once for each live slot, in slot order. An empty slot and a
+ * tombstone are skipped. The callback is not stored.
+ * @self the map
+ * @param body called with the stored key and value
+ */
+fn *Map<K, V>.each(body: (K, V) -> ()) {
+    if self.cap == 0 {
+        return
+    }
+    val slots = self.ptr!!
+    for i in 0 as usize..self.cap {
+        val s = slots[i]
+        if s.state == slot_live {
+            body(s.key, s.value)
+        }
+    }
+}
+
+/**
+ * Whether key is stored in a live slot. Pass the same hash that insert
+ * used. A str key is still hashed by the caller with fnv1a.
+ * @self the map
+ * @param key key to find
+ * @param hash hash passed to insert
+ * @return true when a live slot holds key
+ */
+fn *Map<K, V>.contains(key: K, hash: u32): bool {
+    val (_, found) = self.find(key, hash)
+    return found
+}
+
+/**
+ * Live keys in slot order. A str key is still a view of the caller's
+ * bytes. The caller frees the list.
+ * @self the map
+ * @context a allocator for the list
+ * @return the keys
+ */
+fn *Map<K, V>.keys(): list.List<K> with (a: mem.Allocator) {
+    var xs = list.empty<K>()
+    if self.count == 0 {
+        return xs
+    }
+    xs.reserve(self.count)
+    val slots = self.ptr!!
+    for i in 0 as usize..self.cap {
+        val s = slots[i]
+        if s.state == slot_live {
+            xs.push(s.key)
+        }
+    }
+    return xs
+}
+
+/**
+ * Live values in slot order, copied from the slots. The caller frees the
+ * list.
+ * @self the map
+ * @context a allocator for the list
+ * @return the values
+ */
+fn *Map<K, V>.values(): list.List<V> with (a: mem.Allocator) {
+    var xs = list.empty<V>()
+    if self.count == 0 {
+        return xs
+    }
+    xs.reserve(self.count)
+    val slots = self.ptr!!
+    for i in 0 as usize..self.cap {
+        val s = slots[i]
+        if s.state == slot_live {
+            xs.push(s.value)
+        }
+    }
+    return xs
 }

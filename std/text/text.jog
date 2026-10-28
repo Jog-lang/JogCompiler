@@ -6,7 +6,13 @@
 // is absent.
 
 import std.c
+import std.list
 import std.mem
+
+/**
+ * A Unicode code point. The same type as u32.
+ */
+type rune = u32
 
 fn slice(s: str, from: usize, to: usize): str {
     if from > to || to > s.len {
@@ -101,4 +107,370 @@ fn clone(s: str): str with (a: mem.Allocator) {
     }
     c.memcpy(raw.ptr as *void, s.ptr as *const void, s.len)
     return raw
+}
+
+/**
+ * True when needle occurs in s. An empty needle is a match, the same
+ * rule as index_of.
+ * @param s text to search
+ * @param needle sequence to find
+ * @return true when needle occurs
+ */
+fn contains(s: str, needle: str): bool {
+    val (_, ok) = index_of(s, needle)
+    return ok
+}
+
+/**
+ * How many times needle occurs in s, without overlap. The next search
+ * starts after the previous match. An empty needle matches at every
+ * byte boundary, including both ends, so the count is s.len + 1.
+ * @param s text to search
+ * @param needle sequence to count
+ * @return the number of matches
+ */
+fn count(s: str, needle: str): usize {
+    if needle.len == 0 {
+        return s.len + 1
+    }
+    var n: usize = 0
+    var i: usize = 0
+    for i < s.len {
+        val (at, ok) = index_of(slice(s, i, s.len), needle)
+        if !ok {
+            return n
+        }
+        n = n + 1
+        i = i + at + needle.len
+    }
+    return n
+}
+
+// ASCII space, tab, CR, or LF.
+private fn is_ascii_space(c: u8): bool {
+    return c == ' ' as u8 || c == '\t' as u8 || c == '\n' as u8 || c == '\r' as u8
+}
+
+/**
+ * A view of s with ASCII space, tab, CR, and LF removed from the start.
+ * It allocates nothing.
+ * @param s text to trim
+ * @return the trimmed view
+ */
+fn trim_start(s: str): str {
+    var i: usize = 0
+    for i < s.len {
+        if !is_ascii_space(s.ptr[i]) {
+            break
+        }
+        i = i + 1
+    }
+    return slice(s, i, s.len)
+}
+
+/**
+ * A view of s with ASCII space, tab, CR, and LF removed from the end.
+ * It allocates nothing.
+ * @param s text to trim
+ * @return the trimmed view
+ */
+fn trim_end(s: str): str {
+    var i: usize = s.len
+    for i > 0 {
+        if !is_ascii_space(s.ptr[i - 1]) {
+            break
+        }
+        i = i - 1
+    }
+    return slice(s, 0, i)
+}
+
+/**
+ * A view of s with ASCII space, tab, CR, and LF removed from both ends.
+ * It allocates nothing.
+ * @param s text to trim
+ * @return the trimmed view
+ */
+fn trim(s: str): str {
+    return trim_end(trim_start(s))
+}
+
+// ASCII A and a differ by 32. Bytes outside the letters are copied as they are.
+private fn ascii_case(s: str, upper: bool): str with (a: mem.Allocator) {
+    if s.len == 0 {
+        return s
+    }
+    val (raw, err) = a.alloc(s.len, align(u8))
+    if err != null {
+        panic("out of memory")
+    }
+    val gap = 'a' as u8 - 'A' as u8
+    for i in 0 as usize..s.len {
+        val c = s.ptr[i]
+        var out = c
+        if upper {
+            if c >= 'a' as u8 && c <= 'z' as u8 {
+                out = c - gap
+            }
+        } else if c >= 'A' as u8 && c <= 'Z' as u8 {
+            out = c + gap
+        }
+        raw.ptr[i] = out
+    }
+    return raw
+}
+
+/**
+ * An owned copy of s with ASCII letters mapped to lowercase. Bytes
+ * outside A-Z are copied unchanged. An empty str allocates nothing.
+ * The caller frees the copy with the same allocator.
+ * @param s text to map
+ * @context a allocator for the copy
+ * @return the owned lowercase text
+ */
+fn to_lower(s: str): str with (a: mem.Allocator) {
+    return ascii_case(s, false)
+}
+
+/**
+ * An owned copy of s with ASCII letters mapped to uppercase. Bytes
+ * outside a-z are copied unchanged. An empty str allocates nothing.
+ * The caller frees the copy with the same allocator.
+ * @param s text to map
+ * @context a allocator for the copy
+ * @return the owned uppercase text
+ */
+fn to_upper(s: str): str with (a: mem.Allocator) {
+    return ascii_case(s, true)
+}
+
+// Copies src onto dest at at. An empty src writes nothing.
+private fn write_at(dest: *u8, at: usize, src: str) {
+    if src.len == 0 {
+        return
+    }
+    c.memcpy((dest + at) as *void, src.ptr as *const void, src.len)
+}
+
+/**
+ * An owned copy of s with every non-overlapping old replaced by
+ * replacement. An empty old inserts replacement at every byte boundary,
+ * including the ends. An empty result allocates nothing. The caller
+ * frees the copy with the same allocator.
+ * @param s text to rewrite
+ * @param old sequence to replace
+ * @param replacement sequence written in its place
+ * @context a allocator for the copy
+ * @return the owned text
+ */
+fn replace(s: str, old: str, replacement: str): str with (a: mem.Allocator) {
+    val n = count(s, old)
+    if n == 0 {
+        return clone(s)
+    }
+    val removed = n * old.len
+    val added = n * replacement.len
+    val total = (s.len - removed) + added
+    if total == 0 {
+        return bytes()
+    }
+    val (raw, err) = a.alloc(total, align(u8))
+    if err != null {
+        panic("out of memory")
+    }
+    if old.len == 0 {
+        var at: usize = 0
+        var k: usize = 0
+        for k < s.len + 1 {
+            write_at(raw.ptr, at, replacement)
+            at = at + replacement.len
+            if k < s.len {
+                raw.ptr[at] = s.ptr[k]
+                at = at + 1
+            }
+            k = k + 1
+        }
+        return raw
+    }
+    var at: usize = 0
+    var src: usize = 0
+    for {
+        val rest = slice(s, src, s.len)
+        val (rel, ok) = index_of(rest, old)
+        if !ok {
+            write_at(raw.ptr, at, rest)
+            break
+        }
+        write_at(raw.ptr, at, slice(rest, 0, rel))
+        at = at + rel
+        write_at(raw.ptr, at, replacement)
+        at = at + replacement.len
+        src = src + rel + old.len
+    }
+    return raw
+}
+
+/**
+ * Views of s split on sep, including the empty pieces. Each view points
+ * into s and dies with that string. The list itself is allocated. An
+ * empty sep yields one view per byte. An empty string and an empty sep
+ * yield an empty list.
+ * @param s text to split
+ * @param sep separator
+ * @context a allocator for the list
+ * @return the views
+ */
+fn split(s: str, sep: str): list.List<str> with (a: mem.Allocator) {
+    var parts = list.empty<str>()
+    if sep.len == 0 {
+        var i: usize = 0
+        for i < s.len {
+            parts.push(slice(s, i, i + 1))
+            i = i + 1
+        }
+        return parts
+    }
+    var start: usize = 0
+    for {
+        val (rel, ok) = index_of(slice(s, start, s.len), sep)
+        if !ok {
+            parts.push(slice(s, start, s.len))
+            break
+        }
+        val at = start + rel
+        parts.push(slice(s, start, at))
+        start = at + sep.len
+    }
+    return parts
+}
+
+// True for a UTF-8 continuation byte, 10xxxxxx.
+private fn is_cont(b: u8): bool {
+    return b >= 0x80 && b <= 0xBF
+}
+
+// One code point at byte i. i is less than s.len. The width is at least 1.
+// A byte that does not start a well-formed UTF-8 code point is U+FFFD
+// and the width is 1, so the walk always ends.
+private fn decode_rune(s: str, i: usize): (rune, usize) {
+    val b0 = s.ptr[i]
+    if b0 < 0x80 {
+        return b0 as rune, 1
+    }
+    val left = s.len - i
+    if b0 >= 0xC2 && b0 <= 0xDF {
+        if left < 2 {
+            return 0xFFFD as rune, 1
+        }
+        val b1 = s.ptr[i + 1]
+        if b1 < 0x80 || b1 > 0xBF {
+            return 0xFFFD as rune, 1
+        }
+        val cp = (((b0 as u32) & 0x1F) << 6) | ((b1 as u32) & 0x3F)
+        return cp as rune, 2
+    }
+    if b0 >= 0xE0 && b0 <= 0xEF {
+        if left < 3 {
+            return 0xFFFD as rune, 1
+        }
+        val b1 = s.ptr[i + 1]
+        val b2 = s.ptr[i + 2]
+        if !is_cont(b1) || !is_cont(b2) {
+            return 0xFFFD as rune, 1
+        }
+        if b0 == 0xE0 && b1 < 0xA0 {
+            return 0xFFFD as rune, 1
+        }
+        if b0 == 0xED && b1 > 0x9F {
+            return 0xFFFD as rune, 1
+        }
+        val cp = (((b0 as u32) & 0x0F) << 12) |
+            (((b1 as u32) & 0x3F) << 6) |
+            ((b2 as u32) & 0x3F)
+        return cp as rune, 3
+    }
+    if b0 >= 0xF0 && b0 <= 0xF4 {
+        if left < 4 {
+            return 0xFFFD as rune, 1
+        }
+        val b1 = s.ptr[i + 1]
+        val b2 = s.ptr[i + 2]
+        val b3 = s.ptr[i + 3]
+        if !is_cont(b1) || !is_cont(b2) || !is_cont(b3) {
+            return 0xFFFD as rune, 1
+        }
+        if b0 == 0xF0 && b1 < 0x90 {
+            return 0xFFFD as rune, 1
+        }
+        if b0 == 0xF4 && b1 > 0x8F {
+            return 0xFFFD as rune, 1
+        }
+        val cp = (((b0 as u32) & 0x07) << 18) |
+            (((b1 as u32) & 0x3F) << 12) |
+            (((b2 as u32) & 0x3F) << 6) |
+            ((b3 as u32) & 0x3F)
+        return cp as rune, 4
+    }
+    return 0xFFFD as rune, 1
+}
+
+/**
+ * A pull cursor over the code points of a str. index is the next byte
+ * offset. One successful next consumes one code point.
+ */
+struct RuneIter {
+    src: str
+    index: usize
+}
+
+/**
+ * A cursor at the first code point of s. The caller owns it.
+ * @param s text to walk
+ * @return the cursor
+ */
+fn rune_iter(s: str): RuneIter {
+    var it = RuneIter()
+    it.src = s
+    it.index = 0
+    return it
+}
+
+/**
+ * The next code point. A byte that is not part of a well-formed UTF-8
+ * code point becomes U+FFFD and consumes that one byte. A finished
+ * cursor stays finished.
+ * @self the cursor
+ * @return the code point and true, or 0 and false when index is past s
+ */
+fn *RuneIter.next(): (rune, bool) {
+    if self.index >= self.src.len {
+        return 0, false
+    }
+    val (cp, n) = decode_rune(self.src, self.index)
+    self.index = self.index + n
+    return cp, true
+}
+
+/**
+ * One Unicode code point per element, in order. A byte that is not part
+ * of a well-formed UTF-8 code point becomes U+FFFD and consumes that one
+ * byte. The caller frees the list. The elements do not alias s.
+ * @param s text to walk
+ * @context a allocator for the list
+ * @return the code points
+ */
+fn runes(s: str): list.List<rune> with (a: mem.Allocator) {
+    var xs = list.empty<rune>()
+    if s.len > 0 {
+        xs.reserve(s.len)
+    }
+    var it = rune_iter(s)
+    for {
+        val (cp, ok) = it.next()
+        if !ok {
+            break
+        }
+        xs.push(cp)
+    }
+    return xs
 }
