@@ -2,9 +2,9 @@
 // command, and exits with that command's code. std.os has no exit, so
 // the code goes through c.jogrt_exit, as in Jog-build.
 //
-// lex, parse, and emit-ir call that stage. check calls the loader, then
-// the checker. emit-c, build, run, and test call the C emitter. Each
-// stage function is a stub until that stage is written.
+// lex and parse call that stage. check calls the loader, then the
+// checker. emit-c, build, run, and test call the C emitter. load, check,
+// lower, and emit are stubs until those stages are written.
 
 import src.check
 import src.emit
@@ -63,7 +63,11 @@ fn dispatch(): i32 with (a: mem.Allocator) {
         return lex.run(os.argv(2))
     }
     if command == "parse" {
-        return parse.run(command)
+        if os.argc() < 3 {
+            io.eprintln("usage: jog parse <file>")
+            return 2
+        }
+        return parse.run(os.argv(2))
     }
     if command == "check" {
         val loaded = load.run(command)

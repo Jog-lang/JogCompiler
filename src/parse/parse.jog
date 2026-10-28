@@ -1,12 +1,3219 @@
-// Parser and AST printer. Checked against compiler/src/parser.c and
+// Package src.parse. jogc parse. The steps are JogDocs
+// bootstrap/ParserGuide.md. Step 12 reports a syntax error and keeps
+// parsing. The grammar matches compiler/src/parser.c and
 // compiler/src/ast_print.c.
-// Study note: JogDocs bootstrap/study/Parsing.
+//
+// A token's text is a view of the file bytes. run keeps those bytes
+// until the tree has been printed.
 
+import src.lex
+import std.arena
+import std.error as errs
+import std.fs
 import std.io
+import std.list
+import std.mem
+import std.strbuilder
+import std.text
 
-fn run(command: str): i32 {
-    io.eprint("jogc: ")
-    io.eprint(command)
-    io.eprintln(" is not implemented")
-    return 1
+/**
+ * A FILE of imports, type declarations, structs, interfaces, and enums.
+ * Imports print first. A top-level function stops the walk.
+ * @param p token cursor, unread
+ * @context a allocator for the nodes
+ * @return the file node
+ */
+fn parse_file(p: *Parser): *Node with (a: mem.Allocator) {
+    val here = p.peek()
+    val file = make_node(NodeKind.FILE, here.line, here.column)
+    val k = lex.kind()
+    var imports = list.empty<*Node>()
+    var decls = list.empty<*Node>()
+    for {
+        for p.eat(k.SEP) {
+        }
+        if p.at(k.EOF) {
+            break
+        }
+        val at = p.index
+        val pending = p.pending_gt
+        val attrs = parse_attributes(p)
+        var vis = parse_visibility(p)
+        when p.peek().kind {
+            KW_IMPORT -> {
+                val node = parse_import(p)
+                attach(node, attrs, vis)
+                imports.push(node)
+            }
+            KW_TYPE -> {
+                decls.push(parse_type_decl(p, attrs, vis))
+            }
+            KW_STRUCT -> {
+                decls.push(parse_aggregate(p, NodeKind.STRUCT, attrs, vis))
+            }
+            KW_INTERFACE -> {
+                decls.push(parse_aggregate(p, NodeKind.INTERFACE, attrs, vis))
+            }
+            KW_ENUM -> {
+                decls.push(parse_aggregate(p, NodeKind.ENUM, attrs, vis))
+            }
+            IDENT -> {
+                // `expect` and `actual` are identifiers, and only immediately before `fn`.
+                if (p.peek().text == "expect" || p.peek().text == "actual") && p.kind_at(1) == k.KW_FN {
+                    val mode = p.peek().text
+                    if mode == "actual" && vis.len > 0 {
+                        complain(p, "an actual function cannot have a visibility modifier")
+                        vis = ""
+                    }
+                    p.advance()
+                    decls.push(parse_fn(p, attrs, vis, mode))
+                } else {
+                    error_at(p, expect_found(p, "expected a declaration, found "))
+                }
+            }
+            KW_FN -> {
+                decls.push(parse_fn(p, attrs, vis, "regular"))
+            }
+            KW_EXTERN -> {
+                decls.push(parse_extern_block(p, attrs, vis))
+            }
+            KW_VAL -> {
+                decls.push(parse_binding(p, NodeKind.VAL, attrs, vis))
+            }
+            KW_VAR -> {
+                decls.push(parse_binding(p, NodeKind.VAR, attrs, vis))
+            }
+            KW_CONTEXT -> {
+                decls.push(parse_binding(p, NodeKind.CONTEXT, attrs, vis))
+            }
+            else -> {
+                error_at(p, expect_found(p, "expected a declaration, found "))
+            }
+        }
+        if p.panic {
+            recover(p)
+        }
+        if p.index == at && p.pending_gt == pending {
+            if !p.panic {
+                error_at(p, expect_found(p, "expected a declaration, found "))
+            }
+            recover(p)
+            if p.index == at && p.pending_gt == pending {
+                p.advance()
+            }
+        }
+    }
+    for node in imports.items() {
+        file.kids.push(node)
+    }
+    for node in decls.items() {
+        file.kids.push(node)
+    }
+    return file
+}
+
+/**
+ * `import std.io` or `import vendor.sdl3 as sdl`. The path is dotted names.
+ * @param p cursor on `import`
+ * @context a allocator for the node
+ * @return the import
+ */
+fn parse_import(p: *Parser): *Node with (a: mem.Allocator) {
+    val here = p.peek()
+    val node = make_node(NodeKind.IMPORT, here.line, here.column)
+    val k = lex.kind()
+    p.advance()
+    node.name = parse_dot_path(p)
+    if p.eat(k.KW_AS) && p.at(k.IDENT) {
+        node.text = p.peek().text
+        p.advance()
+    }
+    return node
+}
+
+/**
+ * An identifier, then `.` and another identifier, repeated. `std.io` is one path.
+ * @param p cursor on the first identifier
+ * @context a allocator for the path text
+ * @return the path, or empty when the token is not an identifier
+ */
+fn parse_dot_path(p: *Parser): str with (a: mem.Allocator) {
+    val k = lex.kind()
+    var b = strbuilder.empty()
+    if !p.at(k.IDENT) {
+        return b.str()
+    }
+    b.append(p.peek().text)
+    p.advance()
+    for {
+        // A dot continues the path only when an identifier follows.
+        if !p.at(k.DOT) || p.kind_at(1) != k.IDENT {
+            break
+        }
+        p.advance()
+        b.append(".")
+        b.append(p.peek().text)
+        p.advance()
+    }
+    return b.str()
+}
+
+/**
+ * `type Name = Type` or `type Name: Type`. `<...>` before the sign is the type parameter list.
+ * @param p cursor on `type`
+ * @param attrs attributes already parsed
+ * @param vis visibility word, empty when the declaration is public
+ * @context a allocator for the nodes
+ * @return the declaration
+ */
+fn parse_type_decl(p: *Parser, attrs: list.List<*Node>, vis: str): *Node with (a: mem.Allocator) {
+    val here = p.peek()
+    val decl = make_node(NodeKind.TYPE_DECL, here.line, here.column)
+    val k = lex.kind()
+    attach(decl, attrs, vis)
+    p.advance()
+    if p.at(k.IDENT) {
+        decl.name = p.peek().text
+        p.advance()
+    }
+    if p.at(k.LT) {
+        parse_type_params(p, decl)
+    }
+    decl.head = decl.kids.len as i64
+    if p.eat(k.COLON) {
+        decl.op = k.COLON
+    } else {
+        p.eat(k.ASSIGN)
+        decl.op = k.ASSIGN
+    }
+    val ty = parse_type(p)
+    if ty != null {
+        decl.kids.push(ty!!)
+    }
+    return decl
+}
+
+/**
+ * Put attributes on a declaration and record its visibility word.
+ * @param node declaration
+ * @param attrs attributes, in source order
+ * @param vis visibility word, empty when public
+ * @context a allocator for the child list
+ */
+fn attach(node: *Node, attrs: list.List<*Node>, vis: str) with (a: mem.Allocator) {
+    node.flag = vis
+    for attr in attrs.items() {
+        node.kids.push(attr)
+    }
+}
+
+/**
+ * `@name` attributes. The stored name drops the `@`. A newline after one is skipped.
+ * @param p cursor on the first attribute, or on whatever follows
+ * @context a allocator for the nodes
+ * @return the attributes
+ */
+fn parse_attributes(p: *Parser): list.List<*Node> with (a: mem.Allocator) {
+    val k = lex.kind()
+    var attrs = list.empty<*Node>()
+    for p.at(k.ATTR) {
+        val tok = p.peek()
+        val node = make_node(NodeKind.ATTRIBUTE, tok.line, tok.column)
+        if tok.text.len > 0 {
+            node.name = text.slice(tok.text, 1, tok.text.len)
+        }
+        p.advance()
+        if p.eat(k.LPAREN) {
+            if p.at(k.RPAREN) {
+                node.text = "()"
+            } else {
+                val args = parse_arg_list(p)
+                for arg in args.items() {
+                    node.kids.push(arg)
+                }
+            }
+            p.eat(k.RPAREN)
+        }
+        attrs.push(node)
+        for p.eat(k.SEP) {
+        }
+    }
+    return attrs
+}
+
+/**
+ * `private`, `private(file)`, `private(package)`, or `private(scope)`.
+ * A bare `private` is file visibility. Public is an empty word.
+ * @param p cursor on `private`, or on the declaration keyword
+ * @return the visibility word
+ */
+fn parse_visibility(p: *Parser): str {
+    val k = lex.kind()
+    if !p.eat(k.KW_PRIVATE) {
+        return ""
+    }
+    if !p.eat(k.LPAREN) {
+        for p.eat(k.SEP) {
+        }
+        return "private(file)"
+    }
+    var word = "private"
+    if p.at(k.IDENT) {
+        val level = p.peek().text
+        p.advance()
+        if level == "file" {
+            word = "private(file)"
+        } else if level == "scope" {
+            word = "private(scope)"
+        }
+    }
+    p.eat(k.RPAREN)
+    for p.eat(k.SEP) {
+    }
+    return word
+}
+
+/**
+ * Names between `<` and `>`. An optional `: Type` is a constraint.
+ * @param p cursor on `<`
+ * @param node declaration that receives the parameters
+ * @context a allocator for the nodes
+ */
+fn parse_type_params(p: *Parser, node: *Node) with (a: mem.Allocator) {
+    val k = lex.kind()
+    p.advance()
+    if p.at_gt() {
+        p.eat_gt()
+        return
+    }
+    for {
+        for p.eat(k.SEP) {
+        }
+        if p.at_gt() || p.at(k.EOF) {
+            break
+        }
+        if !p.at(k.IDENT) {
+            break
+        }
+        val tok = p.peek()
+        val param = make_node(NodeKind.TYPE_PARAM, tok.line, tok.column)
+        param.name = tok.text
+        p.advance()
+        if p.eat(k.COLON) {
+            val bound = parse_type(p)
+            if bound != null {
+                param.kids.push(bound!!)
+            }
+        }
+        node.kids.push(param)
+        for p.eat(k.SEP) {
+        }
+        if !p.eat(k.COMMA) {
+            break
+        }
+    }
+    p.eat_gt()
+}
+
+/**
+ * An integer, or a unary minus of an integer. Enum values and field defaults use this.
+ * @param p cursor on the value
+ * @context a allocator for the nodes
+ * @return the value, or null when it is not an integer form yet
+ */
+fn parse_value(p: *Parser): *Node? with (a: mem.Allocator) {
+    val k = lex.kind()
+    if p.at(k.MINUS) {
+        val here = p.peek()
+        p.advance()
+        val node = make_node(NodeKind.UNARY, here.line, here.column)
+        node.text = "-"
+        val lit = parse_int_lit(p)
+        if lit != null {
+            node.kids.push(lit!!)
+        }
+        return node
+    }
+    return parse_int_lit(p)
+}
+
+/**
+ * `name: Type` or `name: Type = value`. `var` is a word on an interface field.
+ * @param p cursor on the name
+ * @param is_var true for `var name`
+ * @param allow_default true when `= value` is kept
+ * @context a allocator for the nodes
+ * @return the field
+ */
+fn parse_field(p: *Parser, is_var: bool, allow_default: bool): *Node with (a: mem.Allocator) {
+    val here = p.peek()
+    val node = make_node(NodeKind.FIELD, here.line, here.column)
+    val k = lex.kind()
+    node.name = here.text
+    if is_var {
+        node.text = "var"
+    }
+    p.advance()
+    p.eat(k.COLON)
+    val ty = parse_type(p)
+    if ty != null {
+        node.kids.push(ty!!)
+    }
+    if p.eat(k.ASSIGN) {
+        if allow_default {
+            val value = parse_value(p)
+            if value != null {
+                node.kids.push(value!!)
+            }
+        }
+    }
+    return node
+}
+
+/**
+ * `name: Type` inside parentheses.
+ * @param p cursor on the name
+ * @context a allocator for the nodes
+ * @return the parameter, or null when the token is not a name
+ */
+fn parse_param(p: *Parser): *Node? with (a: mem.Allocator) {
+    val k = lex.kind()
+    if !p.at(k.IDENT) {
+        return null
+    }
+    val here = p.peek()
+    val node = make_node(NodeKind.PARAM, here.line, here.column)
+    node.name = here.text
+    p.advance()
+    p.eat(k.COLON)
+    val ty = parse_type(p)
+    if ty != null {
+        node.kids.push(ty!!)
+    }
+    if p.eat(k.ASSIGN) {
+        val value = parse_expr(p)
+        if value != null {
+            node.kids.push(value!!)
+        }
+    }
+    return node
+}
+
+/**
+ * Parameters until `)`. A comma separates them. A bare `...` is the C variadic. `...T: name` is a pack.
+ * @param p cursor on the first parameter or on `)`
+ * @context a allocator for the nodes
+ * @return the parameters, and true when a bare `...` was present
+ */
+fn parse_param_list(p: *Parser): (list.List<*Node>, bool) with (a: mem.Allocator) {
+    val k = lex.kind()
+    var params = list.empty<*Node>()
+    var variadic = false
+    for {
+        if p.at(k.RPAREN) || p.at(k.EOF) {
+            break
+        }
+        if p.at(k.ELLIPSIS) && type_can_start(p.kind_at(1)) {
+            params.push(parse_pack_param(p))
+            if !p.eat(k.COMMA) {
+                break
+            }
+            continue
+        }
+        if p.eat(k.ELLIPSIS) {
+            variadic = true
+            break
+        }
+        val at = p.index
+        val param = parse_param(p)
+        if p.index == at {
+            break
+        }
+        if param != null {
+            params.push(param!!)
+        }
+        if !p.eat(k.COMMA) {
+            break
+        }
+    }
+    return params, variadic
+}
+
+/**
+ * A field `name: Type`, or a bare embedded type.
+ * @param p cursor on the member
+ * @context a allocator for the nodes
+ * @return the member, or null when it is not a member yet
+ */
+fn parse_struct_member(p: *Parser): *Node? with (a: mem.Allocator) {
+    val k = lex.kind()
+    val vis = parse_visibility(p)
+    if p.at(k.IDENT) && p.kind_at(1) == k.COLON {
+        val field = parse_field(p, false, true)
+        if vis.len > 0 {
+            field.flag = vis
+        }
+        return field
+    }
+    if p.at(k.IDENT) && vis.len == 0 {
+        val ty = parse_type_name(p)
+        val embed = make_node(NodeKind.EMBED, ty.line, ty.column)
+        embed.kids.push(ty)
+        return embed
+    }
+    return null
+}
+
+/**
+ * `~T | ~U`, starting from the first term, which is already parsed.
+ * @param p cursor after the first term
+ * @param first the first term
+ * @param first_approx true when the first term had `~`
+ * @context a allocator for the nodes
+ * @return the type set
+ */
+fn parse_type_set(p: *Parser, first: *Node, first_approx: bool): *Node with (a: mem.Allocator) {
+    val node = make_node(NodeKind.TYPE_SET, first.line, first.column)
+    val k = lex.kind()
+    var marks = strbuilder.empty()
+    if first_approx {
+        marks.append("~")
+    } else {
+        marks.append(".")
+    }
+    node.kids.push(first)
+    for {
+        // A newline before `|` still continues the type set.
+        if p.at(k.SEP) && p.kind_at(1) == k.PIPE {
+            for p.eat(k.SEP) {
+            }
+        }
+        if !p.eat(k.PIPE) {
+            break
+        }
+        for p.eat(k.SEP) {
+        }
+        val approx = p.eat(k.TILDE)
+        if approx {
+            marks.append("~")
+        } else {
+            marks.append(".")
+        }
+        val ty = parse_type(p)
+        if ty != null {
+            node.kids.push(ty!!)
+        }
+    }
+    node.text = marks.str()
+    return node
+}
+
+/**
+ * An interface method. `fn *move` records a pointer receiver and no receiver type.
+ * The source uses `: Type` for the result. The printer writes `->`.
+ * @param p cursor on `fn`
+ * @context a allocator for the nodes
+ * @return the method
+ */
+fn parse_iface_fn(p: *Parser): *Node with (a: mem.Allocator) {
+    val here = p.peek()
+    val node = make_node(NodeKind.FN, here.line, here.column)
+    val k = lex.kind()
+    p.advance()
+    if p.eat(k.STAR) {
+        node.text = "recv *"
+    }
+    val (op_name, found_op) = parse_op_name(p)
+    if found_op {
+        node.name = op_name
+    } else if p.at(k.IDENT) {
+        node.name = p.peek().text
+        p.advance()
+    }
+    p.eat(k.LPAREN)
+    val (params, variadic) = parse_param_list(p)
+    if variadic {
+    }
+    node.head = fn_shape(params.len as i64, 0, false, false, false, false, 0, 0)
+    for param in params.items() {
+        node.kids.push(param)
+    }
+    p.eat(k.RPAREN)
+    var ret_node: *Node? = null
+    var has_ret = false
+    if p.eat(k.COLON) {
+        ret_node = parse_type(p)
+        if ret_node != null {
+            has_ret = true
+        }
+    }
+    var nctx: i64 = 0
+    if with_is_param_clause(p) {
+        p.advance()
+        p.eat(k.LPAREN)
+        val (contexts, ctx_variadic) = parse_param_list(p)
+        if ctx_variadic {
+        }
+        nctx = contexts.len as i64
+        for ctx in contexts.items() {
+            node.kids.push(ctx)
+        }
+        p.eat(k.RPAREN)
+    }
+    if ret_node != null {
+        node.kids.push(ret_node!!)
+    }
+    node.head = fn_shape(params.len as i64, nctx, false, has_ret, false, false, 0, 0)
+    return node
+}
+
+/**
+ * A field, a method, an embedded type, or a type set.
+ * @param p cursor on the member
+ * @context a allocator for the nodes
+ * @return the member, or null when it is not a member yet
+ */
+fn parse_iface_member(p: *Parser): *Node? with (a: mem.Allocator) {
+    val k = lex.kind()
+    if p.at(k.KW_VAR) || p.at(k.KW_VAL) {
+        val is_var = p.at(k.KW_VAR)
+        p.advance()
+        return parse_field(p, is_var, false)
+    }
+    if p.at(k.KW_FN) {
+        return parse_iface_fn(p)
+    }
+    val approx = p.eat(k.TILDE)
+    val ty = parse_type(p)
+    if ty == null {
+        return null
+    }
+    val type_node = ty!!
+    if approx || p.at(k.PIPE) || (p.at(k.SEP) && p.kind_at(1) == k.PIPE) {
+        return parse_type_set(p, type_node, approx)
+    }
+    val embed = make_node(NodeKind.EMBED, type_node.line, type_node.column)
+    embed.kids.push(type_node)
+    return embed
+}
+
+/**
+ * `Name`, `Name(fields)`, or `Name = value`.
+ * @param p cursor on the variant name
+ * @context a allocator for the nodes
+ * @return the variant, or null when the token is not a name
+ */
+fn parse_variant(p: *Parser): *Node? with (a: mem.Allocator) {
+    val k = lex.kind()
+    if !p.at(k.IDENT) {
+        return null
+    }
+    val here = p.peek()
+    val node = make_node(NodeKind.VARIANT, here.line, here.column)
+    node.name = here.text
+    p.advance()
+    if p.eat(k.LPAREN) {
+        val (fields, variadic) = parse_param_list(p)
+        if variadic {
+        }
+        node.head = fields.len as i64
+        for field in fields.items() {
+            node.kids.push(field)
+        }
+        p.eat(k.RPAREN)
+    }
+    if p.eat(k.ASSIGN) {
+        node.op = k.ASSIGN
+        val value = parse_value(p)
+        if value != null {
+            node.kids.push(value!!)
+        }
+    }
+    return node
+}
+
+/**
+ * Members until `}`. A newline or a comma separates them.
+ * @param p cursor just after `{`
+ * @param node aggregate that receives the members
+ * @context a allocator for the nodes
+ */
+fn parse_members(p: *Parser, node: *Node) with (a: mem.Allocator) {
+    val k = lex.kind()
+    for p.eat(k.SEP) {
+    }
+    for {
+        if p.at(k.RBRACE) || p.at(k.EOF) {
+            break
+        }
+        val at = p.index
+        val pending = p.pending_gt
+        var member: *Node? = null
+        if node.kind == NodeKind.STRUCT {
+            member = parse_struct_member(p)
+        } else if node.kind == NodeKind.INTERFACE {
+            member = parse_iface_member(p)
+        } else {
+            member = parse_variant(p)
+        }
+        if member != null {
+            node.kids.push(member!!)
+        }
+        if p.index == at && p.pending_gt == pending {
+            p.advance()
+            continue
+        }
+        var separated = false
+        if p.eat(k.COMMA) {
+            separated = true
+        }
+        for p.eat(k.SEP) {
+            separated = true
+        }
+        if p.at(k.RBRACE) || p.at(k.EOF) {
+            break
+        }
+        if !separated {
+            break
+        }
+    }
+}
+
+/**
+ * `struct`, `interface`, or `enum`. A missing `{...}` is an empty body. An enum's `: Type` is its tag type.
+ * @param p cursor on the keyword
+ * @param kind STRUCT, INTERFACE, or ENUM
+ * @param attrs attributes already parsed
+ * @param vis visibility word
+ * @context a allocator for the nodes
+ * @return the declaration
+ */
+fn parse_aggregate(p: *Parser, kind: NodeKind, attrs: list.List<*Node>, vis: str): *Node with (a: mem.Allocator) {
+    val here = p.peek()
+    val node = make_node(kind, here.line, here.column)
+    val k = lex.kind()
+    attach(node, attrs, vis)
+    p.advance()
+    if p.at(k.IDENT) {
+        node.name = p.peek().text
+        p.advance()
+    }
+    if p.at(k.LT) {
+        parse_type_params(p, node)
+    }
+    node.head = node.kids.len as i64
+    if kind == NodeKind.ENUM && p.eat(k.COLON) {
+        node.op = k.COLON
+        val tag = parse_type(p)
+        if tag != null {
+            node.kids.push(tag!!)
+        }
+    }
+    if !p.eat(k.LBRACE) {
+        return node
+    }
+    parse_members(p, node)
+    p.eat(k.RBRACE)
+    return node
+}
+
+/**
+ * A type, then one optional `?`. The `?` wraps the type just parsed, so `*T?` is an option of a pointer.
+ * @param p cursor on the type
+ * @context a allocator for the nodes
+ * @return the type, or null when the token is not a type yet
+ */
+fn parse_type(p: *Parser): *Node? with (a: mem.Allocator) {
+    val inner = parse_non_null(p)
+    if inner != null {
+        val node = inner!!
+        // `?` is outside the pointer, the name, and the parentheses.
+        if !p.eat(lex.kind().QUESTION) {
+            return node
+        }
+        val opt = make_node(NodeKind.TYPE_OPTION, node.line, node.column)
+        opt.kids.push(node)
+        return opt
+    }
+    return null
+}
+
+/**
+ * A type that does not consume a trailing `?`. A pointer's element is parsed here, so the `?` in `*T?` belongs to the outer type.
+ * @param p cursor on the type
+ * @context a allocator for the nodes
+ * @return the type, or null when the token is not a type yet
+ */
+fn parse_non_null(p: *Parser): *Node? with (a: mem.Allocator) {
+    val k = lex.kind()
+    val here = p.peek()
+    when p.peek().kind {
+        STAR -> {
+            p.advance()
+            val node = make_node(NodeKind.TYPE_PTR, here.line, here.column)
+            if p.eat(k.KW_CONST) {
+                node.flag = "const"
+            }
+            val elem = parse_non_null(p)
+            if elem != null {
+                node.kids.push(elem!!)
+            }
+            return node
+        }
+        LBRACKET -> {
+            return parse_bracket_type(p)
+        }
+        LPAREN -> {
+            return parse_paren_type(p)
+        }
+        KW_CONST -> {
+            return parse_bytes_type(p, true)
+        }
+        KW_BYTES -> {
+            return parse_bytes_type(p, false)
+        }
+        KW_ESCAPING, KW_EXTERN -> {
+            val extern_kw = p.at(k.KW_EXTERN)
+            p.advance()
+            if !p.at(k.LPAREN) {
+                return null
+            }
+            val parsed = parse_paren_type(p)
+            if parsed == null {
+                return null
+            }
+            val node = parsed!!
+            // Only a function type takes the word. Its position is the keyword, not the `(`.
+            if node.kind == NodeKind.TYPE_FN {
+                node.line = here.line
+                node.column = here.column
+                if extern_kw {
+                    node.flag = "extern"
+                } else {
+                    node.flag = "escaping"
+                }
+            }
+            return node
+        }
+        IDENT -> {
+            return parse_type_name(p)
+        }
+        else -> {
+            return null
+        }
+    }
+}
+
+/**
+ * One type name. `c.int` is a single name. A dot continues it only when an identifier follows.
+ * `<` after the name starts type arguments.
+ * @param p cursor on the first identifier
+ * @context a allocator for the node
+ * @return the name
+ */
+fn parse_type_name(p: *Parser): *Node with (a: mem.Allocator) {
+    val tok = p.peek()
+    val ty = make_node(NodeKind.TYPE_NAME, tok.line, tok.column)
+    val k = lex.kind()
+    ty.name = parse_dot_path(p)
+    if p.at(k.LT) {
+        parse_type_args(p, ty)
+    }
+    return ty
+}
+
+/**
+ * Types between `<` and `>`. A comma separates them. `>>` is two closing brackets.
+ * @param p cursor on `<`
+ * @param ty type name that receives the arguments
+ * @context a allocator for the nodes
+ * @return true when a closing `>` was found
+ */
+fn parse_type_args(p: *Parser, ty: *Node): bool with (a: mem.Allocator) {
+    val k = lex.kind()
+    p.advance()
+    if p.at_gt() {
+        return p.eat_gt()
+    }
+    for {
+        for p.eat(k.SEP) {
+        }
+        if p.at_gt() || p.at(k.EOF) {
+            break
+        }
+        val at = p.index
+        val pending = p.pending_gt
+        val arg = parse_type(p)
+        if arg != null {
+            ty.kids.push(arg!!)
+        }
+        // The argument did not move. Stop rather than reading it again.
+        if p.index == at && p.pending_gt == pending {
+            break
+        }
+        for p.eat(k.SEP) {
+        }
+        if !p.eat(k.COMMA) {
+            break
+        }
+    }
+    return p.eat_gt()
+}
+
+/**
+ * `()`, `(i32)`, `(i32, str)`, or the parameter list of a function type.
+ * A list with no comma is the inner type, so `(i32)` is not a tuple. `()` with no arrow is `TYPE_UNIT`.
+ * @param p cursor on `(`
+ * @context a allocator for the nodes
+ * @return the type
+ */
+fn parse_paren_type(p: *Parser): *Node? with (a: mem.Allocator) {
+    val here = p.peek()
+    val k = lex.kind()
+    p.advance()
+    if p.eat(k.RPAREN) {
+        if p.eat(k.ARROW) {
+            var none = list.empty<*Node>()
+            return finish_fn_type(p, here.line, here.column, none)
+        }
+        return make_node(NodeKind.TYPE_UNIT, here.line, here.column)
+    }
+    var params = list.empty<*Node>()
+    var comma = false
+    val first = parse_type(p)
+    if first != null {
+        params.push(first!!)
+    }
+    for p.eat(k.COMMA) {
+        if p.at(k.RPAREN) {
+            break
+        }
+        comma = true
+        val next = parse_type(p)
+        if next != null {
+            params.push(next!!)
+        }
+    }
+    p.eat(k.RPAREN)
+    if p.eat(k.ARROW) {
+        return finish_fn_type(p, here.line, here.column, params)
+    }
+    if !comma {
+        if params.len > 0 {
+            return params.get(0)
+        }
+        return null
+    }
+    val tuple = make_node(NodeKind.TYPE_TUPLE, here.line, here.column)
+    for param in params.items() {
+        tuple.kids.push(param)
+    }
+    return tuple
+}
+
+/**
+ * True when `with` starts `with (name: ...)`, a declaration context rather than a function type's context list.
+ * @param p cursor on the token after the function return type
+ * @return true when the clause is not part of the function type
+ */
+fn with_is_param_clause(p: *Parser): bool {
+    val k = lex.kind()
+    return p.at(k.KW_WITH) && p.kind_at(1) == k.LPAREN && p.kind_at(2) == k.IDENT && p.kind_at(3) == k.COLON
+}
+
+/**
+ * A function type after `->`. Parameters are the leading kids. The next kid is the return type. The rest are `with` types.
+ * @param p cursor on the return type
+ * @param line 1-based line of `(` or of `extern` or `escaping`
+ * @param column 1-based column of that token
+ * @param params parameter types, already parsed
+ * @context a allocator for the nodes
+ * @return the function type
+ */
+fn finish_fn_type(p: *Parser, line: i64, column: i64, params: list.List<*Node>): *Node with (a: mem.Allocator) {
+    val node = make_node(NodeKind.TYPE_FN, line, column)
+    node.head = params.len as i64
+    for param in params.items() {
+        node.kids.push(param)
+    }
+    val ret = parse_type(p)
+    if ret != null {
+        node.kids.push(ret!!)
+    }
+    if p.at(lex.kind().KW_WITH) && !with_is_param_clause(p) {
+        parse_fn_contexts(p, node)
+    }
+    return node
+}
+
+/**
+ * Types after `with` on a function type. Commas separate them.
+ * @param p cursor on `with`
+ * @param node function type that receives the context types
+ * @context a allocator for the nodes
+ */
+fn parse_fn_contexts(p: *Parser, node: *Node) with (a: mem.Allocator) {
+    val k = lex.kind()
+    p.advance()
+    for {
+        for p.eat(k.SEP) {
+        }
+        val ty = parse_type(p)
+        if ty == null {
+            break
+        }
+        node.kids.push(ty!!)
+        for p.eat(k.SEP) {
+        }
+        if !p.eat(k.COMMA) {
+            break
+        }
+    }
+}
+
+/**
+ * An integer literal. The text is the lexeme, including underscores.
+ * @param p cursor on the number
+ * @context a allocator for the node
+ * @return the literal, or null when the token is not an integer
+ */
+fn parse_int_lit(p: *Parser): *Node? with (a: mem.Allocator) {
+    if !p.at(lex.kind().INT) {
+        return null
+    }
+    val tok = p.peek()
+    val node = make_node(NodeKind.INT_LIT, tok.line, tok.column)
+    node.text = tok.text
+    p.advance()
+    return node
+}
+
+/**
+ * `[]T`, `[]const T`, `[4]T`, or `[_]T`. The element is a full type, so `[]T?` is a slice of an option.
+ * @param p cursor on `[`
+ * @context a allocator for the nodes
+ * @return the slice or the array
+ */
+fn parse_bracket_type(p: *Parser): *Node? with (a: mem.Allocator) {
+    val here = p.peek()
+    val k = lex.kind()
+    p.advance()
+    if p.eat(k.RBRACKET) {
+        val node = make_node(NodeKind.TYPE_SLICE, here.line, here.column)
+        if p.eat(k.KW_CONST) {
+            node.flag = "const"
+        }
+        val elem = parse_type(p)
+        if elem != null {
+            node.kids.push(elem!!)
+        }
+        return node
+    }
+    val node = make_node(NodeKind.TYPE_ARRAY, here.line, here.column)
+    // `_` immediately before `]` is an inferred length, not a type name.
+    var infer = false
+    if p.at(k.IDENT) && p.peek().text == "_" {
+        val ahead = p.index + 1
+        if ahead < p.tokens.len {
+            val nxt: lex.Token = p.tokens.get(ahead)
+            if nxt.kind == k.RBRACKET {
+                infer = true
+            }
+        }
+    }
+    if infer {
+        node.name = "_"
+        p.advance()
+    } else {
+        val len = parse_expr(p)
+        if len != null {
+            node.kids.push(len!!)
+        }
+    }
+    p.eat(k.RBRACKET)
+    val elem = parse_type(p)
+    if elem != null {
+        node.kids.push(elem!!)
+    }
+    return node
+}
+
+/**
+ * `bytes`, `bytes[4]`, `const bytes`, or `const bytes[8]`.
+ * @param p cursor on `bytes`, or on `const` when is_const is set
+ * @param is_const true when the type starts with `const`
+ * @context a allocator for the nodes
+ * @return the bytes type, or null when `const` is not followed by `bytes`
+ */
+fn parse_bytes_type(p: *Parser, is_const: bool): *Node? with (a: mem.Allocator) {
+    val here = p.peek()
+    val k = lex.kind()
+    p.advance()
+    if is_const && !p.eat(k.KW_BYTES) {
+        return null
+    }
+    val node = make_node(NodeKind.TYPE_BYTES, here.line, here.column)
+    if is_const {
+        node.flag = "const"
+    }
+    if p.eat(k.LBRACKET) {
+        val len = parse_int_lit(p)
+        if len != null {
+            node.kids.push(len!!)
+        }
+        p.eat(k.RBRACKET)
+    }
+    return node
+}
+
+/**
+ * True when a token can start a type.
+ * @param kind token kind
+ * @return true for a name, pointer, bracket, paren, bytes, const, escaping, or extern
+ */
+fn type_can_start(kind: lex.TokenKind): bool {
+    val k = lex.kind()
+    return kind == k.IDENT || kind == k.STAR || kind == k.LBRACKET || kind == k.LPAREN || kind == k.KW_BYTES || kind == k.KW_CONST || kind == k.KW_ESCAPING || kind == k.KW_EXTERN
+}
+
+/**
+ * The printed spelling of an operator token.
+ * @param kind operator
+ * @return the spelling, or empty when this step does not print that operator
+ */
+fn spelling(kind: lex.TokenKind): str {
+    return when kind {
+        PLUS -> "+"
+        MINUS -> "-"
+        STAR -> "*"
+        SLASH -> "/"
+        PERCENT -> "%"
+        ASSIGN -> "="
+        PLUS_ASSIGN -> "+="
+        MINUS_ASSIGN -> "-="
+        STAR_ASSIGN -> "*="
+        SLASH_ASSIGN -> "/="
+        PERCENT_ASSIGN -> "%="
+        AMP_ASSIGN -> "&="
+        PIPE_ASSIGN -> "|="
+        CARET_ASSIGN -> "^="
+        SHL_ASSIGN -> "<<="
+        SHR_ASSIGN -> ">>="
+        PIPEPIPE -> "||"
+        AMPAMP -> "&&"
+        EQ -> "=="
+        NEQ -> "!="
+        LT -> "<"
+        LE -> "<="
+        GT -> ">"
+        GE -> ">="
+        CMP3 -> "<=>"
+        ELVIS -> "?:"
+        DOTDOT -> ".."
+        PIPE -> "|"
+        CARET -> "^"
+        AMP -> "&"
+        SHL -> "<<"
+        SHR -> ">>"
+        BANG -> "!"
+        TILDE -> "~"
+        BANGBANG -> "!!"
+        KW_AS -> "as"
+        AS_Q -> "as?"
+        else -> ""
+    }
+}
+
+/**
+ * The word a diagnostic uses for a token kind.
+ * Keywords with empty spelling fall through so the caller can use the lexeme.
+ * @param kind token kind
+ * @return the spelling, or empty when the lexeme should be used
+ */
+fn token_word(kind: lex.TokenKind): str {
+    val spelled = spelling(kind)
+    if spelled.len > 0 {
+        return spelled
+    }
+    return when kind {
+        DOT -> "."
+        QDOT -> "?."
+        LPAREN -> "("
+        RPAREN -> ")"
+        LBRACE -> "{"
+        RBRACE -> "}"
+        LBRACKET -> "["
+        RBRACKET -> "]"
+        COMMA -> ","
+        COLON -> ":"
+        ARROW -> "->"
+        QUESTION -> "?"
+        EOF -> "end of file"
+        SEP -> "newline"
+        IDENT -> "identifier"
+        INT -> "integer literal"
+        FLOAT -> "float literal"
+        CHAR -> "char literal"
+        STRING -> "string literal"
+        STR_HEAD -> "string start"
+        STR_MID -> "string middle"
+        STR_TAIL -> "string end"
+        CSTRING -> "C string literal"
+        HEXBLOB -> "hex blob literal"
+        ATTR -> "attribute"
+        else -> ""
+    }
+}
+
+/**
+ * The word after "found " for the current token.
+ * @param tok the token the diagnostic points at
+ * @return its spelling
+ */
+fn found_word(tok: lex.Token): str {
+    val word = token_word(tok.kind)
+    if word.len > 0 {
+        return word
+    }
+    if tok.text.len > 0 {
+        return tok.text
+    }
+    return "token"
+}
+
+/**
+ * Prefix plus the current token's spelling. "expected a declaration, found ."
+ * @param p cursor on the unexpected token
+ * @param prefix text ending in "found "
+ * @return the message
+ */
+fn expect_found(p: *Parser, prefix: str): str with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    b.append(prefix)
+    b.append(found_word(p.peek()))
+    return b.str()
+}
+
+/**
+ * Record one syntax error at the current token and stop the current parse.
+ * A second error while already panicking is dropped. A quiet trial records nothing.
+ * @param p cursor
+ * @param message the text after "error: "
+ */
+fn error_at(p: *Parser, message: str) with (a: mem.Allocator) {
+    if p.panic {
+        return
+    }
+    p.panic = true
+    if p.quiet > 0 {
+        return
+    }
+    val tok = p.peek()
+    var e: ParseError
+    e.line = tok.line
+    e.column = tok.column
+    e.message = message
+    p.errors.push(e)
+}
+
+/**
+ * Record a diagnostic without stopping the parse. A panic or a quiet trial drops it.
+ * @param p cursor on the token the message belongs to
+ * @param message the text after "error: "
+ */
+fn complain(p: *Parser, message: str) with (a: mem.Allocator) {
+    if p.panic || p.quiet > 0 {
+        return
+    }
+    val tok = p.peek()
+    var e: ParseError
+    e.line = tok.line
+    e.column = tok.column
+    e.message = message
+    p.errors.push(e)
+}
+
+/**
+ * True when `@name` is followed by a block, so it is a statement rather than a call.
+ * Parentheses after the name are skipped. Newlines before `{` are skipped.
+ * @param p cursor on `@`
+ * @return true when a block follows the attributes
+ */
+fn starts_attr_block(p: *Parser): bool {
+    val k = lex.kind()
+    var n: usize = 0
+    for {
+        if p.kind_at(n) != k.ATTR {
+            return false
+        }
+        n = n + 1
+        if p.kind_at(n) == k.LPAREN {
+            var depth: i64 = 0
+            for {
+                val kind = p.kind_at(n)
+                if kind == k.EOF {
+                    return false
+                }
+                if kind == k.LPAREN {
+                    depth = depth + 1
+                } else if kind == k.RPAREN {
+                    depth = depth - 1
+                }
+                n = n + 1
+                if depth == 0 {
+                    break
+                }
+            }
+        }
+        for p.kind_at(n) == k.SEP {
+            n = n + 1
+        }
+        if p.kind_at(n) == k.LBRACE {
+            return true
+        }
+        if p.kind_at(n) != k.ATTR {
+            return false
+        }
+    }
+    return false
+}
+
+/**
+ * `@unchecked { ... }`. Attributes are the leading kids. The last kid is the block.
+ * @param p cursor on `@`
+ * @context a allocator for the nodes
+ * @return the attribute block
+ */
+fn parse_attr_block(p: *Parser): *Node with (a: mem.Allocator) {
+    val here = p.peek()
+    val attrs = parse_attributes(p)
+    val body = parse_block(p)
+    val node = make_node(NodeKind.ATTR_BLOCK, here.line, here.column)
+    for attr in attrs.items() {
+        node.kids.push(attr)
+    }
+    node.kids.push(body)
+    return node
+}
+
+/**
+ * Skip to the next statement separator, or to a `}` that closes the current list.
+ * A `{` raises the depth so a function body is skipped as a whole.
+ * @param p cursor on the bad token
+ */
+fn recover(p: *Parser) {
+    var depth: i64 = 0
+    val k = lex.kind()
+    for !p.at(k.EOF) {
+        if p.at(k.LBRACE) {
+            depth = depth + 1
+            p.advance()
+            continue
+        }
+        if p.at(k.RBRACE) {
+            if depth == 0 {
+                break
+            }
+            depth = depth - 1
+            p.advance()
+            continue
+        }
+        if p.at(k.SEP) && depth == 0 {
+            p.advance()
+            break
+        }
+        p.advance()
+    }
+    p.panic = false
+}
+
+/**
+ * Print one parse diagnostic the same way the lexer prints its own.
+ * @param path source path
+ * @param e the error
+ */
+fn print_parse_error(path: str, e: ParseError) with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    defer b.free()
+    b.append(path)
+    b.append(":")
+    b.append_int(e.line, 10)
+    b.append(":")
+    b.append_int(e.column, 10)
+    b.append(": error: ")
+    b.append(e.message)
+    io.eprintln(b.str())
+}
+
+/**
+ * True for `=` and the compound assignment operators.
+ * @param kind token kind
+ * @return true when the token assigns
+ */
+fn is_assign(kind: lex.TokenKind): bool {
+    val k = lex.kind()
+    return kind == k.ASSIGN || kind == k.PLUS_ASSIGN || kind == k.MINUS_ASSIGN || kind == k.STAR_ASSIGN || kind == k.SLASH_ASSIGN || kind == k.PERCENT_ASSIGN || kind == k.AMP_ASSIGN || kind == k.PIPE_ASSIGN || kind == k.CARET_ASSIGN || kind == k.SHL_ASSIGN || kind == k.SHR_ASSIGN
+}
+
+/**
+ * Pack a function's child layout into one count. Parameters and contexts stay below 256.
+ * @param nparams parameter count
+ * @param nctx context count
+ * @param recv true when a receiver type is the first child
+ * @param ret true when a return type is present
+ * @param body true when a body is present
+ * @param expr true when the body is an expression after `=`
+ * @param ntype type-parameter count
+ * @param nattrs attribute count
+ * @return the packed count
+ */
+fn fn_shape(nparams: i64, nctx: i64, recv: bool, ret: bool, body: bool, expr: bool, ntype: i64, nattrs: i64): i64 {
+    var h = nparams + nctx * 256
+    if recv { h = h + 65536 }
+    if ret { h = h + 131072 }
+    if body { h = h + 262144 }
+    if expr { h = h + 524288 }
+    return h + ntype * 1048576 + nattrs * 268435456
+}
+
+/**
+ * Join two words, skipping an empty one.
+ * @param a first word
+ * @param b second word
+ * @context a allocator for the text
+ * @return the words separated by a space
+ */
+fn join_word(left: str, right: str): str with (a: mem.Allocator) {
+    if left.len == 0 { return right }
+    if right.len == 0 { return left }
+    var buf = strbuilder.empty()
+    buf.append(left)
+    buf.append(" ")
+    buf.append(right)
+    return buf.str()
+}
+
+/**
+ * True for an operator that can be a function name after `op`.
+ * @param kind token kind
+ * @return true for `+`, `[]`, and the other overloadable operators
+ */
+fn is_overload(kind: lex.TokenKind): bool {
+    val k = lex.kind()
+    return kind == k.PLUS || kind == k.MINUS || kind == k.STAR || kind == k.SLASH || kind == k.PERCENT || kind == k.AMP || kind == k.PIPE || kind == k.CARET || kind == k.SHL || kind == k.SHR || kind == k.TILDE || kind == k.BANG || kind == k.EQ || kind == k.CMP3 || kind == k.PLUS_ASSIGN || kind == k.MINUS_ASSIGN || kind == k.STAR_ASSIGN || kind == k.SLASH_ASSIGN
+}
+
+/**
+ * `op+`, `op<=>`, `op[]`, or `op[]=`. A plain name is not an operator.
+ * @param p cursor on the name
+ * @context a allocator for the name
+ * @return the printed name, and true when an operator name was consumed
+ */
+fn parse_op_name(p: *Parser): (str, bool) with (a: mem.Allocator) {
+    val k = lex.kind()
+    if !(p.at(k.IDENT) && p.peek().text == "op") {
+        return ("", false)
+    }
+    val next = p.kind_at(1)
+    if next == k.LBRACKET {
+        p.advance()
+        p.advance()
+        p.eat(k.RBRACKET)
+        if p.eat(k.ASSIGN) {
+            return ("op[]=", true)
+        }
+        return ("op[]", true)
+    }
+    if !is_overload(next) {
+        return ("", false)
+    }
+    val spell = spelling(next)
+    p.advance()
+    p.advance()
+    var buf = strbuilder.empty()
+    buf.append("op")
+    buf.append(spell)
+    return (buf.str(), true)
+}
+
+/**
+ * `...T: name`. The child is the element type.
+ * @param p cursor on `...`
+ * @context a allocator for the nodes
+ * @return the pack parameter
+ */
+fn parse_pack_param(p: *Parser): *Node with (a: mem.Allocator) {
+    val here = p.peek()
+    val node = make_node(NodeKind.PARAM, here.line, here.column)
+    val k = lex.kind()
+    node.text = "pack"
+    p.advance()
+    val ty = parse_type(p)
+    if ty != null {
+        node.kids.push(ty!!)
+    }
+    p.eat(k.COLON)
+    if p.at(k.IDENT) {
+        node.name = p.peek().text
+        p.advance()
+    }
+    return node
+}
+
+/**
+ * True when `<...>` after the current name is followed by `.`.
+ * @param p cursor on the name
+ * @return true when this is a generic method receiver
+ */
+fn angles_then_dot(p: *Parser): bool {
+    val k = lex.kind()
+    if p.kind_at(1) != k.LT {
+        return false
+    }
+    var depth: i64 = 0
+    var n: usize = 1
+    for {
+        val kind = p.kind_at(n)
+        if kind == k.EOF {
+            return false
+        }
+        if kind == k.LT {
+            depth = depth + 1
+        } else if kind == k.GT {
+            depth = depth - 1
+            if depth == 0 {
+                return p.kind_at(n + 1) == k.DOT
+            }
+        } else if kind == k.SHR {
+            depth = depth - 2
+            if depth == 0 {
+                return p.kind_at(n + 1) == k.DOT
+            }
+            if depth < 0 {
+                return false
+            }
+        }
+        n = n + 1
+    }
+}
+
+/**
+ * Infix precedence. The right operand is parsed one level tighter.
+ * Comparisons, `is`, `<=>`, and `..` do not chain.
+ * @param kind operator
+ * @return the precedence, or -1 when the token is not infix
+ */
+fn infix_prec(kind: lex.TokenKind): i64 {
+    return when kind {
+        PIPEPIPE -> 1
+        AMPAMP -> 2
+        EQ, NEQ, LT, LE, GT, GE -> 3
+        KW_IS -> 4
+        CMP3 -> 5
+        ELVIS -> 6
+        DOTDOT -> 7
+        PIPE -> 8
+        CARET -> 9
+        AMP -> 10
+        SHL, SHR -> 11
+        PLUS, MINUS -> 12
+        STAR, SLASH, PERCENT -> 13
+        KW_AS, AS_Q -> 14
+        else -> -1
+    }
+}
+
+/**
+ * True when a second operator at the same precedence is not allowed.
+ * @param kind operator
+ * @return true for comparisons, `is`, `<=>`, and `..`
+ */
+fn non_assoc(kind: lex.TokenKind): bool {
+    val k = lex.kind()
+    return kind == k.EQ || kind == k.NEQ || kind == k.LT || kind == k.LE || kind == k.GT || kind == k.GE || kind == k.KW_IS || kind == k.CMP3 || kind == k.DOTDOT
+}
+
+/**
+ * True for a prefix operator. Prefix binds tighter than every infix operator.
+ * @param kind token kind
+ * @return true for `-`, `!`, `~`, `*`, and `&`
+ */
+fn is_prefix(kind: lex.TokenKind): bool {
+    val k = lex.kind()
+    return kind == k.MINUS || kind == k.BANG || kind == k.TILDE || kind == k.STAR || kind == k.AMP
+}
+
+/**
+ * True when a token can follow a type, so `<...>` was type arguments.
+ * @param kind the token after `>`
+ * @return true for a bracket, comma, separator, dot, or `{`
+ */
+fn keeps_type_args(kind: lex.TokenKind): bool {
+    val k = lex.kind()
+    return kind == k.LPAREN || kind == k.RPAREN || kind == k.RBRACKET || kind == k.RBRACE || kind == k.COMMA || kind == k.SEP || kind == k.DOT || kind == k.QDOT || kind == k.LBRACE
+}
+
+/**
+ * True when `?` after a type-as-value closes that type.
+ * @param kind the token after `?`
+ * @return true for a closer or the end of the file
+ */
+fn type_closer(kind: lex.TokenKind): bool {
+    val k = lex.kind()
+    return kind == k.RPAREN || kind == k.COMMA || kind == k.RBRACKET || kind == k.RBRACE || kind == k.SEP || kind == k.EOF
+}
+
+/**
+ * A name, literal, parenthesis, block, array value, builtin, or `.Variant`.
+ * `<` after a name is type arguments when the following token can follow a type.
+ * @param p cursor on the value
+ * @context a allocator for the node
+ * @return the value, or null when the token is not one of those
+ */
+fn parse_primary(p: *Parser): *Node? with (a: mem.Allocator) {
+    val k = lex.kind()
+    val here = p.peek()
+    when p.peek().kind {
+        IDENT, KW_BYTES, KW_IN -> {
+            val node = make_node(NodeKind.IDENT, here.line, here.column)
+            node.name = here.text
+            p.advance()
+            attach_expr_type_args(p, node)
+            return node
+        }
+        INT -> {
+            return parse_int_lit(p)
+        }
+        FLOAT -> {
+            val node = make_node(NodeKind.FLOAT_LIT, here.line, here.column)
+            node.text = here.text
+            p.advance()
+            return node
+        }
+        STRING, CSTRING, CHAR, HEXBLOB -> {
+            return parse_string_piece(p)
+        }
+        STR_HEAD -> {
+            return parse_interp(p)
+        }
+        KW_TRUE, KW_FALSE -> {
+            val node = make_node(NodeKind.BOOL_LIT, here.line, here.column)
+            if p.at(k.KW_TRUE) {
+                node.text = "true"
+            } else {
+                node.text = "false"
+            }
+            p.advance()
+            return node
+        }
+        KW_NULL -> {
+            p.advance()
+            return make_node(NodeKind.NULL_LIT, here.line, here.column)
+        }
+        LPAREN -> {
+            if at_paren_lambda(p) {
+                return parse_lambda(p)
+            }
+            return parse_paren_expr(p)
+        }
+        DOT -> {
+            // `.Empty` needs a name after the dot. A bare dot is not a primary.
+            if p.kind_at(1) == k.IDENT {
+                val node = make_node(NodeKind.DOT_VARIANT, here.line, here.column)
+                p.advance()
+                node.name = p.peek().text
+                p.advance()
+                return node
+            }
+            return null
+        }
+        ATTR -> {
+            return parse_builtin(p)
+        }
+        LBRACE -> {
+            return parse_block(p)
+        }
+        LBRACKET -> {
+            return parse_array_lit(p)
+        }
+        else -> {
+            return null
+        }
+    }
+}
+
+/**
+ * Try `<...>` as type arguments. On failure the cursor is back on `<`, so it is less-than.
+ * @param p cursor on `<`, or elsewhere when there is nothing to try
+ * @param node the name or member that receives the arguments
+ * @context a allocator for the argument nodes
+ */
+fn attach_expr_type_args(p: *Parser, node: *Node) with (a: mem.Allocator) {
+    val k = lex.kind()
+    if !p.at(k.LT) {
+        return
+    }
+    val index = p.index
+    val pending = p.pending_gt
+    val gt_line = p.gt_line
+    val gt_column = p.gt_column
+    val scratch = make_node(NodeKind.IDENT, node.line, node.column)
+    val closed = parse_type_args(p, scratch)
+    val ok = closed && scratch.kids.len > 0 && keeps_type_args(p.peek().kind)
+    p.index = index
+    p.pending_gt = pending
+    p.gt_line = gt_line
+    p.gt_column = gt_column
+    if ok {
+        parse_type_args(p, node)
+    }
+}
+
+/**
+ * A string, c string, character, or hex blob. The text is the decoded value.
+ * @param p cursor on the literal
+ * @context a allocator for the node
+ * @return the literal
+ */
+fn parse_string_piece(p: *Parser): *Node with (a: mem.Allocator) {
+    val tok = p.peek()
+    val k = lex.kind()
+    var kind = NodeKind.STRING_LIT
+    if p.at(k.CSTRING) {
+        kind = NodeKind.CSTRING_LIT
+    } else if p.at(k.CHAR) {
+        kind = NodeKind.CHAR_LIT
+    } else if p.at(k.HEXBLOB) {
+        kind = NodeKind.HEXBLOB_LIT
+    }
+    val node = make_node(kind, tok.line, tok.column)
+    node.text = tok.value
+    p.advance()
+    return node
+}
+
+/**
+ * `"a ${x} b"`. Pieces alternate between string literals and expressions.
+ * @param p cursor on the opening piece
+ * @context a allocator for the nodes
+ * @return the interpolation
+ */
+fn parse_interp(p: *Parser): *Node with (a: mem.Allocator) {
+    val here = p.peek()
+    val node = make_node(NodeKind.INTERP, here.line, here.column)
+    val k = lex.kind()
+    node.kids.push(parse_string_piece(p))
+    for {
+        if p.at(k.EOF) {
+            break
+        }
+        val value = parse_expr(p)
+        if value != null {
+            node.kids.push(value!!)
+        }
+        if p.at(k.STR_MID) {
+            node.kids.push(parse_string_piece(p))
+            continue
+        }
+        if p.at(k.STR_TAIL) {
+            node.kids.push(parse_string_piece(p))
+        }
+        break
+    }
+    return node
+}
+
+/**
+ * `@name(...)` used as a value.
+ * @param p cursor on the attribute
+ * @context a allocator for the nodes
+ * @return the builtin
+ */
+fn parse_builtin(p: *Parser): *Node with (a: mem.Allocator) {
+    val tok = p.peek()
+    val node = make_node(NodeKind.BUILTIN, tok.line, tok.column)
+    if tok.text.len > 0 {
+        node.name = text.slice(tok.text, 1, tok.text.len)
+    }
+    val k = lex.kind()
+    p.advance()
+    if p.eat(k.LPAREN) {
+        val args = parse_arg_list(p)
+        for arg in args.items() {
+            node.kids.push(arg)
+        }
+        p.eat(k.RPAREN)
+    }
+    return node
+}
+
+/**
+ * `[4]T(...)` is an array value. Without `(`, the brackets are the type itself.
+ * @param p cursor on `[`
+ * @context a allocator for the nodes
+ * @return the value, or null when the brackets are not a type
+ */
+fn parse_array_lit(p: *Parser): *Node? with (a: mem.Allocator) {
+    val ty = parse_bracket_type(p)
+    if ty == null {
+        return null
+    }
+    val k = lex.kind()
+    if !p.at(k.LPAREN) {
+        return ty
+    }
+    val type_node = ty!!
+    val node = make_node(NodeKind.ARRAY_LIT, type_node.line, type_node.column)
+    node.kids.push(type_node)
+    p.advance()
+    val args = parse_arg_list(p)
+    for arg in args.items() {
+        node.kids.push(arg)
+    }
+    p.eat(k.RPAREN)
+    return node
+}
+
+/**
+ * The digits of a tuple index, ignoring underscores. A bad index is `0`.
+ * @param lexeme the integer lexeme
+ * @context a allocator for the digits
+ * @return the decimal text
+ */
+fn tuple_index_text(lexeme: str): str with (a: mem.Allocator) {
+    var acc: i64 = 0
+    var any = false
+    var bad = false
+    var i: usize = 0
+    for i < lexeme.len {
+        val c = lexeme.ptr[i]
+        if c == '_' as u8 {
+            i = i + 1
+            continue
+        }
+        if c < '0' as u8 || c > '9' as u8 {
+            bad = true
+            break
+        }
+        any = true
+        acc = acc * 10 + ((c as i64) - ('0' as i64))
+        i = i + 1
+    }
+    if !any || bad {
+        acc = 0
+    }
+    var buf = strbuilder.empty()
+    buf.append_int(acc, 10)
+    return buf.str()
+}
+
+/**
+ * `(a, b)` is a tuple. `(a)` is just `a`. A trailing comma does not make a one-element tuple.
+ * @param p cursor on `(`
+ * @context a allocator for the nodes
+ * @return the expression
+ */
+fn parse_paren_expr(p: *Parser): *Node? with (a: mem.Allocator) {
+    val here = p.peek()
+    val k = lex.kind()
+    p.advance()
+    var elems = list.empty<*Node>()
+    var many = false
+    val first = parse_expr(p)
+    if first != null {
+        elems.push(first!!)
+    }
+    for p.eat(k.COMMA) {
+        if p.at(k.RPAREN) {
+            break
+        }
+        many = true
+        val next = parse_expr(p)
+        if next != null {
+            elems.push(next!!)
+        }
+    }
+    p.eat(k.RPAREN)
+    if !many {
+        if elems.len == 0 {
+            return null
+        }
+        return elems.get(0)
+    }
+    val tuple = make_node(NodeKind.TUPLE, here.line, here.column)
+    for elem in elems.items() {
+        tuple.kids.push(elem)
+    }
+    return tuple
+}
+
+/**
+ * A call's arguments. `name: value` keeps the name.
+ * @param p cursor after `(`
+ * @context a allocator for the nodes
+ * @return the arguments
+ */
+fn parse_arg_list(p: *Parser): list.List<*Node> with (a: mem.Allocator) {
+    val k = lex.kind()
+    var args = list.empty<*Node>()
+    for {
+        if p.at(k.RPAREN) || p.at(k.EOF) {
+            break
+        }
+        val here = p.peek()
+        val arg = make_node(NodeKind.ARG, here.line, here.column)
+        if p.at(k.IDENT) && p.kind_at(1) == k.COLON {
+            arg.name = p.peek().text
+            p.advance()
+            p.advance()
+        }
+        val value = parse_expr(p)
+        if value != null {
+            arg.kids.push(value!!)
+        }
+        args.push(arg)
+        if !p.eat(k.COMMA) {
+            break
+        }
+    }
+    return args
+}
+
+/**
+ * Member access, calls, indexes, slices, and `!!` after a primary value.
+ * `..` inside `a[lo..hi]` splits the slice. A struct value stays a call.
+ * @param p cursor after the primary
+ * @param first the primary
+ * @context a allocator for the nodes
+ * @return the value with its suffixes
+ */
+fn parse_postfix(p: *Parser, first: *Node): *Node with (a: mem.Allocator) {
+    val k = lex.kind()
+    var node = first
+    for {
+        if p.at(k.DOT) || p.at(k.QDOT) {
+            val safe = p.at(k.QDOT)
+            val here = p.peek()
+            p.advance()
+            val mem = make_node(NodeKind.MEMBER, here.line, here.column)
+            if safe {
+                mem.flag = "?."
+            }
+            mem.kids.push(node)
+            if p.at(k.IDENT) {
+                mem.name = p.peek().text
+                p.advance()
+                attach_expr_type_args(p, mem)
+            } else if !safe && p.at(k.INT) {
+                mem.text = tuple_index_text(p.peek().text)
+                p.advance()
+            }
+            node = mem
+        } else if p.at(k.LPAREN) {
+            val call = make_node(NodeKind.CALL, node.line, node.column)
+            p.advance()
+            call.kids.push(node)
+            val args = parse_arg_list(p)
+            for arg in args.items() {
+                call.kids.push(arg)
+            }
+            p.eat(k.RPAREN)
+            if p.at(k.KW_WITH) && p.kind_at(1) == k.LPAREN {
+                p.advance()
+                p.advance()
+                var nctx: i64 = 0
+                for {
+                    if p.at(k.RPAREN) || p.at(k.EOF) {
+                        break
+                    }
+                    val ctx = parse_expr(p)
+                    if ctx != null {
+                        call.kids.push(ctx!!)
+                        nctx = nctx + 1
+                    }
+                    if !p.eat(k.COMMA) {
+                        break
+                    }
+                }
+                p.eat(k.RPAREN)
+                call.head = nctx
+            }
+            node = call
+        } else if p.at(k.LBRACKET) {
+            node = parse_index_or_slice(p, node)
+        } else if p.at(k.BANGBANG) {
+            val here = p.peek()
+            p.advance()
+            val force = make_node(NodeKind.FORCE, here.line, here.column)
+            force.text = "!!"
+            force.kids.push(node)
+            node = force
+        } else if p.allow_trail && p.at(k.LBRACE) {
+            node = attach_trailing(p, node)
+        } else {
+            break
+        }
+    }
+    return node
+}
+
+/**
+ * `a[i]`, `a[lo..hi]`, `a[..hi]`, `a[lo..]`, or `a[..]`.
+ * @param p cursor on `[`
+ * @param base the indexed value
+ * @context a allocator for the nodes
+ * @return the index or the slice
+ */
+fn parse_index_or_slice(p: *Parser, base: *Node): *Node with (a: mem.Allocator) {
+    val here = p.peek()
+    val k = lex.kind()
+    p.advance()
+    if p.eat(k.DOTDOT) {
+        var hi: *Node? = null
+        if !p.at(k.RBRACKET) && !p.at(k.EOF) {
+            hi = parse_slice_bound(p)
+        }
+        p.eat(k.RBRACKET)
+        return make_slice(base, null, hi, here.line, here.column)
+    }
+    val mid = parse_slice_bound(p)
+    if p.eat(k.DOTDOT) {
+        var hi: *Node? = null
+        if !p.at(k.RBRACKET) && !p.at(k.EOF) {
+            hi = parse_slice_bound(p)
+        }
+        p.eat(k.RBRACKET)
+        return make_slice(base, mid, hi, here.line, here.column)
+    }
+    p.eat(k.RBRACKET)
+    val node = make_node(NodeKind.INDEX, here.line, here.column)
+    node.kids.push(base)
+    if mid != null {
+        node.kids.push(mid!!)
+    }
+    return node
+}
+
+/**
+ * A slice. A missing bound stays absent and prints as null.
+ * @param base the sliced value
+ * @param lo the low bound, or null
+ * @param hi the high bound, or null
+ * @param line 1-based line of `[`
+ * @param column 1-based column of `[`
+ * @context a allocator for the node
+ * @return the slice
+ */
+fn make_slice(base: *Node, lo: *Node?, hi: *Node?, line: i64, column: i64): *Node with (a: mem.Allocator) {
+    val node = make_node(NodeKind.SLICE, line, column)
+    node.kids.push(base)
+    var bits: i64 = 0
+    if lo != null {
+        node.kids.push(lo!!)
+        bits = bits + 1
+    }
+    if hi != null {
+        node.kids.push(hi!!)
+        bits = bits + 2
+    }
+    node.head = bits
+    return node
+}
+
+/**
+ * A prefix operator, or a postfix value. `*const T` is a type.
+ * @param p cursor on the value
+ * @context a allocator for the nodes
+ * @return the value, or null when the token is not an expression yet
+ */
+fn parse_unary_expr(p: *Parser): *Node? with (a: mem.Allocator) {
+    val k = lex.kind()
+    val kind = p.peek().kind
+    if kind == k.STAR && p.kind_at(1) == k.KW_CONST {
+        return parse_type(p)
+    }
+    if is_prefix(kind) {
+        val here = p.peek()
+        p.advance()
+        val node = make_node(NodeKind.UNARY, here.line, here.column)
+        node.text = spelling(kind)
+        val operand = parse_unary_expr(p)
+        if operand != null {
+            node.kids.push(operand!!)
+        }
+        return node
+    }
+    val first = parse_primary(p)
+    if first == null {
+        return null
+    }
+    return parse_postfix(p, first!!)
+}
+
+/**
+ * Precedence climbing. `..` stops when this expression is a slice bound.
+ * `as` and `is` take a type on the right. `T?` wraps a type used as a value when the next token closes it.
+ * @param p cursor on the value
+ * @param min lowest precedence to accept
+ * @param range_ok false inside `a[lo..hi]`, so `..` is the separator
+ * @context a allocator for the nodes
+ * @return the expression, or null when the token is not an expression yet
+ */
+fn parse_prec(p: *Parser, min: i64, range_ok: bool): *Node? with (a: mem.Allocator) {
+    val first = parse_unary_expr(p)
+    if first == null {
+        return null
+    }
+    var left = first!!
+    val k = lex.kind()
+    for p.at(k.QUESTION) && type_closer(p.kind_at(1)) {
+        p.advance()
+        val opt = make_node(NodeKind.TYPE_OPTION, left.line, left.column)
+        opt.kids.push(left)
+        left = opt
+    }
+    for {
+        val op = p.peek().kind
+        if op == k.DOTDOT && !range_ok {
+            break
+        }
+        val prec = infix_prec(op)
+        if prec < min {
+            break
+        }
+        val here = p.peek()
+        p.advance()
+        if op == k.KW_AS || op == k.AS_Q {
+            val cast = make_node(NodeKind.CAST, here.line, here.column)
+            cast.text = spelling(op)
+            cast.kids.push(left)
+            val ty = parse_type(p)
+            if ty != null {
+                cast.kids.push(ty!!)
+            }
+            left = cast
+        } else if op == k.KW_IS {
+            val test = make_node(NodeKind.IS, here.line, here.column)
+            test.kids.push(left)
+            val ty = parse_type(p)
+            if ty != null {
+                test.kids.push(ty!!)
+            }
+            left = test
+        } else {
+            val right = parse_prec(p, prec + 1, range_ok)
+            val bin = make_node(NodeKind.BINARY, here.line, here.column)
+            bin.text = spelling(op)
+            bin.kids.push(left)
+            if right != null {
+                bin.kids.push(right!!)
+            }
+            left = bin
+        }
+        if non_assoc(op) && infix_prec(p.peek().kind) == prec {
+            break
+        }
+    }
+    return left
+}
+
+/**
+ * An expression. `..` is the range operator here.
+ * @param p cursor on the value
+ * @context a allocator for the nodes
+ * @return the expression, or null when the token is not an expression yet
+ */
+fn parse_expr(p: *Parser): *Node? with (a: mem.Allocator) {
+    return parse_expr_trail(p, true)
+}
+
+/**
+ * An expression. `trail` is false in the head of `if`, `when`, `for`, and `with`, so `{` opens the body.
+ * @param p cursor on the value
+ * @param trail true when `{` after a call is a trailing lambda
+ * @context a allocator for the nodes
+ * @return the expression, or null when the token is not an expression yet
+ */
+fn parse_expr_trail(p: *Parser, trail: bool): *Node? with (a: mem.Allocator) {
+    val saved = p.allow_trail
+    p.allow_trail = trail
+    val node = parse_expr_head(p)
+    p.allow_trail = saved
+    return node
+}
+
+/**
+ * `if`, `when`, and `go` sit outside the operator grammar.
+ * @param p cursor on the value
+ * @context a allocator for the nodes
+ * @return the expression, or null when the token is not an expression yet
+ */
+fn parse_expr_head(p: *Parser): *Node? with (a: mem.Allocator) {
+    when p.peek().kind {
+        KW_IF -> {
+            return parse_if(p)
+        }
+        KW_WHEN -> {
+            return parse_when(p)
+        }
+        KW_GO -> {
+            return parse_go(p)
+        }
+        KW_QUOTE -> {
+            error_at(p, expect_found(p, "expected an expression, found "))
+            return null
+        }
+        else -> {
+            return parse_prec(p, 0, true)
+        }
+    }
+}
+
+/**
+ * True when `(` ... `)` is a lambda. The token after the matching `)` is `:` or `->`.
+ * @param p cursor on `(`
+ * @return true when the parentheses are a lambda
+ */
+fn at_paren_lambda(p: *Parser): bool {
+    val k = lex.kind()
+    if !p.at(k.LPAREN) {
+        return false
+    }
+    var depth: i64 = 0
+    var n: usize = 0
+    for {
+        val kind = p.kind_at(n)
+        if kind == k.EOF {
+            return false
+        }
+        if kind == k.LPAREN {
+            depth = depth + 1
+        } else if kind == k.RPAREN {
+            depth = depth - 1
+            if depth == 0 {
+                val next = p.kind_at(n + 1)
+                return next == k.COLON || next == k.ARROW
+            }
+        }
+        n = n + 1
+    }
+    return false
+}
+
+/**
+ * `(x: i32) -> x` or `(x: i32): i32 -> { x }`.
+ * @param p cursor on `(`
+ * @context a allocator for the nodes
+ * @return the lambda
+ */
+fn parse_lambda(p: *Parser): *Node with (a: mem.Allocator) {
+    val here = p.peek()
+    val node = make_node(NodeKind.LAMBDA, here.line, here.column)
+    val k = lex.kind()
+    p.advance()
+    var nparams: i64 = 0
+    if !p.at(k.RPAREN) {
+        for {
+            if p.at(k.RPAREN) || p.at(k.EOF) {
+                break
+            }
+            val param_at = p.peek()
+            val param = make_node(NodeKind.PARAM, param_at.line, param_at.column)
+            if p.at(k.IDENT) {
+                param.name = p.peek().text
+                p.advance()
+            }
+            if p.eat(k.COLON) {
+                val ty = parse_type(p)
+                if ty != null {
+                    param.kids.push(ty!!)
+                }
+            }
+            node.kids.push(param)
+            nparams = nparams + 1
+            if !p.eat(k.COMMA) {
+                break
+            }
+        }
+    }
+    p.eat(k.RPAREN)
+    var has_ret = false
+    if p.eat(k.COLON) {
+        val ret = parse_type(p)
+        if ret != null {
+            node.kids.push(ret!!)
+            has_ret = true
+        }
+    }
+    p.eat(k.ARROW)
+    var expr = false
+    if p.at(k.LBRACE) {
+        node.kids.push(parse_block(p))
+    } else {
+        expr = true
+        val body = parse_expr(p)
+        if body != null {
+            node.kids.push(body!!)
+        }
+    }
+    var shape = nparams
+    if has_ret {
+        shape = shape + 256
+    }
+    if expr {
+        shape = shape + 512
+    }
+    node.head = shape
+    return node
+}
+
+/**
+ * `{` or `{ x, y -> ... }` after a call. A block with no parameter list is `it`.
+ * @param p cursor on `{`
+ * @context a allocator for the nodes
+ * @return the lambda
+ */
+fn parse_trailing_lambda(p: *Parser): *Node with (a: mem.Allocator) {
+    val here = p.peek()
+    val node = make_node(NodeKind.LAMBDA, here.line, here.column)
+    val k = lex.kind()
+    p.advance()
+    var nparams: i64 = 0
+    var it = true
+    if at_lambda_params(p) {
+        it = false
+        for {
+            val param_at = p.peek()
+            val param = make_node(NodeKind.PARAM, param_at.line, param_at.column)
+            param.name = param_at.text
+            p.advance()
+            node.kids.push(param)
+            nparams = nparams + 1
+            if !p.eat(k.COMMA) {
+                break
+            }
+        }
+        p.eat(k.ARROW)
+    }
+    val body = make_node(NodeKind.BLOCK, here.line, here.column)
+    fill_block(p, body)
+    node.kids.push(body)
+    var shape = nparams
+    if it {
+        shape = shape + 1024
+    }
+    node.head = shape
+    return node
+}
+
+/**
+ * `x` or `x, y ->` at the start of a trailing lambda.
+ * @param p cursor inside `{`
+ * @return true when parameter names are followed by `->`
+ */
+fn at_lambda_params(p: *Parser): bool {
+    val k = lex.kind()
+    if !p.at(k.IDENT) {
+        return false
+    }
+    var n: usize = 1
+    for p.kind_at(n) == k.COMMA && p.kind_at(n + 1) == k.IDENT {
+        n = n + 2
+    }
+    return p.kind_at(n) == k.ARROW
+}
+
+/**
+ * Attach `{ ... }` to a call. A value that is not a call becomes a call with no arguments.
+ * @param p cursor on `{`
+ * @param node the callee
+ * @context a allocator for the nodes
+ * @return the call
+ */
+fn attach_trailing(p: *Parser, node: *Node): *Node with (a: mem.Allocator) {
+    val lam = parse_trailing_lambda(p)
+    if node.kind == NodeKind.CALL && (node.head / 256) % 2 == 0 {
+        node.kids.push(lam)
+        node.head = node.head + 256
+        return node
+    }
+    val call = make_node(NodeKind.CALL, node.line, node.column)
+    call.kids.push(node)
+    call.kids.push(lam)
+    call.head = 256
+    return call
+}
+
+/**
+ * `if cond { } else { }` or `else if`. The condition does not take a trailing lambda.
+ * @param p cursor on `if`
+ * @context a allocator for the nodes
+ * @return the conditional
+ */
+fn parse_if(p: *Parser): *Node with (a: mem.Allocator) {
+    val here = p.peek()
+    val node = make_node(NodeKind.IF, here.line, here.column)
+    val k = lex.kind()
+    p.advance()
+    val cond = parse_expr_trail(p, false)
+    if cond != null {
+        node.kids.push(cond!!)
+    }
+    if p.at(k.LBRACE) {
+        node.kids.push(parse_block(p))
+    }
+    for p.eat(k.SEP) {
+    }
+    if p.eat(k.KW_ELSE) {
+        for p.eat(k.SEP) {
+        }
+        if p.at(k.KW_IF) {
+            node.kids.push(parse_if(p))
+        } else if p.at(k.LBRACE) {
+            node.kids.push(parse_block(p))
+        }
+    }
+    return node
+}
+
+/**
+ * A pattern. `Name(...)` is a variant. A bare name that ends the pattern is a binding, and `_` is a wildcard.
+ * @param p cursor on the pattern
+ * @param in_arm true when `->`, a comma, or `}` can end it
+ * @context a allocator for the nodes
+ * @return the pattern, or null when nothing was parsed
+ */
+fn parse_pattern(p: *Parser, in_arm: bool): *Node? with (a: mem.Allocator) {
+    val k = lex.kind()
+    val here = p.peek()
+    if in_arm && p.at(k.KW_IS) {
+        val node = make_node(NodeKind.PAT_IS, here.line, here.column)
+        p.advance()
+        val ty = parse_type(p)
+        if ty != null {
+            node.kids.push(ty!!)
+        }
+        return node
+    }
+    if p.at(k.KW_IN) {
+        val node = make_node(NodeKind.PAT_IN, here.line, here.column)
+        p.advance()
+        val expr = parse_expr(p)
+        if expr != null {
+            node.kids.push(expr!!)
+        }
+        return node
+    }
+    if p.at(k.IDENT) && p.kind_at(1) == k.LPAREN {
+        return parse_variant_pat(p)
+    }
+    if p.at(k.IDENT) && pattern_stops(p, 1, in_arm) {
+        if here.text == "_" {
+            p.advance()
+            return make_node(NodeKind.PAT_WILDCARD, here.line, here.column)
+        }
+        val node = make_node(NodeKind.PAT_BIND, here.line, here.column)
+        node.name = here.text
+        p.advance()
+        return node
+    }
+    val expr = parse_expr(p)
+    if expr == null {
+        return null
+    }
+    val node = make_node(NodeKind.PAT_EXPR, here.line, here.column)
+    node.kids.push(expr!!)
+    return node
+}
+
+/**
+ * True when the token ahead ends a pattern.
+ * @param p cursor
+ * @param ahead how many tokens ahead
+ * @param in_arm true for a when arm
+ * @return true when the pattern should stop
+ */
+fn pattern_stops(p: *Parser, ahead: usize, in_arm: bool): bool {
+    val k = lex.kind()
+    val kind = p.kind_at(ahead)
+    if in_arm {
+        return kind == k.ARROW || kind == k.COMMA || kind == k.RBRACE || kind == k.SEP || kind == k.EOF
+    }
+    return kind == k.RPAREN || kind == k.COMMA || kind == k.EOF
+}
+
+/**
+ * `Circle(r)` or `Rect(w: width, h)`.
+ * @param p cursor on the name
+ * @context a allocator for the nodes
+ * @return the variant pattern
+ */
+fn parse_variant_pat(p: *Parser): *Node with (a: mem.Allocator) {
+    val here = p.peek()
+    val node = make_node(NodeKind.PAT_VARIANT, here.line, here.column)
+    node.name = here.text
+    val k = lex.kind()
+    p.advance()
+    p.advance()
+    if !p.at(k.RPAREN) {
+        for {
+            if p.at(k.RPAREN) || p.at(k.EOF) {
+                break
+            }
+            val field_at = p.peek()
+            val field = make_node(NodeKind.PAT_FIELD, field_at.line, field_at.column)
+            if p.at(k.IDENT) && p.kind_at(1) == k.COLON {
+                field.name = p.peek().text
+                p.advance()
+                p.advance()
+            }
+            val pat = parse_pattern(p, false)
+            if pat != null {
+                field.kids.push(pat!!)
+            }
+            node.kids.push(field)
+            if !p.eat(k.COMMA) {
+                break
+            }
+        }
+    }
+    p.eat(k.RPAREN)
+    return node
+}
+
+/**
+ * One `when` arm. `else` has no patterns. A `{` body is a block.
+ * @param p cursor on the arm
+ * @context a allocator for the nodes
+ * @return the arm
+ */
+fn parse_when_arm(p: *Parser): *Node with (a: mem.Allocator) {
+    val here = p.peek()
+    val node = make_node(NodeKind.WHEN_ARM, here.line, here.column)
+    val k = lex.kind()
+    var ncond: i64 = 0
+    if !p.eat(k.KW_ELSE) {
+        for {
+            if p.at(k.ARROW) || p.at(k.RBRACE) || p.at(k.EOF) {
+                break
+            }
+            val at = p.index
+            val pending = p.pending_gt
+            val pat = parse_pattern(p, true)
+            if pat != null {
+                node.kids.push(pat!!)
+                ncond = ncond + 1
+            }
+            if p.index == at && p.pending_gt == pending {
+                break
+            }
+            if !p.eat(k.COMMA) {
+                break
+            }
+            for p.eat(k.SEP) {
+            }
+        }
+    }
+    for p.eat(k.SEP) {
+    }
+    p.eat(k.ARROW)
+    if p.at(k.LBRACE) {
+        node.kids.push(parse_block(p))
+    } else {
+        val body = parse_expr(p)
+        if body != null {
+            node.kids.push(body!!)
+        }
+    }
+    node.head = ncond
+    return node
+}
+
+/**
+ * `when subject { arm }` or `when { arm }`. The subject does not take a trailing lambda.
+ * @param p cursor on `when`
+ * @context a allocator for the nodes
+ * @return the match
+ */
+fn parse_when(p: *Parser): *Node with (a: mem.Allocator) {
+    val here = p.peek()
+    val node = make_node(NodeKind.WHEN, here.line, here.column)
+    val k = lex.kind()
+    p.advance()
+    for p.eat(k.SEP) {
+    }
+    if !p.at(k.LBRACE) {
+        val subject = parse_expr_trail(p, false)
+        if subject != null {
+            node.kids.push(subject!!)
+        }
+        for p.eat(k.SEP) {
+        }
+    }
+    if p.eat(k.LBRACE) {
+        for p.eat(k.SEP) {
+        }
+        for {
+            if p.at(k.RBRACE) || p.at(k.EOF) {
+                break
+            }
+            val at = p.index
+            val pending = p.pending_gt
+            node.kids.push(parse_when_arm(p))
+            if p.index == at && p.pending_gt == pending {
+                p.advance()
+            }
+            for p.eat(k.SEP) {
+            }
+        }
+        p.eat(k.RBRACE)
+    }
+    return node
+}
+
+/**
+ * True when `go(...)` is a launch-argument list. The token after `)` is `{` or `with`.
+ * @param p cursor on `(`
+ * @return true when the parentheses are launch arguments
+ */
+fn go_paren_is_launch(p: *Parser): bool {
+    val k = lex.kind()
+    if !p.at(k.LPAREN) {
+        return false
+    }
+    var depth: i64 = 0
+    var n: usize = 0
+    for {
+        val kind = p.kind_at(n)
+        if kind == k.EOF {
+            return false
+        }
+        if kind == k.LPAREN {
+            depth = depth + 1
+        } else if kind == k.RPAREN {
+            depth = depth - 1
+            if depth == 0 {
+                val next = p.kind_at(n + 1)
+                return next == k.LBRACE || next == k.KW_WITH
+            }
+        }
+        n = n + 1
+    }
+    return false
+}
+
+/**
+ * `go fetch()`, `go { }`, `go with (log) { }`, or `go(stack: n) { }`.
+ * @param p cursor on `go`
+ * @context a allocator for the nodes
+ * @return the launch
+ */
+fn parse_go(p: *Parser): *Node with (a: mem.Allocator) {
+    val here = p.peek()
+    val node = make_node(NodeKind.GO, here.line, here.column)
+    val k = lex.kind()
+    p.advance()
+    var nargs: i64 = 0
+    if go_paren_is_launch(p) {
+        p.advance()
+        val args = parse_arg_list(p)
+        for arg in args.items() {
+            node.kids.push(arg)
+            nargs = nargs + 1
+        }
+        p.eat(k.RPAREN)
+    }
+    var nctx: i64 = 0
+    if p.at(k.KW_WITH) {
+        p.advance()
+        p.eat(k.LPAREN)
+        for {
+            if p.at(k.RPAREN) || p.at(k.EOF) {
+                break
+            }
+            val ctx = parse_expr(p)
+            if ctx != null {
+                node.kids.push(ctx!!)
+                nctx = nctx + 1
+            }
+            if !p.eat(k.COMMA) {
+                break
+            }
+        }
+        p.eat(k.RPAREN)
+    }
+    var has_body = false
+    if p.at(k.LBRACE) {
+        node.kids.push(parse_block(p))
+        has_body = true
+    } else {
+        val saved = p.allow_trail
+        p.allow_trail = true
+        val first = parse_primary(p)
+        if first != null {
+            node.kids.push(parse_postfix(p, first!!))
+            has_body = true
+        }
+        p.allow_trail = saved
+    }
+    var shape = nargs + nctx * 256
+    if has_body {
+        shape = shape + 65536
+    }
+    node.head = shape
+    return node
+}
+
+/**
+ * One side of `a[lo..hi]`. `..` is the separator, not an operator.
+ * @param p cursor on the bound
+ * @context a allocator for the nodes
+ * @return the bound, or null when it is absent
+ */
+fn parse_slice_bound(p: *Parser): *Node? with (a: mem.Allocator) {
+    return parse_prec(p, 0, false)
+}
+
+/**
+ * A statement. A newline separates statements. A newline before `else` is skipped.
+ * @param p cursor on the statement
+ * @context a allocator for the nodes
+ * @return the statement, or null when it is not a statement yet
+ */
+fn parse_stmt(p: *Parser): *Node? with (a: mem.Allocator) {
+    when p.peek().kind {
+        KW_VAL -> {
+            return parse_binding(p, NodeKind.VAL, list.empty<*Node>(), "")
+        }
+        KW_VAR -> {
+            return parse_binding(p, NodeKind.VAR, list.empty<*Node>(), "")
+        }
+        KW_CONTEXT -> {
+            return parse_binding(p, NodeKind.CONTEXT, list.empty<*Node>(), "")
+        }
+        KW_RETURN -> {
+            return parse_return(p)
+        }
+        KW_BREAK -> {
+            val here = p.peek()
+            return finish_word(p, NodeKind.BREAK, here.line, here.column)
+        }
+        KW_CONTINUE -> {
+            val here = p.peek()
+            return finish_word(p, NodeKind.CONTINUE, here.line, here.column)
+        }
+        KW_FOR -> {
+            return parse_for(p)
+        }
+        KW_DEFER -> {
+            return parse_defer(p, NodeKind.DEFER)
+        }
+        KW_ERRDEFER -> {
+            return parse_defer(p, NodeKind.ERRDEFER)
+        }
+        KW_WITH -> {
+            return parse_with_stmt(p)
+        }
+        ATTR -> {
+            // `@name { }` is a statement. `@name(...)` with no block is a call.
+            if starts_attr_block(p) {
+                return parse_attr_block(p)
+            }
+            return parse_expr_stmt(p)
+        }
+        else -> {
+            return parse_expr_stmt(p)
+        }
+    }
+}
+
+/**
+ * Consume one token and return a node with no children.
+ * @param p cursor on the keyword
+ * @param kind node kind
+ * @param line 1-based line
+ * @param column 1-based column
+ * @context a allocator for the node
+ * @return the node
+ */
+fn finish_word(p: *Parser, kind: NodeKind, line: i64, column: i64): *Node with (a: mem.Allocator) {
+    p.advance()
+    return make_node(kind, line, column)
+}
+
+/**
+ * `return` or `return a, b`. A newline or `}` ends the value list.
+ * @param p cursor on `return`
+ * @context a allocator for the nodes
+ * @return the return
+ */
+fn parse_return(p: *Parser): *Node with (a: mem.Allocator) {
+    val here = p.peek()
+    val node = make_node(NodeKind.RETURN, here.line, here.column)
+    val k = lex.kind()
+    p.advance()
+    if p.at(k.SEP) || p.at(k.RBRACE) || p.at(k.EOF) {
+        return node
+    }
+    for {
+        val value = parse_expr(p)
+        if value != null {
+            node.kids.push(value!!)
+        }
+        if !p.eat(k.COMMA) {
+            break
+        }
+        if p.at(k.RPAREN) || p.at(k.SEP) || p.at(k.RBRACE) || p.at(k.EOF) {
+            break
+        }
+    }
+    return node
+}
+
+/**
+ * An assignment, or an expression used as a statement. `(a, b) = f()` is a destructure.
+ * @param p cursor on the expression
+ * @context a allocator for the nodes
+ * @return the statement, or null when it is not an expression yet
+ */
+fn parse_expr_stmt(p: *Parser): *Node? with (a: mem.Allocator) {
+    val expr = parse_expr(p)
+    if expr == null {
+        return null
+    }
+    val left = expr!!
+    val op = p.peek().kind
+    if !is_assign(op) {
+        val stmt = make_node(NodeKind.EXPR_STMT, left.line, left.column)
+        stmt.kids.push(left)
+        return stmt
+    }
+    val here = p.peek()
+    p.advance()
+    val value = parse_expr(p)
+    if left.kind == NodeKind.TUPLE && op == lex.kind().ASSIGN {
+        val node = make_node(NodeKind.DESTRUCTURE, here.line, here.column)
+        node.head = left.kids.len as i64
+        for kid in left.kids.items() {
+            node.kids.push(kid)
+        }
+        if value != null {
+            node.kids.push(value!!)
+        }
+        return node
+    }
+    val node = make_node(NodeKind.ASSIGN, here.line, here.column)
+    node.text = spelling(op)
+    node.kids.push(left)
+    if value != null {
+        node.kids.push(value!!)
+    }
+    return node
+}
+
+/**
+ * `for { }`, `for cond { }`, `for x in xs { }`, or `for i, x in xs { }`.
+ * @param p cursor on `for`
+ * @context a allocator for the nodes
+ * @return the loop
+ */
+fn parse_for(p: *Parser): *Node with (a: mem.Allocator) {
+    val here = p.peek()
+    val node = make_node(NodeKind.FOR, here.line, here.column)
+    val k = lex.kind()
+    p.advance()
+    if p.at(k.LBRACE) {
+        node.text = "forever"
+        node.kids.push(parse_block(p))
+        return node
+    }
+    if p.at(k.IDENT) && (p.kind_at(1) == k.KW_IN || (p.kind_at(1) == k.COMMA && p.kind_at(2) == k.IDENT && p.kind_at(3) == k.KW_IN)) {
+        node.text = "in"
+        node.name = p.peek().text
+        p.advance()
+        if p.eat(k.COMMA) && p.at(k.IDENT) {
+            node.flag = p.peek().text
+            p.advance()
+        }
+        p.eat(k.KW_IN)
+        val seq = parse_expr_trail(p, false)
+        if seq != null {
+            node.kids.push(seq!!)
+        }
+    } else {
+        node.text = "cond"
+        val cond = parse_expr_trail(p, false)
+        if cond != null {
+            node.kids.push(cond!!)
+        }
+    }
+    if p.at(k.LBRACE) {
+        node.kids.push(parse_block(p))
+    }
+    return node
+}
+
+/**
+ * `defer` or `errdefer`, then a block or one statement.
+ * @param p cursor on the keyword
+ * @param kind DEFER or ERRDEFER
+ * @context a allocator for the nodes
+ * @return the statement
+ */
+fn parse_defer(p: *Parser, kind: NodeKind): *Node with (a: mem.Allocator) {
+    val here = p.peek()
+    val node = make_node(kind, here.line, here.column)
+    val k = lex.kind()
+    p.advance()
+    if p.at(k.LBRACE) {
+        node.kids.push(parse_block(p))
+    } else {
+        val body = parse_stmt(p)
+        if body != null {
+            node.kids.push(body!!)
+        }
+    }
+    return node
+}
+
+/**
+ * `with (value) { }`. The values are expressions, not arguments.
+ * @param p cursor on `with`
+ * @context a allocator for the nodes
+ * @return the statement
+ */
+fn parse_with_stmt(p: *Parser): *Node with (a: mem.Allocator) {
+    val here = p.peek()
+    val node = make_node(NodeKind.WITH, here.line, here.column)
+    val k = lex.kind()
+    p.advance()
+    p.eat(k.LPAREN)
+    for {
+        if p.at(k.RPAREN) || p.at(k.EOF) {
+            break
+        }
+        val value = parse_expr_trail(p, false)
+        if value != null {
+            node.kids.push(value!!)
+        }
+        if !p.eat(k.COMMA) {
+            break
+        }
+    }
+    p.eat(k.RPAREN)
+    if p.at(k.LBRACE) {
+        node.kids.push(parse_block(p))
+    }
+    return node
+}
+
+/**
+ * `{ statements }`. The brace is consumed.
+ * @param p cursor on `{`
+ * @context a allocator for the nodes
+ * @return the block
+ */
+fn parse_block(p: *Parser): *Node with (a: mem.Allocator) {
+    val here = p.peek()
+    val node = make_node(NodeKind.BLOCK, here.line, here.column)
+    p.advance()
+    fill_block(p, node)
+    return node
+}
+
+/**
+ * Statements until `}`. The `{` is already consumed.
+ * @param p cursor after `{`
+ * @param node the block that receives the statements
+ * @context a allocator for the nodes
+ */
+fn fill_block(p: *Parser, node: *Node) with (a: mem.Allocator) {
+    val k = lex.kind()
+    for p.eat(k.SEP) {
+    }
+    for {
+        if p.at(k.RBRACE) || p.at(k.EOF) {
+            break
+        }
+        val at = p.index
+        val pending = p.pending_gt
+        val stmt = parse_stmt(p)
+        if p.panic {
+            recover(p)
+        }
+        if stmt != null {
+            node.kids.push(stmt!!)
+        }
+        if p.index == at && p.pending_gt == pending {
+            if !p.panic {
+                error_at(p, expect_found(p, "expected a statement, found "))
+            }
+            recover(p)
+            if p.index == at && p.pending_gt == pending {
+                p.advance()
+            }
+        }
+        for p.eat(k.SEP) {
+        }
+    }
+    p.eat(k.RBRACE)
+}
+
+/**
+ * `val`, `var`, or `context`. `(a, b)` is a destructure. A single name is printed on the first line.
+ * @param p cursor on the keyword
+ * @param kind VAL, VAR, or CONTEXT
+ * @param attrs attributes already parsed
+ * @param vis visibility word
+ * @context a allocator for the nodes
+ * @return the binding
+ */
+fn parse_binding(p: *Parser, kind: NodeKind, attrs: list.List<*Node>, vis: str): *Node with (a: mem.Allocator) {
+    val here = p.peek()
+    val node = make_node(kind, here.line, here.column)
+    val k = lex.kind()
+    attach(node, attrs, vis)
+    p.advance()
+    if p.eat(k.LPAREN) {
+        var names = strbuilder.empty()
+        var first = true
+        for {
+            if p.at(k.RPAREN) || p.at(k.EOF) {
+                break
+            }
+            if p.at(k.IDENT) {
+                if !first {
+                    names.append(" ")
+                }
+                names.append(p.peek().text)
+                first = false
+                p.advance()
+            }
+            if !p.eat(k.COMMA) {
+                break
+            }
+        }
+        p.eat(k.RPAREN)
+        node.text = names.str()
+    } else if p.at(k.IDENT) {
+        node.name = p.peek().text
+        p.advance()
+    }
+    if p.eat(k.COLON) {
+        node.op = k.COLON
+        val ty = parse_type(p)
+        if ty != null {
+            node.kids.push(ty!!)
+        }
+    }
+    if p.eat(k.ASSIGN) {
+        val init = parse_expr(p)
+        if init != null {
+            node.kids.push(init!!)
+        }
+    }
+    return node
+}
+
+/**
+ * A function or a method. `expect` and `actual` are the mode word. A body is `= expr` or a block.
+ * @param p cursor on `fn`
+ * @param attrs attributes already parsed
+ * @param vis visibility word
+ * @param mode regular, extern, expect, or actual
+ * @context a allocator for the nodes
+ * @return the function
+ */
+fn parse_fn(p: *Parser, attrs: list.List<*Node>, vis: str, mode: str): *Node with (a: mem.Allocator) {
+    val here = p.peek()
+    val node = make_node(NodeKind.FN, here.line, here.column)
+    val k = lex.kind()
+    attach(node, attrs, "")
+    p.advance()
+    var has_recv = false
+    if p.at(k.STAR) || (p.at(k.IDENT) && (p.kind_at(1) == k.DOT || angles_then_dot(p))) {
+        if p.eat(k.STAR) {
+            node.text = "recv *"
+        } else {
+            node.text = "recv"
+        }
+        val recv_tok = p.peek()
+        val recv = make_node(NodeKind.TYPE_NAME, recv_tok.line, recv_tok.column)
+        if p.at(k.IDENT) {
+            recv.name = recv_tok.text
+            p.advance()
+        }
+        if p.at(k.LT) {
+            parse_type_args(p, recv)
+        }
+        node.kids.push(recv)
+        has_recv = true
+        p.eat(k.DOT)
+    }
+    val (op_name, found_op) = parse_op_name(p)
+    if found_op {
+        node.name = op_name
+    } else if p.at(k.IDENT) {
+        node.name = p.peek().text
+        p.advance()
+    } else {
+        error_at(p, expect_found(p, "expected a function name, found "))
+        node.flag = join_word(vis, "")
+        node.head = fn_shape(0, 0, has_recv, false, false, false, 0, attrs.len as i64)
+        return node
+    }
+    var ntype: i64 = 0
+    if p.at(k.LT) {
+        val before = node.kids.len
+        parse_type_params(p, node)
+        ntype = (node.kids.len - before) as i64
+    }
+    p.eat(k.LPAREN)
+    val (params, variadic) = parse_param_list(p)
+    for param in params.items() {
+        node.kids.push(param)
+    }
+    p.eat(k.RPAREN)
+    var nctx: i64 = 0
+    var ret_node: *Node? = null
+    var has_ret = false
+    if p.eat(k.COLON) {
+        ret_node = parse_type(p)
+        if ret_node != null {
+            has_ret = true
+        }
+    }
+    if with_is_param_clause(p) {
+        p.advance()
+        p.eat(k.LPAREN)
+        val (contexts, ctx_variadic) = parse_param_list(p)
+        if ctx_variadic {
+        }
+        nctx = contexts.len as i64
+        for ctx in contexts.items() {
+            node.kids.push(ctx)
+        }
+        p.eat(k.RPAREN)
+    }
+    if ret_node != null {
+        node.kids.push(ret_node!!)
+    }
+    var has_body = false
+    var expr_body = false
+    if mode == "regular" || mode == "actual" {
+        if p.eat(k.ASSIGN) {
+            val body = parse_expr(p)
+            if body != null {
+                node.kids.push(body!!)
+                has_body = true
+                expr_body = true
+            }
+        } else if p.at(k.LBRACE) {
+            node.kids.push(parse_block(p))
+            has_body = true
+        }
+    }
+    var extra = ""
+    if mode == "extern" {
+        extra = "extern"
+        if variadic {
+            extra = "extern variadic"
+        }
+    } else if mode == "expect" {
+        extra = "expect"
+    } else if mode == "actual" {
+        extra = "actual"
+    }
+    node.flag = join_word(vis, extra)
+    node.head = fn_shape(params.len as i64, nctx, has_recv, has_ret, has_body, expr_body, ntype, attrs.len as i64)
+    return node
+}
+
+/**
+ * `extern { functions }`.
+ * @param p cursor on `extern`
+ * @param attrs attributes already parsed
+ * @param vis visibility word
+ * @context a allocator for the nodes
+ * @return the block
+ */
+fn parse_extern_block(p: *Parser, attrs: list.List<*Node>, vis: str): *Node with (a: mem.Allocator) {
+    val here = p.peek()
+    val node = make_node(NodeKind.EXTERN_BLOCK, here.line, here.column)
+    val k = lex.kind()
+    attach(node, attrs, vis)
+    p.advance()
+    if !p.eat(k.LBRACE) {
+        return node
+    }
+    for p.eat(k.SEP) {
+    }
+    for {
+        if p.at(k.RBRACE) || p.at(k.EOF) {
+            break
+        }
+        for p.eat(k.SEP) {
+        }
+        if p.at(k.RBRACE) || p.at(k.EOF) {
+            break
+        }
+        val fn_attrs = parse_attributes(p)
+        if p.at(k.KW_FN) {
+            node.kids.push(parse_fn(p, fn_attrs, "", "extern"))
+        } else {
+            break
+        }
+        for p.eat(k.SEP) {
+        }
+    }
+    p.eat(k.RBRACE)
+    return node
+}
+
+/**
+ * Read path, lex it, and print the tree. A lex error is printed
+ * with lex.print_error and nothing is parsed. The file bytes stay
+ * alive until the print returns.
+ * @param path source path
+ * @context a allocator for the file bytes
+ * @return 0 when the file lexed, 1 when it cannot be read or a token is ill-formed
+ */
+fn run(path: str): i32 with (a: mem.Allocator) {
+    var (data, err) = fs.read_all(path)
+    if err != null {
+        io.eprint("jogc: failed to read ")
+        io.eprint(path)
+        if err == errs.ErrNotFound {
+            io.eprintln(": file not found")
+        } else {
+            io.eprintln(": io error")
+        }
+        return 1
+    }
+    defer a.free(data)
+    var status: i32 = 0
+    arena.arena(4096) {
+        var errors: list.List<lex.LexError>
+        var tokens = lex.lex(data, &errors)
+        var p: Parser
+        p.tokens = tokens
+        p.path = path
+        p.errors = list.empty<ParseError>()
+        val file = parse_file(&p)
+        print_node(file, 0)
+        io.print("\n")
+        if errors.len > 0 {
+            for e in errors.items() {
+                lex.print_error(path, e)
+            }
+            status = 1
+        }
+        if p.errors.len > 0 {
+            for e in p.errors.items() {
+                print_parse_error(path, e)
+            }
+            status = 1
+        }
+    }
+    return status
 }

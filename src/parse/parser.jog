@@ -1,0 +1,180 @@
+// The tokens still to read. index is the current token. path is the
+// source path, used in diagnostics. pending_gt is the second `>` of a
+// `>>` that closed a type argument list. gt_line and gt_column are that
+// `>`'s position. allow_trail is true when `{` after a value is a trailing lambda.
+
+import src.lex
+import std.list
+import std.mem
+import std.strbuilder
+
+// One syntax error. Printed after lex errors, as path:line:column: error: message.
+struct ParseError {
+    line: i64
+    column: i64
+    message: str
+}
+
+struct Parser {
+    tokens: list.List<lex.Token>
+    index: usize
+    path: str
+    pending_gt: bool
+    gt_line: i64
+    gt_column: i64
+    allow_trail: bool
+    panic: bool
+    quiet: i64
+    errors: list.List<ParseError>
+}
+
+/**
+ * The current token. Past the last token, or an empty list, this is EOF at column 1.
+ * @self token cursor
+ * @return the token, not consumed
+ */
+fn *Parser.peek(): lex.Token {
+    if self.pending_gt {
+        var t: lex.Token
+        t.kind = lex.kind().GT
+        t.line = self.gt_line
+        t.column = self.gt_column
+        t.text = ">"
+        return t
+    }
+    if self.tokens.len == 0 || self.index >= self.tokens.len {
+        var t: lex.Token
+        t.line = 1
+        t.column = 1
+        return t
+    }
+    return self.tokens.get(self.index)
+}
+
+/**
+ * Whether the current token has this kind.
+ * @self token cursor
+ * @param kind kind to test
+ * @return true when peek matches kind
+ */
+fn *Parser.at(kind: lex.TokenKind): bool {
+    return self.peek().kind == kind
+}
+
+/**
+ * The kind n tokens ahead. Past the end, this is EOF.
+ * @self token cursor
+ * @param n how many tokens ahead. 0 is the current token
+ * @return the kind
+ */
+fn *Parser.kind_at(n: usize): lex.TokenKind {
+    var ahead = n
+    if self.pending_gt {
+        if ahead == 0 {
+            return lex.kind().GT
+        }
+        ahead = ahead - 1
+    }
+    val i = self.index + ahead
+    if i >= self.tokens.len {
+        return lex.kind().EOF
+    }
+    val tok: lex.Token = self.tokens.get(i)
+    return tok.kind
+}
+
+/**
+ * Move to the next token. Stays on EOF.
+ * @self token cursor
+ */
+fn *Parser.advance() {
+    if self.pending_gt {
+        self.pending_gt = false
+        return
+    }
+    if self.index >= self.tokens.len {
+        return
+    }
+    val current: lex.Token = self.tokens.get(self.index)
+    if current.kind == lex.kind().EOF {
+        return
+    }
+    self.index = self.index + 1
+}
+
+/**
+ * Consume kind when it is current.
+ * @self token cursor
+ * @param kind kind to consume
+ * @return true when the token was consumed
+ */
+fn *Parser.eat(kind: lex.TokenKind): bool {
+    if !self.at(kind) {
+        return false
+    }
+    self.advance()
+    return true
+}
+
+/**
+ * Consume kind when it is current. A mismatch reports and leaves the cursor there.
+ * @self token cursor
+ * @param kind kind that must be current
+ * @return true when the token was consumed
+ */
+fn *Parser.expect(kind: lex.TokenKind): bool with (a: mem.Allocator) {
+    if self.eat(kind) {
+        return true
+    }
+    var b = strbuilder.empty()
+    b.append("expected ")
+    val word = token_word(kind)
+    if word.len > 0 {
+        b.append(word)
+    } else {
+        b.append("token")
+    }
+    b.append(", found ")
+    b.append(found_word(self.peek()))
+    error_at(self, b.str())
+    return false
+}
+
+/**
+ * Whether a type-argument list is closed. `>>` counts as a closing `>`.
+ * @self token cursor
+ * @return true on `>` or `>>`
+ */
+fn *Parser.at_gt(): bool {
+    if self.pending_gt {
+        return true
+    }
+    val k = lex.kind()
+    return self.at(k.GT) || self.at(k.SHR)
+}
+
+/**
+ * Consume one closing `>`. `>>` consumes the first and leaves the second.
+ * @self token cursor
+ * @return true when a `>` was consumed
+ */
+fn *Parser.eat_gt(): bool {
+    if self.pending_gt {
+        self.pending_gt = false
+        return true
+    }
+    val k = lex.kind()
+    if self.eat(k.GT) {
+        return true
+    }
+    // `>>` is one token. The first `>` closes this list. The second stays pending.
+    if !self.at(k.SHR) {
+        return false
+    }
+    val tok = self.peek()
+    self.gt_line = tok.line
+    self.gt_column = tok.column + 1
+    self.advance()
+    self.pending_gt = true
+    return true
+}

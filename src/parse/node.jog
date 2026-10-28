@@ -1,0 +1,47 @@
+// One node of the syntax tree. Fields a kind does not use stay empty.
+// kids is the print order. op is EOF when the node has no operator.
+// flag holds a word the printer shows, such as const or private(file).
+// head is how many leading kids are the parameters of a function type.
+
+import src.lex
+import std.list
+import std.mem
+
+struct Node {
+    kind: NodeKind
+    line: i64
+    column: i64
+    name: str
+    text: str
+    op: lex.TokenKind
+    flag: str
+    head: i64
+    kids: list.List<*Node>
+}
+
+/**
+ * A node in the arena. name, text, and flag are empty. op is EOF.
+ * kids is an empty list. head is 0.
+ * @param kind node kind
+ * @param line 1-based line of the first token
+ * @param column 1-based column of the first token
+ * @context a allocator for the node
+ * @return the node
+ */
+fn make_node(kind: NodeKind, line: i64, column: i64): *Node with (a: mem.Allocator) {
+    val (raw, err) = a.alloc(size(Node), align(Node))
+    if err != null {
+        panic("out of memory")
+    }
+    val node = raw.ptr as *Node
+    node.kind = kind
+    node.line = line
+    node.column = column
+    node.name = ""
+    node.text = ""
+    node.flag = ""
+    node.op = lex.kind().EOF
+    node.head = 0
+    node.kids = list.empty<*Node>()
+    return node
+}

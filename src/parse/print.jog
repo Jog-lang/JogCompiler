@@ -1,0 +1,799 @@
+// The tree printer. The text matches compiler/src/ast_print.c.
+// print_node prints one node. print_indent and print_quoted serve it.
+
+import src.lex
+import std.io
+import std.text
+
+/**
+ * Print spaces for one indent level. A level is two spaces.
+ * @param ind indent level, 0 at the file
+ */
+fn print_indent(ind: i64) {
+    var i: i64 = 0
+    for i < ind {
+        io.print("  ")
+        i = i + 1
+    }
+}
+
+/**
+ * A quoted literal, with the same escapes as the C printer.
+ * @param s decoded text
+ */
+fn print_quoted(s: str) {
+    io.print("\"")
+    val digits = "0123456789ABCDEF"
+    var i: usize = 0
+    for i < s.len {
+        val c = s.ptr[i]
+        if c == '\n' as u8 {
+            io.print("\\n")
+        } else if c == '\t' as u8 {
+            io.print("\\t")
+        } else if c == '\r' as u8 {
+            io.print("\\r")
+        } else if c == '\\' as u8 {
+            io.print("\\\\")
+        } else if c == '"' as u8 {
+            io.print("\\\"")
+        } else if c < 32 || c == 127 {
+            val n = c as i64
+            val hi = (n / 16) as usize
+            val lo = (n % 16) as usize
+            io.print("\\x")
+            io.print(text.slice(digits, hi, hi + 1))
+            io.print(text.slice(digits, lo, lo + 1))
+        } else {
+            io.print(text.slice(s, i, i + 1))
+        }
+        i = i + 1
+    }
+    io.print("\"")
+}
+
+/**
+ * Print one node. TYPE_DECL prints its name, then `=`, then the type.
+ * TYPE_NAME prints its name, then type arguments when it has them. INT_LIT prints its text on one line. An inferred array
+ * prints `_`. A function type prints its parameters, then `->`, then the
+ * return type, then `with`. A flag such as const is a word after the kind.
+ * Other nodes print their kind and their children.
+ * @param node node to print
+ * @param ind indent level
+ */
+fn print_node(node: *Node, ind: i64) {
+    when node.kind {
+        BOOL_LIT -> {
+        print_indent(ind)
+        io.print("(BOOL ")
+        io.print(node.text)
+        io.print(")")
+        return
+        }
+        NULL_LIT -> {
+        print_indent(ind)
+        io.print("(NULL)")
+        return
+        }
+        else -> {}
+    }
+    print_indent(ind)
+    io.print("(")
+    io.print(node.kind.name)
+    when node.kind {
+        TYPE_DECL -> {
+        if node.name.len > 0 {
+            io.print(" ")
+            io.print(node.name)
+        }
+        if node.flag.len > 0 {
+            io.print(" ")
+            io.print(node.flag)
+        }
+        var i: i64 = 0
+        for i < node.head {
+            io.print("\n")
+            print_node(node.kids.get(i as usize), ind + 1)
+            i = i + 1
+        }
+        io.print("\n")
+        print_indent(ind + 1)
+        if node.op == lex.kind().COLON {
+            io.print(":")
+        } else {
+            io.print("=")
+        }
+        if node.kids.len > node.head as usize {
+            io.print("\n")
+            print_node(node.kids.get(node.head as usize), ind + 2)
+        }
+        io.print("\n")
+        print_indent(ind)
+        io.print(")")
+        return
+    }
+        STRUCT, INTERFACE, ENUM -> {
+        if node.name.len > 0 {
+            io.print(" ")
+            io.print(node.name)
+        }
+        if node.flag.len > 0 {
+            io.print(" ")
+            io.print(node.flag)
+        }
+        var i: i64 = 0
+        var multi = false
+        for i < node.head {
+            io.print("\n")
+            print_node(node.kids.get(i as usize), ind + 1)
+            i = i + 1
+            multi = true
+        }
+        if node.op == lex.kind().COLON {
+            io.print("\n")
+            print_indent(ind + 1)
+            io.print(":")
+            if node.kids.len > i as usize {
+                io.print("\n")
+                print_node(node.kids.get(i as usize), ind + 2)
+                i = i + 1
+            }
+            multi = true
+        }
+        for node.kids.len > i as usize {
+            io.print("\n")
+            print_node(node.kids.get(i as usize), ind + 1)
+            i = i + 1
+            multi = true
+        }
+        if multi {
+            io.print("\n")
+            print_indent(ind)
+        }
+        io.print(")")
+        return
+    }
+        IMPORT -> {
+        io.print(" ")
+        io.print(node.name)
+        if node.text.len > 0 {
+            io.print(" as ")
+            io.print(node.text)
+        }
+        if node.flag.len > 0 {
+            io.print(" ")
+            io.print(node.flag)
+        }
+        io.print(")")
+        return
+    }
+        ATTRIBUTE -> {
+        io.print(" ")
+        io.print(node.name)
+        if node.kids.len == 0 {
+            if node.text.len > 0 {
+                io.print(" ")
+                io.print(node.text)
+            }
+            io.print(")")
+            return
+        }
+        var i: usize = 0
+        for i < node.kids.len {
+            io.print("\n")
+            print_node(node.kids.get(i), ind + 1)
+            i = i + 1
+        }
+        io.print("\n")
+        print_indent(ind)
+        io.print(")")
+        return
+    }
+        TYPE_PARAM -> {
+        io.print(" ")
+        io.print(node.name)
+        if node.kids.len == 0 {
+            io.print(")")
+            return
+        }
+        }
+        FIELD, PARAM -> {
+        if node.name.len > 0 {
+            io.print(" ")
+            io.print(node.name)
+        }
+        if node.text.len > 0 {
+            io.print(" ")
+            io.print(node.text)
+        }
+        if node.flag.len > 0 {
+            io.print(" ")
+            io.print(node.flag)
+        }
+        if node.kids.len > 0 {
+            io.print("\n")
+            print_node(node.kids.get(0), ind + 1)
+        }
+        if node.kids.len > 1 {
+            io.print("\n")
+            print_indent(ind + 1)
+            io.print("=")
+            io.print("\n")
+            print_node(node.kids.get(1), ind + 2)
+        }
+        if node.kids.len > 0 {
+            io.print("\n")
+            print_indent(ind)
+        }
+        io.print(")")
+        return
+        }
+        VARIANT -> {
+        io.print(" ")
+        io.print(node.name)
+        if node.kids.len == 0 {
+            io.print(")")
+            return
+        }
+        var i: i64 = 0
+        for i < node.head {
+            io.print("\n")
+            print_node(node.kids.get(i as usize), ind + 1)
+            i = i + 1
+        }
+        if node.op == lex.kind().ASSIGN && node.kids.len > i as usize {
+            io.print("\n")
+            print_indent(ind + 1)
+            io.print("=")
+            io.print("\n")
+            print_node(node.kids.get(i as usize), ind + 2)
+        }
+        io.print("\n")
+        print_indent(ind)
+        io.print(")")
+        return
+        }
+        FN -> {
+        if node.name.len > 0 {
+            io.print(" ")
+            io.print(node.name)
+        }
+        if node.flag.len > 0 {
+            io.print(" ")
+            io.print(node.flag)
+        }
+        val shape = node.head
+        val nparams = shape % 256
+        val nctx = (shape / 256) % 256
+        val has_recv = (shape / 65536) % 2 == 1
+        val has_ret = (shape / 131072) % 2 == 1
+        val has_body = (shape / 262144) % 2 == 1
+        val expr_body = (shape / 524288) % 2 == 1
+        val ntype = (shape / 1048576) % 256
+        val nattrs = (shape / 268435456) % 256
+        var i: i64 = 0
+        var multi = false
+        var acount = nattrs
+        for acount > 0 {
+            io.print("\n")
+            print_node(node.kids.get(i as usize), ind + 1)
+            i = i + 1
+            acount = acount - 1
+            multi = true
+        }
+        if node.text.len > 0 || has_recv {
+            io.print("\n")
+            print_indent(ind + 1)
+            if node.text.len > 0 {
+                io.print(node.text)
+            } else {
+                io.print("recv")
+            }
+            if has_recv {
+                io.print("\n")
+                print_node(node.kids.get(i as usize), ind + 2)
+                i = i + 1
+            }
+            multi = true
+        }
+        var tcount = ntype
+        for tcount > 0 {
+            io.print("\n")
+            print_node(node.kids.get(i as usize), ind + 1)
+            i = i + 1
+            tcount = tcount - 1
+            multi = true
+        }
+        var pcount = nparams
+        for pcount > 0 {
+            io.print("\n")
+            print_node(node.kids.get(i as usize), ind + 1)
+            i = i + 1
+            pcount = pcount - 1
+            multi = true
+        }
+        if nctx > 0 {
+            io.print("\n")
+            print_indent(ind + 1)
+            io.print("with")
+            var ccount = nctx
+            for ccount > 0 {
+                io.print("\n")
+                print_node(node.kids.get(i as usize), ind + 2)
+                i = i + 1
+                ccount = ccount - 1
+            }
+            multi = true
+        }
+        if has_ret {
+            io.print("\n")
+            print_indent(ind + 1)
+            io.print("->")
+            io.print("\n")
+            print_node(node.kids.get(i as usize), ind + 2)
+            i = i + 1
+            multi = true
+        }
+        if has_body {
+            if expr_body {
+                io.print("\n")
+                print_indent(ind + 1)
+                io.print("=")
+                io.print("\n")
+                print_node(node.kids.get(i as usize), ind + 2)
+            } else {
+                io.print("\n")
+                print_node(node.kids.get(i as usize), ind + 1)
+            }
+            multi = true
+        }
+        if multi {
+            io.print("\n")
+            print_indent(ind)
+        }
+        io.print(")")
+        return
+        }
+        VAL, VAR, CONTEXT -> {
+        if node.flag.len > 0 {
+            io.print(" ")
+            io.print(node.flag)
+        }
+        if node.name.len > 0 {
+            io.print(" ")
+            io.print(node.name)
+        }
+        var multi = false
+        if node.text.len > 0 {
+            io.print("\n")
+            print_indent(ind + 1)
+            io.print("names ")
+            io.print(node.text)
+            multi = true
+        }
+        var i: usize = 0
+        if node.op == lex.kind().COLON && node.kids.len > 0 {
+            io.print("\n")
+            print_node(node.kids.get(0), ind + 1)
+            i = 1
+            multi = true
+        }
+        if node.kids.len > i {
+            io.print("\n")
+            print_indent(ind + 1)
+            io.print("=")
+            io.print("\n")
+            print_node(node.kids.get(i), ind + 2)
+            multi = true
+        }
+        if multi {
+            io.print("\n")
+            print_indent(ind)
+        }
+        io.print(")")
+        return
+        }
+        IDENT, DOT_VARIANT, BUILTIN, PAT_VARIANT, PAT_BIND -> {
+        io.print(" ")
+        io.print(node.name)
+        if node.kids.len == 0 {
+            io.print(")")
+            return
+        }
+        }
+        ARG, PAT_FIELD -> {
+        if node.name.len > 0 {
+            io.print(" ")
+            io.print(node.name)
+        }
+        }
+        WHEN_ARM -> {
+        if node.head == 0 {
+            io.print(" else")
+        }
+        }
+        IF -> {
+        if node.kids.len == 0 {
+            io.print(")")
+            return
+        }
+        if node.kids.len > 0 {
+            io.print("\n")
+            print_node(node.kids.get(0), ind + 1)
+        } else {
+            io.print("\n")
+            print_indent(ind + 1)
+            io.print("null")
+        }
+        if node.kids.len > 1 {
+            io.print("\n")
+            print_node(node.kids.get(1), ind + 1)
+        } else {
+            io.print("\n")
+            print_indent(ind + 1)
+            io.print("null")
+        }
+        if node.kids.len > 2 {
+            io.print("\n")
+            print_indent(ind + 1)
+            io.print("else")
+            io.print("\n")
+            print_node(node.kids.get(2), ind + 2)
+        }
+        io.print("\n")
+        print_indent(ind)
+        io.print(")")
+        return
+        }
+        LAMBDA -> {
+        val nparams = node.head % 256
+        val has_ret = (node.head / 256) % 2 == 1
+        val expr_body = (node.head / 512) % 2 == 1
+        val it = (node.head / 1024) % 2 == 1
+        if it {
+            io.print(" it")
+        }
+        if nparams == 0 && !has_ret && node.kids.len == 0 {
+            io.print(")")
+            return
+        }
+        var i: i64 = 0
+        for i < nparams && (i as usize) < node.kids.len {
+            io.print("\n")
+            print_node(node.kids.get(i as usize), ind + 1)
+            i = i + 1
+        }
+        if has_ret && (i as usize) < node.kids.len {
+            io.print("\n")
+            print_indent(ind + 1)
+            io.print("->")
+            io.print("\n")
+            print_node(node.kids.get(i as usize), ind + 2)
+            i = i + 1
+        }
+        if (i as usize) < node.kids.len {
+            if expr_body {
+                io.print("\n")
+                print_indent(ind + 1)
+                io.print("=")
+                io.print("\n")
+                print_node(node.kids.get(i as usize), ind + 2)
+            } else {
+                io.print("\n")
+                print_node(node.kids.get(i as usize), ind + 1)
+            }
+        }
+        io.print("\n")
+        print_indent(ind)
+        io.print(")")
+        return
+        }
+        GO -> {
+        val nargs = node.head % 256
+        val nctx = (node.head / 256) % 256
+        val has_body = (node.head / 65536) % 2 == 1
+        if nargs == 0 && nctx == 0 && !has_body {
+            io.print(")")
+            return
+        }
+        var i: i64 = 0
+        if nargs > 0 {
+            io.print("\n")
+            print_indent(ind + 1)
+            io.print("args")
+            for i < nargs && (i as usize) < node.kids.len {
+                io.print("\n")
+                print_node(node.kids.get(i as usize), ind + 2)
+                i = i + 1
+            }
+        }
+        if nctx > 0 {
+            io.print("\n")
+            print_indent(ind + 1)
+            io.print("with")
+            val ctx_end = i + nctx
+            for i < ctx_end && (i as usize) < node.kids.len {
+                io.print("\n")
+                print_node(node.kids.get(i as usize), ind + 2)
+                i = i + 1
+            }
+        }
+        if has_body && (i as usize) < node.kids.len {
+            io.print("\n")
+            print_node(node.kids.get(i as usize), ind + 1)
+        }
+        io.print("\n")
+        print_indent(ind)
+        io.print(")")
+        return
+        }
+        STRING_LIT, CSTRING_LIT, CHAR_LIT, HEXBLOB_LIT -> {
+        io.print(" ")
+        print_quoted(node.text)
+        io.print(")")
+        return
+        }
+        MEMBER -> {
+        if node.flag.len > 0 {
+            io.print(" ")
+            io.print(node.flag)
+        }
+        if node.kids.len > 0 {
+            io.print("\n")
+            print_node(node.kids.get(0), ind + 1)
+        }
+        io.print("\n")
+        print_indent(ind + 1)
+        if node.name.len > 0 {
+            io.print(node.name)
+        } else {
+            io.print(".")
+            io.print(node.text)
+        }
+        var m: usize = 1
+        for m < node.kids.len {
+            io.print("\n")
+            print_node(node.kids.get(m), ind + 1)
+            m = m + 1
+        }
+        io.print("\n")
+        print_indent(ind)
+        io.print(")")
+        return
+        }
+        CALL -> {
+        val nctx = node.head % 256
+        val trail = (node.head / 256) % 2 == 1
+        var end = node.kids.len
+        if trail && end > 0 {
+            end = end - 1
+        }
+        var ctx_at = end
+        if nctx > 0 && (nctx as usize) <= end {
+            ctx_at = end - (nctx as usize)
+        }
+        var c: usize = 0
+        for c < ctx_at {
+            io.print("\n")
+            print_node(node.kids.get(c), ind + 1)
+            c = c + 1
+        }
+        if nctx > 0 {
+            io.print("\n")
+            print_indent(ind + 1)
+            io.print("with")
+            for c < end {
+                io.print("\n")
+                print_node(node.kids.get(c), ind + 2)
+                c = c + 1
+            }
+        }
+        if trail && node.kids.len > 0 {
+            io.print("\n")
+            print_indent(ind + 1)
+            io.print("trailing")
+            io.print("\n")
+            print_node(node.kids.get(node.kids.len - 1), ind + 2)
+        }
+        io.print("\n")
+        print_indent(ind)
+        io.print(")")
+        return
+        }
+        SLICE -> {
+        var at: usize = 0
+        if node.kids.len > 0 {
+            io.print("\n")
+            print_node(node.kids.get(0), ind + 1)
+            at = 1
+        }
+        io.print("\n")
+        if node.head % 2 == 1 && at < node.kids.len {
+            print_node(node.kids.get(at), ind + 1)
+            at = at + 1
+        } else {
+            print_indent(ind + 1)
+            io.print("null")
+        }
+        io.print("\n")
+        if (node.head / 2) % 2 == 1 && at < node.kids.len {
+            print_node(node.kids.get(at), ind + 1)
+        } else {
+            print_indent(ind + 1)
+            io.print("null")
+        }
+        io.print("\n")
+        print_indent(ind)
+        io.print(")")
+        return
+        }
+        FOR -> {
+        io.print(" ")
+        io.print(node.text)
+        if node.name.len > 0 {
+            io.print(" ")
+            io.print(node.name)
+        }
+        if node.flag.len > 0 {
+            io.print(" ")
+            io.print(node.flag)
+        }
+        var i: usize = 0
+        if node.text != "forever" && node.kids.len > 0 {
+            io.print("\n")
+            print_node(node.kids.get(0), ind + 1)
+            i = 1
+        }
+        for i < node.kids.len {
+            io.print("\n")
+            print_node(node.kids.get(i), ind + 1)
+            i = i + 1
+        }
+        if node.kids.len > 0 {
+            io.print("\n")
+            print_indent(ind)
+        }
+        io.print(")")
+        return
+        }
+        DESTRUCTURE -> {
+        var i: i64 = 0
+        for i < node.head {
+            io.print("\n")
+            print_node(node.kids.get(i as usize), ind + 1)
+            i = i + 1
+        }
+        io.print("\n")
+        print_indent(ind + 1)
+        io.print("=")
+        if node.kids.len > node.head as usize {
+            io.print("\n")
+            print_node(node.kids.get(node.head as usize), ind + 2)
+        }
+        io.print("\n")
+        print_indent(ind)
+        io.print(")")
+        return
+        }
+        BINARY, ASSIGN, CAST -> {
+        io.print(" ")
+        io.print(node.text)
+        if node.kids.len > 0 {
+            io.print("\n")
+            print_node(node.kids.get(0), ind + 1)
+        }
+        if node.kids.len > 1 {
+            io.print("\n")
+            print_node(node.kids.get(1), ind + 1)
+        }
+        io.print("\n")
+        print_indent(ind)
+        io.print(")")
+        return
+        }
+        TYPE_SET -> {
+        var i: usize = 0
+        for i < node.kids.len {
+            io.print("\n")
+            val mark = text.slice(node.text, i, i + 1)
+            if mark == "~" {
+                print_indent(ind + 1)
+                io.print("~\n")
+                print_node(node.kids.get(i), ind + 2)
+            } else {
+                print_node(node.kids.get(i), ind + 1)
+            }
+            i = i + 1
+        }
+        io.print("\n")
+        print_indent(ind)
+        io.print(")")
+        return
+        }
+        UNARY, FORCE -> {
+        io.print(" ")
+        io.print(node.text)
+        if node.kids.len > 0 {
+            io.print("\n")
+            print_node(node.kids.get(0), ind + 1)
+        }
+        io.print("\n")
+        print_indent(ind)
+        io.print(")")
+        return
+    }
+        TYPE_NAME -> {
+        if node.name.len > 0 {
+            io.print(" ")
+            io.print(node.name)
+        }
+        if node.kids.len == 0 {
+            io.print(")")
+            return
+        }
+        }
+        INT_LIT, FLOAT_LIT -> {
+        io.print(" ")
+        io.print(node.text)
+        io.print(")")
+        return
+        }
+        else -> {}
+    }
+    if node.kind == NodeKind.TYPE_FN {
+        if node.flag.len > 0 {
+            io.print(" ")
+            io.print(node.flag)
+        }
+        var i: i64 = 0
+        for i < node.head {
+            io.print("\n")
+            print_node(node.kids.get(i as usize), ind + 1)
+            i = i + 1
+        }
+        io.print("\n")
+        print_indent(ind + 1)
+        io.print("->")
+        val ret_at = node.head
+        if node.kids.len > ret_at as usize {
+            io.print("\n")
+            print_node(node.kids.get(ret_at as usize), ind + 2)
+        }
+        var c = ret_at + 1
+        if node.kids.len > c as usize {
+            io.print("\n")
+            print_indent(ind + 1)
+            io.print("with")
+            for node.kids.len > c as usize {
+                io.print("\n")
+                print_node(node.kids.get(c as usize), ind + 2)
+                c = c + 1
+            }
+        }
+        io.print("\n")
+        print_indent(ind)
+        io.print(")")
+        return
+    }
+    if node.kind == NodeKind.TYPE_ARRAY && node.name.len > 0 {
+        io.print(" ")
+        io.print(node.name)
+    }
+    if node.flag.len > 0 {
+        io.print(" ")
+        io.print(node.flag)
+    }
+    if node.kids.len == 0 {
+        io.print(")")
+        return
+    }
+    var i: usize = 0
+    for i < node.kids.len {
+        io.print("\n")
+        print_node(node.kids.get(i), ind + 1)
+        i = i + 1
+    }
+    io.print("\n")
+    print_indent(ind)
+    io.print(")")
+}

@@ -1,0 +1,80 @@
+// The node kinds. The printer writes the variant name. The list matches
+// compiler/src/ast.h.
+
+enum NodeKind {
+    FILE // the whole source file
+    IMPORT // `import std.io` or `import vendor.sdl3 as sdl`
+    FN // `fn f(x: i32): i32 { }`
+    VAR // `var x: i32 = 1`
+    VAL // `val x = 1`
+    CONTEXT // `context log: Logger = l`
+    TYPE_DECL // `type A = i32` or `type Celsius: f64`
+    STRUCT // `struct Point { x: f32 }`
+    INTERFACE // `interface Shape { fn area(): f64 }`
+    ENUM // `enum Ordering: i8 { Less = -1 }`
+    EXTERN_BLOCK // `extern { fn open(path: *u8): i32 }`
+    ATTRIBUTE // `@packed` or `@test`
+    FIELD // `x: f32` or `len: u32 = 0`
+    EMBED // a bare type in a struct or interface, `Entity`
+    TYPE_SET // `~i8 | ~i16`
+    VARIANT // `Less = -1` or `Circle(r: f32)`
+    PARAM // `x: i32 = 0` or `...T: items`
+    TYPE_PARAM // `A` in `Pair<A, B>`
+    TYPE_NAME // `i32` or `Map<str, i32>`
+    TYPE_PTR // `*T` or `*const T`
+    TYPE_SLICE // `[]u8` or `[]const u8`
+    TYPE_ARRAY // `[4]i32` or `[_]T`
+    TYPE_BYTES // `bytes` or `bytes[4]`
+    TYPE_OPTION // `T?`. `*T?` wraps the pointer
+    TYPE_TUPLE // `(i32, str)` or `(i32)`
+    TYPE_FN // `(i32) -> i32` or `escaping () -> ()`
+    TYPE_UNIT // `()` as a type, not a tuple of one
+    BLOCK // `{ val x = 1 }`
+    EXPR_STMT // a call or other expression used as a statement
+    ASSIGN // `x = 1` or `x += 1`
+    DESTRUCTURE // `(a, b) = f()`
+    WITH // `with (log) { }`
+    DEFER // `defer close(f)`
+    ERRDEFER // `errdefer close(f)`
+    RETURN // `return 1`
+    FOR // `for x in xs { }`
+    BREAK // `break`
+    CONTINUE // `continue`
+    ATTR_BLOCK // `@unchecked { x = p }`
+    INT_LIT // `1_000` or `0xFF`. text is the lexeme
+    FLOAT_LIT // `3.14` or `1e-9`
+    STRING_LIT // `"hi"`. text is the decoded bytes
+    CSTRING_LIT // `c"hi"`
+    CHAR_LIT // `'a'` or `'\n'`
+    HEXBLOB_LIT // `x"de ad"`
+    BOOL_LIT // `true` or `false`
+    NULL_LIT // `null`
+    INTERP // `"a ${x} b"`
+    IDENT // a value name, `foo`
+    DOT_VARIANT // `.Empty`
+    TUPLE // `(1, 2)` as a value
+    UNARY // `-x`, `!x`, `~x`, `*p`, `&x`
+    BINARY // `a + b`, `a .. b`, `a ?: b`
+    CAST // `n as i32` or `n as? i32`
+    IS // `shape is Circle`
+    CALL // `f(1)` or `Point(x: 1)`
+    ARG // one argument, `x: 1` or `1`
+    INDEX // `a[i]`
+    SLICE // `a[lo..hi]`
+    MEMBER // `a.b` or `a?.b`
+    FORCE // `a!!`
+    IF // `if cond { 1 } else { 0 }`
+    WHEN // `when shape { Circle(r) -> r }`
+    WHEN_ARM // `Circle(r) -> r`
+    LAMBDA // `(x: i32) -> x + 1`
+    GO // `go work()`
+    ARRAY_LIT // `[4]i32(1, 2)`
+    BUILTIN // `@comptime(f())` or `@embed("f")`
+    PAT_VARIANT // `Circle(r)` or `Rect(w: 1, h)`
+    PAT_FIELD // `w: width` inside a pattern
+    PAT_BIND // a bare name in a pattern
+    PAT_WILDCARD // `_`
+    PAT_IN // `in 0..10`
+    PAT_IS // `is Circle`
+    PAT_EXPR // a constant compared with `==`
+}

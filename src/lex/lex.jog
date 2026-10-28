@@ -112,6 +112,208 @@ enum TokenKind {
     AS_Q // `as?` as one token; `as?.` is not this
 }
 
+// Every token kind as a value. src.parse cannot write lex.TokenKind.KW_FN:
+// a variant of another package is not a value. kind().KW_FN is.
+struct Kind {
+    EOF: TokenKind
+    IDENT: TokenKind
+    INT: TokenKind
+    FLOAT: TokenKind
+    STRING: TokenKind
+    STR_HEAD: TokenKind
+    STR_MID: TokenKind
+    STR_TAIL: TokenKind
+    CHAR: TokenKind
+    CSTRING: TokenKind
+    HEXBLOB: TokenKind
+    ATTR: TokenKind
+    SEP: TokenKind
+    LPAREN: TokenKind
+    RPAREN: TokenKind
+    LBRACE: TokenKind
+    RBRACE: TokenKind
+    LBRACKET: TokenKind
+    RBRACKET: TokenKind
+    DOT: TokenKind
+    DOTDOT: TokenKind
+    ELLIPSIS: TokenKind
+    QDOT: TokenKind
+    ELVIS: TokenKind
+    QUESTION: TokenKind
+    COMMA: TokenKind
+    COLON: TokenKind
+    TILDE: TokenKind
+    BANG: TokenKind
+    BANGBANG: TokenKind
+    NEQ: TokenKind
+    MINUS: TokenKind
+    ARROW: TokenKind
+    MINUS_ASSIGN: TokenKind
+    ASSIGN: TokenKind
+    EQ: TokenKind
+    LT: TokenKind
+    LE: TokenKind
+    CMP3: TokenKind
+    SHL: TokenKind
+    SHL_ASSIGN: TokenKind
+    GT: TokenKind
+    GE: TokenKind
+    SHR: TokenKind
+    SHR_ASSIGN: TokenKind
+    PLUS: TokenKind
+    PLUS_ASSIGN: TokenKind
+    STAR: TokenKind
+    STAR_ASSIGN: TokenKind
+    SLASH: TokenKind
+    SLASH_ASSIGN: TokenKind
+    PERCENT: TokenKind
+    PERCENT_ASSIGN: TokenKind
+    AMP: TokenKind
+    AMPAMP: TokenKind
+    AMP_ASSIGN: TokenKind
+    PIPE: TokenKind
+    PIPEPIPE: TokenKind
+    PIPE_ASSIGN: TokenKind
+    CARET: TokenKind
+    CARET_ASSIGN: TokenKind
+    KW_FN: TokenKind
+    KW_VAR: TokenKind
+    KW_VAL: TokenKind
+    KW_TYPE: TokenKind
+    KW_STRUCT: TokenKind
+    KW_INTERFACE: TokenKind
+    KW_ENUM: TokenKind
+    KW_IF: TokenKind
+    KW_ELSE: TokenKind
+    KW_WHEN: TokenKind
+    KW_FOR: TokenKind
+    KW_IN: TokenKind
+    KW_BREAK: TokenKind
+    KW_CONTINUE: TokenKind
+    KW_RETURN: TokenKind
+    KW_DEFER: TokenKind
+    KW_ERRDEFER: TokenKind
+    KW_GO: TokenKind
+    KW_WITH: TokenKind
+    KW_CONTEXT: TokenKind
+    KW_PRIVATE: TokenKind
+    KW_IMPORT: TokenKind
+    KW_AS: TokenKind
+    KW_IS: TokenKind
+    KW_NULL: TokenKind
+    KW_TRUE: TokenKind
+    KW_FALSE: TokenKind
+    KW_BYTES: TokenKind
+    KW_ESCAPING: TokenKind
+    KW_CONST: TokenKind
+    KW_EXTERN: TokenKind
+    KW_QUOTE: TokenKind
+    AS_Q: TokenKind
+}
+
+/**
+ * One value of every token kind. The parser spells a kind as kind().KW_FN.
+ * @return the kinds
+ */
+fn kind(): Kind {
+    var k: Kind
+    k.EOF = TokenKind.EOF
+    k.IDENT = TokenKind.IDENT
+    k.INT = TokenKind.INT
+    k.FLOAT = TokenKind.FLOAT
+    k.STRING = TokenKind.STRING
+    k.STR_HEAD = TokenKind.STR_HEAD
+    k.STR_MID = TokenKind.STR_MID
+    k.STR_TAIL = TokenKind.STR_TAIL
+    k.CHAR = TokenKind.CHAR
+    k.CSTRING = TokenKind.CSTRING
+    k.HEXBLOB = TokenKind.HEXBLOB
+    k.ATTR = TokenKind.ATTR
+    k.SEP = TokenKind.SEP
+    k.LPAREN = TokenKind.LPAREN
+    k.RPAREN = TokenKind.RPAREN
+    k.LBRACE = TokenKind.LBRACE
+    k.RBRACE = TokenKind.RBRACE
+    k.LBRACKET = TokenKind.LBRACKET
+    k.RBRACKET = TokenKind.RBRACKET
+    k.DOT = TokenKind.DOT
+    k.DOTDOT = TokenKind.DOTDOT
+    k.ELLIPSIS = TokenKind.ELLIPSIS
+    k.QDOT = TokenKind.QDOT
+    k.ELVIS = TokenKind.ELVIS
+    k.QUESTION = TokenKind.QUESTION
+    k.COMMA = TokenKind.COMMA
+    k.COLON = TokenKind.COLON
+    k.TILDE = TokenKind.TILDE
+    k.BANG = TokenKind.BANG
+    k.BANGBANG = TokenKind.BANGBANG
+    k.NEQ = TokenKind.NEQ
+    k.MINUS = TokenKind.MINUS
+    k.ARROW = TokenKind.ARROW
+    k.MINUS_ASSIGN = TokenKind.MINUS_ASSIGN
+    k.ASSIGN = TokenKind.ASSIGN
+    k.EQ = TokenKind.EQ
+    k.LT = TokenKind.LT
+    k.LE = TokenKind.LE
+    k.CMP3 = TokenKind.CMP3
+    k.SHL = TokenKind.SHL
+    k.SHL_ASSIGN = TokenKind.SHL_ASSIGN
+    k.GT = TokenKind.GT
+    k.GE = TokenKind.GE
+    k.SHR = TokenKind.SHR
+    k.SHR_ASSIGN = TokenKind.SHR_ASSIGN
+    k.PLUS = TokenKind.PLUS
+    k.PLUS_ASSIGN = TokenKind.PLUS_ASSIGN
+    k.STAR = TokenKind.STAR
+    k.STAR_ASSIGN = TokenKind.STAR_ASSIGN
+    k.SLASH = TokenKind.SLASH
+    k.SLASH_ASSIGN = TokenKind.SLASH_ASSIGN
+    k.PERCENT = TokenKind.PERCENT
+    k.PERCENT_ASSIGN = TokenKind.PERCENT_ASSIGN
+    k.AMP = TokenKind.AMP
+    k.AMPAMP = TokenKind.AMPAMP
+    k.AMP_ASSIGN = TokenKind.AMP_ASSIGN
+    k.PIPE = TokenKind.PIPE
+    k.PIPEPIPE = TokenKind.PIPEPIPE
+    k.PIPE_ASSIGN = TokenKind.PIPE_ASSIGN
+    k.CARET = TokenKind.CARET
+    k.CARET_ASSIGN = TokenKind.CARET_ASSIGN
+    k.KW_FN = TokenKind.KW_FN
+    k.KW_VAR = TokenKind.KW_VAR
+    k.KW_VAL = TokenKind.KW_VAL
+    k.KW_TYPE = TokenKind.KW_TYPE
+    k.KW_STRUCT = TokenKind.KW_STRUCT
+    k.KW_INTERFACE = TokenKind.KW_INTERFACE
+    k.KW_ENUM = TokenKind.KW_ENUM
+    k.KW_IF = TokenKind.KW_IF
+    k.KW_ELSE = TokenKind.KW_ELSE
+    k.KW_WHEN = TokenKind.KW_WHEN
+    k.KW_FOR = TokenKind.KW_FOR
+    k.KW_IN = TokenKind.KW_IN
+    k.KW_BREAK = TokenKind.KW_BREAK
+    k.KW_CONTINUE = TokenKind.KW_CONTINUE
+    k.KW_RETURN = TokenKind.KW_RETURN
+    k.KW_DEFER = TokenKind.KW_DEFER
+    k.KW_ERRDEFER = TokenKind.KW_ERRDEFER
+    k.KW_GO = TokenKind.KW_GO
+    k.KW_WITH = TokenKind.KW_WITH
+    k.KW_CONTEXT = TokenKind.KW_CONTEXT
+    k.KW_PRIVATE = TokenKind.KW_PRIVATE
+    k.KW_IMPORT = TokenKind.KW_IMPORT
+    k.KW_AS = TokenKind.KW_AS
+    k.KW_IS = TokenKind.KW_IS
+    k.KW_NULL = TokenKind.KW_NULL
+    k.KW_TRUE = TokenKind.KW_TRUE
+    k.KW_FALSE = TokenKind.KW_FALSE
+    k.KW_BYTES = TokenKind.KW_BYTES
+    k.KW_ESCAPING = TokenKind.KW_ESCAPING
+    k.KW_CONST = TokenKind.KW_CONST
+    k.KW_EXTERN = TokenKind.KW_EXTERN
+    k.KW_QUOTE = TokenKind.KW_QUOTE
+    k.AS_Q = TokenKind.AS_Q
+    return k
+}
+
 /**
  * True when `b` can start an identifier.
  * @param b source byte
