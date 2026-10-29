@@ -1,7 +1,7 @@
 main f1
 init none
 
-global g0 const jog_app__title: const bytes = hex:00 00 00 00 00 00 00 00 03 00 00 00 00 00 00 00 reloc 0 str "jog"  ; global_agg.jog:17:1
+global g0 const jog_app__title: str = hex:00 00 00 00 00 00 00 00 03 00 00 00 00 00 00 00 reloc 0 str "jog"  ; global_agg.jog:17:1
 global g1 const jog_app__pair: Pair = hex:00 00 00 00 00 00 00 00 03 00 00 00 00 00 00 00 02 00 00 00 00 00 00 00 reloc 0 str "jog"  ; global_agg.jog:18:1
 global g2 const jog_app__tag: Tag = hex:01 00 00 00  ; global_agg.jog:19:1
 global g3 const jog_app__shape: Shape = hex:00 00 00 00 04 00 00 00  ; global_agg.jog:20:1

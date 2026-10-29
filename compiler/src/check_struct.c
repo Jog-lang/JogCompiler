@@ -8,6 +8,7 @@
 #include "check_interface.h"
 #include "check_memory.h"
 #include "check_package.h"
+#include "scalar_op.h"
 
 #include "resolve_package.h"
 
@@ -877,6 +878,10 @@ static void dup_visit(JogNode *fn, JogPackage *pkg, void *ud) {
     if (!on) {
         return;
     }
+    if ((on->kind == JOG_TY_INT || on->kind == JOG_TY_FLOAT || on->kind == JOG_TY_BOOL) && walk->ck->program &&
+        jog_types_scalar_op(walk->ck->program->types, on, fn->as.fn.name, (int)fn->as.fn.params.count)) {
+        jog_check_fail(walk->ck, fn->pos, "duplicate method '%s'", fn->as.fn.name);
+    }
     for (prev = walk->seen; prev; prev = prev->next) {
         JogNode *earlier = prev->fn;
         JogType *prev_on = NULL;
@@ -1048,6 +1053,108 @@ static int lookup_method(Check *ck, CheckJob *job, JogType *outer, const char *n
         return 1;
     }
     return hit->symbol ? 1 : 0;
+}
+
+int jog_check_scalar_op(Check *ck, CheckJob *job, JogPos pos, JogTokenKind op, int unary, JogType *type, JogType **ret) {
+    const char *name;
+    JogMachine machine;
+    JogType *found_ret = NULL;
+    int value_params;
+    int found = 0;
+    size_t p;
+    size_t f;
+    size_t d;
+    if (ret) {
+        *ret = NULL;
+    }
+    if (!ck || !ck->program || !type || !jog_type_machine(type, &machine)) {
+        return 0;
+    }
+    name = jog_op_method_name(op);
+    if (!name) {
+        return 2;
+    }
+    value_params = unary ? 0 : 1;
+    if (type->kind == JOG_TY_INT || type->kind == JOG_TY_FLOAT || type->kind == JOG_TY_BOOL) {
+        JogType *got = jog_types_scalar_op(ck->program->types, type, name, value_params);
+        if (!got) {
+            return 2;
+        }
+        if (ret) {
+            *ret = got;
+        }
+        return 1;
+    }
+    if (!job) {
+        return 2;
+    }
+    for (p = 0; p < ck->program->package_count && !ck->stop; p++) {
+        JogPackage *pkg = ck->program->packages[p];
+        if (!pkg) {
+            continue;
+        }
+        for (f = 0; f < pkg->file_count && !ck->stop; f++) {
+            JogSourceFile *source = pkg->files ? pkg->files[f] : NULL;
+            JogNode *file;
+            if (!source || !source->ast || source->ast->kind != JOG_NODE_FILE) {
+                continue;
+            }
+            file = source->ast;
+            for (d = 0; d < file->as.file.decls.count && !ck->stop; d++) {
+                JogNode *decl = list_at(file->as.file.decls, d);
+                JogType *on = NULL;
+                int is_ptr = 0;
+                const char *intrinsic = NULL;
+                if (!decl || decl->kind != JOG_NODE_FN || !decl->as.fn.receiver || !decl->as.fn.name) {
+                    continue;
+                }
+                if (strcmp(decl->as.fn.name, name) != 0 || (int)decl->as.fn.params.count != value_params ||
+                    decl->as.fn.receiver_is_ptr) {
+                    continue;
+                }
+                if (job && decl == job->decl) {
+                    if (!decl->type || decl->type->kind != JOG_TY_FN) {
+                        continue;
+                    }
+                } else if (decl->symbol) {
+                    if (!jog_check_wait(ck, job, decl->symbol)) {
+                        return -1;
+                    }
+                    if (!decl->type || decl->type->kind != JOG_TY_FN) {
+                        continue;
+                    }
+                    if (!method_visible(job, decl->symbol)) {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+                if (!jog_fn_intrinsic_body(decl, &intrinsic)) {
+                    continue;
+                }
+                jog_method_receiver(decl, &on, &is_ptr);
+                if (on != type || is_ptr) {
+                    continue;
+                }
+                found++;
+                found_ret = decl->type->as.fn.ret;
+            }
+        }
+    }
+    if (ck->stop) {
+        return -1;
+    }
+    if (found > 1) {
+        jog_check_fail(ck, pos, "ambiguous method '%s'", name);
+        return -1;
+    }
+    if (found != 1 || !found_ret) {
+        return 2;
+    }
+    if (ret) {
+        *ret = found_ret;
+    }
+    return 1;
 }
 
 static JogNode *fn_param(JogNode *fn, size_t index) {
@@ -1486,6 +1593,33 @@ static JogType *named_receiver_type(Check *ck, CheckJob *job, JogNode *ident, Jo
     if (!sym) {
         return jog_check_error_type(ck);
     }
+    if (jog_symbol_is_core_option(sym)) {
+        JogList args;
+        JogNode *arg;
+        JogType *elem;
+        memset(&args, 0, sizeof(args));
+        if (ident) {
+            args = ident->as.ident.type_args;
+        }
+        if (args.count != 1) {
+            jog_check_fail(ck, ident ? ident->pos : (JogPos){0}, "Option takes one type argument");
+            return jog_check_error_type(ck);
+        }
+        arg = args.items ? args.items[0] : NULL;
+        elem = jog_check_resolve_type(ck, job, arg);
+        if (!elem || ck->stop) {
+            return NULL;
+        }
+        if (elem->kind == JOG_TY_ERROR) {
+            return elem;
+        }
+        elem = jog_type_option(ck->program->types, elem);
+        if (!elem) {
+            jog_check_oom(ck);
+            return NULL;
+        }
+        return elem;
+    }
     if (sym->decl && sym->decl->kind == JOG_NODE_TYPE_DECL && sym->type_param_count > 0 &&
         !sym->decl->as.type_decl.distinct) {
         return jog_generic_alias_apply(ck, job, sym, ident->as.ident.type_args, ident->pos);
@@ -1910,10 +2044,17 @@ static void check_field_value(Check *ck, CheckJob *job, JogBlockScope *scope, Jo
             assign->type = unit;
             return;
         }
-        if (!field_ty || field_ty->kind != JOG_TY_INT) {
-            char buf[160];
-            type_text(ck, field_ty, buf, sizeof(buf));
-            jog_check_fail(ck, assign->pos, "operator '%s' does not apply to %s", jog_token_spelling(base), buf);
+        {
+            JogType *op_ret = NULL;
+            int sr = jog_check_scalar_op(ck, job, assign->pos, base, 0, field_ty, &op_ret);
+            if (sr < 0 || ck->stop) {
+                return;
+            }
+            if (sr != 1) {
+                char buf[160];
+                type_text(ck, field_ty, buf, sizeof(buf));
+                jog_check_fail(ck, assign->pos, "operator '%s' does not apply to %s", jog_token_spelling(base), buf);
+            }
         }
         (void)jog_check_expr(ck, job, scope, assign->as.assign.value, field_ty);
     } else if (assign->as.assign.op == JOG_TOK_ASSIGN) {

@@ -1,0 +1,12 @@
+fn main() {
+    val s: str = "hi"
+    val back: bytes = s
+    val c: []const byte = s
+    val u: []u8 = s
+    val cast = s as bytes
+}
+
+// error: type mismatch: expected bytes, got str
+// error: type mismatch: expected const bytes, got str
+// error: type mismatch: expected []u8, got str
+// error: cannot cast str to bytes

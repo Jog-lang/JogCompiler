@@ -2,9 +2,9 @@ main f0
 init none
 
 fn f0 public jog_app__main "app.main": () -> ()  ; str.jog:3:1
-  l0 text: const bytes
+  l0 text: str
   l1 same: bool
-  l2: const bytes
+  l2: str
   l3: bool
   l4: usize
   l5: usize
@@ -20,7 +20,7 @@ fn f0 public jog_app__main "app.main": () -> ()  ; str.jog:3:1
   l15: bool
   l16: usize
   l17 diff: bool
-  l18: const bytes
+  l18: str
   l19: bool
   l20: usize
   l21: usize
@@ -36,8 +36,8 @@ fn f0 public jog_app__main "app.main": () -> ()  ; str.jog:3:1
   l31: bool
   l32: usize
 b0 entry:
-  l0 = copy const bytes "ab"  ; str.jog:4:5
-  l2 = copy const bytes "ab"  ; str.jog:5:21
+  l0 = copy str "ab"  ; str.jog:4:5
+  l2 = copy str "ab"  ; str.jog:5:21
   l6 = extract l0, 0  ; str.jog:5:21
   l5 = extract l0, 1  ; str.jog:5:21
   l8 = extract l2, 0  ; str.jog:5:21
@@ -67,7 +67,7 @@ b5 "eq.no":
   br b6 "eq.join"  ; str.jog:5:21
 b6 "eq.join":
   l1 = copy l3  ; str.jog:5:5
-  l18 = copy const bytes ""  ; str.jog:6:21
+  l18 = copy str ""  ; str.jog:6:21
   l22 = extract l0, 0  ; str.jog:6:21
   l21 = extract l0, 1  ; str.jog:6:21
   l24 = extract l18, 0  ; str.jog:6:21

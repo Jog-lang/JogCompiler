@@ -90,6 +90,7 @@ typedef struct JogProgram {
     const char *module_root;  /* folder containing jog.mod */
     const char *module_name;
     const char *std_root;     /* the std directory; import std.io is std_root/io */
+    const char *core_root;    /* the core directory; scalar.jog is the prelude */
     const char *runtime_root; /* folder containing jogrt.h and jogrt.c */
     JogPackage **packages;    /* dependency order: every package after the ones it imports */
     size_t package_count;

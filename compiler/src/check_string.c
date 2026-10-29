@@ -132,7 +132,8 @@ static JogType *universe_error(JogProgram *program) {
 }
 
 static bool is_str_type(const JogType *type) {
-    return type && type->kind == JOG_TY_BYTES && type->is_const;
+    return type && type->kind == JOG_TY_DISTINCT && type->as.nominal.package == NULL && type->as.nominal.name &&
+           strcmp(type->as.nominal.name, "str") == 0;
 }
 
 static bool is_mut_bytes(const JogType *type) {
@@ -366,7 +367,7 @@ static JogType *check_hole(Check *ck, CheckJob *job, JogBlockScope *scope, JogNo
 }
 
 static JogType *str_type(Check *ck) {
-    return jog_type_builtin(ck->program->types, JOG_BUILTIN_CONST_BYTES);
+    return jog_type_core_str(ck->program->types);
 }
 
 static JogType *fmt_result(Check *ck, CheckJob *job) {

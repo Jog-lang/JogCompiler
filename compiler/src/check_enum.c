@@ -682,9 +682,21 @@ static JogType *variant_value(Check *ck, JogNode *node, JogType *type, const Jog
     return type;
 }
 
+int jog_symbol_is_core_option(const JogSymbol *symbol) {
+    const JogType *type;
+    if (!symbol || symbol->kind != JOG_SYM_TYPE || symbol->package != NULL || symbol->type_param_count != 1 ||
+        !symbol->name || strcmp(symbol->name, "Option") != 0) {
+        return 0;
+    }
+    type = symbol->type;
+    return type && type->kind == JOG_TY_ENUM && !type->has_layout && type->as.nominal.variant_count == 0 &&
+           type->as.nominal.package == NULL && type->as.nominal.name && strcmp(type->as.nominal.name, "Option") == 0;
+}
+
 /* Option<T> is the structural option, unless this file already has a type
    named Option. Some and None name that option. A user method named Some
-   is not this path: the base has to be the name Option. */
+   is not this path: the base has to be the name Option. The core prelude
+   enum is that constructor, not a second layout. */
 static JogType *builtin_option_type(Check *ck, CheckJob *job, JogBlockScope *scope, JogNode *base) {
     JogSymbol *symbol;
     JogType *elem;
@@ -697,7 +709,7 @@ static JogType *builtin_option_type(Check *ck, CheckJob *job, JogBlockScope *sco
     if (!symbol && job) {
         symbol = jog_check_lookup_file(job, "Option");
     }
-    if (symbol && symbol->kind == JOG_SYM_TYPE) {
+    if (symbol && symbol->kind == JOG_SYM_TYPE && !jog_symbol_is_core_option(symbol)) {
         return NULL;
     }
     if (base->as.ident.type_args.count != 1) {
@@ -1503,7 +1515,7 @@ int jog_check_enum_name(Check *ck, JogNode *member, JogType *outer) {
     if (!en || en->kind != JOG_TY_ENUM || enum_has_field(en, "name")) {
         return 0;
     }
-    str = jog_type_builtin(ck->program->types, JOG_BUILTIN_CONST_BYTES);
+    str = jog_type_core_str(ck->program->types);
     if (!str) {
         jog_check_oom(ck);
         return -1;

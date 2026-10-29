@@ -70,7 +70,7 @@ private fn write_i32(p: *u8, at: usize, n: i32): usize {
 }
 
 fn report(ran: i32) {
-    var raw: bytes[80]
+    var raw: [80]byte
     val p = raw[..].ptr
     var at: usize = 0
     at = write_i32(p, at, ran)

@@ -39,11 +39,11 @@ fn main() {
     val cell = nested[1][0]
     val c = []const i32(4, 5)
     val cz = c[0]
-    var raw: bytes[4]
-    val one: bytes[1] = raw[0]
+    var raw: [4]byte
+    val one: [1]byte = raw[0]
     val midb = raw[1..3]
     val empty = bytes()
-    val ch: bytes[1] = "ab"[0]
+    val ch: [1]byte = "ab"[0]
     val pre: str = "abcd"[1..3]
     var n: i32 = 1
     var np: *i32 = &n

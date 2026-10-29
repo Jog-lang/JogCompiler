@@ -75,12 +75,13 @@ static int is_float_type(const JogType *type) {
 }
 
 static int is_str_type(const Check *ck, const JogType *type) {
-    JogType *str;
     if (!ck || !ck->program || !ck->program->types || !type) {
         return 0;
     }
-    str = jog_type_builtin(ck->program->types, JOG_BUILTIN_CONST_BYTES);
-    return str && type == str;
+    if (jog_type_is_core_str(ck->program->types, type)) {
+        return 1;
+    }
+    return type->kind == JOG_TY_BYTES && type->is_const;
 }
 
 static JogType *peel_ptr(JogType *type) {

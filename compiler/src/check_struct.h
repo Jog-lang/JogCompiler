@@ -51,6 +51,15 @@ bool jog_struct_has_zero(const JogType *type);
    self is that type or *that type, taken from the function's first parameter. */
 void jog_method_receiver(const JogNode *fn, JogType **on, int *is_ptr);
 
+/* 1 when op resolves on an intrinsic scalar or a distinct type built on one.
+   *ret is the result type. 2 when the type is a scalar but has no such
+   operator. 0 when type is not a scalar carrier. -1 when an error was
+   reported or the checker stopped. unary is 1 for a method with no value
+   parameter. Builtin integers, floats, and bool use the prelude table.
+   A distinct type uses a method declared on that type. */
+int jog_check_scalar_op(Check *ck, CheckJob *job, JogPos pos, JogTokenKind op, int unary, JogType *type,
+                        JogType **ret);
+
 /* Visible field or promoted field. here is the declaration being checked
    or lowered (a function, for private(scope)); NULL hides private(scope). */
 void jog_struct_lookup_field(JogType *type, const char *name, const JogNode *here, const JogPackage *pkg,

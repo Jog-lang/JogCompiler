@@ -812,7 +812,7 @@ static bool fold_int(Lower *L, JogNode *expr, uint64_t *bits) {
 /* A value arm uses the same compare as ==: str and bytes by length then
    bytes, enums by tag and payload, integers and bools by JIR_EQ. */
 static bool value_eq(Lower *L, JirOperand subject, JirOperand rhs, JogPos pos, JirOperand *out) {
-    if (subject.type && subject.type->kind == JOG_TY_BYTES) {
+    if (jog_type_bytes_view(subject.type)) {
         *out = jog_lower_bytes_cmp(L, subject, rhs, false, pos);
         return !L->failed && out->kind != JIR_OPND_NONE;
     }

@@ -42,10 +42,12 @@
    standard library at std_root (JOG_ROOT/std when JOG_ROOT is set and
    non-empty, otherwise <directory of this executable>/../std); a module M
    requires, at its --module folder; otherwise a folder under M's root.
-   Package paths are canonical: as written in the root module, prefixed
-   with the module name in a dependency, so sdl's `import video` is
-   sdl.video. A folder named std, or named like a required module, is an
-   error.
+   core is found the same way, as a sibling of std, and is loaded by the
+   checker rather than by import. Package paths are canonical: as written
+   in the root module, prefixed with the module name in a dependency, so
+   sdl's `import video` is sdl.video. A folder named std or core, or named
+   like a required module, is an error when it is a different directory
+   from the library the compiler already resolved.
 
    *.jog files in a package folder are lexed and parsed. *.test.jog files
    are included only when options.include_tests is set, and only in the
@@ -944,22 +946,28 @@ static void loader_free(Loader *loader) {
     ct_da_free(&loader->order);
 }
 
-static bool locate_roots(Loader *loader) {
-    CtArena *arena = loader->program->arena;
-    const char *env = ct_fs_getenv(arena, "JOG_ROOT");
+bool jog_locate_roots(JogProgram *program) {
+    CtArena *arena;
+    const char *env;
     const char *base = NULL;
     const char *std_dir = NULL;
+    const char *core_dir = NULL;
     const char *runtime_dir = NULL;
     CtPos pos = {0};
+    if (!program || !program->arena || !program->diag) {
+        return false;
+    }
+    arena = program->arena;
+    env = ct_fs_getenv(arena, "JOG_ROOT");
     if (env && env[0] != '\0') {
         pos.file = env;
         if (!ct_fs_is_dir(env)) {
-            LOAD_ERROR(loader, pos, "JOG_ROOT '%s' is not a directory", env);
+            ct_diag_emit(program->diag, CT_SEVERITY_ERROR, pos, "JOG_ROOT '%s' is not a directory", env);
             return false;
         }
         base = absolute_path(arena, env);
         if (!base) {
-            LOAD_ERROR(loader, pos, "cannot resolve JOG_ROOT '%s'", env);
+            ct_diag_emit(program->diag, CT_SEVERITY_ERROR, pos, "cannot resolve JOG_ROOT '%s'", env);
             return false;
         }
     } else {
@@ -969,7 +977,7 @@ static bool locate_roots(Loader *loader) {
             exe_dir = parent_dir(arena, exe);
             base = exe_dir ? parent_dir(arena, exe_dir) : NULL;
             if (!exe_dir || !base) {
-                LOAD_ERROR(loader, pos, "out of memory");
+                ct_diag_emit(program->diag, CT_SEVERITY_ERROR, pos, "out of memory");
                 return false;
             }
         }
@@ -978,30 +986,54 @@ static bool locate_roots(Loader *loader) {
         return true;
     }
     std_dir = ct_path_join(arena, base, "std");
+    core_dir = ct_path_join(arena, base, "core");
     runtime_dir = ct_path_join(arena, base, "runtime");
-    if (!std_dir || !runtime_dir) {
-        LOAD_ERROR(loader, pos, "out of memory");
+    if (!std_dir || !core_dir || !runtime_dir) {
+        ct_diag_emit(program->diag, CT_SEVERITY_ERROR, pos, "out of memory");
         return false;
     }
-    /* build/jog.exe finds <exe>/../std. bootstrap/stage0/jog.exe is one
-       directory deeper, so try the parent once before giving up. JOG_ROOT
-       stays exact: a missing library there is an error, not a search. */
-    if ((!env || env[0] == '\0') && !ct_fs_is_dir(std_dir)) {
-        const char *up = parent_dir(arena, base);
-        const char *alt_std = up ? ct_path_join(arena, up, "std") : NULL;
-        const char *alt_rt = up ? ct_path_join(arena, up, "runtime") : NULL;
-        if (alt_std && ct_fs_is_dir(alt_std)) {
-            std_dir = alt_std;
-            if (alt_rt && ct_fs_is_dir(alt_rt)) {
-                runtime_dir = alt_rt;
+    /* build/jog.exe finds <exe>/../std and <exe>/../core.
+       bootstrap/stage0/jog.exe is one directory deeper, so try the parent
+       once before giving up. JOG_ROOT stays exact: a missing library there
+       is an error, not a search. */
+    if (!env || env[0] == '\0') {
+        const char *up = NULL;
+        if (!ct_fs_is_dir(std_dir) || !ct_fs_is_dir(core_dir)) {
+            up = parent_dir(arena, base);
+        }
+        if (up && !ct_fs_is_dir(std_dir)) {
+            const char *alt_std = ct_path_join(arena, up, "std");
+            const char *alt_rt = ct_path_join(arena, up, "runtime");
+            if (alt_std && ct_fs_is_dir(alt_std)) {
+                std_dir = alt_std;
+                if (alt_rt && ct_fs_is_dir(alt_rt)) {
+                    runtime_dir = alt_rt;
+                }
+            }
+        }
+        if (up && !ct_fs_is_dir(core_dir)) {
+            const char *alt_core = ct_path_join(arena, up, "core");
+            if (alt_core && ct_fs_is_dir(alt_core)) {
+                core_dir = alt_core;
             }
         }
     }
     if (ct_fs_is_dir(std_dir)) {
-        loader->program->std_root = std_dir;
+        program->std_root = std_dir;
+    }
+    if (ct_fs_is_dir(core_dir)) {
+        program->core_root = core_dir;
     }
     if (ct_fs_is_dir(runtime_dir)) {
-        loader->program->runtime_root = runtime_dir;
+        program->runtime_root = runtime_dir;
+    }
+    return true;
+}
+
+static bool locate_roots(Loader *loader) {
+    if (!jog_locate_roots(loader->program)) {
+        loader->failed = true;
+        return false;
     }
     return true;
 }
@@ -1128,9 +1160,20 @@ static bool open_module(Loader *loader, const char *start) {
     }
     /* This repository is both the module and the standard library. A
        folder named std is a shadow only when it is some other directory.
-       Imports of std still resolve through program->std_root. */
+       Imports of std still resolve through program->std_root. core is
+       the same: the prelude next to this module is not a shadow of itself. */
     if (ct_fs_is_dir(local_std) && !same_directory(arena, local_std, loader->program->std_root)) {
         LOAD_ERROR(loader, loader->module_pos, "folder 'std' shadows the standard library");
+    }
+    {
+        const char *local_core = ct_path_join(arena, root, "core");
+        if (!local_core) {
+            LOAD_ERROR(loader, loader->module_pos, "out of memory");
+            return false;
+        }
+        if (ct_fs_is_dir(local_core) && !same_directory(arena, local_core, loader->program->core_root)) {
+            LOAD_ERROR(loader, loader->module_pos, "folder 'core' shadows the core prelude");
+        }
     }
     return true;
 }

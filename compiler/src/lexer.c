@@ -187,7 +187,6 @@ static bool ends_statement(JogTokenKind kind) {
     case JOG_TOK_KW_TRUE:
     case JOG_TOK_KW_FALSE:
     case JOG_TOK_KW_NULL:
-    case JOG_TOK_KW_BYTES:
         return true;
     default:
         return false;

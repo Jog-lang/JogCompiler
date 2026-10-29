@@ -11,7 +11,7 @@
    result as i64 and a boolean result as bool. A value that does not fit,
    overflow of an operator, and division by zero are compile errors.
 
-   A hex integer literal (0x, underscores ignored) with a bytes[N] target
+   A hex integer literal (0x, underscores ignored) with a [N]byte target
    is the bytes in written order, and it must contain exactly 2*N digits.
    Every other integer literal is a number; a hex literal used as an
    integer is that number, zero-extended into an unsigned target.

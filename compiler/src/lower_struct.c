@@ -744,6 +744,9 @@ static void walk_self(JogNode *node, JogNode *fn, JogSymbol **out) {
         walk_list(node->as.call.args, fn, out);
         walk_self(node->as.call.trailing, fn, out);
         return;
+    case JOG_NODE_BUILTIN:
+        walk_list(node->as.builtin.args, fn, out);
+        return;
     case JOG_NODE_UNARY:
     case JOG_NODE_FORCE:
         walk_self(node->as.unary.operand, fn, out);

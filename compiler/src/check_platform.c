@@ -124,7 +124,8 @@ static int same_type(const JogNode *a, const JogNode *b) {
     }
     switch (a->kind) {
     case JOG_NODE_TYPE_NAME:
-        if (!same_names(a->as.type_name.path, b->as.type_name.path) ||
+        if (a->as.type_name.is_const != b->as.type_name.is_const ||
+            !same_names(a->as.type_name.path, b->as.type_name.path) ||
             a->as.type_name.args.count != b->as.type_name.args.count) {
             return 0;
         }
@@ -144,9 +145,6 @@ static int same_type(const JogNode *a, const JogNode *b) {
         return a->as.type_array.infer_len == b->as.type_array.infer_len &&
                same_expr(a->as.type_array.len, b->as.type_array.len) &&
                same_type(a->as.type_array.elem, b->as.type_array.elem);
-    case JOG_NODE_TYPE_BYTES:
-        return a->as.type_bytes.is_const == b->as.type_bytes.is_const &&
-               same_expr(a->as.type_bytes.len, b->as.type_bytes.len);
     case JOG_NODE_TYPE_TUPLE:
         if (a->as.type_tuple.elems.count != b->as.type_tuple.elems.count) {
             return 0;
@@ -216,6 +214,9 @@ static void append_type(CtSb *sb, const JogNode *node) {
     }
     switch (node->kind) {
     case JOG_NODE_TYPE_NAME:
+        if (node->as.type_name.is_const) {
+            ct_sb_append_cstr(sb, "const ");
+        }
         if (node->as.type_name.path.count == 0 || !node->as.type_name.path.items) {
             ct_sb_append_cstr(sb, "?");
         }
@@ -263,17 +264,6 @@ static void append_type(CtSb *sb, const JogNode *node) {
         }
         ct_sb_putc(sb, ']');
         append_type(sb, node->as.type_array.elem);
-        return;
-    case JOG_NODE_TYPE_BYTES:
-        if (node->as.type_bytes.is_const) {
-            ct_sb_append_cstr(sb, "const ");
-        }
-        ct_sb_append_cstr(sb, "bytes");
-        if (node->as.type_bytes.len) {
-            ct_sb_putc(sb, '[');
-            append_expr(sb, node->as.type_bytes.len);
-            ct_sb_putc(sb, ']');
-        }
         return;
     case JOG_NODE_TYPE_TUPLE:
         ct_sb_putc(sb, '(');

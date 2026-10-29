@@ -7,7 +7,7 @@
 #include <string.h>
 
 /* Arrays are C structs with the payload at offset 0, so a bitcast from
-   *[N]T to *T is the first element. bytes[N] bitcasts to *u8 or *(bytes[1]).
+   *[N]T to *T is the first element. [N]byte bitcasts to *u8 or *byte.
    Slice and bytes headers are (ptr, len). A slice literal in a function
    owns a hidden stack array. A pack argument is that same header: one
    stack array of the elements, or a zero slice when there are none.
@@ -348,6 +348,9 @@ static JirOperand index_ptr(Lower *L, JogNode *node) {
     }
     base_node = node->as.index.base;
     base = base_node ? jog_lower_type(L, base_node->type) : NULL;
+    if (base && base->kind == JOG_TY_DISTINCT && jog_type_bytes_view(base)) {
+        base = jog_type_bytes_view(base);
+    }
     usize = builtin(L, JOG_BUILTIN_USIZE);
     if (!base || !usize || !base_node) {
         jog_lower_fail(L, node->pos, "cannot index this value");
@@ -415,6 +418,9 @@ static JirOperand lower_slice(Lower *L, JogNode *node) {
     JogNode *base_node = node->as.slice.base;
     JogType *base = base_node ? jog_lower_type(L, base_node->type) : NULL;
     JogType *result = jog_lower_type(L, node->type);
+    if (base && base->kind == JOG_TY_DISTINCT && jog_type_bytes_view(base)) {
+        base = jog_type_bytes_view(base);
+    }
     JogType *usize;
     JogType *elem = NULL;
     JogType *ptr_ty;
@@ -489,17 +495,25 @@ static JirOperand lower_slice(Lower *L, JogNode *node) {
     }
     span = emit_binop(L, JIR_SUB, true, hi, lo, usize, node->pos);
     ptr = emit_elem(L, first, lo, ptr_ty, node->pos);
-    if (result->kind == JOG_TY_BYTES) {
-        JogType *u8 = builtin(L, JOG_BUILTIN_U8);
-        agg_ptr = u8 ? jog_type_ptr(L->program->types, u8, result->is_const) : NULL;
-    } else {
-        agg_ptr = jog_type_ptr(L->program->types, result->as.elem.elem, result->is_const);
+    {
+        JogType *agg = result;
+        JogType *view = jog_type_bytes_view(result);
+        if (view && result->kind == JOG_TY_DISTINCT) {
+            agg = view;
+        }
+        if (agg->kind == JOG_TY_BYTES) {
+            JogType *u8 = builtin(L, JOG_BUILTIN_U8);
+            agg_ptr = u8 ? jog_type_ptr(L->program->types, u8, agg->is_const) : NULL;
+        } else {
+            agg_ptr = jog_type_ptr(L->program->types, agg->as.elem.elem, agg->is_const);
+        }
     }
     ptr = emit_bitcast(L, ptr, agg_ptr, node->pos);
     return emit_agg2(L, result, ptr, span, node->pos);
 }
 
 static bool fill_array(Lower *L, uint32_t slot, JogType *array_ty, JogList elems, JogPos pos) {
+    JogType *elem;
     JogType *elem_ptr;
     JogType *usize;
     JirOperand first;
@@ -509,7 +523,12 @@ static bool fill_array(Lower *L, uint32_t slot, JogType *array_ty, JogList elems
         return !L->failed;
     }
     usize = builtin(L, JOG_BUILTIN_USIZE);
-    elem_ptr = jog_type_ptr(L->program->types, array_ty->as.array.elem, false);
+    if (array_ty->kind == JOG_TY_BYTES_N) {
+        elem = jog_type_bytes_n(L->program->types, 1);
+    } else {
+        elem = array_ty->as.array.elem;
+    }
+    elem_ptr = elem ? jog_type_ptr(L->program->types, elem, false) : NULL;
     first = emit_bitcast(L, addr_local(L, slot, pos), elem_ptr, pos);
     if (!usize || !elem_ptr || L->failed) {
         return false;
@@ -536,11 +555,6 @@ static JirOperand lower_slice_lit(Lower *L, JogNode *node, JogType *slice_ty) {
     JogType *ptr_ty;
     uint32_t slot;
     size_t count = node->as.array_lit.elems.count;
-    if (slice_ty->kind == JOG_TY_BYTES) {
-        elem = builtin(L, JOG_BUILTIN_U8);
-    } else {
-        elem = slice_ty->as.elem.elem;
-    }
     if (count == 0) {
         return emit_zero_value(L, slice_ty, node->pos);
     }
@@ -548,11 +562,19 @@ static JirOperand lower_slice_lit(Lower *L, JogNode *node, JogType *slice_ty) {
         jog_lower_fail(L, node->pos, "slice literal in a global initializer does not outlive initialization");
         return jir_none();
     }
-    if (!elem) {
-        return jir_none();
+    if (slice_ty->kind == JOG_TY_BYTES) {
+        JogType *u8 = builtin(L, JOG_BUILTIN_U8);
+        /* Elements are byte. The view header still stores *u8. */
+        array_ty = jog_type_bytes_n(L->program->types, (uint64_t)count);
+        ptr_ty = u8 ? jog_type_ptr(L->program->types, u8, slice_ty->is_const) : NULL;
+    } else {
+        elem = slice_ty->as.elem.elem;
+        if (!elem) {
+            return jir_none();
+        }
+        array_ty = jog_type_array(L->program->types, elem, (uint64_t)count);
+        ptr_ty = jog_type_ptr(L->program->types, elem, slice_ty->is_const);
     }
-    array_ty = jog_type_array(L->program->types, elem, (uint64_t)count);
-    ptr_ty = jog_type_ptr(L->program->types, elem, slice_ty->is_const);
     if (!array_ty || !ptr_ty || !jog_lower_new_local(L, NULL, array_ty, &slot)) {
         if (!L->failed) {
             jog_lower_fail(L, node->pos, "out of memory");
@@ -575,7 +597,7 @@ static JirOperand lower_array_lit(Lower *L, JogNode *node) {
     if (type->kind == JOG_TY_SLICE || type->kind == JOG_TY_BYTES) {
         return lower_slice_lit(L, node, type);
     }
-    if (type->kind != JOG_TY_ARRAY) {
+    if (type->kind != JOG_TY_ARRAY && type->kind != JOG_TY_BYTES_N) {
         jog_lower_fail(L, node->pos, "array literal type is not an array or a slice");
         return jir_none();
     }

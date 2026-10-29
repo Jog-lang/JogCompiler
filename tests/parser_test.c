@@ -256,7 +256,7 @@ static void test_bindings_and_types(void) {
                               "var buf: [256]u8\n"
                               "context alloc = defaultAllocator\n"
                               "type Celsius: f64\n"
-                              "type Handle = bytes[8]\n"
+                              "type Handle = [8]byte\n"
                               "type Opt = *T?\n"
                               "type Inner = *(T?)\n"
                               "type View = []T?\n"
@@ -290,8 +290,8 @@ static void test_bindings_and_types(void) {
     CHECK(celsius->as.type_decl.distinct);
     CHECK(path_is(celsius->as.type_decl.target, "f64"));
     CHECK(!decl_at(&parsed, 5)->as.type_decl.distinct);
-    CHECK(decl_at(&parsed, 5)->as.type_decl.target->kind == JOG_NODE_TYPE_BYTES);
-    CHECK(decl_at(&parsed, 5)->as.type_decl.target->as.type_bytes.len != NULL);
+    CHECK(decl_at(&parsed, 5)->as.type_decl.target->kind == JOG_NODE_TYPE_ARRAY);
+    CHECK(path_is(decl_at(&parsed, 5)->as.type_decl.target->as.type_array.elem, "byte"));
 
     JogNode *opt = decl_at(&parsed, 6)->as.type_decl.target;
     CHECK(opt->kind == JOG_NODE_TYPE_OPTION);
@@ -334,7 +334,7 @@ static void test_bindings_and_types(void) {
 
 static void test_aggregates(void) {
     Parsed parsed = parse_src("@packed\n"
-                              "private(file) struct Header { magic: bytes[4], len: u32 = 0 }\n"
+                              "private(file) struct Header { magic: [4]byte, len: u32 = 0 }\n"
                               "struct Player { Entity\n name: str }\n"
                               "interface Shape {\n"
                               "    Named\n"
@@ -362,7 +362,8 @@ static void test_aggregates(void) {
     CHECK(header->as.aggregate.members.count == 2);
     JogNode *magic = header->as.aggregate.members.items[0];
     CHECK(magic->kind == JOG_NODE_FIELD);
-    CHECK(magic->as.field.type->kind == JOG_NODE_TYPE_BYTES);
+    CHECK(magic->as.field.type->kind == JOG_NODE_TYPE_ARRAY);
+    CHECK(path_is(magic->as.field.type->as.type_array.elem, "byte"));
     CHECK(header->as.aggregate.members.items[1]->as.field.default_value != NULL);
 
     JogNode *player = decl_at(&parsed, 1);
@@ -422,7 +423,7 @@ static void test_precedence_and_exprs(void) {
                               "val e = \"hi ${name}\"\n"
                               "val f = items[1..]\n"
                               "val g = p!!\n"
-                              "val h = n as bytes[4]\n"
+                              "val h = n as [4]byte\n"
                               "val i = a < b < c\n");
     CHECK(ct_diag_error_count(parsed.diag) == 1);
     JogNode *a = decl_at(&parsed, 0)->as.binding.init;
@@ -452,7 +453,8 @@ static void test_precedence_and_exprs(void) {
     CHECK(decl_at(&parsed, 6)->as.binding.init->kind == JOG_NODE_FORCE);
     JogNode *h = decl_at(&parsed, 7)->as.binding.init;
     CHECK(h->kind == JOG_NODE_CAST && h->as.cast.op == JOG_TOK_KW_AS);
-    CHECK(h->as.cast.type->kind == JOG_NODE_TYPE_BYTES);
+    CHECK(h->as.cast.type->kind == JOG_NODE_TYPE_ARRAY);
+    CHECK(path_is(h->as.cast.type->as.type_array.elem, "byte"));
     close_parsed(&parsed);
 }
 

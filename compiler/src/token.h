@@ -48,7 +48,6 @@
     X(KW_NULL, "null")                  \
     X(KW_TRUE, "true")                  \
     X(KW_FALSE, "false")                \
-    X(KW_BYTES, "bytes")                \
     X(KW_OP, "op")                      \
     X(KW_ESCAPING, "escaping")          \
     X(KW_CONST, "const")                \

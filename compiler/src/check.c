@@ -12,6 +12,8 @@
 #include "check_struct.h"
 #include "check_coro.h"
 #include "const_eval.h"
+#include "prelude.h"
+#include "scalar_op.h"
 #include "resolve_package.h"
 #include "resolve_universe.h"
 
@@ -112,7 +114,6 @@ static bool is_type_expr(JogNodeKind kind) {
     case JOG_NODE_TYPE_PTR:
     case JOG_NODE_TYPE_SLICE:
     case JOG_NODE_TYPE_ARRAY:
-    case JOG_NODE_TYPE_BYTES:
     case JOG_NODE_TYPE_OPTION:
     case JOG_NODE_TYPE_TUPLE:
     case JOG_NODE_TYPE_FN:
@@ -479,7 +480,7 @@ static JogType *resolve_type_name(Check *ck, CheckJob *self, JogNode *node) {
     if (node->as.type_name.path.count == 1 && node->as.type_name.path.items && node->as.type_name.path.items[0] &&
         strcmp(node->as.type_name.path.items[0], "Option") == 0) {
         JogSymbol *existing = self ? lookup_in_file(self, "Option") : NULL;
-        if (!existing || existing->kind != JOG_SYM_TYPE) {
+        if (!existing || existing->kind != JOG_SYM_TYPE || jog_symbol_is_core_option(existing)) {
             JogType *elem;
             JogType *built;
             JogNode *arg;
@@ -592,6 +593,39 @@ static JogType *resolve_type_name(Check *ck, CheckJob *self, JogNode *node) {
     return symbol->type;
 }
 
+/* const Name is allowed when Name is a pointer, a slice, or the bytes view.
+   const on an array, including byte and [N]byte, is an error. */
+static JogType *apply_name_const(Check *ck, JogNode *node, JogType *type) {
+    JogTypes *types;
+    JogType *built;
+    if (!type || type->kind == JOG_TY_ERROR) {
+        return type;
+    }
+    types = ck->program->types;
+    built = NULL;
+    if (type->kind == JOG_TY_PTR) {
+        built = jog_type_ptr(types, type->as.elem.elem, true);
+    } else if (type->kind == JOG_TY_SLICE) {
+        built = jog_type_slice(types, type->as.elem.elem, true);
+    } else if (type->kind == JOG_TY_BYTES) {
+        built = jog_type_builtin(types, JOG_BUILTIN_CONST_BYTES);
+    } else if (type->kind == JOG_TY_ARRAY || type->kind == JOG_TY_BYTES_N) {
+        fail(ck, node->pos, "const is not allowed on an array type");
+        node->type = error_type(ck);
+        return node->type;
+    } else {
+        fail(ck, node->pos, "const is only allowed on a pointer, a slice, or bytes");
+        node->type = error_type(ck);
+        return node->type;
+    }
+    if (!built) {
+        oom(ck);
+        return NULL;
+    }
+    node->type = built;
+    return built;
+}
+
 static JogType *resolve_type(Check *ck, CheckJob *self, JogNode *node) {
     JogTypes *types;
     JogType *error;
@@ -606,8 +640,13 @@ static JogType *resolve_type(Check *ck, CheckJob *self, JogNode *node) {
     }
     bad = false;
     switch (node->kind) {
-    case JOG_NODE_TYPE_NAME:
-        return resolve_type_name(ck, self, node);
+    case JOG_NODE_TYPE_NAME: {
+        JogType *named = resolve_type_name(ck, self, node);
+        if (!named || !node->as.type_name.is_const) {
+            return named;
+        }
+        return apply_name_const(ck, node, named);
+    }
     case JOG_NODE_TYPE_UNIT: {
         JogType *unit = unit_type(ck);
         if (!unit) {
@@ -678,28 +717,6 @@ static JogType *resolve_type(Check *ck, CheckJob *self, JogNode *node) {
             return error;
         }
         built = jog_type_array(types, elem, len);
-        if (!built) {
-            oom(ck);
-            return NULL;
-        }
-        node->type = built;
-        return built;
-    }
-    case JOG_NODE_TYPE_BYTES: {
-        JogType *built;
-        if (!node->as.type_bytes.len) {
-            built = jog_type_builtin(types, node->as.type_bytes.is_const ? JOG_BUILTIN_CONST_BYTES : JOG_BUILTIN_BYTES);
-        } else {
-            uint64_t len = const_length(ck, self, node->as.type_bytes.len, node->pos, &bad);
-            if (ck->stop) {
-                return NULL;
-            }
-            if (bad) {
-                node->type = error;
-                return error;
-            }
-            built = jog_type_bytes_n(types, len);
-        }
         if (!built) {
             oom(ck);
             return NULL;
@@ -1013,6 +1030,7 @@ static JogType *make_distinct(Check *ck, CheckJob *job, JogType *base) {
         fail(ck, node->pos, "type '%s' has no layout", node->as.type_decl.name ? node->as.type_decl.name : "?");
         return error_type(ck);
     }
+    jog_type_apply_intrinsic(ck->program->types, type, node);
     return type;
 }
 
@@ -1753,7 +1771,17 @@ bool jog_check(JogProgram *program) {
         ct_diag_emit(program->diag, CT_SEVERITY_ERROR, pos, "out of memory");
         return false;
     }
+    if (!program->core_root && !jog_locate_roots(program)) {
+        return false;
+    }
+    if (!jog_bind_prelude(program->arena, program->diag, program->intern, program->types, universe,
+                          program->core_root)) {
+        return false;
+    }
     if (!jog_resolve_packages(program, universe)) {
+        return false;
+    }
+    if (!jog_reject_intrinsic(program)) {
         return false;
     }
     if (!jog_check_platform(program)) {

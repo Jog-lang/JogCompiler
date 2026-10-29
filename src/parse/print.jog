@@ -54,7 +54,8 @@ fn print_quoted(s: str) {
 
 /**
  * Print one node. TYPE_DECL prints its name, then `=`, then the type.
- * TYPE_NAME prints its name, then type arguments when it has them. INT_LIT prints its text on one line. An inferred array
+ * TYPE_NAME prints ` const` before its name when the name is const, then the name,
+ * then type arguments when it has them. INT_LIT prints its text on one line. An inferred array
  * prints `_`. A function type prints its parameters, then `->`, then the
  * return type, then `with`. A flag such as const is a word after the kind.
  * Other nodes print their kind and their children.
@@ -723,6 +724,11 @@ fn print_node(node: *Node, ind: i64) {
         return
     }
         TYPE_NAME -> {
+        // ` const` sits on the header, before the name, as it does for TYPE_PTR.
+        if node.flag.len > 0 {
+            io.print(" ")
+            io.print(node.flag)
+        }
         if node.name.len > 0 {
             io.print(" ")
             io.print(node.name)
@@ -731,6 +737,16 @@ fn print_node(node: *Node, ind: i64) {
             io.print(")")
             return
         }
+        var i: usize = 0
+        for i < node.kids.len {
+            io.print("\n")
+            print_node(node.kids.get(i), ind + 1)
+            i = i + 1
+        }
+        io.print("\n")
+        print_indent(ind)
+        io.print(")")
+        return
         }
         INT_LIT, FLOAT_LIT -> {
         io.print(" ")

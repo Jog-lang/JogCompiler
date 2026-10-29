@@ -114,13 +114,7 @@ static void mangle_type(Lower *L, CtSb *sb, const JogType *type) {
         ct_sb_append_cstr(sb, "unit");
         return;
     case JOG_TY_BYTES:
-        if (type == jog_type_builtin(L->program->types, JOG_BUILTIN_CONST_BYTES)) {
-            ct_sb_append_cstr(sb, "str");
-        } else if (type->is_const) {
-            ct_sb_append_cstr(sb, "cbytes");
-        } else {
-            ct_sb_append_cstr(sb, "bytes");
-        }
+        ct_sb_append_cstr(sb, type->is_const ? "cbytes" : "bytes");
         return;
     case JOG_TY_BYTES_N:
         ct_sb_appendf(sb, "bytes%u", (unsigned)type->as.bytes_n.n);

@@ -1,0 +1,10 @@
+@intrinsic(int, signed: false, bits: 32)
+type Word: [4]byte
+
+fn Word.op+(o: Word): Word = @add(self, o)
+
+fn main() {
+    @add(1, 2)
+}
+
+// error: @add is only allowed in an intrinsic operator

@@ -37,6 +37,13 @@ void jog_ast_print(const JogNode *node, CtSb *out);
    loader.c. */
 bool jog_load(JogProgram *program, const char *start);
 
+/* Driver stream. Sets std_root, core_root, and runtime_root when those
+   directories exist. JOG_ROOT is exact. Without it, the search starts at
+   the executable's parent and tries one directory higher. A missing
+   directory leaves that root NULL. False on a bad JOG_ROOT or out of
+   memory. Implemented in loader.c. */
+bool jog_locate_roots(JogProgram *program);
+
 /* Checker stream. Resolves names and checks types for the whole program,
    filling JogNode.type and JogNode.symbol. Implemented in resolve.c and
    check.c. */

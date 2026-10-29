@@ -767,10 +767,14 @@ fn parse_non_null(p: *Parser): *Node? with (a: mem.Allocator) {
             return parse_paren_type(p)
         }
         KW_CONST -> {
-            return parse_bytes_type(p, true)
-        }
-        KW_BYTES -> {
-            return parse_bytes_type(p, false)
+            p.advance()
+            if !p.at(k.IDENT) {
+                error_at(p, "expected a type name after 'const'")
+                return null
+            }
+            val named = parse_type_name(p)
+            named.flag = "const"
+            return named
         }
         KW_ESCAPING, KW_EXTERN -> {
             val extern_kw = p.at(k.KW_EXTERN)
@@ -1030,7 +1034,9 @@ fn parse_bracket_type(p: *Parser): *Node? with (a: mem.Allocator) {
             node.kids.push(len!!)
         }
     }
-    p.eat(k.RBRACKET)
+    if p.eat(k.RBRACKET) && p.eat(k.KW_CONST) {
+        complain(p, "const is not allowed on an array type")
+    }
     val elem = parse_type(p)
     if elem != null {
         node.kids.push(elem!!)
@@ -1039,41 +1045,13 @@ fn parse_bracket_type(p: *Parser): *Node? with (a: mem.Allocator) {
 }
 
 /**
- * `bytes`, `bytes[4]`, `const bytes`, or `const bytes[8]`.
- * @param p cursor on `bytes`, or on `const` when is_const is set
- * @param is_const true when the type starts with `const`
- * @context a allocator for the nodes
- * @return the bytes type, or null when `const` is not followed by `bytes`
- */
-fn parse_bytes_type(p: *Parser, is_const: bool): *Node? with (a: mem.Allocator) {
-    val here = p.peek()
-    val k = lex.kind()
-    p.advance()
-    if is_const && !p.eat(k.KW_BYTES) {
-        return null
-    }
-    val node = make_node(NodeKind.TYPE_BYTES, here.line, here.column)
-    if is_const {
-        node.flag = "const"
-    }
-    if p.eat(k.LBRACKET) {
-        val len = parse_int_lit(p)
-        if len != null {
-            node.kids.push(len!!)
-        }
-        p.eat(k.RBRACKET)
-    }
-    return node
-}
-
-/**
  * True when a token can start a type.
  * @param kind token kind
- * @return true for a name, pointer, bracket, paren, bytes, const, escaping, or extern
+ * @return true for a name, pointer, bracket, paren, const, escaping, or extern
  */
 fn type_can_start(kind: lex.TokenKind): bool {
     val k = lex.kind()
-    return kind == k.IDENT || kind == k.STAR || kind == k.LBRACKET || kind == k.LPAREN || kind == k.KW_BYTES || kind == k.KW_CONST || kind == k.KW_ESCAPING || kind == k.KW_EXTERN
+    return kind == k.IDENT || kind == k.STAR || kind == k.LBRACKET || kind == k.LPAREN || kind == k.KW_CONST || kind == k.KW_ESCAPING || kind == k.KW_EXTERN
 }
 
 /**
@@ -1574,7 +1552,7 @@ fn parse_primary(p: *Parser): *Node? with (a: mem.Allocator) {
     val k = lex.kind()
     val here = p.peek()
     when p.peek().kind {
-        IDENT, KW_BYTES, KW_IN -> {
+        IDENT, KW_IN -> {
             val node = make_node(NodeKind.IDENT, here.line, here.column)
             node.name = here.text
             p.advance()

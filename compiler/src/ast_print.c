@@ -92,7 +92,7 @@ static void print_escaped(CtSb *out, const char *text, size_t len) {
 }
 
 static void print_type_name(const JogNode *node, CtSb *out, int ind) {
-    ct_sb_append_cstr(out, "(TYPE_NAME");
+    ct_sb_appendf(out, "(TYPE_NAME%s", node->as.type_name.is_const ? " const" : "");
     if (node->as.type_name.path.count > 0) {
         ct_sb_putc(out, ' ');
         print_path(node->as.type_name.path, out);
@@ -438,15 +438,6 @@ static void print_node(const JogNode *node, CtSb *out, int ind) {
             print_child(node->as.type_array.len, out, ind + 1);
         }
         print_child(node->as.type_array.elem, out, ind + 1);
-        close_node(out, ind, true);
-        break;
-    case JOG_NODE_TYPE_BYTES:
-        ct_sb_appendf(out, "(TYPE_BYTES%s", node->as.type_bytes.is_const ? " const" : "");
-        if (!node->as.type_bytes.len) {
-            ct_sb_putc(out, ')');
-            break;
-        }
-        print_child(node->as.type_bytes.len, out, ind + 1);
         close_node(out, ind, true);
         break;
     case JOG_NODE_TYPE_OPTION:

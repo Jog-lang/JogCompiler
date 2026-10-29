@@ -3,7 +3,7 @@ import vendor.sdl3 as sdl
 
 @packed
 private(file) struct Header {
-    magic: bytes[4]
+    magic: [4]byte
     len: u32 = 0
 }
 
@@ -19,7 +19,7 @@ struct Player {
 }
 
 type Celsius: f64
-type Handle = bytes[8]
+type Handle = [8]byte
 type Pair<A, B> = (A, B)
 
 interface Signed {

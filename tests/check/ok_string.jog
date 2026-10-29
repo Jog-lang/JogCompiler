@@ -11,7 +11,7 @@ fn fill(buf: bytes, n: i32, name: str, flag: bool): (str, error?) {
 }
 
 fn show(buf: bytes) {
-    var raw: bytes[8]
+    var raw: [8]byte
     var u: u64 = 1
     var name = "ab"
     var flag = true

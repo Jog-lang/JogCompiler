@@ -13,6 +13,10 @@
    published before payloads are resolved so *E inside E is not a cycle. */
 JogType *jog_check_enum(Check *ck, CheckJob *job);
 
+/* The core prelude's Option marker: an unlaid-out generic enum whose
+   instances are the structural option type, including the *T? niche. */
+int jog_symbol_is_core_option(const JogSymbol *symbol);
+
 /* True when some variant's tag is 0 and that payload has a zero value. */
 bool jog_enum_has_zero(const JogType *type);
 

@@ -5,6 +5,7 @@
 #include "const_eval.h"
 #include "lexer.h"
 #include "phases.h"
+#include "prelude.h"
 #include "resolve_package.h"
 #include "resolve_universe.h"
 #include "symbols.h"
@@ -133,24 +134,21 @@ static const struct {
     JogSymbolKind kind;
     JogBuiltin builtin;
 } k_universe[] = {
-    {"i8", JOG_SYM_TYPE, JOG_BUILTIN_I8},
-    {"i16", JOG_SYM_TYPE, JOG_BUILTIN_I16},
-    {"i32", JOG_SYM_TYPE, JOG_BUILTIN_I32},
-    {"i64", JOG_SYM_TYPE, JOG_BUILTIN_I64},
-    {"u8", JOG_SYM_TYPE, JOG_BUILTIN_U8},
-    {"u16", JOG_SYM_TYPE, JOG_BUILTIN_U16},
-    {"u32", JOG_SYM_TYPE, JOG_BUILTIN_U32},
-    {"u64", JOG_SYM_TYPE, JOG_BUILTIN_U64},
-    {"isize", JOG_SYM_TYPE, JOG_BUILTIN_ISIZE},
-    {"usize", JOG_SYM_TYPE, JOG_BUILTIN_USIZE},
-    {"f32", JOG_SYM_TYPE, JOG_BUILTIN_F32},
-    {"f64", JOG_SYM_TYPE, JOG_BUILTIN_F64},
-    {"bool", JOG_SYM_TYPE, JOG_BUILTIN_BOOL},
-    {"bytes", JOG_SYM_TYPE, JOG_BUILTIN_BYTES},
-    {"str", JOG_SYM_TYPE, JOG_BUILTIN_CONST_BYTES},
     {"true", JOG_SYM_CONSTANT, JOG_BUILTIN_BOOL},
     {"false", JOG_SYM_CONSTANT, JOG_BUILTIN_BOOL},
     {"null", JOG_SYM_CONSTANT, JOG_BUILTIN_NULL},
+};
+
+static const struct {
+    const char *name;
+    JogBuiltin builtin;
+} k_scalar[] = {
+    {"i8", JOG_BUILTIN_I8},     {"i16", JOG_BUILTIN_I16}, {"i32", JOG_BUILTIN_I32}, {"i64", JOG_BUILTIN_I64},
+    {"u8", JOG_BUILTIN_U8},     {"u16", JOG_BUILTIN_U16}, {"u32", JOG_BUILTIN_U32}, {"u64", JOG_BUILTIN_U64},
+    {"isize", JOG_BUILTIN_ISIZE}, {"usize", JOG_BUILTIN_USIZE},
+    {"f32", JOG_BUILTIN_F32},   {"f64", JOG_BUILTIN_F64}, {"bool", JOG_BUILTIN_BOOL},
+    {"bytes", JOG_BUILTIN_BYTES},
+    {"str", JOG_BUILTIN_CONST_BYTES},
 };
 
 static void test_universe(void) {
@@ -187,7 +185,7 @@ static void test_universe(void) {
     }
 
     count = sizeof(k_universe) / sizeof(k_universe[0]);
-    CHECK(ct_map_count(scope->bindings) == count + 7);
+    CHECK(ct_map_count(scope->bindings) == count + 1);
     for (i = 0; i < count; i++) {
         const char *name = ct_intern_cstr(intern, k_universe[i].name);
         JogSymbol *symbol = jog_package_scope_lookup(scope, name);
@@ -202,52 +200,135 @@ static void test_universe(void) {
         CHECK(symbol->name == name);
         CHECK(symbol->type == type);
     }
+    CHECK(jog_package_scope_lookup(scope, "void") == NULL);
+    CHECK(jog_package_scope_lookup(scope, "error") == NULL);
+    CHECK(jog_package_scope_lookup(scope, "Option") == NULL);
+    CHECK(jog_package_scope_lookup(scope, "Ordering") == NULL);
     {
-        JogSymbol *void_symbol = jog_package_scope_lookup(scope, "void");
-        JogType *unit = jog_type_builtin(types, JOG_BUILTIN_UNIT);
-        JogType *ptr;
-        JogType *cptr;
+        JogSymbol *byte_symbol = jog_package_scope_lookup(scope, "byte");
+        JogType *byte = jog_type_bytes_n(types, 1);
         CtSb sb;
-        CHECK(void_symbol != NULL && unit != NULL);
-        if (void_symbol && unit) {
-            CHECK(void_symbol->kind == JOG_SYM_TYPE);
-            CHECK(void_symbol->decl == NULL && void_symbol->package == NULL);
-            CHECK(void_symbol->name == ct_intern_cstr(intern, "void"));
-            CHECK(void_symbol->type != NULL && void_symbol->type != unit);
-            CHECK(void_symbol->type->kind == JOG_TY_STRUCT);
-            CHECK(void_symbol->type->as.nominal.field_count == 0);
-            CHECK(!void_symbol->type->has_layout);
-            ptr = jog_type_ptr(types, void_symbol->type, false);
-            cptr = jog_type_ptr(types, void_symbol->type, true);
-            CHECK(ptr != NULL && cptr != NULL && ptr != cptr);
-            CHECK(ptr && !ptr->is_const && ptr->as.elem.elem == void_symbol->type);
-            CHECK(cptr && cptr->is_const && cptr->as.elem.elem == void_symbol->type);
+        CHECK(byte_symbol != NULL && byte != NULL);
+        if (byte_symbol && byte) {
+            CHECK(byte_symbol->kind == JOG_SYM_TYPE);
+            CHECK(byte_symbol->decl == NULL && byte_symbol->package == NULL);
+            CHECK(byte_symbol->name == ct_intern_cstr(intern, "byte"));
+            CHECK(byte_symbol->type == byte);
+            CHECK(byte->kind == JOG_TY_BYTES_N && byte->as.bytes_n.n == 1);
             ct_sb_init(&sb);
-            jog_type_print(void_symbol->type, &sb);
-            CHECK(strcmp(ct_sb_cstr(&sb), "void") == 0);
-            ct_sb_clear(&sb);
-            jog_type_print(ptr, &sb);
-            CHECK(strcmp(ct_sb_cstr(&sb), "*void") == 0);
-            ct_sb_clear(&sb);
-            jog_type_print(cptr, &sb);
-            CHECK(strcmp(ct_sb_cstr(&sb), "*const void") == 0);
+            jog_type_print(byte, &sb);
+            CHECK(strcmp(ct_sb_cstr(&sb), "[1]byte") == 0);
             ct_sb_free(&sb);
         }
     }
+    CHECK(jog_package_scope_lookup(scope, "unit") == NULL);
+    CHECK(jog_package_scope_lookup(scope, "i32") == NULL);
+    CHECK(jog_package_scope_lookup(scope, "str") == NULL);
     {
-        JogSymbol *error_symbol = jog_package_scope_lookup(scope, "error");
-        CHECK(error_symbol != NULL);
-        if (error_symbol) {
-            CHECK(error_symbol->kind == JOG_SYM_TYPE);
-            CHECK(error_symbol->decl == NULL && error_symbol->package == NULL);
-            CHECK(error_symbol->name == ct_intern_cstr(intern, "error"));
-            CHECK(error_symbol->type != NULL);
-            CHECK(error_symbol->type->kind == JOG_TY_INTERFACE);
-            CHECK(error_symbol->type->has_layout);
-            CHECK(error_symbol->type->as.nominal.name == error_symbol->name);
+        CtDiag *diag = ct_diag_create(arena);
+        const char *root = ct_path_join(arena, CT_SOURCE_DIR, "core");
+        size_t i;
+        CHECK(diag != NULL && root != NULL);
+        if (!diag || !root || !jog_bind_prelude(arena, diag, intern, types, scope, root) ||
+            ct_diag_error_count(diag) != 0) {
+            fprintf(stderr, "prelude bind failed\n");
+            if (diag) {
+                ct_diag_print(diag, stderr);
+            }
+            CHECK(0);
+        } else {
+            CHECK(ct_map_count(scope->bindings) == count + sizeof(k_scalar) / sizeof(k_scalar[0]) + 11);
+            for (i = 0; i < sizeof(k_scalar) / sizeof(k_scalar[0]); i++) {
+                const char *name = ct_intern_cstr(intern, k_scalar[i].name);
+                JogSymbol *symbol = jog_package_scope_lookup(scope, name);
+                JogType *type = jog_type_builtin(types, k_scalar[i].builtin);
+                CHECK(symbol != NULL && type != NULL);
+                CHECK(symbol && symbol->kind == JOG_SYM_TYPE && symbol->package == NULL);
+                if (symbol && type && strcmp(k_scalar[i].name, "str") == 0) {
+                    CHECK(symbol->type->kind == JOG_TY_DISTINCT);
+                    CHECK(symbol->type->as.nominal.base == type);
+                    CHECK(symbol->type != type);
+                    CHECK(jog_type_is_core_str(types, symbol->type));
+                    CHECK(symbol->decl != NULL);
+                } else if (symbol && type) {
+                    CHECK(symbol->type == type);
+                    CHECK(symbol->decl == NULL);
+                }
+            }
+            {
+                JogSymbol *rune_symbol = jog_package_scope_lookup(scope, "rune");
+                JogType *u32 = jog_type_builtin(types, JOG_BUILTIN_U32);
+                CHECK(rune_symbol != NULL && rune_symbol->type != NULL && u32 != NULL);
+                if (rune_symbol && rune_symbol->type && u32) {
+                    CHECK(rune_symbol->type->kind == JOG_TY_DISTINCT);
+                    CHECK(rune_symbol->type->as.nominal.base == u32);
+                    CHECK(rune_symbol->type != u32);
+                }
+            }
+            {
+                JogSymbol *void_symbol = jog_package_scope_lookup(scope, "void");
+                JogType *unit = jog_type_builtin(types, JOG_BUILTIN_UNIT);
+                JogType *ptr;
+                JogType *cptr;
+                CtSb sb;
+                CHECK(void_symbol != NULL && unit != NULL);
+                if (void_symbol && unit) {
+                    CHECK(void_symbol->kind == JOG_SYM_TYPE);
+                    CHECK(void_symbol->decl == NULL && void_symbol->package == NULL);
+                    CHECK(void_symbol->name == ct_intern_cstr(intern, "void"));
+                    CHECK(void_symbol->type != NULL && void_symbol->type != unit);
+                    CHECK(void_symbol->type->kind == JOG_TY_STRUCT);
+                    CHECK(void_symbol->type->as.nominal.field_count == 0);
+                    CHECK(!void_symbol->type->has_layout);
+                    ptr = jog_type_ptr(types, void_symbol->type, false);
+                    cptr = jog_type_ptr(types, void_symbol->type, true);
+                    CHECK(ptr != NULL && cptr != NULL && ptr != cptr);
+                    CHECK(ptr && !ptr->is_const && ptr->as.elem.elem == void_symbol->type);
+                    CHECK(cptr && cptr->is_const && cptr->as.elem.elem == void_symbol->type);
+                    ct_sb_init(&sb);
+                    jog_type_print(void_symbol->type, &sb);
+                    CHECK(strcmp(ct_sb_cstr(&sb), "void") == 0);
+                    ct_sb_clear(&sb);
+                    jog_type_print(ptr, &sb);
+                    CHECK(strcmp(ct_sb_cstr(&sb), "*void") == 0);
+                    ct_sb_clear(&sb);
+                    jog_type_print(cptr, &sb);
+                    CHECK(strcmp(ct_sb_cstr(&sb), "*const void") == 0);
+                    ct_sb_free(&sb);
+                }
+            }
+            {
+                JogSymbol *error_symbol = jog_package_scope_lookup(scope, "error");
+                CHECK(error_symbol != NULL);
+                if (error_symbol) {
+                    CHECK(error_symbol->kind == JOG_SYM_TYPE);
+                    CHECK(error_symbol->decl == NULL && error_symbol->package == NULL);
+                    CHECK(error_symbol->name == ct_intern_cstr(intern, "error"));
+                    CHECK(error_symbol->type != NULL);
+                    CHECK(error_symbol->type->kind == JOG_TY_INTERFACE);
+                    CHECK(error_symbol->type->has_layout);
+                    CHECK(error_symbol->type->as.nominal.name == error_symbol->name);
+                }
+            }
+            {
+                JogSymbol *option_symbol = jog_package_scope_lookup(scope, "Option");
+                JogSymbol *order_symbol = jog_package_scope_lookup(scope, "Ordering");
+                JogType *i8 = jog_type_builtin(types, JOG_BUILTIN_I8);
+                CHECK(option_symbol && option_symbol->kind == JOG_SYM_TYPE && option_symbol->type_param_count == 1);
+                CHECK(option_symbol && option_symbol->type && option_symbol->type->kind == JOG_TY_ENUM);
+                CHECK(option_symbol && option_symbol->type && !option_symbol->type->has_layout);
+                CHECK(option_symbol && option_symbol->type && option_symbol->type->as.nominal.variant_count == 0);
+                CHECK(order_symbol && order_symbol->type && i8);
+                if (order_symbol && order_symbol->type && i8) {
+                    CHECK(order_symbol->type->kind == JOG_TY_ENUM);
+                    CHECK(order_symbol->type->as.nominal.base == i8);
+                    CHECK(order_symbol->type->has_layout && order_symbol->type->size == 1);
+                    CHECK(order_symbol->type->as.nominal.variant_count == 3);
+                    CHECK(order_symbol->type->as.nominal.variants && order_symbol->type->as.nominal.variants[0].tag == -1);
+                }
+            }
         }
     }
-    CHECK(jog_package_scope_lookup(scope, "unit") == NULL);
 
     jog_types_release(types);
     ct_arena_destroy(arena);
@@ -650,10 +731,10 @@ static void test_const_eval(void) {
     expect_err(arena, diag, types, boolean(arena, pos, true), i64, "constant does not fit", &errors);
     expect_err(arena, diag, types, lit(arena, pos, "1"), jog_type_builtin(types, JOG_BUILTIN_BOOL), "constant does not fit",
                &errors);
-    expect_err(arena, diag, types, lit(arena, pos, "255"), jog_type_bytes_n(types, 1), "hex literal required for bytes[N]",
+    expect_err(arena, diag, types, lit(arena, pos, "255"), jog_type_bytes_n(types, 1), "hex literal required for [N]byte",
                &errors);
     expect_err(arena, diag, types, lit(arena, pos, "0xBEEF"), jog_type_bytes_n(types, 4),
-               "hex literal has 4 digits, bytes[4] needs 8", &errors);
+               "hex literal has 4 digits, [4]byte needs 8", &errors);
     expect_err(arena, diag, types, bin(arena, pos, JOG_TOK_PLUS, boolean(arena, pos, true), lit(arena, pos, "1")), NULL,
                "operator '+' expects an integer", &errors);
     expect_err(arena, diag, types, una(arena, pos, JOG_TOK_BANG, lit(arena, pos, "1")), NULL, "operator '!' expects a bool",
@@ -1057,6 +1138,18 @@ static void test_package_scopes(void) {
         jog_types_release(types);
         ct_arena_destroy(arena);
         return;
+    }
+    {
+        const char *root = ct_path_join(arena, CT_SOURCE_DIR, "core");
+        char text[2048];
+        CHECK(root && jog_bind_prelude(arena, diag, intern, types, universe, root));
+        if (!root || ct_diag_error_count(diag) != 0) {
+            diag_text(diag, text, sizeof(text));
+            fprintf(stderr, "%s\n", text);
+            jog_types_release(types);
+            ct_arena_destroy(arena);
+            return;
+        }
     }
 
     memset(&program, 0, sizeof(program));
@@ -2600,9 +2693,41 @@ static void test_check_sources(void) {
     ct_arena_destroy(arena);
 }
 
+static void test_prelude_mismatch(void) {
+    CtArena *arena = ct_arena_create();
+    CtDiag *diag;
+    CtIntern *intern;
+    JogTypes *types;
+    JogPackageScope *scope;
+    const char *root;
+    char text[4096];
+    CHECK(arena != NULL);
+    if (!arena) {
+        return;
+    }
+    diag = ct_diag_create(arena);
+    intern = ct_intern_create(arena);
+    types = jog_types_create(arena, 8);
+    scope = diag && intern && types ? jog_universe_scope(arena, intern, types) : NULL;
+    root = ct_path_join(arena, CT_SOURCE_DIR, "tests/prelude/badwidth");
+    CHECK(diag && intern && types && scope && root);
+    if (!diag || !intern || !types || !scope || !root) {
+        jog_types_release(types);
+        ct_arena_destroy(arena);
+        return;
+    }
+    CHECK(!jog_bind_prelude(arena, diag, intern, types, scope, root));
+    diag_text(diag, text, sizeof(text));
+    CHECK(strstr(text, "prelude declaration 'u8'") != NULL);
+    CHECK(strstr(text, "wrong width") != NULL);
+    jog_types_release(types);
+    ct_arena_destroy(arena);
+}
+
 int main(void) {
     test_symbols();
     test_universe();
+    test_prelude_mismatch();
     test_const_eval();
     test_package_scopes();
     test_package_scope_errors();

@@ -6,7 +6,7 @@ import std.c
 import std.error as errors
 
 actual fn open_c_file(path: str, mode: *const c.char): (*c.FILE?, error?) {
-    var buf: bytes[4096]
+    var buf: [4096]byte
     if path.len == 0 || path.len >= 4096 {
         return null, errors.ErrIO
     }

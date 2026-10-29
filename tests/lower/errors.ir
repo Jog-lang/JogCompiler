@@ -162,7 +162,7 @@ b6 cleanup:
   call f0(l2)  ; errors.jog:44:11
   br b5 ret  ; errors.jog:47:9
 b7 "if.then":
-  panic const bytes "boom"  ; errors.jog:51:9
+  panic str "boom"  ; errors.jog:51:9
   unreachable  ; errors.jog:51:9
 b8 "if.join":
   br b10 cleanup  ; errors.jog:39:11

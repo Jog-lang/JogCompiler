@@ -6,7 +6,7 @@ global g1 const jog_app__ready: bool = hex:01  ; globals.jog:6:1
 global g2 var jog_app__count: i32 = zero  ; globals.jog:7:1
 global g3 var jog_app__second: i32 = zero  ; globals.jog:8:1
 global g4 var jog_app__first: i32 = zero  ; globals.jog:9:1
-global g5 const jog_app__title: const bytes = hex:00 00 00 00 00 00 00 00 03 00 00 00 00 00 00 00 reloc 0 str "jog"  ; globals.jog:10:1
+global g5 const jog_app__title: str = hex:00 00 00 00 00 00 00 00 03 00 00 00 00 00 00 00 reloc 0 str "jog"  ; globals.jog:10:1
 
 fn f0 public jog_app__id "app.id": (i32) -> i32  ; globals.jog:3:1
   l0 n: i32 param
@@ -14,8 +14,8 @@ b0 entry:
   ret l0  ; globals.jog:3:22
 
 fn f1 public jog_app__main "app.main": () -> i32  ; globals.jog:12:1
-  l0 s: const bytes
-  l1: const bytes
+  l0 s: str
+  l1: str
   l2: bool
   l3: u8
   l4: i32

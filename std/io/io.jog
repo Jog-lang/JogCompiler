@@ -105,7 +105,7 @@ fn read_all(path: str): (bytes, error?) with (a: mem.Allocator) {
         return bytes(), open_err
     }
     var acc = bytes()
-    var chunk: bytes[4096]
+    var chunk: [4096]byte
     val chunk_ptr = chunk[..].ptr
     for {
         val n = c.fread(chunk_ptr as *void, 1, 4096, file!!)

@@ -76,7 +76,6 @@ typedef enum JogVisibility {
     X(TYPE_PTR, type_elem)                                                      \
     X(TYPE_SLICE, type_elem)                                                    \
     X(TYPE_ARRAY, type_array)                                                   \
-    X(TYPE_BYTES, type_bytes)                                                   \
     X(TYPE_OPTION, type_elem)                                                   \
     X(TYPE_TUPLE, type_tuple)                                                   \
     X(TYPE_FN, type_fn)                                                         \
@@ -246,6 +245,7 @@ struct JogNode {
         struct {
             JogNames path; /* std.io.Reader -> {"std", "io", "Reader"} */
             JogList args;  /* type expressions */
+            bool is_const; /* const Name: a const pointer, slice, or bytes view */
         } type_name;
         struct {
             JogNode *elem;
@@ -256,10 +256,6 @@ struct JogNode {
             bool infer_len;
             JogNode *elem;
         } type_array;
-        struct {
-            JogNode *len; /* NULL for unsized bytes */
-            bool is_const;
-        } type_bytes;
         struct {
             JogList elems;
         } type_tuple;

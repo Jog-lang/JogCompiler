@@ -3,7 +3,7 @@
 import std.io
 
 fn main() {
-    var raw: bytes[3]
+    var raw: [3]byte
     val p = raw[..].ptr
     *p = 1
     *(p + 1) = 2

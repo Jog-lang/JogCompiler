@@ -1,0 +1,11 @@
+@intrinsic(nope)
+type Marker: byte
+// error: unknown intrinsic 'nope'
+
+@intrinsic(int, signed: false, bits: 16)
+type Wide: [4]byte
+// error: @intrinsic width does not match the base
+
+@intrinsic(int, signed: false, bits: 24)
+type Odd: [4]byte
+// error: @intrinsic has the wrong width

@@ -17,6 +17,7 @@
 #include "lower_coro.h"
 #include "lower_chan_for.h"
 #include "lower_comptime.h"
+#include "scalar_op.h"
 #include "lower_global.h"
 #include "lower_struct.h"
 #include "symbols.h"
@@ -369,6 +370,9 @@ static const char *mangle_fn(Lower *L, const JogPackage *pkg, JogNode *fn) {
         ct_sb_append_cstr(&sb, "__");
     }
     piece = method_spell(fn->as.fn.name);
+    if (fn->as.fn.name && strcmp(fn->as.fn.name, "op-") == 0 && fn->as.fn.params.count == 0) {
+        piece = "op_neg";
+    }
     append_c_piece(&sb, piece);
     /* File-local names may repeat in one package. The C file is one
        translation unit, so the declaring file keeps the symbols apart. */
@@ -803,11 +807,18 @@ static bool try_fold(Lower *L, JogNode *node, JirOperand *out) {
         fold_ty = fold_ty->as.elem.elem;
     }
     if (node && jog_float_lit_tree(node) && fold_ty &&
-        (fold_ty->kind == JOG_TY_FLOAT || fold_ty->kind == JOG_TY_UNTYPED_FLOAT)) {
+        (fold_ty->kind == JOG_TY_FLOAT || fold_ty->kind == JOG_TY_UNTYPED_FLOAT ||
+         fold_ty->intrinsic == JOG_INTRINSIC_FLOAT)) {
         double fvalue = 0.0;
-        unsigned bits = fold_ty->kind == JOG_TY_FLOAT && fold_ty->as.flt.bits == 32 ? 32 : 64;
-        JogFloatLitStatus st = jog_float_lit_eval(node, bits, &fvalue);
-        JogType *ty = fold_ty->kind == JOG_TY_FLOAT ? fold_ty : NULL;
+        unsigned bits = 64;
+        JogFloatLitStatus st;
+        JogType *ty;
+        if ((fold_ty->kind == JOG_TY_FLOAT && fold_ty->as.flt.bits == 32) ||
+            (fold_ty->intrinsic == JOG_INTRINSIC_FLOAT && fold_ty->intrinsic_bits == 32)) {
+            bits = 32;
+        }
+        st = jog_float_lit_eval(node, bits, &fvalue);
+        ty = fold_ty->kind == JOG_TY_FLOAT || fold_ty->intrinsic == JOG_INTRINSIC_FLOAT ? fold_ty : NULL;
         if (st != JOG_FLOAT_LIT_OK) {
             fail_at(L, node->pos, "%s", float_lit_msg(st));
             *out = jir_none();
@@ -1019,7 +1030,14 @@ static JirOperand lower_bytes_cmp(Lower *L, JirOperand lhs, JirOperand rhs, bool
     boolean = jog_type_builtin(L->program->types, JOG_BUILTIN_BOOL);
     usize = jog_type_builtin(L->program->types, JOG_BUILTIN_USIZE);
     u8 = jog_type_builtin(L->program->types, JOG_BUILTIN_U8);
-    bytes = lhs.type ? lhs.type : rhs.type;
+    {
+        JogType *left_view = jog_type_bytes_view(lhs.type);
+        JogType *right_view = jog_type_bytes_view(rhs.type);
+        bytes = left_view ? left_view : right_view;
+        if (bytes && ((left_view && left_view->is_const) || (right_view && right_view->is_const)) && !bytes->is_const) {
+            bytes = jog_type_builtin(L->program->types, JOG_BUILTIN_CONST_BYTES);
+        }
+    }
     if (!boolean || !usize || !u8 || !bytes) {
         oom(L);
         return value_none();
@@ -2260,6 +2278,144 @@ JirOperand jog_lower_enum_eq(Lower *L, JirOperand lhs, JirOperand rhs, bool nega
     return lower_enum_eq(L, lhs, rhs, negate, pos);
 }
 
+static JogNode *intrinsic_arg(JogNode *node, size_t index) {
+    JogNode *arg;
+    if (!node || !node->as.builtin.args.items || index >= node->as.builtin.args.count) {
+        return NULL;
+    }
+    arg = node->as.builtin.args.items[index];
+    if (arg && arg->kind == JOG_NODE_ARG) {
+        return arg->as.arg.value;
+    }
+    return arg;
+}
+
+static int intrinsic_binop(const char *name, JirBinOp *op, bool *checked) {
+    *checked = false;
+    if (!name || !op || !checked) {
+        return 0;
+    }
+    if (strcmp(name, "add") == 0) {
+        *op = JIR_ADD;
+        *checked = true;
+        return 1;
+    }
+    if (strcmp(name, "sub") == 0) {
+        *op = JIR_SUB;
+        *checked = true;
+        return 1;
+    }
+    if (strcmp(name, "mul") == 0) {
+        *op = JIR_MUL;
+        *checked = true;
+        return 1;
+    }
+    if (strcmp(name, "div") == 0) {
+        *op = JIR_DIV;
+        *checked = true;
+        return 1;
+    }
+    if (strcmp(name, "rem") == 0) {
+        *op = JIR_REM;
+        *checked = true;
+        return 1;
+    }
+    if (strcmp(name, "shl") == 0) {
+        *op = JIR_SHL;
+        *checked = true;
+        return 1;
+    }
+    if (strcmp(name, "shr") == 0) {
+        *op = JIR_SHR;
+        *checked = true;
+        return 1;
+    }
+    if (strcmp(name, "and") == 0) {
+        *op = JIR_AND;
+        return 1;
+    }
+    if (strcmp(name, "or") == 0) {
+        *op = JIR_OR;
+        return 1;
+    }
+    if (strcmp(name, "xor") == 0) {
+        *op = JIR_XOR;
+        return 1;
+    }
+    if (strcmp(name, "eq") == 0) {
+        *op = JIR_EQ;
+        return 1;
+    }
+    if (strcmp(name, "ne") == 0) {
+        *op = JIR_NE;
+        return 1;
+    }
+    if (strcmp(name, "lt") == 0) {
+        *op = JIR_LT;
+        return 1;
+    }
+    if (strcmp(name, "le") == 0) {
+        *op = JIR_LE;
+        return 1;
+    }
+    if (strcmp(name, "gt") == 0) {
+        *op = JIR_GT;
+        return 1;
+    }
+    if (strcmp(name, "ge") == 0) {
+        *op = JIR_GE;
+        return 1;
+    }
+    return 0;
+}
+
+/* 1 when node is @add or another operator intrinsic, including after a failure. */
+static int lower_scalar_intrinsic(Lower *L, JogNode *node, JirOperand *out) {
+    const char *name;
+    JirBinOp bin = JIR_ADD;
+    bool checked = false;
+    JirOperand lhs;
+    JirOperand rhs;
+    if (!node || !jog_is_op_intrinsic_name(node->as.builtin.name)) {
+        return 0;
+    }
+    name = node->as.builtin.name;
+    if (!node->type) {
+        fail_at(L, node->pos, "@%s is not lowered yet", name);
+        *out = value_none();
+        return 1;
+    }
+    lhs = lower_expr(L, intrinsic_arg(node, 0));
+    if (L->failed) {
+        *out = value_none();
+        return 1;
+    }
+    if (strcmp(name, "neg") == 0) {
+        *out = emit_unop(L, JIR_NEG, true, lhs, node->type, node->pos);
+        return 1;
+    }
+    if (strcmp(name, "bitnot") == 0) {
+        *out = emit_unop(L, JIR_BITNOT, false, lhs, node->type, node->pos);
+        return 1;
+    }
+    if (strcmp(name, "not") == 0) {
+        *out = emit_unop(L, JIR_NOT, false, lhs, node->type, node->pos);
+        return 1;
+    }
+    rhs = lower_expr(L, intrinsic_arg(node, 1));
+    if (L->failed) {
+        *out = value_none();
+        return 1;
+    }
+    if (!intrinsic_binop(name, &bin, &checked)) {
+        fail_at(L, node->pos, "@%s is not lowered yet", name);
+        *out = value_none();
+        return 1;
+    }
+    *out = emit_binop(L, bin, checked, lhs, rhs, node->type, node->pos);
+    return 1;
+}
+
 static JirOperand lower_expr_raw(Lower *L, JogNode *node) {
     JirOperand folded;
     JirOperand lhs;
@@ -2407,8 +2563,8 @@ static JirOperand lower_expr_raw(Lower *L, JogNode *node) {
                 return cmp;
             }
         }
-        if ((node->as.binary.op == JOG_TOK_EQ || node->as.binary.op == JOG_TOK_NEQ) && lhs.type &&
-            lhs.type->kind == JOG_TY_BYTES) {
+        if ((node->as.binary.op == JOG_TOK_EQ || node->as.binary.op == JOG_TOK_NEQ) &&
+            jog_type_bytes_view(lhs.type)) {
             return lower_bytes_cmp(L, lhs, rhs, node->as.binary.op == JOG_TOK_NEQ, node->pos);
         }
         if ((node->as.binary.op == JOG_TOK_EQ || node->as.binary.op == JOG_TOK_NEQ) && lhs.type) {
@@ -2463,7 +2619,9 @@ static JirOperand lower_expr_raw(Lower *L, JogNode *node) {
                 return value_none();
             }
             if (bytes_to_const_view(lhs.type, dest_ty) || slice_to_const_view(lhs.type, dest_ty) ||
-                u8_slice_to_str_view(lhs.type, dest_ty) || bytes_n_reinterpret(lhs.type, dest_ty)) {
+                u8_slice_to_str_view(lhs.type, dest_ty) ||
+                jog_type_converts_to_str(L->program->types, lhs.type, dest_ty) ||
+                bytes_n_reinterpret(lhs.type, dest_ty)) {
                 return bitcast_value(L, lhs, dest_ty, node->pos);
             }
         }
@@ -2529,6 +2687,9 @@ static JirOperand lower_expr_raw(Lower *L, JogNode *node) {
         return lower_lambda(L, node);
     case JOG_NODE_BUILTIN: {
         JirOperand got;
+        if (lower_scalar_intrinsic(L, node, &got)) {
+            return got;
+        }
         if (jog_lower_comptime_builtin(L, node, &got)) {
             return got;
         }
@@ -2552,7 +2713,8 @@ static JirOperand lower_expr(Lower *L, JogNode *node) {
     if (L->failed || !want) {
         return op;
     }
-    if (bytes_to_const_view(op.type, want) || slice_to_const_view(op.type, want) || u8_slice_to_str_view(op.type, want)) {
+    if (bytes_to_const_view(op.type, want) || slice_to_const_view(op.type, want) || u8_slice_to_str_view(op.type, want) ||
+        jog_type_converts_to_str(L->program->types, op.type, want)) {
         return bitcast_value(L, op, want, node->pos);
     }
     if (want->kind == JOG_TY_OPTION && op.type && want->as.elem.elem == op.type) {
@@ -2989,12 +3151,15 @@ static bool is_collection_type(const JogType *type) {
 }
 
 /* for x in xs copies xs once. for i, x in xs binds i as usize.
-   The element is a copy: T, or bytes[1] for str, bytes, and bytes[N].
+   The element is a copy: T, or byte for str, bytes, and [N]byte.
    continue increments the index. A channel is lowered in lower_chan_for.c. */
 static void lower_collection_for(Lower *L, JogNode *node) {
     JogNode *expr = node->as.for_.expr;
     JogPos pos = node->pos;
     JogType *base = expr && expr->type ? jog_lower_type(L, expr->type) : NULL;
+    if (base && base->kind == JOG_TY_DISTINCT && jog_type_bytes_view(base)) {
+        base = jog_type_bytes_view(base);
+    }
     JogType *elem = NULL;
     JogType *ptr_ty = NULL;
     JogType *usize;
@@ -4145,7 +4310,11 @@ static const char *global_gap(const JogType *type) {
         return "globals of this type";
     }
     if (type->kind == JOG_TY_DISTINCT) {
-        return "distinct types";
+        JogType *base = jog_type_underlying((JogType *)type);
+        if (!base || base == type) {
+            return "distinct types";
+        }
+        return global_gap(base);
     }
     switch (type->kind) {
     case JOG_TY_BOOL:

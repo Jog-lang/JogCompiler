@@ -104,7 +104,6 @@ enum TokenKind {
     KW_NULL // keyword `null`
     KW_TRUE // keyword `true`
     KW_FALSE // keyword `false`
-    KW_BYTES // keyword `bytes`
     KW_ESCAPING // keyword `escaping`
     KW_CONST // keyword `const`
     KW_EXTERN // keyword `extern`
@@ -203,7 +202,6 @@ struct Kind {
     KW_NULL: TokenKind
     KW_TRUE: TokenKind
     KW_FALSE: TokenKind
-    KW_BYTES: TokenKind
     KW_ESCAPING: TokenKind
     KW_CONST: TokenKind
     KW_EXTERN: TokenKind
@@ -305,7 +303,6 @@ fn kind(): Kind {
     k.KW_NULL = TokenKind.KW_NULL
     k.KW_TRUE = TokenKind.KW_TRUE
     k.KW_FALSE = TokenKind.KW_FALSE
-    k.KW_BYTES = TokenKind.KW_BYTES
     k.KW_ESCAPING = TokenKind.KW_ESCAPING
     k.KW_CONST = TokenKind.KW_CONST
     k.KW_EXTERN = TokenKind.KW_EXTERN
@@ -942,7 +939,6 @@ fn keyword_kind(text: str): TokenKind {
         "null" -> TokenKind.KW_NULL
         "true" -> TokenKind.KW_TRUE
         "false" -> TokenKind.KW_FALSE
-        "bytes" -> TokenKind.KW_BYTES
         "escaping" -> TokenKind.KW_ESCAPING
         "const" -> TokenKind.KW_CONST
         "extern" -> TokenKind.KW_EXTERN
@@ -953,13 +949,13 @@ fn keyword_kind(text: str): TokenKind {
 
 /**
  * Whether this keyword can end a statement.
- * `return`, `break`, `continue`, `true`, `false`, `null`, and `bytes` can.
+ * `return`, `break`, `continue`, `true`, `false`, and `null` can.
  * `fn` and the other keywords cannot. An identifier can.
  * @param k kind returned by `keyword_kind`, or `IDENT`
  * @return true when a following newline inserts SEP
  */
 fn keyword_ends(k: TokenKind): bool {
-    return k == TokenKind.IDENT || k == TokenKind.KW_RETURN || k == TokenKind.KW_BREAK || k == TokenKind.KW_CONTINUE || k == TokenKind.KW_TRUE || k == TokenKind.KW_FALSE || k == TokenKind.KW_NULL || k == TokenKind.KW_BYTES
+    return k == TokenKind.IDENT || k == TokenKind.KW_RETURN || k == TokenKind.KW_BREAK || k == TokenKind.KW_CONTINUE || k == TokenKind.KW_TRUE || k == TokenKind.KW_FALSE || k == TokenKind.KW_NULL
 }
 
 struct LexError {

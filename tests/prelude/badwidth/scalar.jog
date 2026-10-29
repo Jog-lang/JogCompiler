@@ -1,0 +1,2 @@
+@intrinsic(int, signed: false, bits: 16)
+type u8: byte

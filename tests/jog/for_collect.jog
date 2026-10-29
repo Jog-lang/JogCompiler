@@ -7,7 +7,7 @@ extern {
 type c_char = i8
 type c_int = i32
 
-fn keep(b: bytes[1]): i32 {
+fn keep(b: [1]byte): i32 {
     return 1
 }
 
@@ -98,7 +98,7 @@ fn main() {
     if n != 1 || m != 2 {
         return
     }
-    var raw: bytes[4]
+    var raw: [4]byte
     n = 0
     for b in raw {
         n = n + keep(b)

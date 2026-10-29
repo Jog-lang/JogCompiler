@@ -1,0 +1,30 @@
+// expect: ok
+// A string literal is str. bytes converts to str. T? is Option<T>.
+// Ordering.Less is -1 as i8. *T? stays the size of a pointer.
+
+extern {
+    fn puts(s: *const c_char): c_int
+}
+
+type c_char = i8
+type c_int = i32
+
+fn main() {
+    val s = "hi"
+    var buf: [2]u8
+    var view = bytes()
+    buf[0] = 104
+    buf[1] = 105
+    view.ptr = &buf[0]
+    view.len = 2
+    val from: str = view
+    val opt: i32? = 1
+    val named: Option<i32> = opt
+    val back: i32? = named
+    val tag: i8 = Ordering.Less as i8
+    if s == "hi" && from == s && named != null && back != null && tag == -1 && size(*i32?) == size(*i32) {
+        if puts(c"ok") < 0 {
+            return
+        }
+    }
+}

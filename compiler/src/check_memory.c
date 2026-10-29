@@ -49,16 +49,13 @@ static JogNode *list_at(JogList list, size_t index) {
 static void type_text(Check *ck, const JogType *type, char *buf, size_t cap) {
     CtSb sb;
     const char *text;
+    (void)ck;
     if (cap == 0) {
         return;
     }
     buf[0] = '\0';
     if (!type) {
         snprintf(buf, cap, "<null type>");
-        return;
-    }
-    if (ck && type == jog_type_builtin(ck->program->types, JOG_BUILTIN_CONST_BYTES)) {
-        snprintf(buf, cap, "str");
         return;
     }
     ct_sb_init(&sb);
@@ -314,6 +311,12 @@ JogType *jog_check_memory_index(Check *ck, CheckJob *job, JogBlockScope *scope, 
         }
         return finish(node, base);
     }
+    if (base->kind == JOG_TY_DISTINCT) {
+        JogType *view = jog_type_bytes_view(base);
+        if (view) {
+            base = view;
+        }
+    }
     if (base->kind == JOG_TY_PTR) {
         pointer = true;
         elem = base->as.elem.elem;
@@ -378,6 +381,7 @@ JogType *jog_check_memory_slice(Check *ck, CheckJob *job, JogBlockScope *scope, 
     JogType *result;
     Place place;
     bool view_const;
+    int slice_is_str = 0;
     char buf[160];
     if (!ck || !node || ck->stop) {
         return NULL;
@@ -389,6 +393,13 @@ JogType *jog_check_memory_slice(Check *ck, CheckJob *job, JogBlockScope *scope, 
     }
     if (is_error(base)) {
         return finish(node, base);
+    }
+    slice_is_str = jog_type_is_core_str(ck->program->types, base);
+    {
+        JogType *view = jog_type_bytes_view(base);
+        if (view && base->kind == JOG_TY_DISTINCT) {
+            base = view;
+        }
     }
     if (base->kind == JOG_TY_PTR ||
         (base->kind != JOG_TY_SLICE && base->kind != JOG_TY_ARRAY && base->kind != JOG_TY_BYTES &&
@@ -412,7 +423,11 @@ JogType *jog_check_memory_slice(Check *ck, CheckJob *job, JogBlockScope *scope, 
     if (base->kind == JOG_TY_SLICE) {
         result = base;
     } else if (base->kind == JOG_TY_BYTES) {
-        result = base;
+        result = slice_is_str ? jog_type_core_str(ck->program->types) : base;
+        if (!result) {
+            jog_check_oom(ck);
+            return NULL;
+        }
     } else if (base->kind == JOG_TY_BYTES_N) {
         place = place_of(base_node);
         view_const = place == PLACE_CONST;
@@ -465,6 +480,26 @@ static JogType *lit_elem_type(Check *ck, CheckJob *job, JogNode *type_node, JogT
     if (is_error(resolved)) {
         return resolved;
     }
+    if (resolved->kind == JOG_TY_BYTES) {
+        JogType *byte = jog_type_bytes_n(ck->program->types, 1);
+        if (!byte) {
+            jog_check_oom(ck);
+            return NULL;
+        }
+        *is_slice = true;
+        *result = resolved;
+        return byte;
+    }
+    if (resolved->kind == JOG_TY_BYTES_N) {
+        JogType *byte = jog_type_bytes_n(ck->program->types, 1);
+        if (!byte) {
+            jog_check_oom(ck);
+            return NULL;
+        }
+        *len = resolved->as.bytes_n.n;
+        *result = resolved;
+        return byte;
+    }
     if (resolved->kind == JOG_TY_SLICE) {
         *is_slice = true;
         *result = resolved;
@@ -512,7 +547,7 @@ JogType *jog_check_memory_array_lit(Check *ck, CheckJob *job, JogBlockScope *sco
         jog_check_fail(ck, node->pos, "slice literal in a global initializer does not outlive initialization");
         lifetime = true;
     }
-    if (!is_slice && result && result->kind == JOG_TY_ARRAY) {
+    if (!is_slice && result && (result->kind == JOG_TY_ARRAY || result->kind == JOG_TY_BYTES_N)) {
         if (count == 0) {
             if (!jog_check_type_has_zero(result)) {
                 jog_check_fail(ck, node->pos, "array literal has no zero value");

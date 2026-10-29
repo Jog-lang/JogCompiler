@@ -1,9 +1,9 @@
 main f2
 init none
 
-global g0 const jog_tid_27: u8 = zero
-global g1 const jog_vt_30_27: u8 = zero
-global g2 const jog_vt_28_27: u8 = zero
+global g0 const jog_tid_32: u8 = zero
+global g1 const jog_vt_35_32: u8 = zero
+global g2 const jog_vt_33_32: u8 = zero
 
 fn f0 public jog_app__Circle__id "app.Circle.id": (Circle) -> i32  ; iface_prop.jog:20:1
   l0 self: Circle param addr
@@ -151,7 +151,7 @@ b0 entry:
   l38 = copy l39  ; iface_prop.jog:41:5
   ret  ; iface_prop.jog:34:1
 
-fn f3 internal jog_ifn_28_27_0 "jog_ifn_28_27_0": extern (*void) -> i32  ; iface_prop.jog:37:24
+fn f3 internal jog_ifn_33_32_0 "jog_ifn_33_32_0": extern (*void) -> i32  ; iface_prop.jog:37:24
   l0: *void param
   l1: *Circle
   l2: Circle

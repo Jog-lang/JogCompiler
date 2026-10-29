@@ -660,15 +660,36 @@ static bool node_prefers_bool(const JogNode *node) {
            op == JOG_TOK_LE || op == JOG_TOK_GT || op == JOG_TOK_GE;
 }
 
+static bool int_layout(const JogType *type, unsigned *bits, bool *is_signed) {
+    if (!type || !bits || !is_signed) {
+        return false;
+    }
+    if (type->kind == JOG_TY_INT) {
+        *bits = type->as.integer.bits;
+        *is_signed = type->as.integer.is_signed;
+        return true;
+    }
+    if (type->intrinsic == JOG_INTRINSIC_INT) {
+        *bits = type->intrinsic_bits;
+        *is_signed = type->intrinsic_signed != 0;
+        return true;
+    }
+    return false;
+}
+
 static JogType *preset_int(const JogNode *node) {
-    if (node && node->type && node->type->kind == JOG_TY_INT) {
+    unsigned bits = 0;
+    bool is_signed = false;
+    if (node && int_layout(node->type, &bits, &is_signed)) {
         return node->type;
     }
     return NULL;
 }
 
 static bool concrete_int(const JogType *type) {
-    return type && type->kind == JOG_TY_INT;
+    unsigned bits = 0;
+    bool is_signed = false;
+    return int_layout(type, &bits, &is_signed);
 }
 
 static void fail_fit_literal(CtDiag *diag, const JogNode *node) {
@@ -682,7 +703,9 @@ static void fail_overflow(CtDiag *diag, const JogNode *node) {
 static bool apply_result_type(CtDiag *diag, JogTypes *types, JogNode *node, JogType *want, JogType *forced, Big *value,
                               bool literal, JogType **produced) {
     JogType *ty = forced ? forced : want;
-    if (concrete_int(ty) && !big_fits(value, ty->as.integer.bits, ty->as.integer.is_signed)) {
+    unsigned fit_bits = 0;
+    bool fit_signed = false;
+    if (int_layout(ty, &fit_bits, &fit_signed) && !big_fits(value, fit_bits, fit_signed)) {
         if (literal) {
             fail_fit_literal(diag, node);
         } else {
@@ -1078,7 +1101,7 @@ static bool fold_bytes(CtArena *arena, CtDiag *diag, JogNode *node, JogType *tar
     text = node->as.literal.text;
     len = node->as.literal.len;
     if (!is_hex_literal(text, len)) {
-        ct_diag_emit(diag, CT_SEVERITY_ERROR, at_node(node), "hex literal required for bytes[N]");
+        ct_diag_emit(diag, CT_SEVERITY_ERROR, at_node(node), "hex literal required for [N]byte");
         return false;
     }
     for (i = 2; i < len; i++) {
@@ -1103,7 +1126,7 @@ static bool fold_bytes(CtArena *arena, CtDiag *diag, JogNode *node, JogType *tar
     need = n * 2u;
     if (digits != need) {
         ct_diag_emit(diag, CT_SEVERITY_ERROR, at_node(node),
-                     "hex literal has %" PRIu64 " digits, bytes[%" PRIu64 "] needs %" PRIu64, digits, n, need);
+                     "hex literal has %" PRIu64 " digits, [%" PRIu64 "]byte needs %" PRIu64, digits, n, need);
         return false;
     }
     if (n > SIZE_MAX) {
@@ -1140,7 +1163,7 @@ static bool finish_int(CtDiag *diag, JogTypes *types, JogNode *node, JogType *ta
     Big value;
     JogType *produced = NULL;
     JogType *want = NULL;
-    if (target && target->kind == JOG_TY_INT) {
+    if (concrete_int(target)) {
         want = target;
     }
     if (!fold_int(diag, types, node, want, &value, &produced)) {
@@ -1198,7 +1221,7 @@ bool jog_const_eval(CtArena *arena, CtDiag *diag, JogTypes *types, JogNode *node
         out->bits = bit ? 1u : 0u;
         return true;
     }
-    if (natural && natural->kind != JOG_TY_INT) {
+    if (natural && !concrete_int(natural)) {
         ct_diag_emit(diag, CT_SEVERITY_ERROR, at_node(node), "constant does not fit");
         return false;
     }

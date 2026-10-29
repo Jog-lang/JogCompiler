@@ -9,15 +9,19 @@
 #include <stdint.h>
 
 /* Semantic types. Structural types (pointers, slices, arrays, options,
-   tuples, functions, bytes[N]) are interned: asking twice for the same
+   tuples, functions, [N]byte) are interned: asking twice for the same
    shape returns the same JogType *, so equality is pointer equality.
    Nominal types (struct, enum, interface, distinct) are created once per
    declaration (or per generic instance) and are unique by construction.
 
-   The std scalars are compiler built-ins here even though the language
-   describes them as @intrinsic distinct types over bytes[N]; the checker
-   gives them that behavior. str is an alias for const bytes, so it is
-   JOG_TY_BYTES with is_const set.
+   The scalar names are bound from core/scalar.jog onto these builtins.
+   str is a distinct type over the const-bytes view, created when the
+   prelude is bound. rune is a distinct type over the u32 builtin.
+   Option<T> stays JOG_TY_OPTION; the prelude enum is that constructor.
+   error and void are the core interface and the incomplete struct.
+   Operator methods from that file are stored beside the builtins, not as
+   scope names. A user distinct type may set intrinsic when its @intrinsic
+   matches a machine type.
 
    Contract owner: see docs/plans/V1Parallel.md. */
 
@@ -33,8 +37,8 @@ typedef enum JogTypeKind {
     JOG_TY_UNTYPED_INT,   /* integer constant before it gets a type (defaults to i64) */
     JOG_TY_UNTYPED_FLOAT, /* float constant before it gets a type (defaults to f64) */
     JOG_TY_NULL,          /* the type of null before it gets an Option type */
-    JOG_TY_BYTES_N,       /* bytes[N], stored inline */
-    JOG_TY_BYTES,         /* bytes / const bytes / str: pointer + length */
+    JOG_TY_BYTES_N,       /* [N]byte, stored inline */
+    JOG_TY_BYTES,         /* bytes / const bytes: pointer + length */
     JOG_TY_PTR,           /* *T, *const T; never null */
     JOG_TY_SLICE,         /* []T, []const T */
     JOG_TY_ARRAY,         /* [N]T */
@@ -71,6 +75,12 @@ struct JogType {
     bool has_layout;  /* size and align are valid */
     uint64_t size;
     uint32_t align;
+    /* 0, or JOG_INTRINSIC_*. Set on a distinct type declared with @intrinsic.
+       Builtin integers, floats, and bool keep their kind and leave this 0. */
+    uint8_t intrinsic;
+    uint8_t intrinsic_bits;
+    uint8_t intrinsic_signed;
+    uint8_t intrinsic_ptr;
     union {
         struct {
             uint8_t bits; /* 8, 16, 32, 64 */
@@ -126,6 +136,22 @@ struct JogType {
     } as;
 };
 
+enum {
+    JOG_INTRINSIC_NONE = 0,
+    JOG_INTRINSIC_INT = 1,
+    JOG_INTRINSIC_FLOAT = 2,
+    JOG_INTRINSIC_BOOL = 3
+};
+
+/* What a value occupies: a builtin integer, float, or bool, or a distinct
+   type built on one of those. bits is 1 for bool. is_ptr is isize or usize. */
+typedef struct JogMachine {
+    int kind;
+    unsigned bits;
+    int is_signed;
+    int is_ptr;
+} JogMachine;
+
 typedef struct JogTypes JogTypes;
 
 typedef enum JogBuiltin {
@@ -136,7 +162,7 @@ typedef enum JogBuiltin {
     JOG_BUILTIN_BOOL,
     JOG_BUILTIN_UNIT,
     JOG_BUILTIN_BYTES,       /* bytes */
-    JOG_BUILTIN_CONST_BYTES, /* const bytes, also str */
+    JOG_BUILTIN_CONST_BYTES, /* []const byte, the base of str */
     JOG_BUILTIN_UNTYPED_INT,
     JOG_BUILTIN_UNTYPED_FLOAT,
     JOG_BUILTIN_NULL,
@@ -185,6 +211,34 @@ bool jog_type_layout(JogTypes *types, JogType *type);
 
 /* Strips DISTINCT layers. */
 JogType *jog_type_underlying(JogType *type);
+
+/* The distinct str from the core prelude, or NULL before it is bound. */
+JogType *jog_type_core_str(const JogTypes *types);
+void jog_types_set_core_str(JogTypes *types, JogType *type);
+
+/* 1 when type is that distinct str. */
+int jog_type_is_core_str(const JogTypes *types, const JogType *type);
+
+/* BYTES itself, or the BYTES under distinct layers. NULL otherwise. */
+JogType *jog_type_bytes_view(JogType *type);
+
+/* 1 when got converts to core str: bytes, []byte, []const byte, []u8,
+   []const u8. The reverse is not this conversion. */
+int jog_type_converts_to_str(const JogTypes *types, const JogType *got, const JogType *want);
+
+/* 1 when type is an integer, float, or bool, including a distinct type whose
+   underlying type is one, or whose own @intrinsic says so. */
+int jog_type_machine(const JogType *type, JogMachine *out);
+
+/* Record a user @intrinsic and raise align to the machine alignment. */
+void jog_type_set_intrinsic(JogType *type, int kind, unsigned bits, int is_signed, int is_ptr);
+
+/* Prelude operator methods. Not scope bindings. value_params is 0 or 1,
+   not counting the receiver. 1 when recorded, 0 on a duplicate or OOM. */
+int jog_types_add_scalar_op(JogTypes *types, JogType *on, const char *name, int value_params, JogType *ret);
+
+/* Result type of that prelude operator, or NULL. */
+JogType *jog_types_scalar_op(const JogTypes *types, const JogType *on, const char *name, int value_params);
 
 /* True for *T? and other options whose None is an all-zero niche, which are
    represented as a plain nullable pointer. */

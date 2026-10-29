@@ -34,16 +34,13 @@ static JogNode *list_at(JogList list, size_t index) {
 static void type_text(Check *ck, const JogType *type, char *buf, size_t cap) {
     CtSb sb;
     const char *text;
+    (void)ck;
     if (cap == 0) {
         return;
     }
     buf[0] = '\0';
     if (!type) {
         snprintf(buf, cap, "<null type>");
-        return;
-    }
-    if (ck && type == jog_type_builtin(ck->program->types, JOG_BUILTIN_CONST_BYTES)) {
-        snprintf(buf, cap, "str");
         return;
     }
     ct_sb_init(&sb);
@@ -221,7 +218,7 @@ int jog_check_error_call(Check *ck, CheckJob *job, JogBlockScope *scope, JogNode
         call->type = poison(ck);
         return ck->stop ? -1 : 1;
     }
-    str = builtin(ck, JOG_BUILTIN_CONST_BYTES);
+    str = jog_type_core_str(ck->program->types);
     if (!str) {
         return -1;
     }
@@ -444,7 +441,7 @@ static int message_ok(Check *ck, JogType *elem) {
                 if (fn_ty->as.fn.variadic || fn_ty->as.fn.context_count != 0 || fn_ty->as.fn.param_count != 1) {
                     continue;
                 }
-                if (fn_ty->as.fn.ret != jog_type_builtin(ck->program->types, JOG_BUILTIN_CONST_BYTES)) {
+                if (fn_ty->as.fn.ret != jog_type_core_str(ck->program->types)) {
                     continue;
                 }
                 found = 1;

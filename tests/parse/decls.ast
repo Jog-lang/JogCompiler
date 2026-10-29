@@ -4,8 +4,9 @@
   (STRUCT Header private(file)
     (ATTRIBUTE packed)
     (FIELD magic
-      (TYPE_BYTES
+      (TYPE_ARRAY
         (INT_LIT 4)
+        (TYPE_NAME byte)
       )
     )
     (FIELD len
@@ -39,8 +40,9 @@
   )
   (TYPE_DECL Handle
     =
-      (TYPE_BYTES
+      (TYPE_ARRAY
         (INT_LIT 8)
+        (TYPE_NAME byte)
       )
   )
   (TYPE_DECL Pair

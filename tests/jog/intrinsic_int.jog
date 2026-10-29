@@ -1,0 +1,20 @@
+// expect: ok
+
+extern {
+    fn puts(s: *const i8): i32
+}
+
+@intrinsic(int, signed: false, bits: 32)
+type Word: [4]byte
+
+fn Word.op+(o: Word): Word = @add(self, o)
+fn Word.op==(o: Word): bool = @eq(self, o)
+fn Word.op<(o: Word): bool = @lt(self, o)
+
+fn main() {
+    val a: Word = 1
+    val b: Word = 2
+    if a + b == 3 && a < b {
+        puts(c"ok")
+    }
+}

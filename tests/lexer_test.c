@@ -128,7 +128,7 @@ static void test_newlines(void) {
     EXPECT_KINDS("var m: Map<str, List<i32>>\nvar b: bytes\nvar p: *T?\n", JOG_TOK_KW_VAR, JOG_TOK_IDENT,
                  JOG_TOK_COLON, JOG_TOK_IDENT, JOG_TOK_LT, JOG_TOK_IDENT, JOG_TOK_COMMA, JOG_TOK_IDENT, JOG_TOK_LT,
                  JOG_TOK_IDENT, JOG_TOK_SHR, JOG_TOK_SEP, JOG_TOK_KW_VAR, JOG_TOK_IDENT, JOG_TOK_COLON,
-                 JOG_TOK_KW_BYTES, JOG_TOK_SEP, JOG_TOK_KW_VAR, JOG_TOK_IDENT, JOG_TOK_COLON, JOG_TOK_STAR,
+                 JOG_TOK_IDENT, JOG_TOK_SEP, JOG_TOK_KW_VAR, JOG_TOK_IDENT, JOG_TOK_COLON, JOG_TOK_STAR,
                  JOG_TOK_IDENT, JOG_TOK_QUESTION, JOG_TOK_SEP, JOG_TOK_EOF);
     /* A block comment that spans lines acts as a newline. */
     EXPECT_KINDS("a /* x /* nested */\n */ b", JOG_TOK_IDENT, JOG_TOK_SEP, JOG_TOK_IDENT, JOG_TOK_SEP, JOG_TOK_EOF);

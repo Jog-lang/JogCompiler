@@ -47,8 +47,8 @@ fn Inner.format(buf: bytes): (str, error?) {
 }
 
 fn main() {
-    var raw: bytes[32]
-    var tiny: bytes[4]
+    var raw: [32]byte
+    var tiny: [4]byte
     var n: i32 = 7
     var m: i32 = -2
     var u: u64 = 3
@@ -85,7 +85,7 @@ fn main() {
     if spp != "4,5" {
         return
     }
-    var tiny2: bytes[2]
+    var tiny2: [2]byte
     val (_, errt) = fmt(tiny2[..], "${p}")
     if errt == null {
         return

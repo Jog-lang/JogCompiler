@@ -447,7 +447,7 @@ static const char *keyword_name(Parser *p) {
 
 static JogNode *parse_param(Parser *p, bool allow_defaults) {
     JogPos pos = here(p);
-    /* `fn put(val: bytes)` uses the keyword as a parameter name. */
+    /* A keyword such as `val` can be a parameter name: `fn put(val: i32)`. */
     int keyword = is_keyword(peek_kind(p)) && peek_n(p, 1) == JOG_TOK_COLON;
     if (!check(p, JOG_TOK_IDENT) && !keyword) {
         error_here(p, "expected a parameter name, found %s", jog_token_spelling(peek_kind(p)));
@@ -561,7 +561,6 @@ static bool type_can_start(JogTokenKind kind) {
     case JOG_TOK_STAR:
     case JOG_TOK_LBRACKET:
     case JOG_TOK_LPAREN:
-    case JOG_TOK_KW_BYTES:
     case JOG_TOK_KW_CONST:
     case JOG_TOK_KW_ESCAPING:
     case JOG_TOK_KW_EXTERN:
@@ -799,31 +798,6 @@ static JogNode *parse_receiver_name(Parser *p) {
     return node;
 }
 
-static JogNode *parse_bytes_type(Parser *p, bool is_const) {
-    JogPos pos = here(p);
-    if (is_const) {
-        advance(p);
-        if (!eat(p, JOG_TOK_KW_BYTES)) {
-            error_here(p, "expected 'bytes' after 'const'");
-            return NULL;
-        }
-    } else {
-        advance(p);
-    }
-    JogNode *len = NULL;
-    if (!give_up(p) && eat(p, JOG_TOK_LBRACKET)) {
-        len = parse_expr(p);
-        expect(p, JOG_TOK_RBRACKET, "']'");
-    }
-    JogNode *node = make_at(p, JOG_NODE_TYPE_BYTES, pos);
-    if (!node) {
-        return NULL;
-    }
-    node->as.type_bytes.len = len;
-    node->as.type_bytes.is_const = is_const;
-    return node;
-}
-
 static JogList parse_fn_type_contexts(Parser *p) {
     CtDa da;
     if (!start_da(p, &da, sizeof(JogNode *))) {
@@ -972,10 +946,16 @@ static JogNode *parse_non_null(Parser *p) {
         return parse_paren_type(p);
     }
     if (kind == JOG_TOK_KW_CONST) {
-        return parse_bytes_type(p, true);
-    }
-    if (kind == JOG_TOK_KW_BYTES) {
-        return parse_bytes_type(p, false);
+        advance(p);
+        if (!check(p, JOG_TOK_IDENT)) {
+            error_here(p, "expected a type name after 'const'");
+            return NULL;
+        }
+        JogNode *named = parse_type_name(p);
+        if (named) {
+            named->as.type_name.is_const = true;
+        }
+        return named;
     }
     if (kind == JOG_TOK_KW_ESCAPING || kind == JOG_TOK_KW_EXTERN) {
         bool is_extern = kind == JOG_TOK_KW_EXTERN;
@@ -1283,9 +1263,8 @@ static JogNode *parse_primary(Parser *p) {
         node->as.ident.type_args = args;
         return node;
     }
-    case JOG_TOK_KW_BYTES:
     case JOG_TOK_KW_IN: {
-        /* `bytes()` is a call. `in` is also a value name in the notes (`in.close()`). */
+        /* `in` is also a value name in the notes (`in.close()`). */
         const char *name = ct_intern_cstr(p->intern, jog_token_spelling(kind));
         if (!name) {
             p->oom = true;
@@ -2656,6 +2635,11 @@ static bool is_overload_op(JogTokenKind kind) {
     case JOG_TOK_TILDE:
     case JOG_TOK_BANG:
     case JOG_TOK_EQ:
+    case JOG_TOK_NEQ:
+    case JOG_TOK_LT:
+    case JOG_TOK_LE:
+    case JOG_TOK_GT:
+    case JOG_TOK_GE:
     case JOG_TOK_CMP3:
     case JOG_TOK_PLUS_ASSIGN:
     case JOG_TOK_MINUS_ASSIGN:

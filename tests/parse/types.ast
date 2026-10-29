@@ -46,22 +46,24 @@
   )
   (TYPE_DECL H
     =
-      (TYPE_BYTES)
+      (TYPE_NAME bytes)
   )
   (TYPE_DECL I
     =
-      (TYPE_BYTES const)
+      (TYPE_NAME const bytes)
   )
   (TYPE_DECL J
     =
-      (TYPE_BYTES
+      (TYPE_ARRAY
         (INT_LIT 4)
+        (TYPE_NAME byte)
       )
   )
   (TYPE_DECL K
     =
-      (TYPE_BYTES const
+      (TYPE_ARRAY
         (INT_LIT 8)
+        (TYPE_NAME byte)
       )
   )
   (TYPE_DECL L

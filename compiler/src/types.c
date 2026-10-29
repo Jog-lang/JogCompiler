@@ -12,7 +12,18 @@ struct JogTypes {
     uint32_t ptr_size;
     uint32_t next_id;
     JogType *builtins[JOG_BUILTIN_COUNT];
+    JogType *core_str; /* distinct str over const bytes; NULL until the prelude binds it */
     CtSb key;
+    struct JogScalarOp *scalar_ops;
+};
+
+/* An operator method from core/scalar.jog. The name is not a scope binding. */
+struct JogScalarOp {
+    JogType *on;
+    const char *name;
+    int value_params;
+    JogType *ret;
+    struct JogScalarOp *next;
 };
 
 static uint64_t round_up(uint64_t value, uint64_t align) {
@@ -206,7 +217,20 @@ JogType *jog_type_ptr(JogTypes *types, JogType *elem, bool is_const) {
     return elem_type(types, JOG_TY_PTR, 'p', elem, is_const);
 }
 
+/* True when type is the universe name byte. Comparing kind and length avoids
+   allocating [1]byte just to ask the question. */
+static bool type_is_byte(const JogType *type) {
+    return type && type->kind == JOG_TY_BYTES_N && type->as.bytes_n.n == 1;
+}
+
 JogType *jog_type_slice(JogTypes *types, JogType *elem, bool is_const) {
+    if (!types || !elem) {
+        return NULL;
+    }
+    /* []byte is the bytes view. []const byte is const bytes. */
+    if (type_is_byte(elem)) {
+        return jog_type_builtin(types, is_const ? JOG_BUILTIN_CONST_BYTES : JOG_BUILTIN_BYTES);
+    }
     return elem_type(types, JOG_TY_SLICE, 's', elem, is_const);
 }
 
@@ -217,6 +241,10 @@ JogType *jog_type_option(JogTypes *types, JogType *elem) {
 JogType *jog_type_array(JogTypes *types, JogType *elem, uint64_t len) {
     if (!types || !elem) {
         return NULL;
+    }
+    /* [N]byte is the inline byte string, not an array of one-byte arrays. */
+    if (type_is_byte(elem)) {
+        return jog_type_bytes_n(types, len);
     }
     key_begin(types, 'a');
     key_id(types, elem);
@@ -495,6 +523,48 @@ JogType *jog_type_underlying(JogType *type) {
     return type;
 }
 
+JogType *jog_type_core_str(const JogTypes *types) {
+    return types ? types->core_str : NULL;
+}
+
+void jog_types_set_core_str(JogTypes *types, JogType *type) {
+    if (types) {
+        types->core_str = type;
+    }
+}
+
+int jog_type_is_core_str(const JogTypes *types, const JogType *type) {
+    return types && type && types->core_str && type == types->core_str;
+}
+
+JogType *jog_type_bytes_view(JogType *type) {
+    type = jog_type_underlying(type);
+    return type && type->kind == JOG_TY_BYTES ? type : NULL;
+}
+
+static int type_is_u8(const JogType *type) {
+    return type && type->kind == JOG_TY_INT && !type->as.integer.is_signed && type->as.integer.bits == 8 &&
+           !type->as.integer.is_size;
+}
+
+int jog_type_converts_to_str(const JogTypes *types, const JogType *got, const JogType *want) {
+    const JogType *elem;
+    if (!jog_type_is_core_str(types, want) || !got || got == want) {
+        return 0;
+    }
+    if (got->kind == JOG_TY_BYTES) {
+        return 1;
+    }
+    if (got->kind != JOG_TY_SLICE) {
+        return 0;
+    }
+    elem = got->as.elem.elem;
+    if (elem && elem->kind == JOG_TY_DISTINCT) {
+        elem = jog_type_underlying((JogType *)elem);
+    }
+    return type_is_u8(elem);
+}
+
 bool jog_type_option_is_niche(const JogType *type) {
     if (!type || type->kind != JOG_TY_OPTION) {
         return false;
@@ -552,7 +622,7 @@ void jog_type_print(const JogType *type, CtSb *out) {
         ct_sb_append_cstr(out, "null");
         return;
     case JOG_TY_BYTES_N:
-        ct_sb_appendf(out, "bytes[%" PRIu64 "]", type->as.bytes_n.n);
+        ct_sb_appendf(out, "[%" PRIu64 "]byte", type->as.bytes_n.n);
         return;
     case JOG_TY_BYTES:
         ct_sb_append_cstr(out, type->is_const ? "const bytes" : "bytes");
@@ -617,4 +687,109 @@ void jog_type_print(const JogType *type, CtSb *out) {
         ct_sb_append_cstr(out, type->as.param.name ? type->as.param.name : "T");
         return;
     }
+}
+
+static void fill_machine(const JogType *type, JogMachine *out) {
+    memset(out, 0, sizeof(*out));
+    if (!type) {
+        return;
+    }
+    if (type->kind == JOG_TY_INT) {
+        out->kind = JOG_INTRINSIC_INT;
+        out->bits = type->as.integer.bits;
+        out->is_signed = type->as.integer.is_signed ? 1 : 0;
+        out->is_ptr = type->as.integer.is_size ? 1 : 0;
+        return;
+    }
+    if (type->kind == JOG_TY_FLOAT) {
+        out->kind = JOG_INTRINSIC_FLOAT;
+        out->bits = type->as.flt.bits;
+        return;
+    }
+    if (type->kind == JOG_TY_BOOL) {
+        out->kind = JOG_INTRINSIC_BOOL;
+        out->bits = 1;
+        return;
+    }
+    if (type->intrinsic == JOG_INTRINSIC_INT || type->intrinsic == JOG_INTRINSIC_FLOAT ||
+        type->intrinsic == JOG_INTRINSIC_BOOL) {
+        out->kind = type->intrinsic;
+        out->bits = type->intrinsic_bits;
+        out->is_signed = type->intrinsic_signed ? 1 : 0;
+        out->is_ptr = type->intrinsic_ptr ? 1 : 0;
+    }
+}
+
+int jog_type_machine(const JogType *type, JogMachine *out) {
+    const JogType *cursor = type;
+    if (!out) {
+        return 0;
+    }
+    memset(out, 0, sizeof(*out));
+    while (cursor && cursor->kind == JOG_TY_DISTINCT) {
+        if (cursor->intrinsic) {
+            fill_machine(cursor, out);
+            return out->kind != JOG_INTRINSIC_NONE;
+        }
+        cursor = cursor->as.nominal.base;
+    }
+    fill_machine(cursor, out);
+    return out->kind != JOG_INTRINSIC_NONE;
+}
+
+void jog_type_set_intrinsic(JogType *type, int kind, unsigned bits, int is_signed, int is_ptr) {
+    uint32_t align;
+    if (!type) {
+        return;
+    }
+    type->intrinsic = (uint8_t)kind;
+    type->intrinsic_bits = (uint8_t)bits;
+    type->intrinsic_signed = is_signed ? 1 : 0;
+    type->intrinsic_ptr = is_ptr ? 1 : 0;
+    if ((kind == JOG_INTRINSIC_INT || kind == JOG_INTRINSIC_FLOAT) && bits >= 8) {
+        align = bits / 8u;
+        if (align > type->align) {
+            type->align = align;
+        }
+    }
+}
+
+int jog_types_add_scalar_op(JogTypes *types, JogType *on, const char *name, int value_params, JogType *ret) {
+    struct JogScalarOp *op;
+    if (!types || !on || !name || !ret) {
+        return 0;
+    }
+    {
+        JogType *existing = jog_types_scalar_op(types, on, name, value_params);
+        /* jog_check binds the prelude again on the same type table. The same
+           operator is not a second declaration. */
+        if (existing) {
+            return existing == ret;
+        }
+    }
+    op = ct_arena_alloc(types->arena, sizeof(*op), _Alignof(struct JogScalarOp));
+    if (!op) {
+        return 0;
+    }
+    memset(op, 0, sizeof(*op));
+    op->on = on;
+    op->name = name;
+    op->value_params = value_params;
+    op->ret = ret;
+    op->next = types->scalar_ops;
+    types->scalar_ops = op;
+    return 1;
+}
+
+JogType *jog_types_scalar_op(const JogTypes *types, const JogType *on, const char *name, int value_params) {
+    struct JogScalarOp *op;
+    if (!types || !on || !name) {
+        return NULL;
+    }
+    for (op = types->scalar_ops; op; op = op->next) {
+        if (op->on == on && op->value_params == value_params && op->name && strcmp(op->name, name) == 0) {
+            return op->ret;
+        }
+    }
+    return NULL;
 }

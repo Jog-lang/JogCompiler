@@ -17,8 +17,8 @@
    ()                    void (function results); no value object
    untyped int / float   int64_t / double (the defaults from types.h)
    null, <error>, T      incomplete typedef struct jt<id>
-   bytes[N], N > 0       struct { uint8_t b[N]; }
-   bytes[0], [0]T, (),
+   [N]byte, N > 0        struct { uint8_t b[N]; }
+   [0]byte, [0]T, (),
      empty struct        incomplete typedef struct (C17 has no zero-size type)
    bytes, str, []T       struct { T *ptr; size_t len; } with const T * when const
    *T / *const T         typedef of T * / const T *
@@ -706,6 +706,43 @@ static bool order_defs(Emit *e) {
 
 static void append_type_name(Emit *e, const JogType *type);
 
+static void append_machine_c_name(Emit *e, const JogType *type) {
+    if (!type) {
+        ct_sb_append_cstr(e->out, "void");
+        return;
+    }
+    if (type->intrinsic == JOG_INTRINSIC_BOOL) {
+        ct_sb_append_cstr(e->out, "_Bool");
+        return;
+    }
+    if (type->intrinsic == JOG_INTRINSIC_FLOAT) {
+        if (type->intrinsic_bits == 32) {
+            ct_sb_append_cstr(e->out, "float");
+        } else if (type->intrinsic_bits == 64) {
+            ct_sb_append_cstr(e->out, "double");
+        } else {
+            emit_fail(e, "C backend: float width has no C name");
+            ct_sb_append_cstr(e->out, "double");
+        }
+        return;
+    }
+    if (type->intrinsic == JOG_INTRINSIC_INT) {
+        unsigned bits = type->intrinsic_bits;
+        if (type->intrinsic_ptr) {
+            ct_sb_append_cstr(e->out, type->intrinsic_signed ? "intptr_t" : "uintptr_t");
+            return;
+        }
+        if (bits != 8 && bits != 16 && bits != 32 && bits != 64) {
+            emit_fail(e, "C backend: integer width has no stdint name");
+            ct_sb_append_cstr(e->out, "int64_t");
+            return;
+        }
+        ct_sb_appendf(e->out, "%s%u_t", type->intrinsic_signed ? "int" : "uint", bits);
+        return;
+    }
+    ct_sb_append_cstr(e->out, "void");
+}
+
 static void append_int_name(Emit *e, const JogType *type) {
     if (type->as.integer.is_size) {
         ct_sb_append_cstr(e->out, type->as.integer.is_signed ? "intptr_t" : "uintptr_t");
@@ -838,6 +875,9 @@ static bool global_is_object(const JirGlobal *global) {
 /* True for a C aggregate. Distinct and niche options use the spelled base. */
 static bool spelled_aggregate(const JogType *type) {
     while (type && type->kind == JOG_TY_DISTINCT) {
+        if (type->intrinsic) {
+            return false;
+        }
         type = type->as.nominal.base;
     }
     if (!type) {
@@ -1099,7 +1139,11 @@ static void emit_alias(Emit *e, const JogType *type) {
         break;
     case JOG_TY_DISTINCT:
         ct_sb_append_cstr(e->out, "typedef ");
-        append_type_name(e, type->as.nominal.base);
+        if (type->intrinsic) {
+            append_machine_c_name(e, type);
+        } else {
+            append_type_name(e, type->as.nominal.base);
+        }
         ct_sb_appendf(e->out, " %s;", name);
         break;
     case JOG_TY_OPTION:
@@ -1166,56 +1210,79 @@ static bool type_kind_is(const JogType *type, JogTypeKind kind) {
 }
 
 static bool type_is_bool(const JogType *type) {
-    return type_kind_is(type, JOG_TY_BOOL);
+    JogMachine machine;
+    if (jog_type_machine(type, &machine)) {
+        return machine.kind == JOG_INTRINSIC_BOOL;
+    }
+    return false;
 }
 
 static bool type_is_float(const JogType *type) {
-    JogType *base = underlying(type);
-    return base && (base->kind == JOG_TY_FLOAT || base->kind == JOG_TY_UNTYPED_FLOAT);
+    JogMachine machine;
+    JogType *base;
+    if (jog_type_machine(type, &machine) && machine.kind == JOG_INTRINSIC_FLOAT) {
+        return true;
+    }
+    base = underlying(type);
+    return base && base->kind == JOG_TY_UNTYPED_FLOAT;
 }
 
 static bool type_is_int(const JogType *type) {
-    JogType *base = underlying(type);
-    return base && (base->kind == JOG_TY_INT || base->kind == JOG_TY_UNTYPED_INT || base->kind == JOG_TY_BOOL);
+    JogMachine machine;
+    JogType *base;
+    if (jog_type_machine(type, &machine) &&
+        (machine.kind == JOG_INTRINSIC_INT || machine.kind == JOG_INTRINSIC_BOOL)) {
+        return true;
+    }
+    base = underlying(type);
+    return base && base->kind == JOG_TY_UNTYPED_INT;
 }
 
 static unsigned int_width(const JogType *type) {
+    JogMachine machine;
     JogType *base = underlying(type);
-    if (!base) {
+    if (jog_type_machine(type, &machine)) {
+        if (machine.kind == JOG_INTRINSIC_BOOL) {
+            return 1;
+        }
+        if (machine.kind == JOG_INTRINSIC_INT && machine.bits > 0 && machine.bits <= 64) {
+            return machine.bits;
+        }
+    }
+    if (base && base->kind == JOG_TY_UNTYPED_INT) {
         return 64;
-    }
-    if (base->kind == JOG_TY_BOOL) {
-        return 1;
-    }
-    if (base->kind == JOG_TY_UNTYPED_INT) {
-        return 64;
-    }
-    if (base->kind == JOG_TY_INT && base->as.integer.bits > 0 && base->as.integer.bits <= 64) {
-        return base->as.integer.bits;
     }
     return 64;
 }
 
 static bool int_signed(const JogType *type) {
-    JogType *base = underlying(type);
+    JogMachine machine;
+    JogType *base;
+    if (jog_type_machine(type, &machine)) {
+        if (machine.kind == JOG_INTRINSIC_BOOL) {
+            return false;
+        }
+        if (machine.kind == JOG_INTRINSIC_INT) {
+            return machine.is_signed != 0;
+        }
+    }
+    base = underlying(type);
     if (!base || base->kind == JOG_TY_BOOL) {
         return false;
     }
-    if (base->kind == JOG_TY_UNTYPED_INT) {
-        return true;
-    }
-    return base->kind == JOG_TY_INT && base->as.integer.is_signed;
+    return base->kind == JOG_TY_UNTYPED_INT;
 }
 
 static bool int_is_size(const JogType *type) {
-    JogType *base = underlying(type);
-    return base && base->kind == JOG_TY_INT && base->as.integer.is_size;
+    JogMachine machine;
+    return jog_type_machine(type, &machine) && machine.kind == JOG_INTRINSIC_INT && machine.is_ptr;
 }
 
 static unsigned float_width(const JogType *type) {
-    JogType *base = underlying(type);
-    if (base && base->kind == JOG_TY_FLOAT) {
-        return base->as.flt.bits;
+    JogMachine machine;
+    if (jog_type_machine(type, &machine) && machine.kind == JOG_INTRINSIC_FLOAT &&
+        (machine.bits == 32 || machine.bits == 64)) {
+        return machine.bits;
     }
     return 64;
 }
@@ -1425,6 +1492,46 @@ static void emit_string_data(Emit *e) {
 
 static void append_bits(Emit *e, const JogType *type, uint64_t bits) {
     JogType *base = underlying(type);
+    if (type && type->intrinsic == JOG_INTRINSIC_BOOL) {
+        ct_sb_append_cstr(e->out, (bits & 1) ? "1" : "0");
+        return;
+    }
+    if (type && type->intrinsic == JOG_INTRINSIC_INT) {
+        unsigned width = type->intrinsic_bits;
+        bool is_signed = type->intrinsic_signed != 0;
+        if (width == 0 || width > 64) {
+            emit_fail(e, "C backend: integer width has no C constant");
+            ct_sb_append_cstr(e->out, "0");
+            return;
+        }
+        uint64_t mask = width == 64 ? ~(uint64_t)0 : (((uint64_t)1 << width) - 1);
+        bits &= mask;
+        if (!is_signed) {
+            ct_sb_appendf(e->out, "%" PRIu64 "%s", bits, bits > 4294967295ull ? "ull" : "u");
+            return;
+        }
+        uint64_t sign = (uint64_t)1 << (width - 1);
+        if ((bits & sign) != 0 && width == 64 && bits == sign) {
+            ct_sb_append_cstr(e->out, "(-9223372036854775807LL-1)");
+            return;
+        }
+        int64_t value;
+        if ((bits & sign) != 0) {
+            if (width == 64) {
+                value = (int64_t)bits;
+            } else {
+                value = (int64_t)bits - (int64_t)((uint64_t)1 << width);
+            }
+        } else {
+            value = (int64_t)bits;
+        }
+        if (value > 2147483647LL || value < -2147483647LL) {
+            ct_sb_appendf(e->out, "%" PRId64 "LL", value);
+        } else {
+            ct_sb_appendf(e->out, "%" PRId64, value);
+        }
+        return;
+    }
     if (base && base->kind == JOG_TY_BOOL) {
         ct_sb_append_cstr(e->out, (bits & 1) ? "1" : "0");
         return;
@@ -1472,7 +1579,7 @@ static void append_bits(Emit *e, const JogType *type, uint64_t bits) {
 }
 
 static void append_float_literal(Emit *e, const JogType *type, double value) {
-    bool single = float_width(type) == 32 && type_kind_is(type, JOG_TY_FLOAT);
+    bool single = float_width(type) == 32 && type_is_float(type);
     if (value != value) {
         ct_sb_append_cstr(e->out, single ? "(0.0f/0.0f)" : "(0.0/0.0)");
         return;
@@ -2980,6 +3087,33 @@ static void append_data_init(Emit *e, const JirGlobal *global, size_t abs_off, J
     size = (size_t)type->size;
     if (size == 0 || (bytes_are_zero(data, size) && !range_has_reloc(global, abs_off, size))) {
         ct_sb_append_cstr(e->out, spelled_aggregate(type) ? "{0}" : "0");
+        return;
+    }
+    if (type->intrinsic == JOG_INTRINSIC_BOOL || type->intrinsic == JOG_INTRINSIC_INT) {
+        uint64_t bits = 0;
+        if (size > 8 || !read_le(data, size, &bits)) {
+            emit_fail(e, "C backend: integer global data has a bad width");
+            return;
+        }
+        append_bits(e, type, bits);
+        return;
+    }
+    if (type->intrinsic == JOG_INTRINSIC_FLOAT) {
+        uint64_t bits = 0;
+        double value;
+        if ((size != 4 && size != 8) || !read_le(data, size, &bits) || !host_is_le()) {
+            emit_fail(e, "C backend: float global data has a bad width");
+            return;
+        }
+        if (size == 4) {
+            uint32_t narrow = (uint32_t)bits;
+            float single;
+            memcpy(&single, &narrow, sizeof single);
+            value = (double)single;
+        } else {
+            memcpy(&value, &bits, sizeof value);
+        }
+        append_float_literal(e, type, value);
         return;
     }
     type = underlying(type);

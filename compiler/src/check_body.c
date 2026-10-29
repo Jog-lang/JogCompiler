@@ -14,6 +14,7 @@
 #include "check_chan_for.h"
 #include "check_comptime.h"
 #include "const_eval.h"
+#include "scalar_op.h"
 #include "float_lit.h"
 #include "resolve_package.h"
 #include "str.h"
@@ -28,7 +29,7 @@
    An untyped float stays soft until a typed float wins, otherwise f64.
    A character literal is the Unicode code point as an untyped integer.
    for x in xs, and for i, x in xs, walk an array, a slice, str, bytes,
-   or bytes[N]. x is a constant element and i is a constant usize.
+   or [N]byte. x is a constant element and i is a constant usize.
    A channel is not a collection. for v in ch receives until the channel is closed.
    A lambda checks where it is written. A named function may be used as a
    value. A non-escaping lambda may name an outer local; it is captured
@@ -121,6 +122,16 @@ static bool is_error(const JogType *type) {
     return type && type->kind == JOG_TY_ERROR;
 }
 
+/* A builtin integer or a distinct type whose own @intrinsic is int.
+   rune is distinct over u32 and does not count. */
+static int host_int(const JogType *type) {
+    return type && (type->kind == JOG_TY_INT || type->intrinsic == JOG_INTRINSIC_INT);
+}
+
+static int host_float(const JogType *type) {
+    return type && (type->kind == JOG_TY_FLOAT || type->intrinsic == JOG_INTRINSIC_FLOAT);
+}
+
 static bool same_type(const JogType *a, const JogType *b) {
     if (!a || !b) {
         return false;
@@ -131,11 +142,11 @@ static bool same_type(const JogType *a, const JogType *b) {
     return a == b;
 }
 
-/* bytes converts to const bytes, which is str. The header is the same
-   pointer and length. The reverse is not implicit. []T converts to
-   []const T the same way when the element type matches. []u8 and
-   []const u8 convert to str the same way; bytes and []u8 stay different
-   types. */
+/* bytes converts to const bytes. The header is the same pointer and
+   length. The reverse is not implicit. []T converts to []const T the
+   same way when the element type matches. bytes, []byte, []const byte,
+   []u8, and []const u8 convert to str. bytes and []u8 stay different
+   types. str does not convert back. */
 static bool bytes_to_const(const JogType *got, const JogType *want) {
     return got && want && got->kind == JOG_TY_BYTES && want->kind == JOG_TY_BYTES && !got->is_const && want->is_const;
 }
@@ -162,7 +173,7 @@ static bool slice_to_const(const JogType *got, const JogType *want) {
            got->as.elem.elem && got->as.elem.elem == want->as.elem.elem;
 }
 
-/* bytes[N] as T, and T as bytes[N], when N is size(T). Unchecked reinterpret. */
+/* [N]byte as T, and T as [N]byte, when N is size(T). Unchecked reinterpret. */
 static bool bytes_n_reinterpret(const JogType *got, const JogType *want) {
     if (!got || !want || !got->has_layout || !want->has_layout || got->size == 0 || got->size != want->size) {
         return false;
@@ -226,16 +237,13 @@ static JogTokenKind compound_base(JogTokenKind op) {
 static void write_type(Check *ck, const JogType *type, char *buf, size_t cap) {
     CtSb sb;
     const char *text;
+    (void)ck;
     if (cap == 0) {
         return;
     }
     buf[0] = '\0';
     if (!type) {
         snprintf(buf, cap, "<null type>");
-        return;
-    }
-    if (ck && type == jog_type_builtin(ck->program->types, JOG_BUILTIN_CONST_BYTES)) {
-        snprintf(buf, cap, "str");
         return;
     }
     ct_sb_init(&sb);
@@ -276,7 +284,10 @@ static JogType *builtin(Check *ck, JogBuiltin which) {
 }
 
 static bool is_str_type(Check *ck, const JogType *type) {
-    return type && type == jog_type_builtin(ck->program->types, JOG_BUILTIN_CONST_BYTES);
+    if (ck && jog_type_is_core_str(ck->program->types, type)) {
+        return true;
+    }
+    return type && type->kind == JOG_TY_BYTES && type->is_const;
 }
 
 static JogType *cstring_type(Check *ck) {
@@ -413,6 +424,9 @@ static unsigned float_bits_of(const JogType *type) {
     if (type && type->kind == JOG_TY_FLOAT && type->as.flt.bits == 32) {
         return 32;
     }
+    if (type && type->intrinsic == JOG_INTRINSIC_FLOAT && type->intrinsic_bits == 32) {
+        return 32;
+    }
     return 64;
 }
 
@@ -435,7 +449,7 @@ static JogType *type_float_tree(Env *env, JogNode *node, JogType *target) {
     double value;
     JogFloatLitStatus st;
     unsigned bits;
-    if (target && target->kind == JOG_TY_FLOAT) {
+    if (target && host_float(target)) {
         want = target;
         bits = float_bits_of(target);
     } else {
@@ -456,14 +470,26 @@ static JogType *type_float_tree(Env *env, JogNode *node, JogType *target) {
 
 static int code_fits(const JogType *type, uint32_t cp) {
     unsigned bits;
-    if (!type || type->kind != JOG_TY_INT || type->as.integer.bits == 0 || type->as.integer.bits > 64) {
+    int is_signed;
+    if (!type) {
         return 0;
     }
-    bits = type->as.integer.bits;
-    if (bits >= 32) {
-        return !type->as.integer.is_signed || cp <= 0x7FFFFFFFu;
+    if (type->kind == JOG_TY_INT) {
+        bits = type->as.integer.bits;
+        is_signed = type->as.integer.is_signed ? 1 : 0;
+    } else if (type->intrinsic == JOG_INTRINSIC_INT) {
+        bits = type->intrinsic_bits;
+        is_signed = type->intrinsic_signed ? 1 : 0;
+    } else {
+        return 0;
     }
-    if (type->as.integer.is_signed) {
+    if (bits == 0 || bits > 64) {
+        return 0;
+    }
+    if (bits >= 32) {
+        return !is_signed || cp <= 0x7FFFFFFFu;
+    }
+    if (is_signed) {
         return cp < (1u << (bits - 1));
     }
     return cp < (1u << bits);
@@ -481,7 +507,7 @@ static JogType *type_char(Env *env, JogNode *node, JogType *target) {
         }
         return error;
     }
-    if (target && target->kind == JOG_TY_INT) {
+    if (target && host_int(target)) {
         if (!code_fits(target, cp)) {
             jog_check_fail(env->ck, node->pos, "integer constant does not fit");
             error = jog_check_error_type(env->ck);
@@ -512,15 +538,10 @@ static JogType *adapt_float(Env *env, JogNode *node, JogType *got, JogType *want
     if (got->kind != JOG_TY_UNTYPED_FLOAT) {
         return got;
     }
-    if (want && want->kind == JOG_TY_FLOAT) {
+    if (want && host_float(want)) {
         return type_float_tree(env, node, want);
     }
     return type_float_tree(env, node, NULL);
-}
-
-static int float_num_op(JogTokenKind op) {
-    return op == JOG_TOK_PLUS || op == JOG_TOK_MINUS || op == JOG_TOK_STAR || op == JOG_TOK_SLASH || op == JOG_TOK_PERCENT ||
-           is_rel_op(op) || is_eq_op(op);
 }
 
 static int float_fits_int(const JogType *type, double value) {
@@ -908,45 +929,56 @@ static JogType *adapt_int(Env *env, JogNode *node, JogType *got, JogType *want) 
     if (got->kind != JOG_TY_UNTYPED_INT) {
         return got;
     }
-    if (want && want->kind == JOG_TY_INT) {
+    if (want && host_int(want)) {
         return fold_const(env->ck, node, want);
     }
     return fold_const(env->ck, node, NULL);
+}
+
+static JogType *finish_scalar_unary(Env *env, JogNode *node, JogType *operand) {
+    JogType *scalar_ret = NULL;
+    JogType *error;
+    int sr = jog_check_scalar_op(env->ck, env->job, node->pos, node->as.unary.op, 1, operand, &scalar_ret);
+    if (sr < 0 || env->ck->stop) {
+        return NULL;
+    }
+    if (sr == 1) {
+        node->type = scalar_ret;
+        return scalar_ret;
+    }
+    if (sr == 0) {
+        JogType *constrained = NULL;
+        int cr = jog_constraint_unary(env->ck, node, operand, &constrained);
+        if (cr < 0 || env->ck->stop) {
+            return NULL;
+        }
+        if (cr > 0) {
+            return constrained;
+        }
+    }
+    fail_op(env->ck, node->pos, node->as.unary.op, operand);
+    error = jog_check_error_type(env->ck);
+    node->type = error;
+    return error;
 }
 
 static JogType *check_unary(Env *env, JogNode *node) {
     JogTokenKind op = node->as.unary.op;
     JogType *operand;
     JogType *error;
-    JogType *boolean;
     if (op == JOG_TOK_AMP || op == JOG_TOK_STAR) {
         return jog_check_memory_unary(env->ck, env->job, env->scope, node);
     }
     if (op == JOG_TOK_BANG) {
-        boolean = builtin(env->ck, JOG_BUILTIN_BOOL);
-        if (!boolean) {
-            return NULL;
+        operand = check_expr(env, node->as.unary.operand, NULL);
+        if (!operand || env->ck->stop) {
+            return operand;
         }
-        operand = check_expr(env, node->as.unary.operand, boolean);
-        if (!operand) {
-            return NULL;
+        if (is_error(operand)) {
+            node->type = operand;
+            return operand;
         }
-        if (!is_error(operand) && operand->kind != JOG_TY_BOOL) {
-            JogType *constrained = NULL;
-            int cr = jog_constraint_unary(env->ck, node, operand, &constrained);
-            if (cr < 0 || env->ck->stop) {
-                return NULL;
-            }
-            if (cr > 0) {
-                return constrained;
-            }
-            fail_op(env->ck, node->pos, op, operand);
-            error = jog_check_error_type(env->ck);
-            node->type = error;
-            return error;
-        }
-        node->type = is_error(operand) ? operand : boolean;
-        return node->type;
+        return finish_scalar_unary(env, node, operand);
     }
     if (op != JOG_TOK_MINUS && op != JOG_TOK_TILDE) {
         jog_check_fail(env->ck, node->pos, "operator '%s' is not checked yet", jog_token_spelling(op));
@@ -975,32 +1007,7 @@ static JogType *check_unary(Env *env, JogNode *node) {
         node->type = operand;
         return operand;
     }
-    if (operand->kind == JOG_TY_FLOAT) {
-        if (op != JOG_TOK_MINUS) {
-            fail_op(env->ck, node->pos, op, operand);
-            error = jog_check_error_type(env->ck);
-            node->type = error;
-            return error;
-        }
-        node->type = operand;
-        return operand;
-    }
-    if (operand->kind != JOG_TY_INT) {
-        JogType *constrained = NULL;
-        int cr = jog_constraint_unary(env->ck, node, operand, &constrained);
-        if (cr < 0 || env->ck->stop) {
-            return NULL;
-        }
-        if (cr > 0) {
-            return constrained;
-        }
-        fail_op(env->ck, node->pos, op, operand);
-        error = jog_check_error_type(env->ck);
-        node->type = error;
-        return error;
-    }
-    node->type = operand;
-    return operand;
+    return finish_scalar_unary(env, node, operand);
 }
 
 static JogType *operand_type(Env *env, JogNode *node) {
@@ -1108,29 +1115,29 @@ static JogType *check_binary(Env *env, JogNode *node) {
         node->type = error;
         return error;
     }
-    if (lt->kind == JOG_TY_UNTYPED_INT && rt->kind == JOG_TY_INT) {
+    if (lt->kind == JOG_TY_UNTYPED_INT && host_int(rt)) {
         lt = adapt_int(env, lhs, lt, rt);
-    } else if (rt->kind == JOG_TY_UNTYPED_INT && lt->kind == JOG_TY_INT) {
+    } else if (rt->kind == JOG_TY_UNTYPED_INT && host_int(lt)) {
         rt = adapt_int(env, rhs, rt, lt);
     } else {
         if (lt->kind == JOG_TY_UNTYPED_INT) {
             lt = adapt_int(env, lhs, lt, NULL);
         }
         if (rt && rt->kind == JOG_TY_UNTYPED_INT) {
-            rt = adapt_int(env, rhs, rt, lt && lt->kind == JOG_TY_INT ? lt : NULL);
+            rt = adapt_int(env, rhs, rt, lt && host_int(lt) ? lt : NULL);
         }
     }
     if (lt && rt && !is_error(lt) && !is_error(rt)) {
-        if (lt->kind == JOG_TY_UNTYPED_FLOAT && rt->kind == JOG_TY_FLOAT) {
+        if (lt->kind == JOG_TY_UNTYPED_FLOAT && host_float(rt)) {
             lt = adapt_float(env, lhs, lt, rt);
-        } else if (rt->kind == JOG_TY_UNTYPED_FLOAT && lt->kind == JOG_TY_FLOAT) {
+        } else if (rt->kind == JOG_TY_UNTYPED_FLOAT && host_float(lt)) {
             rt = adapt_float(env, rhs, rt, lt);
         } else {
             if (lt->kind == JOG_TY_UNTYPED_FLOAT) {
                 lt = adapt_float(env, lhs, lt, NULL);
             }
             if (rt && rt->kind == JOG_TY_UNTYPED_FLOAT) {
-                rt = adapt_float(env, rhs, rt, lt && lt->kind == JOG_TY_FLOAT ? lt : NULL);
+                rt = adapt_float(env, rhs, rt, lt && host_float(lt) ? lt : NULL);
             }
         }
     }
@@ -1178,10 +1185,10 @@ static JogType *check_binary(Env *env, JogNode *node) {
     }
     /* A char literal adapts to the integer it is compared or combined with,
        the same way an assignment `val x: u8 = 'a'` already does. */
-    if (lhs && lhs->kind == JOG_NODE_CHAR_LIT && rt->kind == JOG_TY_INT && lt->kind == JOG_TY_INT && lt != rt) {
+    if (lhs && lhs->kind == JOG_NODE_CHAR_LIT && host_int(rt) && host_int(lt) && lt != rt) {
         lt = type_char(env, lhs, rt);
     }
-    if (rhs && rhs->kind == JOG_NODE_CHAR_LIT && lt && lt->kind == JOG_TY_INT && rt->kind == JOG_TY_INT && rt != lt) {
+    if (rhs && rhs->kind == JOG_NODE_CHAR_LIT && host_int(lt) && host_int(rt) && rt != lt) {
         rt = type_char(env, rhs, lt);
     }
     if (!lt || !rt || env->ck->stop) {
@@ -1193,12 +1200,21 @@ static JogType *check_binary(Env *env, JogNode *node) {
         return error;
     }
     if (!same_type(lt, rt)) {
+        /* bytes, []byte, []const byte, []u8, and []const u8 compare with
+           str through the same length-then-bytes path. The reverse of
+           that conversion is still not an assignment. */
+        if (is_eq_op(op) &&
+            (jog_type_converts_to_str(env->ck->program->types, lt, rt) ||
+             jog_type_converts_to_str(env->ck->program->types, rt, lt))) {
+            node->type = boolean;
+            return boolean;
+        }
         fail_types(env->ck, node->pos, "mismatched types", lt, rt);
         error = jog_check_error_type(env->ck);
         node->type = error;
         return error;
     }
-    if (compare && (lt->kind == JOG_TY_BOOL || is_str_type(env->ck, lt))) {
+    if (compare && is_str_type(env->ck, lt)) {
         if (is_rel_op(op)) {
             fail_op(env->ck, node->pos, op, lt);
             error = jog_check_error_type(env->ck);
@@ -1216,13 +1232,22 @@ static JogType *check_binary(Env *env, JogNode *node) {
             return boolean;
         }
     }
-    if (lt->kind == JOG_TY_INT && (compare || is_arith_op(op))) {
-        node->type = compare ? boolean : lt;
-        return node->type;
-    }
-    if (lt->kind == JOG_TY_FLOAT && rt->kind == JOG_TY_FLOAT && float_num_op(op)) {
-        node->type = compare ? boolean : lt;
-        return node->type;
+    {
+        JogType *scalar_ret = NULL;
+        int sr = jog_check_scalar_op(env->ck, env->job, node->pos, op, 0, lt, &scalar_ret);
+        if (sr < 0 || env->ck->stop) {
+            return NULL;
+        }
+        if (sr == 1) {
+            node->type = scalar_ret;
+            return scalar_ret;
+        }
+        if (sr == 2) {
+            fail_op(env->ck, node->pos, op, lt);
+            error = jog_check_error_type(env->ck);
+            node->type = error;
+            return error;
+        }
     }
     {
         JogType *constrained = NULL;
@@ -1248,10 +1273,10 @@ static JogType *expect_type(Env *env, JogNode *node, JogType *got, JogType *want
     if (!want || is_error(want) || is_error(got) || same_type(got, want)) {
         return is_error(got) ? got : (want && !is_error(want) ? want : got);
     }
-    if (got->kind == JOG_TY_UNTYPED_INT && want->kind == JOG_TY_INT) {
+    if (got->kind == JOG_TY_UNTYPED_INT && host_int(want)) {
         return adapt_int(env, node, got, want);
     }
-    if (got->kind == JOG_TY_UNTYPED_FLOAT && want->kind == JOG_TY_FLOAT) {
+    if (got->kind == JOG_TY_UNTYPED_FLOAT && host_float(want)) {
         return adapt_float(env, node, got, want);
     }
     {
@@ -1264,7 +1289,8 @@ static JogType *expect_type(Env *env, JogNode *node, JogType *got, JogType *want
             return replaced;
         }
     }
-    if (bytes_to_const(got, want) || slice_to_const(got, want) || u8_slice_to_str(got, want)) {
+    if (bytes_to_const(got, want) || slice_to_const(got, want) || u8_slice_to_str(got, want) ||
+        jog_type_converts_to_str(env->ck->program->types, got, want)) {
         node->type = want;
         return want;
     }
@@ -1389,6 +1415,29 @@ static JogType *named_type_use(Env *env, JogSymbol *sym, JogList args, JogPos po
     }
     if (!jog_check_wait(env->ck, env->job, sym)) {
         return NULL;
+    }
+    if (jog_symbol_is_core_option(sym)) {
+        JogNode *arg;
+        JogType *elem;
+        JogType *built;
+        if (args.count != 1) {
+            jog_check_fail(env->ck, pos, "Option takes one type argument");
+            return jog_check_error_type(env->ck);
+        }
+        arg = args.items ? args.items[0] : NULL;
+        elem = jog_check_resolve_type(env->ck, env->job, arg);
+        if (!elem || env->ck->stop) {
+            return NULL;
+        }
+        if (elem->kind == JOG_TY_ERROR) {
+            return elem;
+        }
+        built = jog_type_option(env->ck->program->types, elem);
+        if (!built) {
+            jog_check_oom(env->ck);
+            return NULL;
+        }
+        return built;
     }
     if (sym->decl && sym->decl->kind == JOG_NODE_TYPE_DECL && sym->type_param_count > 0 &&
         !sym->decl->as.type_decl.distinct) {
@@ -1534,8 +1583,8 @@ static JogType *size_type_arg(Env *env, JogNode *node, const char *what) {
         return built;
     }
     if (node->kind == JOG_NODE_TYPE_NAME || node->kind == JOG_NODE_TYPE_PTR || node->kind == JOG_NODE_TYPE_SLICE ||
-        node->kind == JOG_NODE_TYPE_ARRAY || node->kind == JOG_NODE_TYPE_BYTES || node->kind == JOG_NODE_TYPE_FN ||
-        node->kind == JOG_NODE_TYPE_TUPLE || node->kind == JOG_NODE_TYPE_UNIT) {
+        node->kind == JOG_NODE_TYPE_ARRAY || node->kind == JOG_NODE_TYPE_FN || node->kind == JOG_NODE_TYPE_TUPLE ||
+        node->kind == JOG_NODE_TYPE_UNIT) {
         JogType *type = jog_check_resolve_type(env->ck, env->job, node);
         if (!type) {
             return NULL;
@@ -1984,7 +2033,7 @@ static JogType *check_cast(Env *env, JogNode *node) {
         node->type = dest;
         return dest;
     }
-    if (is_int_lit_tree(node->as.cast.expr) && dest->kind == JOG_TY_INT) {
+    if (is_int_lit_tree(node->as.cast.expr) && host_int(dest)) {
         got = fold_const(env->ck, node->as.cast.expr, dest);
         if (!got || is_error(got)) {
             node->type = got;
@@ -2053,7 +2102,7 @@ static JogType *check_cast(Env *env, JogNode *node) {
         return dest;
     }
     if (bytes_to_const(got, dest) || slice_to_const(got, dest) || u8_slice_to_str(got, dest) ||
-        bytes_n_reinterpret(got, dest)) {
+        jog_type_converts_to_str(env->ck->program->types, got, dest) || bytes_n_reinterpret(got, dest)) {
         node->type = dest;
         return dest;
     }
@@ -2234,34 +2283,33 @@ static JogType *check_if(Env *env, JogNode *node, JogType *target, bool as_value
     if (then_ty->kind == JOG_TY_UNTYPED_INT || else_ty->kind == JOG_TY_UNTYPED_INT) {
         JogNode *then_tail = block_tail(node->as.if_.then_block);
         JogNode *else_tail = else_branch && else_branch->kind == JOG_NODE_BLOCK ? block_tail(else_branch) : NULL;
-        if (then_ty->kind == JOG_TY_UNTYPED_INT && else_ty->kind == JOG_TY_INT && then_tail) {
+        if (then_ty->kind == JOG_TY_UNTYPED_INT && host_int(else_ty) && then_tail) {
             then_ty = adapt_int(env, then_tail, then_ty, else_ty);
-        } else if (else_ty->kind == JOG_TY_UNTYPED_INT && then_ty->kind == JOG_TY_INT && else_tail) {
+        } else if (else_ty->kind == JOG_TY_UNTYPED_INT && host_int(then_ty) && else_tail) {
             else_ty = adapt_int(env, else_tail, else_ty, then_ty);
         } else {
             if (then_ty->kind == JOG_TY_UNTYPED_INT && then_tail) {
                 then_ty = adapt_int(env, then_tail, then_ty, target);
             }
             if (else_ty && else_ty->kind == JOG_TY_UNTYPED_INT && else_tail) {
-                else_ty = adapt_int(env, else_tail, else_ty, then_ty && then_ty->kind == JOG_TY_INT ? then_ty : target);
+                else_ty = adapt_int(env, else_tail, else_ty, then_ty && host_int(then_ty) ? then_ty : target);
             }
         }
     }
     if (then_ty && else_ty && (then_ty->kind == JOG_TY_UNTYPED_FLOAT || else_ty->kind == JOG_TY_UNTYPED_FLOAT)) {
         JogNode *then_tail = block_tail(node->as.if_.then_block);
         JogNode *else_tail = else_branch && else_branch->kind == JOG_NODE_BLOCK ? block_tail(else_branch) : NULL;
-        if (then_ty->kind == JOG_TY_UNTYPED_FLOAT && else_ty->kind == JOG_TY_FLOAT && then_tail) {
+        if (then_ty->kind == JOG_TY_UNTYPED_FLOAT && host_float(else_ty) && then_tail) {
             then_ty = adapt_float(env, then_tail, then_ty, else_ty);
-        } else if (else_ty->kind == JOG_TY_UNTYPED_FLOAT && then_ty->kind == JOG_TY_FLOAT && else_tail) {
+        } else if (else_ty->kind == JOG_TY_UNTYPED_FLOAT && host_float(then_ty) && else_tail) {
             else_ty = adapt_float(env, else_tail, else_ty, then_ty);
         } else {
             if (then_ty->kind == JOG_TY_UNTYPED_FLOAT && then_tail) {
-                then_ty = adapt_float(env, then_tail, then_ty, target && target->kind == JOG_TY_FLOAT ? target : NULL);
+                then_ty = adapt_float(env, then_tail, then_ty, target && host_float(target) ? target : NULL);
             }
             if (else_ty && else_ty->kind == JOG_TY_UNTYPED_FLOAT && else_tail) {
                 else_ty = adapt_float(env, else_tail, else_ty,
-                                      then_ty && then_ty->kind == JOG_TY_FLOAT ? then_ty
-                                                                               : (target && target->kind == JOG_TY_FLOAT ? target : NULL));
+                                      then_ty && host_float(then_ty) ? then_ty : (target && host_float(target) ? target : NULL));
             }
         }
     }
@@ -2434,9 +2482,13 @@ static void check_assign(Env *env, JogNode *node) {
         if (!got || env->ck->stop) {
             return;
         }
-        if (!is_error(got) && dest && !is_error(dest) && dest->kind != JOG_TY_INT) {
-            if (dest->kind != JOG_TY_FLOAT || (base != JOG_TOK_PLUS && base != JOG_TOK_MINUS && base != JOG_TOK_STAR &&
-                                               base != JOG_TOK_SLASH && base != JOG_TOK_PERCENT)) {
+        if (!is_error(got) && dest && !is_error(dest)) {
+            JogType *op_ret = NULL;
+            int sr = jog_check_scalar_op(env->ck, env->job, node->pos, base, 0, dest, &op_ret);
+            if (sr < 0 || env->ck->stop) {
+                return;
+            }
+            if (sr != 1) {
                 fail_op(env->ck, node->pos, base, dest);
             }
         }
@@ -2528,12 +2580,18 @@ static void bind_iter_name(Env *env, JogNode *at, const char *name, JogType *typ
     }
 }
 
-/* Element of an array, slice, str, bytes, or bytes[N]. False when base
-   is not one of those. bytes[1] is the element of every bytes form. */
+/* Element of an array, slice, str, bytes, or [N]byte. False when base
+   is not one of those. byte is the element of every bytes form. */
 static bool collection_elem(Env *env, JogType *base, JogType **elem) {
     *elem = NULL;
     if (!base || is_error(base)) {
         return false;
+    }
+    if (base->kind == JOG_TY_DISTINCT) {
+        JogType *view = jog_type_bytes_view(base);
+        if (view) {
+            base = view;
+        }
     }
     if (base->kind == JOG_TY_ARRAY) {
         *elem = base->as.array.elem;
@@ -2874,10 +2932,56 @@ static JogType *literal_target(JogType *target) {
         return target;
     }
     if (elem->kind == JOG_TY_INT || elem->kind == JOG_TY_FLOAT || elem->kind == JOG_TY_BOOL ||
-        elem->kind == JOG_TY_UNTYPED_INT || elem->kind == JOG_TY_UNTYPED_FLOAT) {
+        elem->intrinsic == JOG_INTRINSIC_INT || elem->intrinsic == JOG_INTRINSIC_FLOAT ||
+        elem->intrinsic == JOG_INTRINSIC_BOOL || elem->kind == JOG_TY_UNTYPED_INT || elem->kind == JOG_TY_UNTYPED_FLOAT) {
         return elem;
     }
     return target;
+}
+
+static JogNode *builtin_arg(JogNode *node, size_t index) {
+    JogNode *arg;
+    if (!node || !node->as.builtin.args.items || index >= node->as.builtin.args.count) {
+        return NULL;
+    }
+    arg = node->as.builtin.args.items[index];
+    if (arg && arg->kind == JOG_NODE_ARG) {
+        return arg->as.arg.value;
+    }
+    return arg;
+}
+
+static JogType *check_op_intrinsic(Env *env, JogNode *node) {
+    JogNode *fn = env->job ? env->job->decl : NULL;
+    JogType *recv = NULL;
+    JogType *ret;
+    JogType *error;
+    JogMachine machine;
+    const char *intrinsic = NULL;
+    size_t i;
+    const char *shown = node && node->as.builtin.name ? node->as.builtin.name : "intrinsic";
+    error = jog_check_error_type(env->ck);
+    if (!fn || fn->kind != JOG_NODE_FN || fn->as.fn.body != node || !jog_fn_intrinsic_body(fn, &intrinsic)) {
+        jog_check_fail(env->ck, node->pos, "@%s is only allowed in an intrinsic operator", shown);
+        node->type = error;
+        return error;
+    }
+    jog_method_receiver(fn, &recv, NULL);
+    ret = fn->type && fn->type->kind == JOG_TY_FN ? fn->type->as.fn.ret : NULL;
+    if (!recv || !ret || !jog_type_machine(recv, &machine) || !jog_intrinsic_allowed(machine.kind, intrinsic) ||
+        (jog_intrinsic_returns_bool(intrinsic) ? ret->kind != JOG_TY_BOOL : ret != recv)) {
+        jog_check_fail(env->ck, node->pos, "@%s is only allowed in an intrinsic operator", shown);
+        node->type = error;
+        return error;
+    }
+    for (i = 0; i < node->as.builtin.args.count; i++) {
+        JogType *got = check_expr(env, builtin_arg(node, (size_t)i), NULL);
+        if (!got || env->ck->stop) {
+            return NULL;
+        }
+    }
+    node->type = ret;
+    return ret;
 }
 
 static JogType *check_expr_raw(Env *env, JogNode *node, JogType *target) {
@@ -2903,7 +3007,7 @@ static JogType *check_expr_raw(Env *env, JogNode *node, JogType *target) {
     }
     if (is_int_lit_tree(node)) {
         JogType *fold = literal_target(target);
-        if (fold && fold->kind == JOG_TY_INT) {
+        if (fold && host_int(fold)) {
             got = fold_const(env->ck, node, fold);
         } else if (fold && !is_error(fold) && fold->kind != JOG_TY_UNTYPED_INT) {
             got = fold_const(env->ck, node, fold);
@@ -2921,7 +3025,7 @@ static JogType *check_expr_raw(Env *env, JogNode *node, JogType *target) {
     }
     if (jog_float_lit_tree(node)) {
         JogType *fold = literal_target(target);
-        if (fold && fold->kind == JOG_TY_FLOAT) {
+        if (fold && host_float(fold)) {
             got = type_float_tree(env, node, fold);
         } else if (fold && !is_error(fold) && fold->kind != JOG_TY_UNTYPED_FLOAT) {
             jog_check_fail(env->ck, node->pos, "constant does not fit");
@@ -3038,18 +3142,22 @@ static JogType *check_expr_raw(Env *env, JogNode *node, JogType *target) {
         if (got && got->kind == JOG_TY_UNTYPED_INT) {
             JogNode *tail = block_tail(node);
             if (tail) {
-                got = adapt_int(env, tail, got, target && target->kind == JOG_TY_INT ? target : NULL);
+                got = adapt_int(env, tail, got, target && host_int(target) ? target : NULL);
             }
         }
         if (got && got->kind == JOG_TY_UNTYPED_FLOAT) {
             JogNode *tail = block_tail(node);
             if (tail) {
-                got = adapt_float(env, tail, got, target && target->kind == JOG_TY_FLOAT ? target : NULL);
+                got = adapt_float(env, tail, got, target && host_float(target) ? target : NULL);
             }
         }
         break;
     case JOG_NODE_STRING_LIT: {
-        JogType *str = builtin(env->ck, JOG_BUILTIN_CONST_BYTES);
+        JogType *str = jog_type_core_str(env->ck->program->types);
+        if (!str) {
+            jog_check_oom(env->ck);
+            return NULL;
+        }
         got = str;
         node->type = str;
         break;
@@ -3066,7 +3174,7 @@ static JogType *check_expr_raw(Env *env, JogNode *node, JogType *target) {
         got = jog_check_error_null(env->ck, node, target);
         break;
     case JOG_NODE_FLOAT_LIT:
-        got = type_float_tree(env, node, target && target->kind == JOG_TY_FLOAT ? target : NULL);
+        got = type_float_tree(env, node, target && host_float(target) ? target : NULL);
         break;
     case JOG_NODE_CHAR_LIT:
         got = type_char(env, node, target);
@@ -3093,6 +3201,10 @@ static JogType *check_expr_raw(Env *env, JogNode *node, JogType *target) {
         got = jog_check_coro_go(env->ck, env->job, env->scope, node);
         break;
     case JOG_NODE_BUILTIN:
+        if (jog_is_op_intrinsic_name(node->as.builtin.name)) {
+            got = check_op_intrinsic(env, node);
+            break;
+        }
         got = jog_check_comptime(env->ck, env->job, env->scope, node, target);
         break;
     default:
