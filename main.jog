@@ -14,8 +14,10 @@ import src.lower
 import src.parse
 import std.c
 import std.io
+import std.list
 import std.mem
 import std.os
+import std.text as texts
 
 fn say(to_err: bool, text: str) {
     if to_err {
@@ -70,11 +72,53 @@ fn dispatch(): i32 with (a: mem.Allocator) {
         return parse.run(os.argv(2))
     }
     if command == "check" {
-        val loaded = load.run(command)
+        var start = "."
+        var saw_start = false
+        var module_flags = list.empty<str>()
+        var i: i64 = 2
+        for i < os.argc() {
+            val arg = os.argv(i)
+            if arg == "--module" {
+                if i + 1 >= os.argc() {
+                    io.eprintln("jogc: --module expects <name>=<dir>")
+                    return 2
+                }
+                i = i + 1
+                val value = os.argv(i)
+                val (_, _, ok) = load.split_module_flag(value)
+                if !ok {
+                    io.eprint("jogc: --module expects <name>=<dir>, got '")
+                    io.eprint(value)
+                    io.eprintln("'")
+                    return 2
+                }
+                module_flags.push(value)
+            } else if arg.len > 9 && texts.slice(arg, 0, 9) == "--module=" {
+                val value = texts.slice(arg, 9, arg.len)
+                val (_, _, ok) = load.split_module_flag(value)
+                if !ok {
+                    io.eprint("jogc: --module expects <name>=<dir>, got '")
+                    io.eprint(value)
+                    io.eprintln("'")
+                    return 2
+                }
+                module_flags.push(value)
+            } else if !saw_start {
+                start = arg
+                saw_start = true
+            } else {
+                io.eprint("jogc: unexpected argument '")
+                io.eprint(arg)
+                io.eprintln("'")
+                return 2
+            }
+            i = i + 1
+        }
+        val (prog, loaded) = load.run(start, module_flags.items())
         if loaded != 0 {
             return loaded
         }
-        return check.run(command)
+        return check.run(prog)
     }
     if command == "emit-ir" {
         return lower.run(command)

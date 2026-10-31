@@ -1,0 +1,54 @@
+// Shared checker diagnostics. Wraps load.print_pos_error and common message shapes.
+
+import src.load
+import src.parse
+import std.mem
+import std.strbuilder
+
+/**
+ * Report a checker error at a source position. Skipped while infer-collecting.
+ */
+fn check_fail(ck: *Check, file: str, line: i64, column: i64, message: str) with (a: mem.Allocator) {
+    // Collection walks the body to discover contexts. The real pass reports
+    // (matches jog_check_fail in check.c).
+    if ck.current != null && ck.current!!.infer_collecting {
+        return
+    }
+    load.print_pos_error(file, line, column, message)
+    ck.failed = true
+}
+
+fn env_fail(env: *Env, node: *parse.Node, message: str) with (a: mem.Allocator) {
+    check_fail(env.ck, env.job.file, node.line, node.column, message)
+}
+
+fn fail_mismatch(env: *Env, node: *parse.Node, want: *Type, got: *Type) with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    b.append("type mismatch: expected ")
+    b.append(type_print(want as *Type?))
+    b.append(", got ")
+    b.append(type_print(got as *Type?))
+    env_fail(env, node, b.str())
+    b.free()
+}
+
+fn fail_types(env: *Env, node: *parse.Node, what: str, left: *Type, right: *Type) with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    b.append(what)
+    b.append(" ")
+    b.append(type_print(left as *Type?))
+    b.append(" and ")
+    b.append(type_print(right as *Type?))
+    env_fail(env, node, b.str())
+    b.free()
+}
+
+fn fail_op(env: *Env, node: *parse.Node, op: str, ty: *Type) with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    b.append("operator '")
+    b.append(op)
+    b.append("' does not apply to ")
+    b.append(type_print(ty as *Type?))
+    env_fail(env, node, b.str())
+    b.free()
+}

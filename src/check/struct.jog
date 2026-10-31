@@ -1,0 +1,886 @@
+// Structs, fields, literals, methods, embedding.
+// Checked against compiler/src/check_struct.c.
+// CheckerGuide step 5.
+
+import src.load
+import src.parse
+import std.list
+import std.mem
+import std.strbuilder
+import std.text as texts
+
+private fn fail_named(ck: *Check, file: str, line: i64, column: i64, prefix: str, name: str) with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    b.append(prefix)
+    b.append(name)
+    b.append("'")
+    check_fail(ck, file, line, column, b.str())
+    b.free()
+}
+
+private fn is_universe_void_ty(t: *Type): bool {
+    return t.kind == TypeKind.STRUCT && !t.has_layout && t.field_names.len == 0 && t.name == "void" &&
+        t.package.len == 0 && t.decl == null
+}
+
+private fn first_flag_word(flag: str): str {
+    var i: usize = 0
+    for i < flag.len {
+        if flag.ptr[i] == ' ' as u8 {
+            return texts.slice(flag, 0, i)
+        }
+        i = i + 1
+    }
+    return flag
+}
+
+private fn type_in_package(ty: *Type, pkg: *load.Package): bool {
+    if ty.kind != TypeKind.STRUCT && ty.kind != TypeKind.ENUM && ty.kind != TypeKind.INTERFACE &&
+        ty.kind != TypeKind.DISTINCT {
+        return false
+    }
+    return ty.package == pkg.path
+}
+
+private fn get_sema_for_decl(pkg: *load.Package, decl: *parse.Node): *Type? {
+    for i in 0 as usize..pkg.methods.len {
+        val s = pkg.methods.at(i)
+        if s.decl != null && s.decl!! == decl {
+            return get_sema(s)
+        }
+    }
+    for i in 0 as usize..pkg.scope.bindings.len {
+        val s = pkg.scope.bindings.at(i)
+        if s.decl != null && s.decl!! == decl {
+            return get_sema(s)
+        }
+    }
+    return null
+}
+
+private fn scope_method_sees(here: *parse.Node?, pkg: *load.Package, owner: *Type): bool {
+    if here == null || !parse.is_fn(here!!) || !parse.fn_has_receiver(here!!) {
+        return false
+    }
+    val fn_ty = get_sema_for_decl(pkg, here!!)
+    if fn_ty == null || fn_ty!!.kind != TypeKind.FN || fn_ty!!.elems.len == 0 {
+        return false
+    }
+    val (on, _) = type_peel_ptr(fn_ty!!.elems.get(0))
+    if on != owner {
+        return false
+    }
+    return type_in_package(owner, pkg)
+}
+
+private fn field_is_visible(here: *parse.Node?, pkg: *load.Package, owner: *Type, field: StructField): bool {
+    val decl = field.decl
+    if decl == null {
+        return true
+    }
+    val vis = first_flag_word(decl!!.flag)
+    if vis.len == 0 {
+        return true
+    }
+    if vis == "private(scope)" {
+        return scope_method_sees(here, pkg, owner)
+    }
+    return type_in_package(owner, pkg)
+}
+
+private fn embed_name(ty: *Type): str {
+    if (ty.kind == TypeKind.STRUCT || ty.kind == TypeKind.ENUM || ty.kind == TypeKind.INTERFACE ||
+        ty.kind == TypeKind.DISTINCT) && ty.name.len > 0 {
+        return ty.name
+    }
+    return ""
+}
+
+private fn member_start(node: *parse.Node): usize {
+    return node.head as usize
+}
+
+private fn value_contains(self: *Type, ty: *Type, depth: i64): bool {
+    if depth > 64 {
+        return true
+    }
+    if ty.kind == TypeKind.DISTINCT {
+        if ty.elem == null {
+            return false
+        }
+        return value_contains(self, ty.elem!!, depth + 1)
+    }
+    if ty.kind == TypeKind.ARRAY {
+        if ty.elem == null {
+            return false
+        }
+        return value_contains(self, ty.elem!!, depth + 1)
+    }
+    if ty.kind == TypeKind.TUPLE {
+        for e in ty.elems.items() {
+            if value_contains(self, e, depth + 1) {
+                return true
+            }
+        }
+        return false
+    }
+    if ty.kind != TypeKind.STRUCT {
+        return false
+    }
+    if ty == self {
+        return true
+    }
+    if self.decl != null && ty.decl != null && self.decl!! == ty.decl!! {
+        return true
+    }
+    if ty.has_layout || is_universe_void_ty(ty) {
+        return false
+    }
+    if ty.field_names.len == 0 {
+        return false
+    }
+    // Hold-open sentinel.
+    if ty.field_names.len == 1 && ty.field_names.get(0).len == 0 && ty.field_types.len == 0 {
+        return true
+    }
+    var i: usize = 0
+    for i < ty.field_types.len {
+        if value_contains(self, ty.field_types.get(i), depth + 1) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+private fn symbol_for_decl(pkg: *load.Package, decl: *parse.Node): *load.Symbol? {
+    for i in 0 as usize..pkg.scope.bindings.len {
+        val s = pkg.scope.bindings.at(i)
+        if s.decl != null && s.decl!! == decl {
+            return s as *load.Symbol?
+        }
+    }
+    for fi in 0 as usize..pkg.scope.file_scopes.len {
+        val fs = pkg.scope.file_scopes.get(fi)
+        for i in 0 as usize..fs.bindings.len {
+            val s = fs.bindings.at(i)
+            if s.decl != null && s.decl!! == decl {
+                return s as *load.Symbol?
+            }
+        }
+    }
+    return null
+}
+
+private fn symbol_for_decl_prog(ck: *Check, decl: *parse.Node): *load.Symbol? {
+    for pkg in ck.prog.packages.items() {
+        val s = symbol_for_decl(pkg, decl)
+        if s != null {
+            return s
+        }
+    }
+    return null
+}
+
+private fn await_value(ck: *Check, job: *CheckJob, self: *Type, ty: *Type, depth: i64): i32 with (a: mem.Allocator) {
+    if ck.stop {
+        return 0
+    }
+    if depth > 64 {
+        return -1
+    }
+    if ty.kind == TypeKind.DISTINCT {
+        if ty.elem == null {
+            return 1
+        }
+        return await_value(ck, job, self, ty.elem!!, depth + 1)
+    }
+    if ty.kind == TypeKind.ARRAY {
+        if ty.elem == null {
+            return 1
+        }
+        return await_value(ck, job, self, ty.elem!!, depth + 1)
+    }
+    if ty.kind == TypeKind.TUPLE {
+        for e in ty.elems.items() {
+            val ready = await_value(ck, job, self, e, depth + 1)
+            if ready != 1 {
+                return ready
+            }
+        }
+        return 1
+    }
+    if ty.kind != TypeKind.STRUCT || ty == self || ty.has_layout || is_universe_void_ty(ty) {
+        return 1
+    }
+    if ty.decl != null && ty.decl!! == job.decl {
+        return 1
+    }
+    val decl = ty.decl
+    if decl == null {
+        return 1
+    }
+    var sym = symbol_for_decl(job.pkg, decl!!)
+    if sym == null {
+        sym = symbol_for_decl_prog(ck, decl!!)
+    }
+    if sym == null {
+        return 1
+    }
+    val s = sym!!
+    val st = get_sema(s)
+    if st != null && st!!.kind == TypeKind.ERROR {
+        return -1
+    }
+    if !wait_for_symbol_finished(ck, job, s) {
+        return 0
+    }
+    val after = get_sema(s)
+    if after != null && after!!.kind == TypeKind.ERROR {
+        return -1
+    }
+    return 1
+}
+
+/**
+ * Check a struct declaration: publish identity early, resolve fields, layout.
+ */
+fn check_struct(ck: *Check, job: *CheckJob): *Type? with (a: mem.Allocator) {
+    if ck.stop || !parse.is_struct(job.decl) {
+        return null
+    }
+    val node = job.decl
+    var sname = node.name
+    if sname.len == 0 {
+        sname = "?"
+    }
+    val sty = type_new_nominal(&ck.types, TypeKind.STRUCT, sname, job.pkg.path)
+    sty.decl = node as *parse.Node?
+    type_hold_open(sty)
+    publish_job_type(job, sty as *Type?)
+    var bad = false
+    if !generic_bind_struct_params(ck, job, &bad) {
+        return null
+    }
+    var names = list.empty<str>()
+    var types = list.empty<*Type>()
+    var embedded_flags = list.empty<bool>()
+    var decls = list.empty<*parse.Node>()
+    var i = member_start(node)
+    for i < node.kids.len && !ck.stop {
+        val member = node.kids.get(i)
+        var field_ty: *Type? = null
+        var fname = ""
+        var embedded = false
+        if parse.is_field(member) {
+            fname = member.name
+            if member.kids.len == 0 {
+                check_fail(ck, job.file, member.line, member.column, "missing type")
+                bad = true
+                i = i + 1
+                continue
+            }
+            field_ty = resolve_type(ck, job, member.kids.get(0))
+            if ck.stop {
+                return null
+            }
+            if field_ty == null || field_ty!!.kind == TypeKind.ERROR {
+                bad = true
+                i = i + 1
+                continue
+            }
+            if member.kids.len > 1 {
+                if generic_has_param(field_ty) {
+                    check_fail(ck, job.file, member.line, member.column, "a type parameter cannot have a default value yet")
+                    bad = true
+                } else {
+                    val got = check_expr_job(ck, job, member.kids.get(1), field_ty)
+                    if ck.stop {
+                        return null
+                    }
+                    if got == null || got!!.kind == TypeKind.ERROR {
+                        bad = true
+                    }
+                }
+            }
+        } else if parse.is_embed(member) {
+            embedded = true
+            if member.kids.len == 0 {
+                check_fail(ck, job.file, member.line, member.column, "missing type")
+                bad = true
+                i = i + 1
+                continue
+            }
+            field_ty = resolve_type(ck, job, member.kids.get(0))
+            if ck.stop {
+                return null
+            }
+            if field_ty == null || field_ty!!.kind == TypeKind.ERROR {
+                bad = true
+                i = i + 1
+                continue
+            }
+            if field_ty!!.kind != TypeKind.STRUCT {
+                check_fail(ck, job.file, member.line, member.column, "embedded field must be a struct")
+                bad = true
+                i = i + 1
+                continue
+            }
+            fname = embed_name(field_ty!!)
+            if fname.len == 0 {
+                check_fail(ck, job.file, member.line, member.column, "embedded field must be a struct")
+                bad = true
+                i = i + 1
+                continue
+            }
+        } else {
+            check_fail(ck, job.file, member.line, member.column, "unsupported struct member")
+            bad = true
+            i = i + 1
+            continue
+        }
+        if fname.len == 0 {
+            check_fail(ck, job.file, member.line, member.column, "missing field name")
+            bad = true
+            i = i + 1
+            continue
+        }
+        var dup = false
+        for prev in names.items() {
+            if prev == fname {
+                fail_named(ck, job.file, member.line, member.column, "duplicate field '", fname)
+                bad = true
+                dup = true
+                break
+            }
+        }
+        if dup {
+            i = i + 1
+            continue
+        }
+        if field_ty != null && is_universe_void_ty(field_ty!!) {
+            var b = strbuilder.empty()
+            b.append("field '")
+            b.append(fname)
+            b.append("' has no layout")
+            check_fail(ck, job.file, member.line, member.column, b.str())
+            b.free()
+            bad = true
+            i = i + 1
+            continue
+        }
+        names.push(fname)
+        types.push(field_ty!!)
+        embedded_flags.push(embedded)
+        decls.push(member)
+        i = i + 1
+    }
+    if ck.stop {
+        return null
+    }
+    if bad {
+        return err_ty(ck) as *Type?
+    }
+    type_set_fields(sty, names, types, embedded_flags, decls)
+    var fi: usize = 0
+    for fi < sty.field_types.len {
+        val ready = await_value(ck, job, sty, sty.field_types.get(fi), 0)
+        if ready == 0 {
+            return null
+        }
+        if ready < 0 {
+            return err_ty(ck) as *Type?
+        }
+        fi = fi + 1
+    }
+    for ft in sty.field_types.items() {
+        if value_contains(sty, ft, 0) {
+            var b = strbuilder.empty()
+            b.append("struct '")
+            b.append(sname)
+            b.append("' recursively contains itself")
+            check_fail(ck, job.file, node.line, node.column, b.str())
+            b.free()
+            return err_ty(ck) as *Type?
+        }
+    }
+    if type_decl_param_count_local(node) > 0 {
+        val sym = job_symbol_of(job)
+        if sym != null {
+            if !generic_struct_finish(ck, sym!!) {
+                return null
+            }
+        }
+        return sty as *Type?
+    }
+    if !type_layout(&ck.types, sty) {
+        var b = strbuilder.empty()
+        b.append("struct '")
+        b.append(sname)
+        b.append("' recursively contains itself")
+        check_fail(ck, job.file, node.line, node.column, b.str())
+        b.free()
+        return err_ty(ck) as *Type?
+    }
+    return sty as *Type?
+}
+
+private fn type_decl_param_count_local(node: *parse.Node): usize {
+    var n: usize = 0
+    var i: usize = 0
+    for i < (node.head as usize) && i < node.kids.len {
+        if parse.is_type_param(node.kids.get(i)) {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+private fn fn_shape_of(node: *parse.Node): (i64, i64, bool, bool, bool, bool, i64, i64) {
+    val shape = node.head
+    val nparams = shape % 256
+    val nctx = (shape / 256) % 256
+    val has_recv = (shape / 65536) % 2 == 1
+    val has_ret = (shape / 131072) % 2 == 1
+    val has_body = (shape / 262144) % 2 == 1
+    val expr_body = (shape / 524288) % 2 == 1
+    val ntype = (shape / 1048576) % 256
+    val nattrs = (shape / 268435456) % 256
+    return nparams, nctx, has_recv, has_ret, has_body, expr_body, ntype, nattrs
+}
+
+/**
+ * Prepend the receiver as param 0 of a method's function type.
+ */
+fn check_method_type(ck: *Check, job: *CheckJob, fn_type: *Type): *Type? with (a: mem.Allocator) {
+    if fn_type.kind != TypeKind.FN {
+        return fn_type as *Type?
+    }
+    val node = job.decl
+    val (_, _, has_recv, _, _, _, _, nattrs) = fn_shape_of(node)
+    if !has_recv {
+        return fn_type as *Type?
+    }
+    var i: i64 = nattrs
+    if i >= node.kids.len as i64 {
+        check_fail(ck, job.file, node.line, node.column, "missing receiver")
+        return err_ty(ck) as *Type?
+    }
+    var recv = resolve_type(ck, job, node.kids.get(i as usize))
+    if recv == null || ck.stop {
+        return recv
+    }
+    if recv!!.kind == TypeKind.ERROR {
+        return err_ty(ck) as *Type?
+    }
+    var is_ptr = node.text == "recv *"
+    if !is_ptr && recv!!.kind == TypeKind.PTR && recv!!.elem != null {
+        is_ptr = true
+        recv = recv!!.elem
+    }
+    var self_ty = recv!!
+    if is_ptr {
+        self_ty = type_ptr(&ck.types, recv!!, false)
+    }
+    var params = list.empty<*Type>()
+    params.push(self_ty)
+    for p in fn_type.elems.items() {
+        params.push(p)
+    }
+    var ret = unit_ty(ck)
+    if fn_type.elem != null {
+        ret = fn_type.elem!!
+    }
+    return type_fn(&ck.types, params, ret, fn_type.contexts, fn_type.fn_variadic, fn_type.fn_escaping, fn_type.fn_extern) as *Type?
+}
+
+/**
+ * Bind `self` into a method body scope.
+ */
+fn check_bind_self(ck: *Check, job: *CheckJob, scope: *load.BlockScope) with (a: mem.Allocator) {
+    if ck.stop || !parse.is_fn(job.decl) || !parse.fn_has_receiver(job.decl) {
+        return
+    }
+    val fn_ty = get_sema_for_decl(job.pkg, job.decl)
+    if fn_ty == null || fn_ty!!.kind != TypeKind.FN || fn_ty!!.elems.len == 0 {
+        check_fail(ck, job.file, job.decl.line, job.decl.column, "missing receiver")
+        return
+    }
+    val self_ty = fn_ty!!.elems.get(0)
+    var kind = load.kind_constant()
+    if self_ty.kind == TypeKind.PTR {
+        kind = load.kind_parameter()
+    }
+    if load.block_scope_lookup_local(scope, "self") != null {
+        check_fail(ck, job.file, job.decl.line, job.decl.column, "duplicate declaration of 'self'")
+        return
+    }
+    var s: load.Symbol
+    s.kind = kind
+    s.name = "self"
+    s.referenced = false
+    s.assigned = true
+    s.file = job.file
+    s.line = job.decl.line
+    s.column = job.decl.column
+    s.flag = ""
+    s.package = job.pkg as *load.Package?
+    s.decl = job.decl as *parse.Node?
+    s.sema = null
+    s.type_params = list.empty<*u8>()
+    s.nominal_insts = list.empty<*u8>()
+    set_sema(&s, self_ty as *Type?)
+    load.block_scope_bind(scope, s)
+}
+
+/**
+ * Report duplicate methods after all jobs finish.
+ */
+fn check_method_duplicates(ck: *Check) with (a: mem.Allocator) {
+    if ck.stop {
+        return
+    }
+    for pkg in ck.prog.packages.items() {
+        var i: usize = 0
+        for i < pkg.methods.len {
+            val sym = pkg.methods.at(i)
+            if sym.decl == null || sym.name.len == 0 {
+                i = i + 1
+                continue
+            }
+            val fn_node = sym.decl!!
+            val ty = get_sema(sym)
+            if ty == null || ty!!.kind != TypeKind.FN || ty!!.elems.len == 0 {
+                i = i + 1
+                continue
+            }
+            val (on, _) = type_peel_ptr(ty!!.elems.get(0))
+            var j: usize = 0
+            for j < i {
+                val prev = pkg.methods.at(j)
+                if prev.name != sym.name || prev.decl == null {
+                    j = j + 1
+                    continue
+                }
+                val pty = get_sema(prev)
+                if pty == null || pty!!.kind != TypeKind.FN || pty!!.elems.len == 0 {
+                    j = j + 1
+                    continue
+                }
+                val (pon, _) = type_peel_ptr(pty!!.elems.get(0))
+                var same = pon == on
+                if !same && pon.kind == on.kind && pon.name == on.name && pon.package == on.package {
+                    same = true
+                }
+                if same {
+                    fail_named(ck, sym.file, fn_node.line, fn_node.column, "duplicate method '", sym.name)
+                    break
+                }
+                j = j + 1
+            }
+            i = i + 1
+        }
+    }
+}
+
+struct FieldPath {
+    found: bool
+    ambiguous: bool
+    hidden: bool
+    field: StructField
+}
+
+private fn empty_field(): StructField {
+    var f: StructField
+    f.name = ""
+    f.field_type = null
+    f.offset = 0
+    f.embedded = false
+    f.decl = null
+    return f
+}
+
+private struct FieldHit {
+    field: StructField
+    depth: i64
+    found: bool
+}
+
+private fn collect_field(
+    ty: *Type,
+    name: str,
+    here: *parse.Node?,
+    pkg: *load.Package,
+    depth: i64,
+    best: *FieldHit,
+    count: *i64,
+    hidden: *i64,
+) {
+    if ty.kind != TypeKind.STRUCT || depth > 16 {
+        return
+    }
+    var i: usize = 0
+    for i < type_field_count(ty) {
+        val f = type_field_at(ty, i)
+        if f.name == name {
+            if !field_is_visible(here, pkg, ty, f) {
+                hidden[0] = 1
+            } else if !best.found || depth < best.depth {
+                best.found = true
+                best.field = f
+                best.depth = depth
+                count[0] = 1
+            } else if depth == best.depth {
+                count[0] = count[0] + 1
+            }
+        }
+        if f.embedded && f.field_type != null && f.field_type!!.kind == TypeKind.STRUCT {
+            collect_field(f.field_type!!, name, here, pkg, depth + 1, best, count, hidden)
+        }
+        i = i + 1
+    }
+}
+
+/**
+ * Look up a field by name, including embeds.
+ */
+fn struct_lookup_field(ty: *Type, name: str, here: *parse.Node?, pkg: *load.Package): FieldPath {
+    var hit: FieldHit
+    hit.found = false
+    hit.depth = 0
+    hit.field = empty_field()
+    var count: i64 = 0
+    var hidden: i64 = 0
+    collect_field(ty, name, here, pkg, 0, &hit, &count, &hidden)
+    var out: FieldPath
+    out.found = hit.found
+    out.ambiguous = count > 1
+    out.hidden = !hit.found && hidden != 0
+    out.field = hit.field
+    if out.ambiguous {
+        out.field = empty_field()
+    }
+    return out
+}
+
+struct MethodHit {
+    symbol: *load.Symbol?
+    decl: *parse.Node?
+    depth: i64
+    found: bool
+}
+
+private fn take_method(best: *MethodHit, count: *i64, sym: *load.Symbol, decl: *parse.Node, depth: i64) {
+    if !best.found || depth < best.depth {
+        best.found = true
+        best.symbol = sym as *load.Symbol?
+        best.decl = decl as *parse.Node?
+        best.depth = depth
+        count[0] = 1
+        return
+    }
+    if depth == best.depth {
+        count[0] = count[0] + 1
+    }
+}
+
+/** Declared receiver is a generic template (all type args are TYPE_PARAM). */
+private fn same_generic_receiver(declared: *Type?, concrete: *Type?): bool {
+    if declared == null || concrete == null {
+        return false
+    }
+    if declared!!.kind != concrete!!.kind {
+        return false
+    }
+    if declared!!.kind != TypeKind.STRUCT && declared!!.kind != TypeKind.ENUM {
+        return false
+    }
+    if declared!!.decl == null || concrete!!.decl == null {
+        return false
+    }
+    if (declared!!.decl!! as *u8) != (concrete!!.decl!! as *u8) {
+        return false
+    }
+    if declared!!.elems.len == 0 || declared!!.elems.len != concrete!!.elems.len {
+        return false
+    }
+    var i: usize = 0
+    for i < declared!!.elems.len {
+        val arg = declared!!.elems.get(i)
+        if arg.kind != TypeKind.TYPE_PARAM {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+private fn scan_methods(
+    ck: *Check,
+    job: *CheckJob,
+    on: *Type,
+    name: str,
+    depth: i64,
+    best: *MethodHit,
+    count: *i64,
+): bool with (a: mem.Allocator) {
+    for pkg in ck.prog.packages.items() {
+        for mi in 0 as usize..pkg.methods.len {
+            val sym = pkg.methods.at(mi)
+            if sym.name != name || sym.decl == null {
+                continue
+            }
+            val fn_node = sym.decl!!
+            if !wait_for_symbol_finished(ck, job, sym) {
+                return false
+            }
+            val ty = get_sema(sym)
+            if ty == null || ty!!.kind != TypeKind.FN || ty!!.elems.len == 0 {
+                continue
+            }
+            val (recv, _) = type_peel_ptr(ty!!.elems.get(0))
+            if recv != on && !same_generic_receiver(recv as *Type?, on as *Type?) {
+                continue
+            }
+            take_method(best, count, sym, fn_node, depth)
+        }
+    }
+    return !ck.stop
+}
+
+private fn find_methods(
+    ck: *Check,
+    job: *CheckJob,
+    ty: *Type,
+    name: str,
+    depth: i64,
+    best: *MethodHit,
+    count: *i64,
+): bool with (a: mem.Allocator) {
+    if depth > 16 {
+        return true
+    }
+    val saved = count[0]
+    if !scan_methods(ck, job, ty, name, depth, best, count) {
+        return false
+    }
+    if count[0] > saved && best.found && best.depth == depth {
+        return true
+    }
+    if ty.kind != TypeKind.STRUCT {
+        return true
+    }
+    var i: usize = 0
+    for i < type_field_count(ty) {
+        val f = type_field_at(ty, i)
+        if f.embedded && f.field_type != null && f.field_type!!.kind == TypeKind.STRUCT {
+            if !find_methods(ck, job, f.field_type!!, name, depth + 1, best, count) {
+                return false
+            }
+        }
+        i = i + 1
+    }
+    return true
+}
+
+/**
+ * Resolve TypeName / TypeName<Args> used as a method receiver base
+ * (Box<i32>.get, Result<T>.Ok path via enum lookup elsewhere).
+ */
+fn named_receiver_type(
+    ck: *Check,
+    job: *CheckJob,
+    ident: *parse.Node,
+    sym: *load.Symbol,
+): *Type? with (a: mem.Allocator) {
+    if sym.decl != null && parse.is_type_decl(sym.decl!!) && sym_type_param_count(sym) > 0 {
+        // Distinct generics are rejected elsewhere; aliases apply here.
+        return generic_alias_apply(ck, job, sym, ident.kids, ident.line, ident.column)
+    }
+    if sym.decl != null && parse.is_enum(sym.decl!!) && sym_type_param_count(sym) > 0 {
+        return generic_enum_apply(ck, job, sym, ident.kids, ident.line, ident.column)
+    }
+    if sym.decl != null && parse.is_struct(sym.decl!!) && sym_type_param_count(sym) > 0 {
+        return generic_struct_apply(ck, job, sym, ident.kids, ident.line, ident.column)
+    }
+    val (coro_ty, coro_rc) = check_coro_type(ck, job, sym, ident)
+    if coro_rc < 0 || ck.stop {
+        return null
+    }
+    if coro_rc > 0 {
+        return coro_ty
+    }
+    if ident.kids.len > 0 {
+        check_fail(ck, job.file, ident.line, ident.column, "type arguments are not checked yet")
+        return err_ty(ck) as *Type?
+    }
+    return get_sema(sym)
+}
+
+private fn embed_match_search(
+    ty: *Type,
+    inner: *Type,
+    depth: i64,
+    count: *i64,
+    best_len: *i64,
+) {
+    if ty.kind != TypeKind.STRUCT || depth > 16 {
+        return
+    }
+    if ty == inner || same_generic_receiver(inner as *Type?, ty as *Type?) {
+        if count[0] == 0 || depth < best_len[0] {
+            best_len[0] = depth
+        }
+        count[0] = count[0] + 1
+        return
+    }
+    var i: usize = 0
+    for i < type_field_count(ty) {
+        val f = type_field_at(ty, i)
+        if f.embedded && f.field_type != null && f.field_type!!.kind == TypeKind.STRUCT {
+            embed_match_search(f.field_type!!, inner, depth + 1, count, best_len)
+        }
+        i = i + 1
+    }
+}
+
+/**
+ * Count embed paths from outer to inner; best_len is the shortest path length (0 = same type).
+ */
+fn struct_embed_match(outer: *Type, inner: *Type): (i64, i64) {
+    var count: i64 = 0
+    var best: i64 = 999
+    embed_match_search(outer, inner, 0, &count, &best)
+    if count == 0 {
+        return 0, 0
+    }
+    return count, best
+}
+
+/**
+ * Look up a method on a type (and embeds).
+ * @return hit, ambiguous, waiting_failed
+ */
+fn lookup_method(ck: *Check, job: *CheckJob, outer: *Type, name: str): (MethodHit, bool, bool) with (a: mem.Allocator) {
+    var best: MethodHit
+    best.found = false
+    best.symbol = null
+    best.decl = null
+    best.depth = 0
+    var count: i64 = 0
+    if !find_methods(ck, job, outer, name, 0, &best, &count) {
+        return best, false, true
+    }
+    return best, count > 1, false
+}
+
+/**
+ * Field has a default value in the AST.
+ */
+fn field_has_default(field: StructField): bool {
+    if field.decl == null || !parse.is_field(field.decl!!) {
+        return false
+    }
+    return field.decl!!.kids.len > 1
+}

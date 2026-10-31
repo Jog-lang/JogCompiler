@@ -1,0 +1,71 @@
+// Loader diagnostics. A message with no line (C CtPos line 0) prints
+// `path: error: message`. A message on a jog.mod line prints
+// `path:line:column: error: message`. Match tools/diag.c, not the lexer.
+// Step 1 still prints cannot-find with its own helpers in load.jog.
+// Later steps call these for jog.mod lines.
+
+import std.io
+import std.mem
+import std.strbuilder
+
+/**
+ * Print a path-only error, the shape used for cannot find.
+ * @param path path as given on the command line, or a jog.mod path
+ * @param message text after `error: `
+ */
+fn print_path_error(path: str, message: str) {
+    io.eprint(path)
+    io.eprint(": error: ")
+    io.eprintln(message)
+}
+
+/**
+ * Print a bare error with no path, the shape used when CtPos has no file
+ * (for example `core prelude was not found`).
+ * @param message text after `error: `
+ */
+fn print_bare_error(message: str) {
+    io.eprint("error: ")
+    io.eprintln(message)
+}
+
+/**
+ * Print a positioned error, the shape used for jog.mod lines.
+ * @param path file path
+ * @param line 1-based line
+ * @param column 1-based column
+ * @param message text after `error: `
+ * @context a allocator for the line and column text
+ */
+fn print_pos_error(path: str, line: i64, column: i64, message: str) with (a: mem.Allocator) {
+    print_pos(path, line, column, "error", message)
+}
+
+/**
+ * Print a positioned note, the shape used for "previous declaration is here".
+ * @param path file path
+ * @param line 1-based line
+ * @param column 1-based column
+ * @param message text after `note: `
+ * @context a allocator for the line and column text
+ */
+fn print_pos_note(path: str, line: i64, column: i64, message: str) with (a: mem.Allocator) {
+    print_pos(path, line, column, "note", message)
+}
+
+private fn print_pos(path: str, line: i64, column: i64, severity: str, message: str) with (a: mem.Allocator) {
+    io.eprint(path)
+    io.eprint(":")
+    var b = strbuilder.empty()
+    b.append_int(line, 10)
+    io.eprint(b.str())
+    b.clear()
+    io.eprint(":")
+    b.append_int(column, 10)
+    io.eprint(b.str())
+    b.free()
+    io.eprint(": ")
+    io.eprint(severity)
+    io.eprint(": ")
+    io.eprintln(message)
+}

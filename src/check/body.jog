@@ -1,0 +1,3510 @@
+// Bidirectional check_expr and statement checking.
+// Checked against compiler/src/check_body.c.
+// CheckerGuide step 4.
+
+import src.load
+import src.lex
+import src.parse
+import std.fs
+import std.list
+import std.mem
+import std.strbuilder
+import std.text as texts
+
+/**
+ * Body-checking environment.
+ */
+struct Env {
+    ck: *Check
+    job: *CheckJob
+    scope: *load.BlockScope?
+    ret: *Type?
+    reachable: bool
+    loop_depth: i64
+}
+
+private fn adapt_float(ck: *Check, got: *Type, want: *Type?): *Type {
+    if got.kind != TypeKind.UNTYPED_FLOAT {
+        return got
+    }
+    if want != null && type_is_host_float(want!!) {
+        return want!!
+    }
+    return type_builtin(&ck.types, Builtin.F64)
+}
+
+private fn assignable_sym(sym: *load.Symbol): bool {
+    return load.is_symbol_variable(sym) || sym.kind == load.kind_parameter()
+}
+
+private fn is_str_type(t: *Type): bool {
+    if t.kind == TypeKind.DISTINCT && t.name == "str" {
+        return true
+    }
+    return t.kind == TypeKind.BYTES && t.is_const
+}
+
+private fn bool_ty(ck: *Check): *Type {
+    return type_builtin(&ck.types, Builtin.BOOL)
+}
+
+private fn untyped_int(ck: *Check): *Type {
+    return type_builtin(&ck.types, Builtin.UNTYPED_INT)
+}
+
+private fn universe_named(ck: *Check, name: str): *Type? {
+    if ck.prog.packages.len == 0 {
+        return null
+    }
+    val uni = ck.prog.packages.get(0).scope.universe
+    if uni == null {
+        return null
+    }
+    val s = load.package_scope_lookup(uni!!, name)
+    if s == null {
+        return null
+    }
+    return get_sema(s!!)
+}
+
+fn str_ty(ck: *Check): *Type with (a: mem.Allocator) {
+    val t = universe_named(ck, "str")
+    if t != null {
+        return t!!
+    }
+    return type_builtin(&ck.types, Builtin.CONST_BYTES)
+}
+
+private fn cstring_ty(ck: *Check): *Type with (a: mem.Allocator) {
+    return type_ptr(&ck.types, type_builtin(&ck.types, Builtin.I8), true)
+}
+
+fn new_scope(env: *Env, parent: *load.BlockScope?): *load.BlockScope? with (a: mem.Allocator) {
+    val (raw, err) = a.alloc(size(load.BlockScope), align(load.BlockScope))
+    if err != null {
+        panic("out of memory")
+    }
+    val b = raw.ptr as *load.BlockScope
+    b.parent = parent
+    b.bindings = list.empty<load.Symbol>()
+    b.package = null
+    return b as *load.BlockScope?
+}
+
+private fn lookup_local_chain(scope: *load.BlockScope?, name: str): *load.Symbol? {
+    var block = scope
+    for block != null {
+        val found = load.block_scope_lookup_local(block!!, name)
+        if found != null {
+            return found
+        }
+        block = block!!.parent
+    }
+    return null
+}
+
+fn lookup_name(env: *Env, name: str): *load.Symbol? {
+    if name.len == 0 || name == "_" {
+        return null
+    }
+    val local = lookup_local_chain(env.scope, name)
+    if local != null {
+        return local
+    }
+    return load.file_lookup(&env.job.pkg.scope, env.job.file_index, name)
+}
+
+fn bind_local(
+    env: *Env,
+    at: *parse.Node,
+    kind: load.SymbolKind,
+    name: str,
+    ty: *Type,
+): *load.Symbol? with (a: mem.Allocator) {
+    if env.scope == null || name.len == 0 || name == "_" {
+        return null
+    }
+    if load.block_scope_lookup_local(env.scope!!, name) != null {
+        var b = strbuilder.empty()
+        b.append("duplicate declaration of '")
+        b.append(name)
+        b.append("'")
+        env_fail(env, at, b.str())
+        b.free()
+        return null
+    }
+    var s: load.Symbol
+    s.kind = kind
+    s.name = fs.copy_str(name)
+    s.referenced = false
+    s.assigned = false
+    s.file = fs.copy_str(env.job.file)
+    s.line = at.line
+    s.column = at.column
+    s.flag = ""
+    s.package = env.job.pkg as *load.Package?
+    s.decl = at as *parse.Node?
+    s.sema = null
+    s.type_params = list.empty<*u8>()
+    s.nominal_insts = list.empty<*u8>()
+    set_sema(&s, ty as *Type?)
+    load.block_scope_bind(env.scope!!, s)
+    return load.block_scope_lookup_local(env.scope!!, name)
+}
+
+fn note_assigned(sym: *load.Symbol) {
+    sym.assigned = true
+}
+
+private fn read_var(env: *Env, node: *parse.Node, sym: *load.Symbol) with (a: mem.Allocator) {
+    if !load.is_symbol_variable(sym) {
+        return
+    }
+    val ty = get_sema(sym)
+    if ty != null && type_has_zero(ty!!) {
+        return
+    }
+    if sym.assigned {
+        return
+    }
+    var b = strbuilder.empty()
+    b.append("variable '")
+    b.append(sym.name)
+    b.append("' is used before it is assigned")
+    env_fail(env, node, b.str())
+    b.free()
+}
+
+/**
+ * Coerce got toward want. Reports type mismatch on failure.
+ */
+private fn is_u8_ty(t: *Type): bool {
+    return t.kind == TypeKind.INT && !t.int_signed && t.int_bits == 8 && !t.int_is_size
+}
+
+private fn bytes_to_const(got: *Type, want: *Type): bool {
+    return got.kind == TypeKind.BYTES && want.kind == TypeKind.BYTES && !got.is_const && want.is_const
+}
+
+private fn slice_to_const(got: *Type, want: *Type): bool {
+    return got.kind == TypeKind.SLICE && want.kind == TypeKind.SLICE && !got.is_const && want.is_const &&
+        got.elem != null && want.elem != null && got.elem!! == want.elem!!
+}
+
+private fn u8_slice_to_str(got: *Type, want: *Type): bool {
+    if got.kind != TypeKind.SLICE || !is_str_type(want) {
+        return false
+    }
+    if got.elem == null {
+        return false
+    }
+    var elem = got.elem!!
+    for elem.kind == TypeKind.DISTINCT && elem.elem != null {
+        elem = elem.elem!!
+    }
+    return is_u8_ty(elem)
+}
+
+private fn converts_to_str(got: *Type, want: *Type): bool {
+    if want.kind != TypeKind.DISTINCT || want.name != "str" || got == want {
+        return false
+    }
+    if got.kind == TypeKind.BYTES {
+        return true
+    }
+    if got.kind != TypeKind.SLICE || got.elem == null {
+        return false
+    }
+    var elem = got.elem!!
+    for elem.kind == TypeKind.DISTINCT && elem.elem != null {
+        elem = elem.elem!!
+    }
+    return is_u8_ty(elem)
+}
+
+fn expect_type(env: *Env, node: *parse.Node, got: *Type?, want: *Type?): *Type? with (a: mem.Allocator) {
+    if got == null || env.ck.stop {
+        return got
+    }
+    if want == null || type_is_error(want!!) || type_is_error(got!!) || type_same(got!!, want!!) {
+        if type_is_error(got!!) {
+            return got
+        }
+        if want != null && !type_is_error(want!!) {
+            return want
+        }
+        return got
+    }
+    if got!!.kind == TypeKind.UNTYPED_INT && type_is_host_int(want!!) {
+        return const_eval(env.ck, env.job.file, node, want)
+    }
+    if got!!.kind == TypeKind.UNTYPED_FLOAT && type_is_host_float(want!!) {
+        return want
+    }
+    val (err_out, err_rc) = check_error_expect(env, got!!, want!!)
+    if err_rc < 0 || env.ck.stop {
+        return null
+    }
+    if err_rc > 0 {
+        return err_out
+    }
+    val (iface_out, iface_rc) = iface_expect(env.ck, env.job, node, got!!, want!!)
+    if iface_rc < 0 || env.ck.stop {
+        return null
+    }
+    if iface_rc > 0 {
+        return iface_out
+    }
+    if bytes_to_const(got!!, want!!) || slice_to_const(got!!, want!!) || u8_slice_to_str(got!!, want!!) ||
+        converts_to_str(got!!, want!!) {
+        return want
+    }
+    if want!!.kind == TypeKind.OPTION && want!!.elem != null && type_same(got!!, want!!.elem!!) {
+        return want
+    }
+    fail_mismatch(env, node, want!!, got!!)
+    return err_ty(env.ck) as *Type?
+}
+
+private fn adapt_int(env: *Env, node: *parse.Node, got: *Type, want: *Type?): *Type? with (a: mem.Allocator) {
+    if got.kind != TypeKind.UNTYPED_INT {
+        return got as *Type?
+    }
+    if want != null && type_is_host_int(want!!) {
+        return const_eval(env.ck, env.job.file, node, want)
+    }
+    return const_eval(env.ck, env.job.file, node, null)
+}
+
+private fn is_eq_op(op: str): bool {
+    return op == "==" || op == "!="
+}
+
+private fn is_rel_op(op: str): bool {
+    return op == "<" || op == "<=" || op == ">" || op == ">="
+}
+
+private fn is_arith_op(op: str): bool {
+    return op == "+" || op == "-" || op == "*" || op == "/" || op == "%" ||
+        op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>"
+}
+
+private fn is_logic_op(op: str): bool {
+    return op == "&&" || op == "||"
+}
+
+private fn scalar_binary(op: str, ty: *Type, boolean: *Type): (*Type?, bool) {
+    if ty.kind == TypeKind.INT || ty.kind == TypeKind.FLOAT {
+        if is_arith_op(op) {
+            return ty as *Type?, true
+        }
+        if is_eq_op(op) || is_rel_op(op) {
+            return boolean as *Type?, true
+        }
+        return null, false
+    }
+    if ty.kind == TypeKind.BOOL {
+        if is_eq_op(op) || is_logic_op(op) {
+            return boolean as *Type?, true
+        }
+        return null, false
+    }
+    return null, false
+}
+
+private fn scalar_unary(op: str, ty: *Type, boolean: *Type): (*Type?, bool) {
+    if op == "-" || op == "~" {
+        if ty.kind == TypeKind.INT || ty.kind == TypeKind.FLOAT {
+            return ty as *Type?, true
+        }
+        return null, false
+    }
+    if op == "!" {
+        if ty.kind == TypeKind.BOOL {
+            return boolean as *Type?, true
+        }
+        return null, false
+    }
+    return null, false
+}
+
+private fn operand_type(env: *Env, node: *parse.Node): *Type? with (a: mem.Allocator) {
+    if is_int_lit_tree(node) {
+        return untyped_int(env.ck) as *Type?
+    }
+    if is_float_lit_tree(node) {
+        return type_builtin(&env.ck.types, Builtin.UNTYPED_FLOAT) as *Type?
+    }
+    if parse.is_bool_lit(node) {
+        return const_eval(env.ck, env.job.file, node, null)
+    }
+    return check_expr(env, node, null)
+}
+
+private fn char_codepoint(text: str): (u32, bool) {
+    if text.len == 0 || text.len > 4 {
+        return 0, false
+    }
+    val b0 = text.ptr[0]
+    if b0 < 0x80 as u8 {
+        if text.len != 1 {
+            return 0, false
+        }
+        return b0 as u32, true
+    }
+    var need: usize = 0
+    var cp: u32 = 0
+    if (b0 & 0xE0 as u8) == 0xC0 as u8 {
+        need = 2
+        cp = (b0 & 0x1F as u8) as u32
+    } else if (b0 & 0xF0 as u8) == 0xE0 as u8 {
+        need = 3
+        cp = (b0 & 0x0F as u8) as u32
+    } else if (b0 & 0xF8 as u8) == 0xF0 as u8 {
+        need = 4
+        cp = (b0 & 0x07 as u8) as u32
+    } else {
+        return 0, false
+    }
+    if text.len != need {
+        return 0, false
+    }
+    var i: usize = 1
+    for i < need {
+        val b = text.ptr[i]
+        if (b & 0xC0 as u8) != 0x80 as u8 {
+            return 0, false
+        }
+        cp = (cp << 6) | ((b & 0x3F as u8) as u32)
+        i = i + 1
+    }
+    if cp > 0x10FFFF as u32 || (cp >= 0xD800 as u32 && cp <= 0xDFFF as u32) {
+        return 0, false
+    }
+    if need == 2 && cp < 0x80 as u32 {
+        return 0, false
+    }
+    if need == 3 && cp < 0x800 as u32 {
+        return 0, false
+    }
+    if need == 4 && cp < 0x10000 as u32 {
+        return 0, false
+    }
+    return cp, true
+}
+
+private fn code_fits_int(ty: *Type, cp: u32): bool {
+    if ty.kind != TypeKind.INT {
+        return false
+    }
+    val bits = ty.int_bits as i32
+    if bits <= 0 || bits > 64 {
+        return false
+    }
+    val v = cp as i64
+    if !ty.int_signed {
+        if bits == 8 {
+            return v <= 255
+        }
+        if bits == 16 {
+            return v <= 65535
+        }
+        if bits == 32 {
+            return v <= 4294967295
+        }
+        return true
+    }
+    if bits == 8 {
+        return v <= 127
+    }
+    if bits == 16 {
+        return v <= 32767
+    }
+    if bits == 32 {
+        return v <= 2147483647
+    }
+    return true
+}
+
+private fn check_char_lit(env: *Env, node: *parse.Node, target: *Type?): *Type? with (a: mem.Allocator) {
+    val (cp, ok) = char_codepoint(node.text)
+    if !ok {
+        env_fail(env, node, "invalid char literal")
+        return err_ty(env.ck) as *Type?
+    }
+    if target != null && type_is_host_int(target!!) {
+        if !code_fits_int(target!!, cp) {
+            env_fail(env, node, "integer constant does not fit")
+            return err_ty(env.ck) as *Type?
+        }
+        return target
+    }
+    if target != null && !type_is_error(target!!) && target!!.kind != TypeKind.UNTYPED_INT {
+        env_fail(env, node, "constant does not fit")
+        return err_ty(env.ck) as *Type?
+    }
+    return type_builtin(&env.ck.types, Builtin.I64) as *Type?
+}
+
+private fn size_type_arg(env: *Env, node: *parse.Node, what: str): *Type? with (a: mem.Allocator) {
+    if parse.is_ident(node) {
+        val param = generic_lookup_param(env.job, node.name)
+        if param != null {
+            if node.kids.len > 0 {
+                env_fail(env, node, "type arguments are not checked yet")
+                return err_ty(env.ck) as *Type?
+            }
+            return param
+        }
+        val sym = lookup_name(env, node.name)
+        if sym == null {
+            var b = strbuilder.empty()
+            b.append("undefined name '")
+            b.append(node.name)
+            b.append("'")
+            env_fail(env, node, b.str())
+            b.free()
+            return err_ty(env.ck) as *Type?
+        }
+        if !load.is_symbol_type(sym!!) {
+            var b = strbuilder.empty()
+            b.append(what)
+            b.append(" expects a type")
+            env_fail(env, node, b.str())
+            b.free()
+            return err_ty(env.ck) as *Type?
+        }
+        if !wait_for_symbol(env.ck, env.job, sym!!, false) {
+            return null
+        }
+        if node.kids.len > 0 {
+            if sym_type_param_count(sym!!) > 0 {
+                val inst = named_receiver_type(env.ck, env.job, node, sym!!)
+                return inst
+            }
+            env_fail(env, node, "type arguments are not checked yet")
+            return err_ty(env.ck) as *Type?
+        }
+        val ty = get_sema(sym!!)
+        if ty == null {
+            return err_ty(env.ck) as *Type?
+        }
+        return ty
+    }
+    if parse.is_member(node) && node.name.len > 0 && node.flag != "?." && node.kids.len > 0 {
+        val base = node.kids.get(0)
+        if parse.is_ident(base) {
+            val pkg_sym = lookup_name(env, base.name)
+            if pkg_sym != null && load.is_symbol_package(pkg_sym!!) && pkg_sym!!.package != null {
+                val mem = load.package_scope_lookup(&pkg_sym!!.package!!.scope, node.name)
+                if mem == null {
+                    var b = strbuilder.empty()
+                    b.append("undefined name '")
+                    b.append(node.name)
+                    b.append("'")
+                    env_fail(env, node, b.str())
+                    b.free()
+                    return err_ty(env.ck) as *Type?
+                }
+                if !symbol_visible_from(mem!!, env.job.pkg, env.job.file) {
+                    var b = strbuilder.empty()
+                    b.append("name '")
+                    b.append(node.name)
+                    b.append("' is not visible")
+                    env_fail(env, node, b.str())
+                    b.free()
+                    return err_ty(env.ck) as *Type?
+                }
+                if !load.is_symbol_type(mem!!) {
+                    var b = strbuilder.empty()
+                    b.append(what)
+                    b.append(" expects a type")
+                    env_fail(env, node, b.str())
+                    b.free()
+                    return err_ty(env.ck) as *Type?
+                }
+                if !wait_for_symbol(env.ck, env.job, mem!!, false) {
+                    return null
+                }
+                val ty = get_sema(mem!!)
+                if ty == null {
+                    return err_ty(env.ck) as *Type?
+                }
+                return ty
+            }
+        }
+    }
+    if parse.is_unary(node) && node.text == "*" && node.kids.len > 0 {
+        val elem = size_type_arg(env, node.kids.get(0), what)
+        if elem == null || env.ck.stop {
+            return elem
+        }
+        if type_is_error(elem!!) {
+            return elem
+        }
+        return type_ptr(&env.ck.types, elem!!, false) as *Type?
+    }
+    if parse.is_type_option(node) && node.kids.len > 0 {
+        val elem = size_type_arg(env, node.kids.get(0), what)
+        if elem == null || env.ck.stop {
+            return elem
+        }
+        if type_is_error(elem!!) {
+            return elem
+        }
+        return type_option(&env.ck.types, elem!!) as *Type?
+    }
+    var b = strbuilder.empty()
+    b.append(what)
+    b.append(" expects a type")
+    env_fail(env, node, b.str())
+    b.free()
+    return err_ty(env.ck) as *Type?
+}
+
+/** (type, 1) handled, (null, 0) not this builtin, (null, -1) stopped. */
+private fn check_layout_call(env: *Env, call: *parse.Node, which: str, noun: str): (*Type?, i32) with (a: mem.Allocator) {
+    if call.kids.len == 0 {
+        return null, 0
+    }
+    val callee = call.kids.get(0)
+    if !parse.is_ident(callee) || callee.kids.len > 0 {
+        return null, 0
+    }
+    if callee.name != which {
+        return null, 0
+    }
+    if lookup_name(env, which) != null {
+        return null, 0
+    }
+    val nctx = parse.call_nctx(call)
+    if nctx > 0 || (call.head / 256) % 2 == 1 || call.kids.len != 2 {
+        var b = strbuilder.empty()
+        b.append(which)
+        b.append(" expects 1 argument")
+        env_fail(env, call, b.str())
+        b.free()
+        return err_ty(env.ck) as *Type?, if env.ck.stop { -1 } else { 1 }
+    }
+    val arg = call.kids.get(1)
+    if !parse.is_arg(arg) || arg.name.len > 0 || arg.kids.len == 0 {
+        var b = strbuilder.empty()
+        b.append(which)
+        b.append(" expects 1 argument")
+        env_fail(env, arg, b.str())
+        b.free()
+        return err_ty(env.ck) as *Type?, if env.ck.stop { -1 } else { 1 }
+    }
+    val value = arg.kids.get(0)
+    val ty = size_type_arg(env, value, which)
+    if ty == null || env.ck.stop {
+        return null, -1
+    }
+    if type_is_error(ty!!) {
+        return ty, 1
+    }
+    val usize_ty = type_builtin(&env.ck.types, Builtin.USIZE) as *Type?
+    if generic_has_param(ty) {
+        return usize_ty, 1
+    }
+    val voidish = ty!!.kind == TypeKind.STRUCT && !ty!!.has_layout && ty!!.field_names.len == 0 &&
+        ty!!.name == "void" && ty!!.package.len == 0 && ty!!.decl == null
+    if voidish || (!ty!!.has_layout && !type_layout(&env.ck.types, ty!!)) || !ty!!.has_layout {
+        var b = strbuilder.empty()
+        b.append("type '")
+        b.append(type_print(ty))
+        b.append("' has no ")
+        b.append(noun)
+        env_fail(env, value, b.str())
+        b.free()
+        return err_ty(env.ck) as *Type?, if env.ck.stop { -1 } else { 1 }
+    }
+    return usize_ty, 1
+}
+
+private fn check_ident(env: *Env, node: *parse.Node): *Type? with (a: mem.Allocator) {
+    val symbol = lookup_name(env, node.name)
+    if symbol == null {
+        var b = strbuilder.empty()
+        b.append("undefined name '")
+        if node.name.len > 0 {
+            b.append(node.name)
+        } else {
+            b.append("?")
+        }
+        b.append("'")
+        env_fail(env, node, b.str())
+        b.free()
+        return err_ty(env.ck) as *Type?
+    }
+    val sym = symbol!!
+    if !wait_for_symbol(env.ck, env.job, sym, false) {
+        return null
+    }
+    if !load.is_symbol_value(sym) {
+        var b = strbuilder.empty()
+        b.append("'")
+        b.append(node.name)
+        b.append("' is not a value")
+        env_fail(env, node, b.str())
+        b.free()
+        return err_ty(env.ck) as *Type?
+    }
+    val ty = get_sema(sym)
+    if ty == null {
+        var b = strbuilder.empty()
+        b.append("'")
+        b.append(node.name)
+        b.append("' has no type")
+        env_fail(env, node, b.str())
+        b.free()
+        return err_ty(env.ck) as *Type?
+    }
+    read_var(env, node, sym)
+    return ty
+}
+
+private fn check_unary(env: *Env, node: *parse.Node): *Type? with (a: mem.Allocator) {
+    if node.kids.len == 0 {
+        env_fail(env, node, "missing operand")
+        return err_ty(env.ck) as *Type?
+    }
+    val op = node.text
+    if op == "*" || op == "&" {
+        return check_memory_unary(env, node)
+    }
+    val operand_node = node.kids.get(0)
+    var operand: *Type? = null
+    if op == "!" {
+        operand = check_expr(env, operand_node, null)
+    } else if op == "-" || op == "~" {
+        if is_int_lit_tree(operand_node) {
+            operand = untyped_int(env.ck) as *Type?
+        } else {
+            operand = check_expr(env, operand_node, null)
+        }
+    } else {
+        var b = strbuilder.empty()
+        b.append("operator '")
+        b.append(op)
+        b.append("' is not checked yet")
+        env_fail(env, node, b.str())
+        b.free()
+        return err_ty(env.ck) as *Type?
+    }
+    if operand == null || env.ck.stop {
+        return operand
+    }
+    if type_is_error(operand!!) {
+        return operand
+    }
+    if operand!!.kind == TypeKind.UNTYPED_INT {
+        operand = adapt_int(env, operand_node, operand!!, null)
+        if operand == null || env.ck.stop || type_is_error(operand!!) {
+            return operand
+        }
+    }
+    if is_int_lit_tree(node) {
+        return const_eval(env.ck, env.job.file, node, null)
+    }
+    val boolean = bool_ty(env.ck)
+    val (ret, ok) = scalar_unary(op, operand!!, boolean)
+    if ok {
+        return ret
+    }
+    fail_op(env, node, op, operand!!)
+    return err_ty(env.ck) as *Type?
+}
+
+private fn check_binary(env: *Env, node: *parse.Node): *Type? with (a: mem.Allocator) {
+    if node.kids.len < 2 {
+        env_fail(env, node, "missing operand")
+        return err_ty(env.ck) as *Type?
+    }
+    val op = node.text
+    val lhs = node.kids.get(0)
+    val rhs = node.kids.get(1)
+    if op == ".." {
+        var b = strbuilder.empty()
+        b.append("operator '")
+        b.append(op)
+        b.append("' is not checked yet")
+        env_fail(env, node, b.str())
+        b.free()
+        return err_ty(env.ck) as *Type?
+    }
+    val compare = is_eq_op(op) || is_rel_op(op)
+    val logic = is_logic_op(op)
+    if !compare && !logic && !is_arith_op(op) {
+        var b = strbuilder.empty()
+        b.append("operator '")
+        b.append(op)
+        b.append("' is not checked yet")
+        env_fail(env, node, b.str())
+        b.free()
+        return err_ty(env.ck) as *Type?
+    }
+    var lt: *Type? = null
+    var rt: *Type? = null
+    if op == "&&" {
+        lt = operand_type(env, lhs)
+        if lt == null || env.ck.stop {
+            return null
+        }
+        var narrow = iface_narrow_enter(env, lhs)
+        rt = operand_type(env, rhs)
+        iface_narrow_leave(&narrow)
+    } else {
+        lt = operand_type(env, lhs)
+        rt = operand_type(env, rhs)
+    }
+    if lt == null || rt == null || env.ck.stop {
+        return null
+    }
+    if type_is_error(lt!!) || type_is_error(rt!!) {
+        return err_ty(env.ck) as *Type?
+    }
+    if lt!!.kind == TypeKind.UNTYPED_INT && type_is_host_int(rt!!) {
+        lt = adapt_int(env, lhs, lt!!, rt)
+    } else if rt!!.kind == TypeKind.UNTYPED_INT && type_is_host_int(lt!!) {
+        rt = adapt_int(env, rhs, rt!!, lt)
+    } else {
+        if lt!!.kind == TypeKind.UNTYPED_INT {
+            lt = adapt_int(env, lhs, lt!!, null)
+        }
+        if rt != null && rt!!.kind == TypeKind.UNTYPED_INT {
+            var want: *Type? = null
+            if lt != null && type_is_host_int(lt!!) {
+                want = lt
+            }
+            rt = adapt_int(env, rhs, rt!!, want)
+        }
+    }
+    if lt != null && rt != null && !env.ck.stop {
+        if lt!!.kind == TypeKind.UNTYPED_FLOAT && type_is_host_float(rt!!) {
+            lt = adapt_float(env.ck, lt!!, rt) as *Type?
+        } else if rt!!.kind == TypeKind.UNTYPED_FLOAT && type_is_host_float(lt!!) {
+            rt = adapt_float(env.ck, rt!!, lt) as *Type?
+        } else {
+            if lt!!.kind == TypeKind.UNTYPED_FLOAT {
+                lt = adapt_float(env.ck, lt!!, null) as *Type?
+            }
+            if rt != null && rt!!.kind == TypeKind.UNTYPED_FLOAT {
+                var fwant: *Type? = null
+                if lt != null && type_is_host_float(lt!!) {
+                    fwant = lt
+                }
+                rt = adapt_float(env.ck, rt!!, fwant) as *Type?
+            }
+        }
+    }
+    if lt == null || rt == null || env.ck.stop {
+        return null
+    }
+    if type_is_error(lt!!) || type_is_error(rt!!) {
+        return err_ty(env.ck) as *Type?
+    }
+    val boolean = bool_ty(env.ck)
+    if logic {
+        if lt!!.kind != TypeKind.BOOL || rt!!.kind != TypeKind.BOOL {
+            if lt!!.kind != TypeKind.BOOL {
+                fail_op(env, node, op, lt!!)
+            } else {
+                fail_op(env, node, op, rt!!)
+            }
+            return err_ty(env.ck) as *Type?
+        }
+        return boolean as *Type?
+    }
+    if lt!!.kind == TypeKind.PTR || rt!!.kind == TypeKind.PTR {
+        val (mem_ty, mem) = check_memory_binary(env, node, lt!!, rt!!)
+        if mem < 0 || env.ck.stop {
+            return null
+        }
+        if mem > 0 {
+            return mem_ty
+        }
+    }
+    if is_eq_op(op) {
+        val (err_ty_out, err_cmp) = check_error_compare(env, node, lt!!, rt!!)
+        if err_cmp < 0 || env.ck.stop {
+            return null
+        }
+        if err_cmp > 0 {
+            return err_ty_out
+        }
+    }
+    if !type_same(lt!!, rt!!) {
+        fail_types(env, node, "mismatched types", lt!!, rt!!)
+        return err_ty(env.ck) as *Type?
+    }
+    val (cr, constrained) = constraint_binary(env.ck, node, lt!!, rt!!)
+    if cr < 0 || env.ck.stop {
+        return null
+    }
+    if cr > 0 {
+        return constrained
+    }
+    if compare && is_str_type(lt!!) {
+        if is_rel_op(op) {
+            fail_op(env, node, op, lt!!)
+            return err_ty(env.ck) as *Type?
+        }
+        return boolean as *Type?
+    }
+    if is_eq_op(op) {
+        val under = lt!!
+        if under.kind == TypeKind.ENUM {
+            if enum_eq_ok(under, 0) {
+                return boolean as *Type?
+            }
+            fail_op(env, node, op, under)
+            return err_ty(env.ck) as *Type?
+        }
+    }
+    val (ret, ok) = scalar_binary(op, lt!!, boolean)
+    if ok {
+        return ret
+    }
+    fail_op(env, node, op, lt!!)
+    return err_ty(env.ck) as *Type?
+}
+
+private fn fn_param_start(fn_node: *parse.Node): (usize, usize) {
+    val shape = fn_node.head
+    val nparams = shape % 256
+    val has_recv = (shape / 65536) % 2 == 1
+    val ntype = (shape / 1048576) % 256
+    val nattrs = (shape / 268435456) % 256
+    var i: i64 = nattrs
+    if has_recv {
+        i = i + 1
+    }
+    i = i + ntype
+    return i as usize, nparams as usize
+}
+
+private fn param_name_at(fn_node: *parse.Node, index: usize): str {
+    val (start, count) = fn_param_start(fn_node)
+    if index >= count {
+        return "?"
+    }
+    val at = start + index
+    if at >= fn_node.kids.len {
+        return "?"
+    }
+    val p = fn_node.kids.get(at)
+    if p.name.len > 0 {
+        return p.name
+    }
+    return "?"
+}
+
+private fn param_index_named(fn_node: *parse.Node, name: str, count: usize): i64 {
+    var i: usize = 0
+    for i < count {
+        if param_name_at(fn_node, i) == name {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+private fn callee_fn_decl(env: *Env, callee: *parse.Node): *parse.Node? {
+    var sym: *load.Symbol? = null
+    if parse.is_ident(callee) {
+        sym = lookup_name(env, callee.name)
+    } else if parse.is_member(callee) && callee.name.len > 0 && callee.flag != "?." && callee.kids.len > 0 {
+        val base = callee.kids.get(0)
+        if parse.is_ident(base) {
+            val pkg_sym = lookup_name(env, base.name)
+            if pkg_sym != null && load.is_symbol_package(pkg_sym!!) && pkg_sym!!.package != null {
+                sym = load.package_scope_lookup(&pkg_sym!!.package!!.scope, callee.name)
+            }
+        }
+    }
+    if sym == null || sym!!.decl == null {
+        return null
+    }
+    if !parse.is_fn(sym!!.decl!!) {
+        return null
+    }
+    return sym!!.decl
+}
+
+private fn filled_set(filled: list.List<bool>, index: usize, value: bool): list.List<bool> with (a: mem.Allocator) {
+    var out = list.empty<bool>()
+    var i: usize = 0
+    for i < filled.len {
+        if i == index {
+            out.push(value)
+        } else {
+            out.push(filled.get(i))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+private fn check_struct_lit(env: *Env, node: *parse.Node, ty: *Type): *Type? with (a: mem.Allocator) {
+    val n = type_field_count(ty)
+    var filled = list.empty<bool>()
+    var fi: usize = 0
+    for fi < n {
+        filled.push(false)
+        fi = fi + 1
+    }
+    var positional: usize = 0
+    var seen_named = false
+    val nctx = parse.call_nctx(node)
+    var arg_end = node.kids.len
+    if nctx > 0 && arg_end >= nctx {
+        arg_end = arg_end - nctx
+    }
+    var ai: usize = 1
+    for ai < arg_end && !env.ck.stop {
+        val arg = node.kids.get(ai)
+        ai = ai + 1
+        if !parse.is_arg(arg) {
+            env_fail(env, arg, "expected an argument")
+            continue
+        }
+        var value: *parse.Node? = null
+        if arg.kids.len > 0 {
+            value = arg.kids.get(0) as *parse.Node?
+        }
+        var slot: i64 = -1
+        if arg.name.len > 0 {
+            seen_named = true
+            var s: usize = 0
+            for s < n {
+                if type_field_at(ty, s).name == arg.name {
+                    slot = s as i64
+                    break
+                }
+                s = s + 1
+            }
+            if slot < 0 {
+                fail_named_msg(env, arg, "unknown field '", arg.name)
+                if value != null {
+                    check_expr(env, value!!, null)
+                }
+                continue
+            }
+            val fld = type_field_at(ty, slot as usize)
+            if !field_visible_env(env, ty, fld) {
+                var b = strbuilder.empty()
+                b.append("field '")
+                b.append(arg.name)
+                b.append("' is not visible")
+                env_fail(env, arg, b.str())
+                b.free()
+            }
+            if filled.get(slot as usize) {
+                fail_named_msg(env, arg, "duplicate field '", arg.name)
+                continue
+            }
+            filled = filled_set(filled, slot as usize, true)
+        } else {
+            if seen_named {
+                env_fail(env, arg, "positional field after a named field")
+                if value != null {
+                    check_expr(env, value!!, null)
+                }
+                continue
+            }
+            if positional >= n {
+                env_fail(env, arg, "too many fields")
+                if value != null {
+                    check_expr(env, value!!, null)
+                }
+                continue
+            }
+            slot = positional as i64
+            positional = positional + 1
+            filled = filled_set(filled, slot as usize, true)
+            val fld = type_field_at(ty, slot as usize)
+            if !field_visible_env(env, ty, fld) {
+                var b = strbuilder.empty()
+                b.append("field '")
+                b.append(fld.name)
+                b.append("' is not visible")
+                env_fail(env, arg, b.str())
+                b.free()
+            }
+        }
+        if value != null && slot >= 0 && (slot as usize) < n {
+            val want = type_field_at(ty, slot as usize).field_type
+            check_expr(env, value!!, want)
+        }
+    }
+    var mi: usize = 0
+    for mi < n && !env.ck.stop {
+        if filled.get(mi) {
+            mi = mi + 1
+            continue
+        }
+        val fld = type_field_at(ty, mi)
+        if field_has_default(fld) {
+            mi = mi + 1
+            continue
+        }
+        if fld.field_type != null && type_has_zero(fld.field_type!!) {
+            mi = mi + 1
+            continue
+        }
+        fail_named_msg(env, node, "missing field '", fld.name)
+        mi = mi + 1
+    }
+    return ty as *Type?
+}
+
+private fn fail_named_msg(env: *Env, node: *parse.Node, prefix: str, name: str) with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    b.append(prefix)
+    b.append(name)
+    b.append("'")
+    env_fail(env, node, b.str())
+    b.free()
+}
+
+private fn field_visible_env(env: *Env, owner: *Type, fld: StructField): bool {
+    val decl = fld.decl
+    if decl == null {
+        return true
+    }
+    var end: usize = 0
+    for end < decl!!.flag.len {
+        if decl!!.flag.ptr[end] == ' ' as u8 {
+            break
+        }
+        end = end + 1
+    }
+    val word = texts.slice(decl!!.flag, 0, end)
+    if word.len == 0 {
+        return true
+    }
+    if word == "private(scope)" {
+        if !parse.is_fn(env.job.decl) || !parse.fn_has_receiver(env.job.decl) {
+            return false
+        }
+        val fn_ty = published_fn_type(env.job)
+        if fn_ty == null || fn_ty!!.kind != TypeKind.FN || fn_ty!!.elems.len == 0 {
+            return false
+        }
+        val (on, _) = type_peel_ptr(fn_ty!!.elems.get(0))
+        return on == owner
+    }
+    return true
+}
+
+private fn method_pack_slot(fn_decl: *parse.Node, fn_ty: *Type): i64 {
+    val (start, ast_n) = fn_param_start(fn_decl)
+    val nparam = fn_ty.elems.len
+    if nparam == 0 || ast_n == 0 || nparam != ast_n + 1 {
+        return -1
+    }
+    val at = start + ast_n - 1
+    if at >= fn_decl.kids.len {
+        return -1
+    }
+    val param = fn_decl.kids.get(at)
+    if !parse.is_param(param) || param.text != "pack" {
+        return -1
+    }
+    return (nparam as i64) - 1
+}
+
+private fn pack_elem_of(fn_ty: *Type, pack: i64): *Type? {
+    if pack < 0 || (pack as usize) >= fn_ty.elems.len {
+        return null
+    }
+    val slot = fn_ty.elems.get(pack as usize)
+    if slot.kind != TypeKind.SLICE || slot.elem == null {
+        return null
+    }
+    return slot.elem
+}
+
+private fn check_method_args(
+    env: *Env,
+    node: *parse.Node,
+    fn_decl: *parse.Node,
+    fn_ty: *Type,
+    implicit: bool,
+): *Type? with (a: mem.Allocator) {
+    if fn_ty.elems.len == 0 {
+        env_fail(env, node, "missing receiver")
+        return err_ty(env.ck) as *Type?
+    }
+    var user_offset: usize = 0
+    if implicit {
+        user_offset = 1
+    }
+    val count = fn_ty.elems.len - user_offset
+    val pack = method_pack_slot(fn_decl, fn_ty)
+    var filled = list.empty<bool>()
+    var fi: usize = 0
+    for fi < fn_ty.elems.len {
+        filled.push(false)
+        fi = fi + 1
+    }
+    if implicit {
+        filled = filled_set(filled, 0, true)
+    }
+    val nctx = parse.call_nctx(node)
+    val has_trailing = parse.call_has_trailing(node)
+    val arg_end = parse.call_arg_end(node)
+    var positional: usize = 0
+    var seen_named = false
+    var saw_elems = false
+    var ai: usize = 1
+    for ai < arg_end && !env.ck.stop {
+        val arg = node.kids.get(ai)
+        ai = ai + 1
+        if !parse.is_arg(arg) {
+            env_fail(env, arg, "expected an argument")
+            continue
+        }
+        var value: *parse.Node? = null
+        if arg.kids.len > 0 {
+            value = arg.kids.get(0) as *parse.Node?
+        }
+        var want: *Type? = null
+        if arg.name.len > 0 {
+            seen_named = true
+            val index = param_index_named(fn_decl, arg.name, count)
+            if index < 0 {
+                var b = strbuilder.empty()
+                b.append("unknown parameter '")
+                b.append(arg.name)
+                b.append("'")
+                env_fail(env, arg, b.str())
+                b.free()
+                if value != null {
+                    check_expr(env, value!!, null)
+                }
+                continue
+            }
+            val slot = (index as usize) + user_offset
+            if filled.get(slot) || (pack >= 0 && (slot as i64) == pack && saw_elems) {
+                var b = strbuilder.empty()
+                b.append("duplicate argument '")
+                b.append(arg.name)
+                b.append("'")
+                env_fail(env, arg, b.str())
+                b.free()
+                continue
+            }
+            filled = filled_set(filled, slot, true)
+            want = fn_ty.elems.get(slot) as *Type?
+        } else {
+            if seen_named {
+                env_fail(env, arg, "positional argument after a named argument")
+                if value != null {
+                    check_expr(env, value!!, null)
+                }
+                continue
+            }
+            val slot_index = positional + user_offset
+            if pack >= 0 && (slot_index as i64) >= pack {
+                val elem = pack_elem_of(fn_ty, pack)
+                if elem == null {
+                    env_fail(env, arg, "pack is not a slice")
+                    if value != null {
+                        check_expr(env, value!!, null)
+                    }
+                    continue
+                }
+                saw_elems = true
+                want = elem
+                positional = positional + 1
+            } else if positional >= count {
+                env_fail(env, arg, "too many arguments")
+                if value != null {
+                    check_expr(env, value!!, null)
+                }
+                continue
+            } else {
+                val slot = slot_index
+                positional = positional + 1
+                filled = filled_set(filled, slot, true)
+                want = fn_ty.elems.get(slot) as *Type?
+            }
+        }
+        if value != null {
+            check_expr(env, value!!, want)
+        }
+    }
+    if pack >= 0 {
+        filled = filled_set(filled, pack as usize, true)
+    }
+    if has_trailing && !env.ck.stop {
+        val lam = node.kids.get(node.kids.len - 1 - nctx)
+        val last = fn_ty.elems.len
+        if last == 0 || (implicit && last <= 1) {
+            env_fail(env, lam, "trailing lambda needs a function parameter")
+            check_expr(env, lam, null)
+        } else if filled.get(last - 1) {
+            env_fail(env, lam, "trailing lambda does not fit")
+            check_expr(env, lam, null)
+        } else {
+            val want = fn_ty.elems.get(last - 1)
+            var under = want
+            if under.kind == TypeKind.DISTINCT && under.elem != null {
+                under = under.elem!!
+            }
+            if under.kind != TypeKind.FN {
+                env_fail(env, lam, "trailing lambda needs a function parameter")
+                check_expr(env, lam, null)
+            } else {
+                filled = filled_set(filled, last - 1, true)
+                check_expr(env, lam, want as *Type?)
+            }
+        }
+    }
+    var mi = user_offset
+    for mi < fn_ty.elems.len && !env.ck.stop {
+        if !filled.get(mi) {
+            var b = strbuilder.empty()
+            b.append("missing argument '")
+            if mi >= user_offset {
+                b.append(param_name_at(fn_decl, mi - user_offset))
+            } else {
+                b.append("self")
+            }
+            b.append("'")
+            env_fail(env, node, b.str())
+            b.free()
+        }
+        mi = mi + 1
+    }
+    if fn_ty.elem == null {
+        return unit_ty(env.ck) as *Type?
+    }
+    return fn_ty.elem
+}
+
+private fn is_addressable(env: *Env, node: *parse.Node): bool {
+    return memory_addressable(env, node)
+}
+
+private fn method_call(
+    env: *Env,
+    node: *parse.Node,
+    base: *parse.Node,
+    base_ty: *Type,
+    name: str,
+    implicit: bool,
+): (*Type?, i32) with (a: mem.Allocator) {
+    val (outer, _) = type_peel_ptr(base_ty)
+    val (hit, ambiguous, waiting) = lookup_method(env.ck, env.job, outer, name)
+    if waiting {
+        return null, -1
+    }
+    if !hit.found {
+        return null, 0
+    }
+    if ambiguous {
+        fail_named_msg(env, node, "ambiguous method '", name)
+        return err_ty(env.ck) as *Type?, 1
+    }
+    if hit.decl == null || hit.symbol == null {
+        return null, 0
+    }
+    val fn_decl = hit.decl!!
+    val fn_ty = get_sema(hit.symbol!!)
+    if fn_ty == null || fn_ty!!.kind != TypeKind.FN {
+        return null, 0
+    }
+    if implicit && fn_ty!!.elems.len > 0 {
+        val self_ty = fn_ty!!.elems.get(0)
+        if self_ty.kind == TypeKind.PTR {
+            val (_, base_is_ptr) = type_peel_ptr(base_ty)
+            if !base_is_ptr && !is_addressable(env, base) {
+                var b = strbuilder.empty()
+                b.append("cannot call pointer method '")
+                b.append(name)
+                b.append("' on this value")
+                env_fail(env, node, b.str())
+                b.free()
+            }
+        }
+    }
+    var mty = fn_ty!!
+    if hit.symbol != null && sym_type_param_count(hit.symbol!!) > 0 {
+        // callee is MEMBER at call.kids[0]
+        var callee_node = node.kids.get(0)
+        val built = generic_instantiate_method(
+            env.ck,
+            env.job,
+            env,
+            node,
+            callee_node,
+            outer as *Type?,
+            implicit,
+            hit.symbol!!,
+            mty,
+        )
+        if built == null || env.ck.stop {
+            return built, -1
+        }
+        if type_is_error(built!!) {
+            return built, 1
+        }
+        if built!!.kind != TypeKind.FN {
+            return err_ty(env.ck) as *Type?, 1
+        }
+        mty = built!!
+    }
+    val ret = check_method_args(env, node, fn_decl, mty, implicit)
+    if env.ck.stop {
+        return null, -1
+    }
+    if context_resolve_method(env, node, mty, hit.symbol) < 0 || env.ck.stop {
+        return null, -1
+    }
+    return ret, 1
+}
+
+private fn lookup_generic_callee(env: *Env, target: *parse.Node): *load.Symbol? with (a: mem.Allocator) {
+    if parse.is_ident(target) {
+        val sym = lookup_name(env, target.name)
+        if sym != null && (load.is_symbol_function(sym!!) || load.is_symbol_method(sym!!)) {
+            return sym
+        }
+        return null
+    }
+    // Package-qualified call: list.empty<str>(), mem.newSlice<T>(...).
+    // C attaches the symbol on the MEMBER node; we re-resolve here.
+    if parse.is_member(target) && target.name.len > 0 && target.flag != "?." && target.kids.len > 0 {
+        val base = target.kids.get(0)
+        if parse.is_ident(base) {
+            val pkg_sym = lookup_name(env, base.name)
+            if pkg_sym != null && load.is_symbol_package(pkg_sym!!) && pkg_sym!!.package != null {
+                val mem = load.package_scope_lookup(&pkg_sym!!.package!!.scope, target.name)
+                if mem != null && (load.is_symbol_function(mem!!) || load.is_symbol_method(mem!!)) {
+                    return mem
+                }
+            }
+        }
+    }
+    return null
+}
+
+private fn check_struct_call(env: *Env, node: *parse.Node): (*Type?, bool) with (a: mem.Allocator) {
+    if node.kids.len == 0 {
+        return null, false
+    }
+    val callee = node.kids.get(0)
+    if parse.is_ident(callee) {
+        val sym = lookup_name(env, callee.name)
+        if sym == null || !load.is_symbol_type(sym!!) {
+            return null, false
+        }
+        if !wait_for_symbol(env.ck, env.job, sym!!, false) {
+            return null, true
+        }
+        var ty = get_sema(sym!!)
+        if ty == null {
+            return null, false
+        }
+        // Generic alias that substitutes to a struct (Boxed<T>).
+        if sym_type_param_count(sym!!) > 0 && sym!!.decl != null && parse.is_type_decl(sym!!.decl!!) {
+            val inst = generic_alias_apply(env.ck, env.job, sym!!, callee.kids, callee.line, callee.column)
+            if inst == null || env.ck.stop {
+                return inst, true
+            }
+            if type_is_error(inst!!) {
+                return inst, true
+            }
+            if inst!!.kind != TypeKind.STRUCT {
+                return null, false
+            }
+            val got = check_struct_lit(env, node, inst!!)
+            return got, true
+        }
+        if ty!!.kind != TypeKind.STRUCT {
+            return null, false
+        }
+        if sym_type_param_count(sym!!) > 0 {
+            val inst = generic_struct_apply(env.ck, env.job, sym!!, callee.kids, callee.line, callee.column)
+            if inst == null || env.ck.stop {
+                return inst, true
+            }
+            if type_is_error(inst!!) {
+                return inst, true
+            }
+            ty = inst
+        } else if callee.kids.len > 0 {
+            env_fail(env, callee, "type arguments are not checked yet")
+            return err_ty(env.ck) as *Type?, true
+        }
+        val got = check_struct_lit(env, node, ty!!)
+        return got, true
+    }
+    if parse.is_member(callee) && callee.name.len > 0 && callee.flag != "?." && callee.kids.len > 0 {
+        val base = callee.kids.get(0)
+        if parse.is_ident(base) {
+            val base_sym = lookup_name(env, base.name)
+            if base_sym != null && load.is_symbol_package(base_sym!!) {
+                // Package-qualified call: leave to check_expr on the MEMBER.
+                return null, false
+            }
+            if base_sym != null && load.is_symbol_type(base_sym!!) {
+                if !wait_for_symbol(env.ck, env.job, base_sym!!, false) {
+                    return null, true
+                }
+                var on: *Type? = null
+                if sym_type_param_count(base_sym!!) > 0 || base.kids.len > 0 {
+                    on = named_receiver_type(env.ck, env.job, base, base_sym!!)
+                    if on == null || env.ck.stop {
+                        return null, true
+                    }
+                    if type_is_error(on!!) {
+                        return on, true
+                    }
+                } else {
+                    on = get_sema(base_sym!!)
+                }
+                if on == null {
+                    return err_ty(env.ck) as *Type?, true
+                }
+                val (ret, rc) = method_call(env, node, base, on!!, callee.name, false)
+                if rc < 0 {
+                    return null, true
+                }
+                if rc == 0 {
+                    fail_named_msg(env, node, "undefined method '", callee.name)
+                    return err_ty(env.ck) as *Type?, true
+                }
+                return ret, true
+            }
+        }
+        val base_ty = check_expr(env, base, null)
+        if env.ck.stop {
+            return null, true
+        }
+        if base_ty == null || type_is_error(base_ty!!) {
+            return err_ty(env.ck) as *Type?, true
+        }
+        val (iface_ret, iface_rc) = check_interface_call(env, node, base_ty!!)
+        if iface_rc < 0 || env.ck.stop {
+            return null, true
+        }
+        if iface_rc > 0 {
+            return iface_ret, true
+        }
+        val (outer, _) = type_peel_ptr(base_ty!!)
+        val path = struct_lookup_field(outer, callee.name, env.job.decl as *parse.Node?, env.job.pkg)
+        if path.found && !path.ambiguous {
+            return null, false
+        }
+        val (ret, rc) = method_call(env, node, base, base_ty!!, callee.name, true)
+        if rc < 0 {
+            return null, true
+        }
+        if rc == 0 {
+            if outer.kind == TypeKind.TYPE_PARAM {
+                val (crc, cty) = constraint_call(env.ck, env.job, node, base_ty!!)
+                if crc < 0 || env.ck.stop {
+                    return null, true
+                }
+                if crc > 0 {
+                    return cty, true
+                }
+            }
+            // Chan/Task/Scope methods are handled by check_coro_method.
+            if is_chan_inst(outer) || is_task_inst(outer) || is_coro_scope_ty(outer) {
+                return null, false
+            }
+            if outer.kind == TypeKind.STRUCT || outer.kind == TypeKind.INT || outer.kind == TypeKind.BOOL ||
+                outer.kind == TypeKind.FLOAT || outer.kind == TypeKind.DISTINCT {
+                fail_named_msg(env, node, "undefined method '", callee.name)
+                return err_ty(env.ck) as *Type?, true
+            }
+            return null, false
+        }
+        return ret, true
+    }
+    return null, false
+}
+
+private fn flag_vis_word(flag: str): str {
+    var i: usize = 0
+    for i < flag.len {
+        if flag.ptr[i] == ' ' as u8 {
+            return texts.slice(flag, 0, i)
+        }
+        i = i + 1
+    }
+    return flag
+}
+
+private fn symbol_visible_from(sym: *load.Symbol, from_pkg: *load.Package, from_file: str): bool {
+    if sym.decl == null {
+        return true
+    }
+    if load.is_symbol_package(sym) {
+        return sym.file == from_file
+    }
+    val vis = flag_vis_word(sym.flag)
+    if vis != "private" && vis != "private(file)" && vis != "private(package)" && vis != "private(scope)" {
+        return true
+    }
+    if sym.package == null || sym.package!! != from_pkg {
+        return false
+    }
+    if vis == "private(package)" {
+        return true
+    }
+    return sym.file == from_file
+}
+
+private fn finish_pkg_value(env: *Env, node: *parse.Node, sym: *load.Symbol): *Type? with (a: mem.Allocator) {
+    if !wait_for_symbol(env.ck, env.job, sym, false) {
+        return null
+    }
+    if !load.is_symbol_value(sym) {
+        var b = strbuilder.empty()
+        b.append("'")
+        b.append(sym.name)
+        b.append("' is not a value")
+        env_fail(env, node, b.str())
+        b.free()
+        return err_ty(env.ck) as *Type?
+    }
+    val ty = get_sema(sym)
+    if ty == null {
+        var b = strbuilder.empty()
+        b.append("'")
+        b.append(sym.name)
+        b.append("' has no type")
+        env_fail(env, node, b.str())
+        b.free()
+        return err_ty(env.ck) as *Type?
+    }
+    read_var(env, node, sym)
+    return ty
+}
+
+private fn check_struct_member(env: *Env, node: *parse.Node): (*Type?, bool) with (a: mem.Allocator) {
+    if node.name.len == 0 || node.flag == "?." || node.kids.len == 0 {
+        return null, false
+    }
+    val base = node.kids.get(0)
+    if parse.is_ident(base) {
+        val sym = lookup_name(env, base.name)
+        if sym != null && load.is_symbol_package(sym!!) {
+            if sym!!.package == null {
+                return err_ty(env.ck) as *Type?, true
+            }
+            val mem = load.package_scope_lookup(&sym!!.package!!.scope, node.name)
+            if mem == null {
+                var b = strbuilder.empty()
+                b.append("undefined name '")
+                b.append(node.name)
+                b.append("'")
+                env_fail(env, node, b.str())
+                b.free()
+                return err_ty(env.ck) as *Type?, true
+            }
+            if !symbol_visible_from(mem!!, env.job.pkg, env.job.file) {
+                var b = strbuilder.empty()
+                b.append("name '")
+                b.append(node.name)
+                b.append("' is not visible")
+                env_fail(env, node, b.str())
+                b.free()
+                return err_ty(env.ck) as *Type?, true
+            }
+            val ty = finish_pkg_value(env, node, mem!!)
+            return ty, true
+        }
+        if sym != null && load.is_symbol_type(sym!!) {
+            if !wait_for_symbol(env.ck, env.job, sym!!, false) {
+                return null, true
+            }
+            var on: *Type? = null
+            if sym_type_param_count(sym!!) > 0 || base.kids.len > 0 {
+                on = named_receiver_type(env.ck, env.job, base, sym!!)
+                if on == null || env.ck.stop {
+                    return null, true
+                }
+                if type_is_error(on!!) {
+                    return on, true
+                }
+            } else {
+                on = get_sema(sym!!)
+            }
+            if on == null {
+                return err_ty(env.ck) as *Type?, true
+            }
+            val (hit, ambiguous, waiting) = lookup_method(env.ck, env.job, on!!, node.name)
+            if waiting {
+                return null, true
+            }
+            if !hit.found {
+                fail_named_msg(env, node, "undefined method '", node.name)
+                return err_ty(env.ck) as *Type?, true
+            }
+            if ambiguous {
+                fail_named_msg(env, node, "ambiguous method '", node.name)
+                return err_ty(env.ck) as *Type?, true
+            }
+            // Method used as a value: must be called.
+            fail_named_msg(env, node, "method '", node.name)
+            var b = strbuilder.empty()
+            b.append("method '")
+            b.append(node.name)
+            b.append("' must be called")
+            env_fail(env, node, b.str())
+            b.free()
+            return err_ty(env.ck) as *Type?, true
+        }
+    }
+    val base_ty = check_expr(env, base, null)
+    if env.ck.stop {
+        return null, true
+    }
+    if base_ty == null || type_is_error(base_ty!!) {
+        return err_ty(env.ck) as *Type?, true
+    }
+    val (outer, _) = type_peel_ptr(base_ty!!)
+    val path = struct_lookup_field(outer, node.name, env.job.decl as *parse.Node?, env.job.pkg)
+    if path.ambiguous {
+        fail_named_msg(env, node, "ambiguous field '", node.name)
+        return err_ty(env.ck) as *Type?, true
+    }
+    if path.found {
+        if path.field.field_type == null {
+            return err_ty(env.ck) as *Type?, true
+        }
+        return path.field.field_type, true
+    }
+    val (name_ty, named) = check_enum_name(env, node, outer)
+    if named < 0 || env.ck.stop {
+        return null, true
+    }
+    if named > 0 {
+        return name_ty, true
+    }
+    val (view_ty, view_ok) = check_view_member(env, node, base_ty!!)
+    if view_ok {
+        return view_ty, true
+    }
+    val (hit, ambiguous, waiting) = lookup_method(env.ck, env.job, outer, node.name)
+    if waiting {
+        return null, true
+    }
+    if ambiguous {
+        fail_named_msg(env, node, "ambiguous method '", node.name)
+        return err_ty(env.ck) as *Type?, true
+    }
+    if hit.found {
+        var b = strbuilder.empty()
+        b.append("method '")
+        b.append(node.name)
+        b.append("' must be called")
+        env_fail(env, node, b.str())
+        b.free()
+        return err_ty(env.ck) as *Type?, true
+    }
+    if path.hidden {
+        var b = strbuilder.empty()
+        b.append("field '")
+        b.append(node.name)
+        b.append("' is not visible")
+        env_fail(env, node, b.str())
+        b.free()
+        return err_ty(env.ck) as *Type?, true
+    }
+    if outer.kind == TypeKind.INTERFACE {
+        val (ity, irc) = check_interface_member(env.ck, env.job, node, outer)
+        if irc < 0 || env.ck.stop {
+            return null, true
+        }
+        if irc > 0 {
+            return ity, true
+        }
+    }
+    if outer.kind == TypeKind.STRUCT || outer.kind == TypeKind.INT || outer.kind == TypeKind.BOOL ||
+        outer.kind == TypeKind.BYTES || outer.kind == TypeKind.DISTINCT {
+        fail_named_msg(env, node, "unknown field '", node.name)
+        return err_ty(env.ck) as *Type?, true
+    }
+    if outer.kind == TypeKind.TYPE_PARAM {
+        val (crc, cty) = constraint_member(env.ck, env.job, node, outer)
+        if crc < 0 || env.ck.stop {
+            return null, true
+        }
+        if crc > 0 {
+            return cty, true
+        }
+    }
+    return null, false
+}
+
+private fn check_call(env: *Env, node: *parse.Node): *Type? with (a: mem.Allocator) {
+    // Order matches C check_call: coro type builtins, struct/methods, coro value
+    // methods, memory, string, then ordinary calls.
+    val (coro_ty, coro_rc) = check_coro_call(env, node)
+    if coro_rc < 0 || env.ck.stop {
+        return null
+    }
+    if coro_rc > 0 {
+        return coro_ty
+    }
+    val (special, handled) = check_struct_call(env, node)
+    if handled {
+        return special
+    }
+    val (cmethod_ty, cmethod_rc) = check_coro_method(env, node)
+    if cmethod_rc < 0 || env.ck.stop {
+        return null
+    }
+    if cmethod_rc > 0 {
+        return cmethod_ty
+    }
+    val (bytes_ty, bytes_rc) = check_memory_call(env, node)
+    if bytes_rc < 0 || env.ck.stop {
+        return null
+    }
+    if bytes_rc > 0 {
+        return bytes_ty
+    }
+    val (fmt_ty, fmt_rc) = check_string_call(env, node)
+    if fmt_rc < 0 || env.ck.stop {
+        return null
+    }
+    if fmt_rc > 0 {
+        return fmt_ty
+    }
+    if node.kids.len == 0 {
+        env_fail(env, node, "missing callee")
+        return err_ty(env.ck) as *Type?
+    }
+    val target = node.kids.get(0)
+    // Undefined method already reported for struct callees; MEMBER without method:
+    if parse.is_member(target) && target.name.len > 0 && target.kids.len > 0 {
+        // If base was typed as struct in a prior partial path — leave to check_expr.
+    }
+    val callee = check_expr(env, target, null)
+    if env.ck.stop {
+        return null
+    }
+    if callee == null || type_is_error(callee!!) {
+        return err_ty(env.ck) as *Type?
+    }
+    if callee!!.kind != TypeKind.FN {
+        var b = strbuilder.empty()
+        b.append("cannot call a value of type ")
+        b.append(type_print(callee))
+        env_fail(env, node, b.str())
+        b.free()
+        return err_ty(env.ck) as *Type?
+    }
+    var fn_ty = callee!!
+    // Generic function call: instantiate before checking value args.
+    if parse.is_ident(target) || parse.is_member(target) {
+        val gsym = lookup_generic_callee(env, target)
+        if gsym != null && sym_type_param_count(gsym!!) > 0 {
+            val built = generic_instantiate(env.ck, env.job, env, node, target, fn_ty, gsym!!)
+            if built == null || env.ck.stop {
+                return built
+            }
+            if type_is_error(built!!) {
+                return built
+            }
+            if built!!.kind != TypeKind.FN {
+                return err_ty(env.ck) as *Type?
+            }
+            fn_ty = built!!
+        }
+    }
+    val count = fn_ty.elems.len
+    val nctx = parse.call_nctx(node)
+    val has_trailing = parse.call_has_trailing(node)
+    val arg_end = parse.call_arg_end(node)
+    var filled = list.empty<bool>()
+    var fi: usize = 0
+    for fi < count {
+        filled.push(false)
+        fi = fi + 1
+    }
+    var positional: usize = 0
+    var seen_named = false
+    val fn_decl = callee_fn_decl(env, target)
+    var pack: i64 = -1
+    if fn_decl != null {
+        val (pstart, ast_n) = fn_param_start(fn_decl!!)
+        if ast_n > 0 && count == ast_n {
+            val at = pstart + ast_n - 1
+            if at < fn_decl!!.kids.len {
+                val plast = fn_decl!!.kids.get(at)
+                if parse.is_param(plast) && plast.text == "pack" {
+                    pack = (count as i64) - 1
+                }
+            }
+        }
+    }
+    var saw_elems = false
+    var ai: usize = 1
+    for ai < arg_end && !env.ck.stop {
+        val arg = node.kids.get(ai)
+        if !parse.is_arg(arg) {
+            env_fail(env, arg, "expected an argument")
+            ai = ai + 1
+            continue
+        }
+        var value: *parse.Node? = null
+        if arg.kids.len > 0 {
+            value = arg.kids.get(0) as *parse.Node?
+        }
+        var want: *Type? = null
+        if arg.name.len > 0 {
+            seen_named = true
+            if fn_decl == null {
+                env_fail(env, arg, "unknown parameter")
+                if value != null {
+                    check_expr(env, value!!, null)
+                }
+                ai = ai + 1
+                continue
+            }
+            val index = param_index_named(fn_decl!!, arg.name, count)
+            if index < 0 {
+                var b = strbuilder.empty()
+                b.append("unknown parameter '")
+                b.append(arg.name)
+                b.append("'")
+                env_fail(env, arg, b.str())
+                b.free()
+                if value != null {
+                    check_expr(env, value!!, null)
+                }
+                ai = ai + 1
+                continue
+            }
+            val idx = index as usize
+            if filled.get(idx) || (pack >= 0 && index == pack && saw_elems) {
+                var b = strbuilder.empty()
+                b.append("duplicate argument '")
+                b.append(arg.name)
+                b.append("'")
+                env_fail(env, arg, b.str())
+                b.free()
+                ai = ai + 1
+                continue
+            }
+            filled = filled_set(filled, idx, true)
+            want = fn_ty.elems.get(idx) as *Type?
+        } else {
+            if seen_named {
+                env_fail(env, arg, "positional argument after a named argument")
+                if value != null {
+                    check_expr(env, value!!, null)
+                }
+                ai = ai + 1
+                continue
+            }
+            if pack >= 0 && (positional as i64) >= pack {
+                val elem = pack_elem_of(fn_ty, pack)
+                if filled.get(pack as usize) {
+                    var b = strbuilder.empty()
+                    b.append("duplicate argument '")
+                    if fn_decl != null {
+                        b.append(param_name_at(fn_decl!!, pack as usize))
+                    } else {
+                        b.append("?")
+                    }
+                    b.append("'")
+                    env_fail(env, arg, b.str())
+                    b.free()
+                    if value != null {
+                        check_expr(env, value!!, null)
+                    }
+                    ai = ai + 1
+                    continue
+                }
+                if elem == null {
+                    env_fail(env, arg, "pack is not a slice")
+                    if value != null {
+                        check_expr(env, value!!, null)
+                    }
+                    ai = ai + 1
+                    continue
+                }
+                saw_elems = true
+                want = elem
+                positional = positional + 1
+            } else if positional >= count {
+                env_fail(env, arg, "too many arguments")
+                if value != null {
+                    check_expr(env, value!!, null)
+                }
+                ai = ai + 1
+                continue
+            } else {
+                val idx = positional
+                positional = positional + 1
+                filled = filled_set(filled, idx, true)
+                want = fn_ty.elems.get(idx) as *Type?
+            }
+        }
+        if value != null {
+            check_expr(env, value!!, want)
+        }
+        ai = ai + 1
+    }
+    if pack >= 0 {
+        filled = filled_set(filled, pack as usize, true)
+    }
+    // Trailing lambda fills the last parameter (C check_call).
+    if has_trailing && !env.ck.stop {
+        val lam = node.kids.get(node.kids.len - 1 - nctx)
+        if count == 0 {
+            env_fail(env, lam, "trailing lambda needs a function parameter")
+            check_expr(env, lam, null)
+        } else if filled.get(count - 1) {
+            env_fail(env, lam, "trailing lambda does not fit")
+            check_expr(env, lam, null)
+        } else {
+            val want = fn_ty.elems.get(count - 1)
+            var under = want
+            if under.kind == TypeKind.DISTINCT && under.elem != null {
+                under = under.elem!!
+            }
+            if under.kind != TypeKind.FN {
+                env_fail(env, lam, "trailing lambda needs a function parameter")
+                check_expr(env, lam, null)
+            } else {
+                filled = filled_set(filled, count - 1, true)
+                check_expr(env, lam, want as *Type?)
+            }
+        }
+    }
+    var mi: usize = 0
+    for mi < count && !env.ck.stop {
+        if !filled.get(mi) {
+            var b = strbuilder.empty()
+            b.append("missing argument '")
+            if fn_decl != null {
+                b.append(param_name_at(fn_decl!!, mi))
+            } else {
+                b.append("?")
+            }
+            b.append("'")
+            env_fail(env, node, b.str())
+            b.free()
+        }
+        mi = mi + 1
+    }
+    if context_resolve_call(env, node, fn_ty, target) < 0 || env.ck.stop {
+        return null
+    }
+    if fn_ty.elem == null {
+        return unit_ty(env.ck) as *Type?
+    }
+    return fn_ty.elem
+}
+
+private fn check_cast(env: *Env, node: *parse.Node): *Type? with (a: mem.Allocator) {
+    if node.kids.len < 2 {
+        env_fail(env, node, "missing cast type")
+        return err_ty(env.ck) as *Type?
+    }
+    if node.text == "as?" {
+        val (asq_ty, asq) = check_interface_asq(env, node)
+        if asq < 0 || env.ck.stop {
+            return null
+        }
+        if asq > 0 {
+            return asq_ty
+        }
+        env_fail(env, node, "as? is not checked yet")
+        return err_ty(env.ck) as *Type?
+    }
+    val expr = node.kids.get(0)
+    val ty_node = node.kids.get(1)
+    val dest = resolve_type(env.ck, env.job, ty_node)
+    if dest == null || env.ck.stop {
+        return dest
+    }
+    if type_is_error(dest!!) {
+        return dest
+    }
+    if is_int_lit_tree(expr) && type_is_host_int(dest!!) {
+        val got = const_eval(env.ck, env.job.file, expr, dest)
+        if got == null || type_is_error(got!!) {
+            return got
+        }
+        return dest
+    }
+    val got = check_expr(env, expr, null)
+    if got == null || env.ck.stop {
+        return got
+    }
+    if type_is_error(got!!) || (got!!.kind == TypeKind.INT && dest!!.kind == TypeKind.INT) ||
+        (got!!.kind == TypeKind.FLOAT && (dest!!.kind == TypeKind.FLOAT || dest!!.kind == TypeKind.INT)) ||
+        (got!!.kind == TypeKind.INT && dest!!.kind == TypeKind.FLOAT) || type_same(got!!, dest!!) {
+        if type_is_error(got!!) {
+            return got
+        }
+        return dest
+    }
+    if memory_ptr_cast_ok(got!!, dest!!) {
+        return dest
+    }
+    if context_cast(got!!, dest!!) {
+        return dest
+    }
+    val (iface_ty, iface) = check_interface_as(env.ck, env.job, node, got!!, dest!!)
+    if iface < 0 || env.ck.stop {
+        return null
+    }
+    if iface > 0 {
+        return iface_ty
+    }
+    // bytes / []u8 / []byte → str (and const variants), matching C check_cast.
+    if bytes_to_const(got!!, dest!!) || slice_to_const(got!!, dest!!) || u8_slice_to_str(got!!, dest!!) ||
+        converts_to_str(got!!, dest!!) {
+        return dest
+    }
+    var b = strbuilder.empty()
+    b.append("cannot cast ")
+    b.append(type_print(got))
+    b.append(" to ")
+    b.append(type_print(dest))
+    env_fail(env, node, b.str())
+    b.free()
+    return err_ty(env.ck) as *Type?
+}
+
+private fn lambda_shape(node: *parse.Node): (usize, bool, bool, bool) {
+    val shape = node.head
+    val nparams = (shape % 256) as usize
+    val has_ret = (shape / 256) % 2 == 1
+    val expr_body = (shape / 512) % 2 == 1
+    val implicit_it = (shape / 1024) % 2 == 1
+    return nparams, has_ret, expr_body, implicit_it
+}
+
+/**
+ * Check a lambda against an optional FN target (C check_lambda).
+ */
+fn check_lambda(env: *Env, node: *parse.Node, target: *Type?): *Type? with (a: mem.Allocator) {
+    var fn_target: *Type? = null
+    if target != null && !type_is_error(target!!) && target!!.kind == TypeKind.FN {
+        fn_target = target
+    }
+    if fn_target != null && fn_target!!.fn_variadic {
+        env_fail(env, node, "a lambda cannot be variadic yet")
+        return err_ty(env.ck) as *Type?
+    }
+    val (nparams_ast, has_ret, expr_body, implicit_it_flag) = lambda_shape(node)
+    var implicit_it = implicit_it_flag
+    var body: *parse.Node? = null
+    var ret_node: *parse.Node? = null
+    var param_nodes = list.empty<*parse.Node>()
+    if implicit_it {
+        // Trailing `{ ... }`: kids are just the body.
+        if node.kids.len > 0 {
+            body = node.kids.get(node.kids.len - 1) as *parse.Node?
+        }
+    } else {
+        var i: usize = 0
+        for i < nparams_ast && i < node.kids.len {
+            param_nodes.push(node.kids.get(i))
+            i = i + 1
+        }
+        if has_ret && i < node.kids.len {
+            ret_node = node.kids.get(i) as *parse.Node?
+            i = i + 1
+        }
+        if i < node.kids.len {
+            body = node.kids.get(i) as *parse.Node?
+        }
+    }
+    if body == null {
+        env_fail(env, node, "lambda has no body")
+        return err_ty(env.ck) as *Type?
+    }
+    val inner = new_scope(env, env.scope)
+    if inner == null {
+        return null
+    }
+    var nested = *env
+    nested.scope = inner
+    nested.loop_depth = 0
+    nested.reachable = true
+    var params = list.empty<*Type>()
+    var nparam: usize = 0
+    if implicit_it {
+        // `{ body }` on () -> R has no parameters. Implicit `it` is the one-param case.
+        if fn_target != null && fn_target!!.elems.len == 0 {
+            implicit_it = false
+            nparam = 0
+        } else if fn_target == null || fn_target!!.elems.len != 1 {
+            env_fail(env, node, "implicit 'it' needs a function type with one parameter")
+            return err_ty(env.ck) as *Type?
+        } else {
+            nparam = 1
+            val pty = fn_target!!.elems.get(0)
+            params.push(pty)
+            val sym = bind_local(&nested, node, load.kind_parameter(), "it", pty)
+            if sym != null {
+                note_assigned(sym!!)
+            }
+        }
+    } else {
+        nparam = param_nodes.len
+        if fn_target != null && nparam != fn_target!!.elems.len {
+            env_fail(env, node, "lambda parameter count does not match the function type")
+            return err_ty(env.ck) as *Type?
+        }
+        var pi: usize = 0
+        for pi < nparam && !env.ck.stop {
+            val param = param_nodes.get(pi)
+            if !parse.is_param(param) {
+                env_fail(env, node, "expected a parameter")
+                return err_ty(env.ck) as *Type?
+            }
+            var want: *Type? = null
+            if fn_target != null && pi < fn_target!!.elems.len {
+                want = fn_target!!.elems.get(pi) as *Type?
+            }
+            var ty: *Type? = null
+            if param.kids.len > 0 {
+                ty = resolve_type(env.ck, env.job, param.kids.get(0))
+                if ty == null || env.ck.stop {
+                    return ty
+                }
+            } else if want != null {
+                ty = want
+            } else {
+                env_fail(env, param, "lambda parameter needs a type")
+                return err_ty(env.ck) as *Type?
+            }
+            if want != null && ty != null && !type_same(ty!!, want!!) {
+                env_fail(env, param, "lambda parameter type does not match the function type")
+                return err_ty(env.ck) as *Type?
+            }
+            params.push(ty!!)
+            if param.name.len > 0 && param.name != "_" {
+                val sym = bind_local(&nested, param, load.kind_parameter(), param.name, ty!!)
+                if sym != null {
+                    note_assigned(sym!!)
+                }
+            }
+            pi = pi + 1
+        }
+        if env.ck.stop {
+            return null
+        }
+    }
+    var annotated: *Type? = null
+    if ret_node != null {
+        annotated = resolve_type(env.ck, env.job, ret_node!!)
+        if annotated == null || env.ck.stop {
+            return annotated
+        }
+    }
+    var ret: *Type? = null
+    if fn_target != null {
+        if annotated != null && fn_target!!.elem != null && !type_same(annotated!!, fn_target!!.elem!!) {
+            env_fail(env, node, "lambda result type does not match the function type")
+            return err_ty(env.ck) as *Type?
+        }
+        ret = fn_target!!.elem
+    } else {
+        ret = annotated
+    }
+    nested.ret = ret
+    val saved_go = env.job.in_go
+    env.job.in_go = false
+    val mark = context_mark(env.job)
+    if fn_target != null && fn_target!!.contexts.len > 0 {
+        context_push_params(env.job, fn_target!!.contexts)
+    }
+    var tail_ty: *Type? = null
+    if expr_body {
+        if ret != null && !type_is_error(ret!!) && ret!!.kind == TypeKind.UNIT {
+            check_expr(&nested, body!!, null)
+        } else {
+            tail_ty = check_expr(&nested, body!!, ret)
+            if ret == null {
+                ret = tail_ty
+            }
+        }
+    } else if !parse.is_block(body!!) {
+        env_fail(env, body!!, "expected a block")
+        ret = err_ty(env.ck) as *Type?
+    } else {
+        val stmts = body!!.kids
+        var limit = stmts.len
+        var last: *parse.Node? = null
+        var tail = false
+        if limit > 0 {
+            last = stmts.get(limit - 1) as *parse.Node?
+            if last != null && parse.is_expr_stmt(last!!) {
+                tail = true
+                if ret != null && !type_is_error(ret!!) && ret!!.kind == TypeKind.UNIT {
+                    tail = false
+                }
+                if tail {
+                    limit = limit - 1
+                }
+            }
+        }
+        var si: usize = 0
+        for si < limit && !nested.ck.stop {
+            check_stmt(&nested, stmts.get(si))
+            si = si + 1
+        }
+        if tail && last != null && !nested.ck.stop {
+            var expr: *parse.Node? = null
+            if last!!.kids.len > 0 {
+                expr = last!!.kids.get(0) as *parse.Node?
+            }
+            if expr != null {
+                tail_ty = check_expr(&nested, expr!!, ret)
+                if ret == null {
+                    ret = tail_ty
+                }
+            }
+        } else if ret == null {
+            ret = unit_ty(env.ck) as *Type?
+        }
+        if nested.reachable && ret != null && !type_is_error(ret!!) && ret!!.kind != TypeKind.UNIT && !tail &&
+            !nested.ck.stop {
+            env_fail(env, node, "missing return")
+        }
+    }
+    context_reset(env.job, mark)
+    env.job.in_go = saved_go
+    if env.ck.stop {
+        return null
+    }
+    if ret == null || type_is_error(ret!!) {
+        return err_ty(env.ck) as *Type?
+    }
+    if fn_target != null {
+        return fn_target
+    }
+    var ctxs = list.empty<*Type>()
+    return type_fn(&env.ck.types, params, ret!!, ctxs, false, false, false) as *Type?
+}
+
+/**
+ * Bidirectional expression check.
+ */
+fn check_expr(env: *Env, node: *parse.Node, target: *Type?): *Type? with (a: mem.Allocator) {
+    if env.ck.stop {
+        return null
+    }
+    var got: *Type? = null
+    if is_int_lit_tree(node) {
+        var fold = target
+        if fold != null && fold!!.kind == TypeKind.OPTION && fold!!.elem != null {
+            fold = fold!!.elem
+        }
+        if fold != null && type_is_host_int(fold!!) {
+            got = const_eval(env.ck, env.job.file, node, fold)
+        } else if fold != null && !type_is_error(fold!!) && fold!!.kind != TypeKind.UNTYPED_INT {
+            got = const_eval(env.ck, env.job.file, node, fold)
+        } else {
+            got = const_eval(env.ck, env.job.file, node, null)
+        }
+        if got == null || env.ck.stop || type_is_error(got!!) {
+            return got
+        }
+        return expect_type(env, node, got, target)
+    }
+    if is_float_lit_tree(node) {
+        var fold = target
+        if fold != null && fold!!.kind == TypeKind.OPTION && fold!!.elem != null {
+            fold = fold!!.elem
+        }
+        if fold != null && type_is_host_float(fold!!) {
+            got = fold
+        } else if fold != null && !type_is_error(fold!!) && fold!!.kind != TypeKind.UNTYPED_FLOAT {
+            env_fail(env, node, "constant does not fit")
+            return err_ty(env.ck) as *Type?
+        } else {
+            // C type_float_tree(null) → f64. Binary uses operand_type (untyped).
+            got = type_builtin(&env.ck.types, Builtin.F64) as *Type?
+        }
+        return expect_type(env, node, got, target)
+    }
+    if parse.is_bool_lit(node) {
+        var fold = target
+        if fold != null && fold!!.kind == TypeKind.OPTION && fold!!.elem != null {
+            val elem = fold!!.elem!!
+            if elem.kind == TypeKind.BOOL || elem.kind == TypeKind.INT || elem.kind == TypeKind.FLOAT ||
+                elem.kind == TypeKind.UNTYPED_INT || elem.kind == TypeKind.UNTYPED_FLOAT {
+                fold = elem as *Type?
+            }
+        }
+        if fold != null && !type_is_error(fold!!) && fold!!.kind != TypeKind.BOOL {
+            got = const_eval(env.ck, env.job.file, node, fold)
+        } else {
+            got = const_eval(env.ck, env.job.file, node, null)
+        }
+        if got == null || env.ck.stop || type_is_error(got!!) {
+            return got
+        }
+        return expect_type(env, node, got, target)
+    }
+    if parse.is_string_lit(node) {
+        got = str_ty(env.ck) as *Type?
+        return expect_type(env, node, got, target)
+    }
+    if parse.is_cstring_lit(node) {
+        got = cstring_ty(env.ck) as *Type?
+        return expect_type(env, node, got, target)
+    }
+    if parse.is_null_lit(node) {
+        got = check_error_null(env, node, target)
+        return expect_type(env, node, got, target)
+    }
+    if parse.is_char_lit(node) {
+        got = check_char_lit(env, node, target)
+        return expect_type(env, node, got, target)
+    }
+    // Float literals are handled via is_float_lit_tree above.
+    if parse.is_interp(node) {
+        got = check_string_interp(env, node)
+        return expect_type(env, node, got, target)
+    }
+    if parse.is_ident(node) {
+        got = check_ident(env, node)
+    } else if parse.is_member(node) {
+        if node.flag == "?." {
+            got = check_enum_safe(env, node)
+        } else {
+            val (tup_ty, tup) = check_error_field(env, node)
+            if tup < 0 || env.ck.stop {
+                return null
+            }
+            if tup > 0 {
+                got = tup_ty
+            } else {
+                val (en_ty, en) = check_enum_member(env, node)
+                if en < 0 || env.ck.stop {
+                    return null
+                }
+                if en > 0 {
+                    got = en_ty
+                } else {
+                    val (mem_ty, handled) = check_struct_member(env, node)
+                    if handled {
+                        got = mem_ty
+                    } else {
+                        env_fail(env, node, "field access is not checked yet")
+                        got = err_ty(env.ck) as *Type?
+                    }
+                }
+            }
+        }
+    } else if parse.is_unary(node) {
+        got = check_unary(env, node)
+    } else if parse.is_force(node) {
+        got = check_enum_force(env, node)
+    } else if parse.is_binary(node) {
+        if node.text == "?:" {
+            got = check_enum_elvis(env, node)
+        } else {
+            got = check_binary(env, node)
+        }
+    } else if parse.is_call(node) {
+        val (en_ty, en) = check_enum_call(env, node, target)
+        if en < 0 || env.ck.stop {
+            return null
+        }
+        if en > 0 {
+            got = en_ty
+        } else {
+            val panic_rc = check_error_call(env, node, target)
+            if panic_rc < 0 || env.ck.stop {
+                return null
+            }
+            if panic_rc > 0 {
+                if target != null && !type_is_error(target!!) {
+                    got = target
+                } else {
+                    got = unit_ty(env.ck) as *Type?
+                }
+            } else {
+                val (sized_ty, sized) = check_layout_call(env, node, "size", "size")
+                if sized < 0 || env.ck.stop {
+                    return null
+                }
+                if sized > 0 {
+                    got = sized_ty
+                } else {
+                    val (aligned_ty, aligned) = check_layout_call(env, node, "align", "alignment")
+                    if aligned < 0 || env.ck.stop {
+                        return null
+                    }
+                    if aligned > 0 {
+                        got = aligned_ty
+                    } else {
+                        got = check_call(env, node)
+                    }
+                }
+            }
+        }
+    } else if parse.is_index(node) {
+        got = check_memory_index(env, node)
+    } else if parse.is_slice_expr(node) {
+        got = check_memory_slice(env, node)
+    } else if parse.is_array_lit(node) {
+        got = check_memory_array_lit(env, node)
+    } else if parse.is_tuple(node) {
+        got = check_error_tuple(env, node, target)
+    } else if parse.is_cast(node) {
+        val (en_ty, en) = check_enum_cast(env, node)
+        if en < 0 || env.ck.stop {
+            return null
+        }
+        if en > 0 {
+            got = en_ty
+        } else {
+            got = check_cast(env, node)
+        }
+    } else if parse.is_is(node) {
+        val (iface_ty, iface) = check_interface_is(env, node)
+        if iface < 0 || env.ck.stop {
+            return null
+        }
+        if iface > 0 {
+            got = iface_ty
+        } else {
+            got = check_enum_is(env, node)
+        }
+    } else if parse.is_dot_variant(node) {
+        got = check_enum_dot(env, node, target)
+    } else if parse.is_when(node) {
+        got = check_enum_when(env, node, target, true)
+    } else if parse.is_if(node) {
+        got = check_if(env, node, target, true)
+    } else if parse.is_lambda(node) {
+        got = check_lambda(env, node, target)
+    } else if parse.is_go(node) {
+        got = check_coro_go(env, node)
+    } else if parse.is_builtin(node) {
+        if is_op_intrinsic_name(node.name) {
+            got = check_op_intrinsic(env, node)
+        } else {
+            got = check_comptime(env, node, target)
+        }
+    } else {
+        env_fail(env, node, "expression is not checked yet")
+        got = err_ty(env.ck) as *Type?
+    }
+    if got == null || env.ck.stop {
+        return got
+    }
+    if type_is_error(got!!) {
+        return got
+    }
+    return expect_type(env, node, got, target)
+}
+
+fn check_block(env: *Env, block: *parse.Node) with (a: mem.Allocator) {
+    if !parse.is_block(block) {
+        env_fail(env, block, "expected a block")
+        return
+    }
+    val inner = new_scope(env, env.scope)
+    if inner == null {
+        return
+    }
+    var nested = *env
+    nested.scope = inner
+    val mark = context_mark(env.job)
+    for stmt in block.kids.items() {
+        if nested.ck.stop {
+            break
+        }
+        check_stmt(&nested, stmt)
+    }
+    context_reset(env.job, mark)
+    env.reachable = nested.reachable
+}
+
+private fn block_tail_expr(block: *parse.Node): *parse.Node? {
+    if !parse.is_block(block) || block.kids.len == 0 {
+        return null
+    }
+    val last = block.kids.get(block.kids.len - 1)
+    if !parse.is_expr_stmt(last) || last.kids.len == 0 {
+        return null
+    }
+    return last.kids.get(0) as *parse.Node?
+}
+
+fn check_block_value(env: *Env, block: *parse.Node, target: *Type?): *Type? with (a: mem.Allocator) {
+    if !parse.is_block(block) {
+        env_fail(env, block, "expected a block")
+        return err_ty(env.ck) as *Type?
+    }
+    val inner = new_scope(env, env.scope)
+    if inner == null {
+        return null
+    }
+    var nested = *env
+    nested.scope = inner
+    val mark = context_mark(env.job)
+    val count = block.kids.len
+    val tail = block_tail_expr(block)
+    var i: usize = 0
+    for i + 1 < count && !nested.ck.stop {
+        check_stmt(&nested, block.kids.get(i))
+        i = i + 1
+    }
+    if nested.ck.stop {
+        context_reset(env.job, mark)
+        return null
+    }
+    if tail == null {
+        if count > 0 {
+            check_stmt(&nested, block.kids.get(count - 1))
+        }
+        env_fail(env, block, "if branch has no value")
+        env.reachable = nested.reachable
+        context_reset(env.job, mark)
+        return err_ty(env.ck) as *Type?
+    }
+    var got: *Type? = null
+    if target == null && is_int_lit_tree(tail!!) {
+        got = untyped_int(env.ck) as *Type?
+    } else {
+        got = check_expr(&nested, tail!!, target)
+    }
+    env.reachable = nested.reachable
+    context_reset(env.job, mark)
+    return got
+}
+
+private fn check_if(env: *Env, node: *parse.Node, target: *Type?, as_value: bool): *Type? with (a: mem.Allocator) {
+    val boolean = bool_ty(env.ck)
+    val entry_reach = env.reachable
+    if node.kids.len == 0 {
+        env_fail(env, node, "missing condition")
+        return err_ty(env.ck) as *Type?
+    }
+    check_expr(env, node.kids.get(0), boolean as *Type?)
+    if env.ck.stop {
+        return null
+    }
+    env.reachable = entry_reach
+    var narrow = iface_narrow_enter(env, node.kids.get(0))
+    var then_ty: *Type? = null
+    if node.kids.len > 1 {
+        val then_block = node.kids.get(1)
+        if as_value {
+            then_ty = check_block_value(env, then_block, target)
+        } else if parse.is_block(then_block) {
+            check_block(env, then_block)
+            then_ty = unit_ty(env.ck) as *Type?
+        }
+    }
+    iface_narrow_leave(&narrow)
+    if env.ck.stop {
+        return null
+    }
+    val then_reach = env.reachable
+    env.reachable = entry_reach
+    var else_ty: *Type? = null
+    var has_else = false
+    if node.kids.len > 2 {
+        has_else = true
+        val else_branch = node.kids.get(2)
+        if parse.is_if(else_branch) {
+            else_ty = check_if(env, else_branch, target, as_value)
+        } else if parse.is_block(else_branch) {
+            if as_value {
+                else_ty = check_block_value(env, else_branch, target)
+            } else {
+                check_block(env, else_branch)
+                else_ty = unit_ty(env.ck) as *Type?
+            }
+        }
+    } else if as_value {
+        env_fail(env, node, "if expression requires else")
+        else_ty = err_ty(env.ck) as *Type?
+    }
+    if env.ck.stop {
+        return null
+    }
+    val else_reach = env.reachable
+    if !has_else {
+        env.reachable = entry_reach
+    } else if then_reach || else_reach {
+        env.reachable = true
+    } else {
+        env.reachable = false
+    }
+    if !as_value {
+        return unit_ty(env.ck) as *Type?
+    }
+    if then_ty == null || else_ty == null {
+        return null
+    }
+    if type_is_error(then_ty!!) || type_is_error(else_ty!!) {
+        return err_ty(env.ck) as *Type?
+    }
+    var lt = then_ty!!
+    var rt = else_ty!!
+    if lt.kind == TypeKind.UNTYPED_INT || rt.kind == TypeKind.UNTYPED_INT {
+        var then_tail: *parse.Node? = null
+        if node.kids.len > 1 {
+            then_tail = block_tail_expr(node.kids.get(1))
+        }
+        var else_branch: *parse.Node? = null
+        if node.kids.len > 2 {
+            else_branch = node.kids.get(2) as *parse.Node?
+        }
+        var else_tail: *parse.Node? = null
+        if else_branch != null && parse.is_block(else_branch!!) {
+            else_tail = block_tail_expr(else_branch!!)
+        }
+        if lt.kind == TypeKind.UNTYPED_INT && type_is_host_int(rt) && then_tail != null {
+            lt = adapt_int(env, then_tail!!, lt, rt as *Type?)!!
+        } else if rt.kind == TypeKind.UNTYPED_INT && type_is_host_int(lt) && else_tail != null {
+            rt = adapt_int(env, else_tail!!, rt, lt as *Type?)!!
+        } else {
+            if lt.kind == TypeKind.UNTYPED_INT && then_tail != null {
+                val folded = adapt_int(env, then_tail!!, lt, target)
+                if folded != null {
+                    lt = folded!!
+                }
+            }
+            if rt.kind == TypeKind.UNTYPED_INT && else_tail != null {
+                var want: *Type? = null
+                if type_is_host_int(lt) {
+                    want = lt as *Type?
+                } else {
+                    want = target
+                }
+                val folded = adapt_int(env, else_tail!!, rt, want)
+                if folded != null {
+                    rt = folded!!
+                }
+            }
+        }
+    }
+    if env.ck.stop {
+        return null
+    }
+    if type_is_error(lt) || type_is_error(rt) {
+        return err_ty(env.ck) as *Type?
+    }
+    if !type_same(lt, rt) {
+        fail_types(env, node, "if branches have types", lt, rt)
+        return err_ty(env.ck) as *Type?
+    }
+    if target != null && !type_same(lt, target!!) {
+        fail_mismatch(env, node, target!!, lt)
+        return err_ty(env.ck) as *Type?
+    }
+    return lt as *Type?
+}
+
+private fn check_if_stmt(env: *Env, node: *parse.Node) with (a: mem.Allocator) {
+    check_if(env, node, null, false)
+}
+
+private fn first_binding_name(node: *parse.Node): str {
+    if node.name.len > 0 {
+        return node.name
+    }
+    if node.text.len == 0 {
+        return ""
+    }
+    var i: usize = 0
+    for i < node.text.len {
+        if node.text.ptr[i] == ' ' as u8 {
+            return texts.slice(node.text, 0, i)
+        }
+        i = i + 1
+    }
+    return node.text
+}
+
+fn local_binding_parts(node: *parse.Node): (*parse.Node?, *parse.Node?, str) {
+    val name = first_binding_name(node)
+    var i: usize = 0
+    for i < node.kids.len {
+        if !parse.is_attribute(node.kids.get(i)) {
+            break
+        }
+        i = i + 1
+    }
+    var annotated: *parse.Node? = null
+    var init: *parse.Node? = null
+    if node.op == lex.kind().COLON && i < node.kids.len {
+        annotated = node.kids.get(i) as *parse.Node?
+        i = i + 1
+    }
+    if i < node.kids.len {
+        init = node.kids.get(i) as *parse.Node?
+    }
+    return annotated, init, name
+}
+
+private fn check_local_binding(env: *Env, node: *parse.Node) with (a: mem.Allocator) {
+    if binding_is_multi(node) {
+        check_error_binding(env, node)
+        return
+    }
+    val (annotated_node, init, name) = local_binding_parts(node)
+    var annotated: *Type? = null
+    if annotated_node != null {
+        annotated = resolve_type(env.ck, env.job, annotated_node!!)
+        if annotated == null || env.ck.stop {
+            return
+        }
+    }
+    if parse.is_val(node) && init == null {
+        env_fail(env, node, "val requires an initializer")
+    }
+    if annotated == null && init == null {
+        env_fail(env, node, "missing type")
+        return
+    }
+    var ty: *Type? = null
+    if init != null {
+        var hint: *Type? = null
+        if annotated != null && !type_is_error(annotated!!) {
+            hint = annotated
+        }
+        ty = check_expr(env, init!!, hint)
+        if env.ck.stop {
+            return
+        }
+    }
+    if annotated != null {
+        ty = annotated
+    }
+    if ty == null {
+        ty = err_ty(env.ck) as *Type?
+    }
+    if ty!!.kind == TypeKind.NULL {
+        env_fail(env, node, "null needs an option type")
+        ty = err_ty(env.ck) as *Type?
+    }
+    var kind = load.kind_constant()
+    if parse.is_var(node) {
+        kind = load.kind_variable()
+    }
+    val bound = bind_local(env, node, kind, name, ty!!)
+    if bound != null {
+        if init != null || type_has_zero(ty!!) || !load.is_symbol_variable(bound!!) {
+            note_assigned(bound!!)
+        }
+    }
+}
+
+private fn check_assign(env: *Env, node: *parse.Node) with (a: mem.Allocator) {
+    if node.kids.len < 2 {
+        env_fail(env, node, "missing assignment")
+        return
+    }
+    val target = node.kids.get(0)
+    val value = node.kids.get(1)
+    if parse.is_ident(target) && (target.name == "_" || target.name.len == 0) {
+        check_expr(env, value, null)
+        return
+    }
+    if parse.is_member(target) && target.name.len == 0 {
+        check_error_tuple_assign(env, node)
+        return
+    }
+    if parse.is_member(target) {
+        val (field_ty, handled) = check_struct_member(env, target)
+        if !handled || field_ty == null || type_is_error(field_ty!!) {
+            check_expr(env, value, field_ty)
+            return
+        }
+        // Constrained type-param property: val cannot be assigned (match C).
+        if constraint_assign_forbidden(env, target) {
+            var b = strbuilder.empty()
+            b.append("cannot assign to property '")
+            b.append(target.name)
+            b.append("'")
+            env_fail(env, target, b.str())
+            b.free()
+            check_expr(env, value, field_ty)
+            return
+        }
+        val st = check_interface_store(env, node)
+        if st < 0 || env.ck.stop {
+            return
+        }
+        if st > 0 {
+            return
+        }
+        if !is_addressable(env, target) {
+            var b = strbuilder.empty()
+            b.append("cannot assign to field '")
+            b.append(target.name)
+            b.append("'")
+            env_fail(env, target, b.str())
+            b.free()
+            check_expr(env, value, field_ty)
+            return
+        }
+        if field_ty!!.kind == TypeKind.PTR && (node.text == "+=" || node.text == "-=") {
+            check_memory_ptr_compound(env, value, field_ty!!)
+            return
+        }
+        if node.text != "=" {
+            // Other compound ops on fields: value against field type.
+            check_expr(env, value, field_ty)
+            return
+        }
+        check_expr(env, value, field_ty)
+        return
+    }
+    if parse.is_index(target) || (parse.is_unary(target) && target.text == "*") {
+        check_memory_assign(env, node)
+        return
+    }
+    if !parse.is_ident(target) {
+        env_fail(env, node, "assignment target is not checked yet")
+        check_expr(env, value, null)
+        return
+    }
+    val sym = lookup_name(env, target.name)
+    if sym == null {
+        var b = strbuilder.empty()
+        b.append("undefined name '")
+        b.append(target.name)
+        b.append("'")
+        env_fail(env, target, b.str())
+        b.free()
+        return
+    }
+    if !wait_for_symbol(env.ck, env.job, sym!!, false) {
+        return
+    }
+    if !assignable_sym(sym!!) {
+        var b = strbuilder.empty()
+        b.append("cannot assign to '")
+        b.append(target.name)
+        b.append("'")
+        env_fail(env, target, b.str())
+        b.free()
+        check_expr(env, value, null)
+        return
+    }
+    val dest = get_sema(sym!!)
+    if node.text == "=" {
+        check_expr(env, value, dest)
+        if !env.ck.stop {
+            note_assigned(sym!!)
+        }
+        return
+    }
+    // Compound assign.
+    if dest != null && dest!!.kind == TypeKind.PTR && (node.text == "+=" || node.text == "-=") {
+        read_var(env, target, sym!!)
+        if check_memory_ptr_compound(env, value, dest!!) < 0 || env.ck.stop {
+            return
+        }
+        note_assigned(sym!!)
+        return
+    }
+    read_var(env, target, sym!!)
+    check_expr(env, value, dest)
+    if !env.ck.stop {
+        note_assigned(sym!!)
+    }
+}
+
+private fn check_return(env: *Env, node: *parse.Node) with (a: mem.Allocator) {
+    if env.job.in_go {
+        check_coro_return(env, node)
+        env.reachable = false
+        return
+    }
+    var ret = env.ret
+    val unit = unit_ty(env.ck)
+    if ret == null {
+        ret = unit as *Type?
+    }
+    val count = node.kids.len
+    if count > 1 {
+        check_error_return(env, node, ret)
+        env.reachable = false
+        return
+    }
+    if count == 0 {
+        if ret != null && !type_is_error(ret!!) && ret!!.kind != TypeKind.UNIT {
+            env_fail(env, node, "missing return value")
+        }
+        env.reachable = false
+        return
+    }
+    if ret != null && ret!!.kind == TypeKind.UNIT && !type_is_error(ret!!) {
+        check_expr(env, node.kids.get(0), null)
+        env_fail(env, node, "unexpected return value")
+        env.reachable = false
+        return
+    }
+    check_expr(env, node.kids.get(0), ret)
+    env.reachable = false
+}
+
+private fn unify_range(env: *Env, range: *parse.Node): *Type? with (a: mem.Allocator) {
+    if !parse.is_binary(range) || range.text != ".." || range.kids.len < 2 {
+        env_fail(env, range, "for-in over a collection is not checked yet")
+        return err_ty(env.ck) as *Type?
+    }
+    var lt = operand_type(env, range.kids.get(0))
+    var rt = operand_type(env, range.kids.get(1))
+    if lt == null || rt == null || env.ck.stop {
+        return null
+    }
+    if lt!!.kind == TypeKind.UNTYPED_INT && rt!!.kind == TypeKind.INT {
+        lt = adapt_int(env, range.kids.get(0), lt!!, rt)
+    } else if rt!!.kind == TypeKind.UNTYPED_INT && lt!!.kind == TypeKind.INT {
+        rt = adapt_int(env, range.kids.get(1), rt!!, lt)
+    } else {
+        if lt!!.kind == TypeKind.UNTYPED_INT {
+            lt = adapt_int(env, range.kids.get(0), lt!!, null)
+        }
+        if rt != null && rt!!.kind == TypeKind.UNTYPED_INT {
+            var want: *Type? = null
+            if lt != null && lt!!.kind == TypeKind.INT {
+                want = lt
+            }
+            rt = adapt_int(env, range.kids.get(1), rt!!, want)
+        }
+    }
+    if lt == null || rt == null || env.ck.stop {
+        return null
+    }
+    if type_is_error(lt!!) || type_is_error(rt!!) {
+        return err_ty(env.ck) as *Type?
+    }
+    if lt!!.kind != TypeKind.INT || !type_same(lt!!, rt!!) {
+        if lt!!.kind != TypeKind.INT {
+            fail_op(env, range, "..", lt!!)
+        } else {
+            fail_types(env, range, "mismatched types", lt!!, rt!!)
+        }
+        return err_ty(env.ck) as *Type?
+    }
+    return lt
+}
+
+private fn collection_elem(env: *Env, base_in: *Type): (*Type?, bool) with (a: mem.Allocator) {
+    var base = base_in
+    if is_str_type(base) || base.kind == TypeKind.BYTES || base.kind == TypeKind.BYTES_N {
+        return type_bytes_n(&env.ck.types, 1) as *Type?, true
+    }
+    if base.kind == TypeKind.ARRAY {
+        if base.elem == null {
+            return null, false
+        }
+        return base.elem, true
+    }
+    if base.kind == TypeKind.SLICE {
+        if base.elem == null {
+            return null, false
+        }
+        return base.elem, true
+    }
+    return null, false
+}
+
+private fn check_for(env: *Env, node: *parse.Node) with (a: mem.Allocator) {
+    val boolean = bool_ty(env.ck)
+    val entry_reach = env.reachable
+    var elem: *Type? = null
+    var collection = false
+    val forever = node.text == "forever"
+    if node.text == "cond" {
+        if node.kids.len > 0 {
+            check_expr(env, node.kids.get(0), boolean as *Type?)
+        }
+    } else if node.text == "in" {
+        if node.kids.len > 0 {
+            val seq = node.kids.get(0)
+            // Two names on a range is not the range form; treat as collection.
+            if node.flag.len == 0 && parse.is_binary(seq) && seq.text == ".." {
+                elem = unify_range(env, seq)
+            } else {
+                collection = true
+                val base = check_expr(env, seq, null)
+                if base == null || env.ck.stop {
+                    return
+                }
+                if type_is_error(base!!) {
+                    elem = base
+                } else {
+                    val (chan_elem, chan_rc) = check_chan_for(env, node, base!!)
+                    if chan_rc < 0 || env.ck.stop {
+                        return
+                    }
+                    if chan_rc > 0 {
+                        elem = chan_elem
+                        collection = false
+                    } else {
+                        val (celem, ok) = collection_elem(env, base!!)
+                        if ok {
+                            elem = celem
+                        } else {
+                            env_fail(env, seq, "for-in over a collection is not checked yet")
+                            elem = err_ty(env.ck) as *Type?
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if env.ck.stop {
+        return
+    }
+    val loop_scope = new_scope(env, env.scope)
+    if loop_scope == null {
+        return
+    }
+    var body = *env
+    body.scope = loop_scope
+    body.loop_depth = env.loop_depth + 1
+    body.reachable = true
+    if node.text == "in" && elem != null && !type_is_error(elem!!) {
+        if collection {
+            if node.flag.len > 0 {
+                if node.name.len > 0 && node.name != "_" {
+                    val usize_ty = type_builtin(&env.ck.types, Builtin.USIZE)
+                    val ib = bind_local(&body, node, load.kind_constant(), node.name, usize_ty)
+                    if ib != null {
+                        note_assigned(ib!!)
+                    }
+                }
+                if node.flag != "_" {
+                    val eb = bind_local(&body, node, load.kind_constant(), node.flag, elem!!)
+                    if eb != null {
+                        note_assigned(eb!!)
+                    }
+                }
+            } else if node.name.len > 0 && node.name != "_" {
+                val eb = bind_local(&body, node, load.kind_constant(), node.name, elem!!)
+                if eb != null {
+                    note_assigned(eb!!)
+                }
+            }
+        } else if node.name.len > 0 && node.name != "_" {
+            val bound = bind_local(&body, node, load.kind_constant(), node.name, elem!!)
+            if bound != null {
+                note_assigned(bound!!)
+            }
+        }
+    }
+    var body_node: *parse.Node? = null
+    if forever {
+        if node.kids.len > 0 {
+            body_node = node.kids.get(0) as *parse.Node?
+        }
+    } else if node.kids.len > 1 {
+        body_node = node.kids.get(1) as *parse.Node?
+    }
+    if body_node != null && parse.is_block(body_node!!) {
+        check_block(&body, body_node!!)
+    }
+    if forever {
+        if body.reachable {
+            env.reachable = false
+        } else {
+            env.reachable = entry_reach
+        }
+    } else {
+        env.reachable = entry_reach
+    }
+}
+
+fn check_stmt(env: *Env, stmt: *parse.Node) with (a: mem.Allocator) {
+    if env.ck.stop {
+        return
+    }
+    when {
+        parse.is_val(stmt) || parse.is_var(stmt) -> {
+            check_local_binding(env, stmt)
+        }
+        parse.is_context(stmt) -> {
+            context_binding(env, stmt)
+        }
+        parse.is_with(stmt) -> {
+            val pushed = context_push_with(env, stmt)
+            if pushed < 0 {
+                return
+            }
+            val mark = context_mark(env.job)
+            val body = context_with_body(stmt)
+            if body != null {
+                if parse.is_block(body!!) {
+                    check_block(env, body!!)
+                } else {
+                    check_stmt(env, body!!)
+                }
+            }
+            context_reset(env.job, mark)
+            if pushed > 0 {
+                context_pop(env.job)
+            }
+        }
+        parse.is_assign_stmt(stmt) -> {
+            check_assign(env, stmt)
+        }
+        parse.is_return(stmt) -> {
+            check_return(env, stmt)
+        }
+        parse.is_for(stmt) -> {
+            check_for(env, stmt)
+        }
+        parse.is_break(stmt) -> {
+            if env.loop_depth <= 0 {
+                env_fail(env, stmt, "break outside of a loop")
+            }
+            env.reachable = false
+        }
+        parse.is_continue(stmt) -> {
+            if env.loop_depth <= 0 {
+                env_fail(env, stmt, "continue outside of a loop")
+            }
+            env.reachable = false
+        }
+        parse.is_expr_stmt(stmt) -> {
+            if stmt.kids.len > 0 {
+                val expr = stmt.kids.get(0)
+                if parse.is_if(expr) {
+                    check_if_stmt(env, expr)
+                } else if parse.is_when(expr) {
+                    check_enum_when(env, expr, null, false)
+                } else {
+                    check_expr(env, expr, null)
+                }
+            }
+        }
+        parse.is_destructure(stmt) -> {
+            check_error_destructure(env, stmt)
+        }
+        parse.is_defer(stmt) || parse.is_errdefer(stmt) -> {
+            check_error_defer(env, stmt)
+        }
+        parse.is_block(stmt) -> {
+            check_block(env, stmt)
+        }
+        parse.is_if(stmt) -> {
+            check_if_stmt(env, stmt)
+        }
+        parse.is_attr_block(stmt) -> {
+            if check_memory_attr(env, stmt) < 0 {
+                return
+            }
+            if stmt.kids.len > 0 {
+                val body = stmt.kids.get(stmt.kids.len - 1)
+                if parse.is_block(body) {
+                    check_block(env, body)
+                }
+            }
+        }
+        else -> {
+            env_fail(env, stmt, "statement is not checked yet")
+        }
+    }
+}
+
+/**
+ * Check a defer/errdefer body without permanently changing reachability.
+ */
+fn check_stmt_isolated(env: *Env, stmt: *parse.Node) with (a: mem.Allocator) {
+    val saved = env.reachable
+    check_stmt(env, stmt)
+    env.reachable = saved
+}
+
+private fn fn_shape_parts(node: *parse.Node): (i64, i64, bool, bool, bool, bool, i64, i64) {
+    val shape = node.head
+    val nparams = shape % 256
+    val nctx = (shape / 256) % 256
+    val has_recv = (shape / 65536) % 2 == 1
+    val has_ret = (shape / 131072) % 2 == 1
+    val has_body = (shape / 262144) % 2 == 1
+    val expr_body = (shape / 524288) % 2 == 1
+    val ntype = (shape / 1048576) % 256
+    val nattrs = (shape / 268435456) % 256
+    return nparams, nctx, has_recv, has_ret, has_body, expr_body, ntype, nattrs
+}
+
+private fn op_intrinsic_for_method(name: str): str {
+    if name == "op+" {
+        return "add"
+    }
+    if name == "op-" {
+        return "sub"
+    }
+    if name == "op*" {
+        return "mul"
+    }
+    if name == "op/" {
+        return "div"
+    }
+    if name == "op%" {
+        return "rem"
+    }
+    if name == "op==" {
+        return "eq"
+    }
+    if name == "op!=" {
+        return "ne"
+    }
+    if name == "op<" {
+        return "lt"
+    }
+    if name == "op<=" {
+        return "le"
+    }
+    if name == "op>" {
+        return "gt"
+    }
+    if name == "op>=" {
+        return "ge"
+    }
+    if name == "op&" {
+        return "and"
+    }
+    if name == "op|" {
+        return "or"
+    }
+    if name == "op^" {
+        return "xor"
+    }
+    if name == "op<<" {
+        return "shl"
+    }
+    if name == "op>>" {
+        return "shr"
+    }
+    if name == "op~" {
+        return "bitnot"
+    }
+    if name == "op!" {
+        return "not"
+    }
+    return ""
+}
+
+private fn builtin_arg_value(arg: *parse.Node?): *parse.Node? {
+    if arg == null {
+        return null
+    }
+    if parse.is_arg(arg!!) {
+        if arg!!.kids.len == 0 {
+            return null
+        }
+        return arg!!.kids.get(0)
+    }
+    return arg
+}
+
+/**
+ * @add and friends: only as the entire expr body of an op method (C check_op_intrinsic).
+ */
+private fn check_op_intrinsic(env: *Env, node: *parse.Node): *Type? with (a: mem.Allocator) {
+    val decl = env.job.decl
+    val expect = op_intrinsic_for_method(decl.name)
+    val (body, has_body, expr_body) = fn_body_node(decl)
+    if has_body && expr_body && body != null && body!!.line == node.line && body!!.column == node.column &&
+        parse.is_builtin(body!!) && body!!.name == node.name && parse.fn_has_receiver(decl) && expect.len > 0 &&
+        node.name == expect {
+        for arg in node.kids.items() {
+            val v = builtin_arg_value(arg as *parse.Node?)
+            if v != null {
+                check_expr(env, v!!, null)
+                if env.ck.stop {
+                    return null
+                }
+            }
+        }
+        val fn_ty = published_fn_type(env.job)
+        if fn_ty != null && fn_ty!!.kind == TypeKind.FN && fn_ty!!.elem != null {
+            return fn_ty!!.elem
+        }
+        return err_ty(env.ck) as *Type?
+    }
+    var b = strbuilder.empty()
+    b.append("@")
+    b.append(node.name)
+    b.append(" is only allowed in an intrinsic operator")
+    env_fail(env, node, b.str())
+    b.free()
+    for arg in node.kids.items() {
+        val v = builtin_arg_value(arg as *parse.Node?)
+        if v != null {
+            check_expr(env, v!!, null)
+            if env.ck.stop {
+                return null
+            }
+        }
+    }
+    return err_ty(env.ck) as *Type?
+}
+
+private fn fn_body_node(node: *parse.Node): (*parse.Node?, bool, bool) {
+    val (nparams, nctx, has_recv, has_ret, has_body, expr_body, ntype, nattrs) = fn_shape_parts(node)
+    if !has_body {
+        return null, false, false
+    }
+    var i: i64 = nattrs
+    if has_recv {
+        i = i + 1
+    }
+    i = i + ntype + nparams + nctx
+    if has_ret {
+        i = i + 1
+    }
+    if i < 0 || (i as usize) >= node.kids.len {
+        return null, has_body, expr_body
+    }
+    return node.kids.get(i as usize) as *parse.Node?, has_body, expr_body
+}
+
+private fn published_fn_type(job: *CheckJob): *Type? {
+    val pkg = job.pkg
+    for i in 0 as usize..pkg.methods.len {
+        val s = pkg.methods.at(i)
+        if s.decl != null && s.decl!! == job.decl {
+            return get_sema(s)
+        }
+    }
+    for i in 0 as usize..pkg.scope.bindings.len {
+        val s = pkg.scope.bindings.at(i)
+        if s.decl != null && s.decl!! == job.decl {
+            return get_sema(s)
+        }
+    }
+    if job.file_index < pkg.scope.file_scopes.len {
+        val file_scope = pkg.scope.file_scopes.get(job.file_index)
+        for i in 0 as usize..file_scope.bindings.len {
+            val s = file_scope.bindings.at(i)
+            if s.decl != null && s.decl!! == job.decl {
+                return get_sema(s)
+            }
+        }
+    }
+    return null
+}
+
+private fn bind_fn_params(env: *Env, fn_node: *parse.Node, fn_ty: *Type) with (a: mem.Allocator) {
+    val (start, count) = fn_param_start(fn_node)
+    var offset: usize = 0
+    if parse.fn_has_receiver(fn_node) {
+        offset = 1
+    }
+    var i: usize = 0
+    for i < count && i + offset < fn_ty.elems.len {
+        val at = start + i
+        if at >= fn_node.kids.len {
+            break
+        }
+        val param = fn_node.kids.get(at)
+        if param.name.len > 0 && param.name != "_" {
+            val bound = bind_local(env, param, load.kind_parameter(), param.name, fn_ty.elems.get(i + offset))
+            if bound != null {
+                note_assigned(bound!!)
+            }
+        }
+        i = i + 1
+    }
+}
+
+/**
+ * Check a function body after its signature is published.
+ * @param ck checker
+ * @param job the function job
+ * @context a allocator
+ */
+fn check_fn_body(ck: *Check, job: *CheckJob) with (a: mem.Allocator) {
+    if ck.stop || !parse.is_fn(job.decl) {
+        return
+    }
+    val fn_node = job.decl
+    if parse.flag_has_word(fn_node.flag, "extern") {
+        check_fail(ck, job.file, fn_node.line, fn_node.column, "an extern function cannot have a body")
+        return
+    }
+    val (body, has_body, expr_body) = fn_body_node(fn_node)
+    if !has_body || body == null {
+        return
+    }
+    val fn_ty = published_fn_type(job)
+    var ret: *Type? = null
+    if fn_ty != null && fn_ty!!.kind == TypeKind.FN {
+        ret = fn_ty!!.elem
+    }
+    var env = Env(
+        ck: ck,
+        job: job,
+        scope: null,
+        ret: ret,
+        reachable: true,
+        loop_depth: 0,
+    )
+    val fn_scope = new_scope(&env, null)
+    if fn_scope == null {
+        return
+    }
+    env.scope = fn_scope
+    if parse.fn_has_receiver(fn_node) {
+        check_bind_self(ck, job, fn_scope!!)
+    }
+    if fn_ty != null && fn_ty!!.kind == TypeKind.FN {
+        bind_fn_params(&env, fn_node, fn_ty!!)
+        context_bind_params(&env, fn_node, fn_ty!!)
+    } else {
+        context_begin(job)
+    }
+    if ck.stop {
+        return
+    }
+    if expr_body {
+        check_expr(&env, body!!, ret)
+        return
+    }
+    check_block(&env, body!!)
+    if ck.stop {
+        return
+    }
+    if env.reachable && ret != null && !type_is_error(ret!!) && ret!!.kind != TypeKind.UNIT {
+        check_fail(ck, job.file, fn_node.line, fn_node.column, "missing return")
+    }
+}
+
+/**
+ * Thin wrapper: check an expression in a job with no local scope.
+ * @param ck checker
+ * @param job current job
+ * @param node expression
+ * @param target expected type, or null
+ * @context a allocator
+ * @return the expression type
+ */
+fn check_expr_job(ck: *Check, job: *CheckJob, node: *parse.Node, target: *Type?): *Type? with (a: mem.Allocator) {
+    var env = Env(
+        ck: ck,
+        job: job,
+        scope: null,
+        ret: null,
+        reachable: true,
+        loop_depth: 0,
+    )
+    return check_expr(&env, node, target)
+}

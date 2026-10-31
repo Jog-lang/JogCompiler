@@ -1,0 +1,93 @@
+// One package folder after its sources are listed. Fields match
+// JogPackage in compiler/src/program.h. Color is the three-color walk
+// in loader.c (PKG_GRAY / PKG_DONE / PKG_FAIL).
+
+import src.parse
+import std.list
+import std.mem
+
+/**
+ * Visit state for the import cycle walk. White is 0 before the walk.
+ */
+enum PackageColor {
+    WHITE // not yet visited
+    GRAY // on the load stack
+    DONE // finished, in dependency order
+    FAIL // load failed; do not visit again
+}
+
+/**
+ * One source file in a package folder. ast is the FILE node after lex/parse.
+ */
+struct SourceFile {
+    path: str
+    is_test: bool
+    ast: *parse.Node?
+}
+
+/**
+ * OS-specific sources for one target from jog.mod `targets`.
+ */
+struct TargetGroup {
+    os: str
+    files: list.List<SourceFile>
+}
+
+/**
+ * An import path taken from a FILE tree, with its source position.
+ * file is the absolute path of the source that wrote the import.
+ */
+struct ImportRef {
+    path: str
+    file: str
+    line: i64
+    column: i64
+}
+
+/**
+ * A package reachable from the root. path is the canonical import path.
+ * color is set by the import walk in package_files.jog. scope is filled
+ * in step 8.
+ */
+struct Package {
+    path: str
+    name: str
+    dir: str
+    is_std: bool
+    module_name: str
+    module_root: str
+    files: list.List<SourceFile>
+    imports: list.List<*Package>
+    color: PackageColor
+    scope: PackageScope
+    // Method symbols are not package-visible; the checker schedules them.
+    methods: list.List<Symbol>
+    // Non-host OS files parsed for expect/actual checking (loader.c platform_files).
+    platform_files: list.List<SourceFile>
+    targets: list.List<str>
+    target_groups: list.List<TargetGroup>
+}
+
+/**
+ * An empty package. Step 6 fills files; step 7 fills imports and color.
+ * @context a allocator for the lists
+ * @return a package with empty lists and WHITE color
+ */
+fn empty_package(): Package with (a: mem.Allocator) {
+    var p: Package
+    p.path = ""
+    p.name = ""
+    p.dir = ""
+    p.is_std = false
+    p.module_name = ""
+    p.module_root = ""
+    p.files = list.empty<SourceFile>()
+    p.imports = list.empty<*Package>()
+    p.color = PackageColor.WHITE
+    p.scope = empty_package_scope()
+    p.methods = list.empty<Symbol>()
+    p.platform_files = list.empty<SourceFile>()
+    p.targets = list.empty<str>()
+    p.target_groups = list.empty<TargetGroup>()
+    return p
+}

@@ -1,0 +1,1261 @@
+// Type decls, top-level bindings, and resolve_type.
+// Checked against compiler/src/check.c (check_type_decl, check_binding, resolve_type).
+// CheckerGuide step 3.
+
+import src.load
+import src.lex
+import src.parse
+import std.list
+import std.mem
+import std.strbuilder
+import std.text as texts
+
+fn err_ty(ck: *Check): *Type {
+    return type_error(&ck.types)
+}
+
+fn unit_ty(ck: *Check): *Type {
+    return type_builtin(&ck.types, Builtin.UNIT)
+}
+
+fn set_sema(symbol: *load.Symbol, ty: *Type?) {
+    if ty == null {
+        symbol.sema = null
+        return
+    }
+    symbol.sema = ty!! as *u8?
+}
+
+fn get_sema(symbol: *load.Symbol): *Type? {
+    if symbol.sema == null {
+        return null
+    }
+    return symbol.sema!! as *Type?
+}
+
+private fn layout_from_base(t: *Type, base: *Type) {
+    t.elem = base as *Type?
+    t.size = base.size
+    t.align = base.align
+    t.has_layout = base.has_layout
+}
+
+private fn universe_bind(scope: *load.PackageScope, name: str, ty: *Type) {
+    val s = load.package_scope_lookup(scope, name)
+    if s != null {
+        set_sema(s!!, ty)
+    }
+}
+
+/**
+ * Attach builtin *Type values to universe symbols. The loader left sema null.
+ * @param ck checker with a filled type table
+ * @context a allocator for nominal core types
+ */
+fn attach_universe_types(ck: *Check) with (a: mem.Allocator) {
+    if ck.prog.packages.len == 0 {
+        return
+    }
+    val uni = ck.prog.packages.get(0).scope.universe
+    if uni == null {
+        return
+    }
+    val scope = uni!!
+    universe_bind(scope, "true", type_builtin(&ck.types, Builtin.BOOL))
+    universe_bind(scope, "false", type_builtin(&ck.types, Builtin.BOOL))
+    universe_bind(scope, "null", type_builtin(&ck.types, Builtin.NULL))
+    universe_bind(scope, "byte", type_bytes_n(&ck.types, 1))
+    universe_bind(scope, "i8", type_builtin(&ck.types, Builtin.I8))
+    universe_bind(scope, "i16", type_builtin(&ck.types, Builtin.I16))
+    universe_bind(scope, "i32", type_builtin(&ck.types, Builtin.I32))
+    universe_bind(scope, "i64", type_builtin(&ck.types, Builtin.I64))
+    universe_bind(scope, "u8", type_builtin(&ck.types, Builtin.U8))
+    universe_bind(scope, "u16", type_builtin(&ck.types, Builtin.U16))
+    universe_bind(scope, "u32", type_builtin(&ck.types, Builtin.U32))
+    universe_bind(scope, "u64", type_builtin(&ck.types, Builtin.U64))
+    universe_bind(scope, "isize", type_builtin(&ck.types, Builtin.ISIZE))
+    universe_bind(scope, "usize", type_builtin(&ck.types, Builtin.USIZE))
+    universe_bind(scope, "f32", type_builtin(&ck.types, Builtin.F32))
+    universe_bind(scope, "f64", type_builtin(&ck.types, Builtin.F64))
+    universe_bind(scope, "bool", type_builtin(&ck.types, Builtin.BOOL))
+    universe_bind(scope, "bytes", type_builtin(&ck.types, Builtin.BYTES))
+
+    val void_ty = type_new_nominal(&ck.types, TypeKind.STRUCT, "void", "")
+    universe_bind(scope, "void", void_ty)
+
+    val err_iface = type_new_nominal(&ck.types, TypeKind.INTERFACE, "error", "")
+    universe_bind(scope, "error", err_iface)
+
+    // Ordering from core/scalar.jog: enum Ordering: i8 { Less = -1, Equal, Greater }.
+    val ordering = type_new_nominal(&ck.types, TypeKind.ENUM, "Ordering", "")
+    ordering.elem = type_builtin(&ck.types, Builtin.I8) as *Type?
+    ordering.variant_names.push("Less")
+    ordering.variant_tags.push(-1)
+    ordering.variant_field_starts.push(0)
+    ordering.variant_field_counts.push(0)
+    ordering.variant_names.push("Equal")
+    ordering.variant_tags.push(0)
+    ordering.variant_field_starts.push(0)
+    ordering.variant_field_counts.push(0)
+    ordering.variant_names.push("Greater")
+    ordering.variant_tags.push(1)
+    ordering.variant_field_starts.push(0)
+    ordering.variant_field_counts.push(0)
+    val order_sym = load.package_scope_lookup(scope, "Ordering")
+    if order_sym != null {
+        ordering.decl = order_sym!!.decl
+    }
+    type_layout(&ck.types, ordering)
+    universe_bind(scope, "Ordering", ordering)
+
+    val str_ty = type_new_nominal(&ck.types, TypeKind.DISTINCT, "str", "")
+    layout_from_base(str_ty, type_builtin(&ck.types, Builtin.CONST_BYTES))
+    universe_bind(scope, "str", str_ty)
+
+    val rune_ty = type_new_nominal(&ck.types, TypeKind.DISTINCT, "rune", "")
+    layout_from_base(rune_ty, type_builtin(&ck.types, Builtin.U32))
+    universe_bind(scope, "rune", rune_ty)
+
+    val void_ptr = type_ptr(&ck.types, void_ty, false)
+    val scope_ty = type_new_nominal(&ck.types, TypeKind.DISTINCT, "Scope", "")
+    layout_from_base(scope_ty, void_ptr)
+    universe_bind(scope, "Scope", scope_ty)
+    val chan_ty = type_new_nominal(&ck.types, TypeKind.DISTINCT, "Chan", "")
+    layout_from_base(chan_ty, void_ptr)
+    universe_bind(scope, "Chan", chan_ty)
+    val task_ty = type_new_nominal(&ck.types, TypeKind.DISTINCT, "Task", "")
+    layout_from_base(task_ty, void_ptr)
+    universe_bind(scope, "Task", task_ty)
+
+    universe_bind(scope, "ErrCancelled", err_iface)
+    universe_bind(scope, "ErrClosed", err_iface)
+}
+
+private fn same_decl(symbol: *load.Symbol, decl: *parse.Node): bool {
+    if symbol.decl == null {
+        return false
+    }
+    return symbol.decl!! == decl
+}
+
+fn publish_job_type(job: *CheckJob, ty: *Type?) {
+    val pkg = job.pkg
+    for i in 0 as usize..pkg.scope.bindings.len {
+        val s = pkg.scope.bindings.at(i)
+        if same_decl(s, job.decl) {
+            set_sema(s, ty)
+        }
+    }
+    if job.file_index < pkg.scope.file_scopes.len {
+        val file_scope = pkg.scope.file_scopes.get(job.file_index)
+        for i in 0 as usize..file_scope.bindings.len {
+            val s = file_scope.bindings.at(i)
+            if same_decl(s, job.decl) {
+                set_sema(s, ty)
+            }
+        }
+    }
+    for i in 0 as usize..pkg.methods.len {
+        val s = pkg.methods.at(i)
+        if same_decl(s, job.decl) {
+            set_sema(s, ty)
+        }
+    }
+}
+
+/**
+ * Mark a job finished and publish type onto its symbols.
+ * @param job the job
+ * @param ty type to publish, or null
+ */
+fn finish_job_typed(job: *CheckJob, ty: *Type?) {
+    if job.done {
+        return
+    }
+    publish_job_type(job, ty)
+    job.parked = false
+    job.waiting_for = null
+    job.done = true
+}
+
+private fn lookup_in_file(job: *CheckJob, name: str): *load.Symbol? {
+    val found = load.file_lookup(&job.pkg.scope, job.file_index, name)
+    if found != null && load.is_symbol_package(found!!) {
+        found!!.referenced = true
+    }
+    return found
+}
+
+private fn path_first(name: str): str {
+    var i: usize = 0
+    for i < name.len {
+        if name.ptr[i] == '.' as u8 {
+            return texts.slice(name, 0, i)
+        }
+        i = i + 1
+    }
+    return name
+}
+
+private fn path_rest(name: str): str {
+    var i: usize = 0
+    for i < name.len {
+        if name.ptr[i] == '.' as u8 {
+            return texts.slice(name, i + 1, name.len)
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+private fn path_dot_count(name: str): usize {
+    var n: usize = 0
+    var i: usize = 0
+    for i < name.len {
+        if name.ptr[i] == '.' as u8 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+private fn undefined_type(ck: *Check, job: *CheckJob, node: *parse.Node, label: str) with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    b.append("undefined type '")
+    b.append(label)
+    b.append("'")
+    check_fail(ck, job.file, node.line, node.column, b.str())
+    b.free()
+}
+
+private fn lookup_type_name(ck: *Check, job: *CheckJob, node: *parse.Node): *load.Symbol? with (a: mem.Allocator) {
+    val label = node.name
+    if label.len == 0 {
+        undefined_type(ck, job, node, "?")
+        return null
+    }
+    val dots = path_dot_count(label)
+    if dots == 0 {
+        val found = lookup_in_file(job, label)
+        if found == null {
+            undefined_type(ck, job, node, label)
+        }
+        return found
+    }
+    if dots != 1 {
+        undefined_type(ck, job, node, label)
+        return null
+    }
+    val first = lookup_in_file(job, path_first(label))
+    if first == null || !load.is_symbol_package(first!!) || first!!.package == null {
+        undefined_type(ck, job, node, label)
+        return null
+    }
+    val sym = load.package_scope_lookup(&first!!.package!!.scope, path_rest(label))
+    if sym == null {
+        undefined_type(ck, job, node, label)
+        return null
+    }
+    return sym
+}
+
+private fn apply_name_const(ck: *Check, job: *CheckJob, node: *parse.Node, ty: *Type): *Type? with (a: mem.Allocator) {
+    if ty.kind == TypeKind.ERROR {
+        return ty
+    }
+    if ty.kind == TypeKind.PTR {
+        if ty.elem == null {
+            return err_ty(ck)
+        }
+        return type_ptr(&ck.types, ty.elem!!, true)
+    }
+    if ty.kind == TypeKind.SLICE {
+        if ty.elem == null {
+            return err_ty(ck)
+        }
+        return type_slice(&ck.types, ty.elem!!, true)
+    }
+    if ty.kind == TypeKind.BYTES {
+        return type_builtin(&ck.types, Builtin.CONST_BYTES)
+    }
+    if ty.kind == TypeKind.ARRAY || ty.kind == TypeKind.BYTES_N {
+        check_fail(ck, job.file, node.line, node.column, "const is not allowed on an array type")
+        return err_ty(ck)
+    }
+    check_fail(ck, job.file, node.line, node.column, "const is only allowed on a pointer, a slice, or bytes")
+    return err_ty(ck)
+}
+
+private fn resolve_type_name(ck: *Check, job: *CheckJob, node: *parse.Node): *Type? with (a: mem.Allocator) {
+    // Type parameter in the current generic decl.
+    if path_dot_count(node.name) == 0 && node.name.len > 0 {
+        val param = generic_lookup_param(job, node.name)
+        if param != null {
+            return param
+        }
+    }
+    // Option<T> sugar matches check.c when the name is not a shadowing non-type.
+    if node.name == "Option" {
+        val existing = lookup_in_file(job, "Option")
+        var sugar = true
+        if existing != null && load.is_symbol_type(existing!!) && existing!!.decl != null &&
+            !parse.is_enum(existing!!.decl!!) {
+            sugar = false
+        }
+        if sugar {
+            if node.kids.len != 1 {
+                check_fail(ck, job.file, node.line, node.column, "Option takes one type argument")
+                return err_ty(ck)
+            }
+            val elem = resolve_type(ck, job, node.kids.get(0))
+            if elem == null {
+                return null
+            }
+            if elem!!.kind == TypeKind.ERROR {
+                return err_ty(ck)
+            }
+            return type_option(&ck.types, elem!!)
+        }
+    }
+    val symbol = lookup_type_name(ck, job, node)
+    if symbol == null {
+        return err_ty(ck)
+    }
+    val sym = symbol!!
+    if !wait_for_symbol(ck, job, sym, false) {
+        return null
+    }
+    if !load.is_symbol_type(sym) {
+        var b = strbuilder.empty()
+        b.append("'")
+        b.append(node.name)
+        b.append("' is not a type")
+        check_fail(ck, job.file, node.line, node.column, b.str())
+        b.free()
+        return err_ty(ck)
+    }
+    val ty = get_sema(sym)
+    if ty == null {
+        var b = strbuilder.empty()
+        b.append("'")
+        b.append(node.name)
+        b.append("' has no type")
+        check_fail(ck, job.file, node.line, node.column, b.str())
+        b.free()
+        return err_ty(ck)
+    }
+    if ty!!.kind == TypeKind.ERROR {
+        return err_ty(ck)
+    }
+    if sym.decl != null && parse.is_type_decl(sym.decl!!) && sym_type_param_count(sym) > 0 {
+        return generic_alias_apply(ck, job, sym, node.kids, node.line, node.column)
+    }
+    if sym.decl != null && parse.is_enum(sym.decl!!) && ty!!.kind == TypeKind.ENUM &&
+        sym_type_param_count(sym) > 0 {
+        return generic_enum_apply(ck, job, sym, node.kids, node.line, node.column)
+    }
+    if sym.decl != null && parse.is_struct(sym.decl!!) && ty!!.kind == TypeKind.STRUCT &&
+        sym_type_param_count(sym) > 0 {
+        return generic_struct_apply(ck, job, sym, node.kids, node.line, node.column)
+    }
+    val (coro_ty, coro_rc) = check_coro_type(ck, job, sym, node)
+    if coro_rc < 0 || ck.stop {
+        return null
+    }
+    if coro_rc > 0 {
+        return coro_ty
+    }
+    if node.kids.len > 0 {
+        check_fail(ck, job.file, node.line, node.column, "type arguments are not checked yet")
+        return err_ty(ck)
+    }
+    if sym.decl != null && parse.is_struct(sym.decl!!) && type_decl_param_count(sym.decl!!) > 0 {
+        var b = strbuilder.empty()
+        b.append("missing type arguments for '")
+        if node.name.len > 0 {
+            b.append(node.name)
+        } else {
+            b.append("?")
+        }
+        b.append("'")
+        check_fail(ck, job.file, node.line, node.column, b.str())
+        b.free()
+        return err_ty(ck)
+    }
+    if sym.decl != null && parse.is_type_decl(sym.decl!!) && type_decl_param_count(sym.decl!!) > 0 {
+        var b = strbuilder.empty()
+        b.append("missing type arguments for '")
+        if node.name.len > 0 {
+            b.append(node.name)
+        } else {
+            b.append("?")
+        }
+        b.append("'")
+        check_fail(ck, job.file, node.line, node.column, b.str())
+        b.free()
+        return err_ty(ck)
+    }
+    if !ck.allow_typeset && constraint_is_typeset(ty) {
+        var b = strbuilder.empty()
+        b.append("type set interface '")
+        if node.name.len > 0 {
+            b.append(node.name)
+        } else {
+            b.append("?")
+        }
+        b.append("' cannot be used as a value")
+        check_fail(ck, job.file, node.line, node.column, b.str())
+        b.free()
+        return err_ty(ck)
+    }
+    return ty
+}
+
+private fn type_decl_param_count(node: *parse.Node): usize {
+    var n: usize = 0
+    var i: usize = 0
+    for i < (node.head as usize) && i < node.kids.len {
+        if parse.is_type_param(node.kids.get(i)) {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+private fn parse_u64_lit(text: str): (u64, bool) {
+    if text.len == 0 {
+        return 0, false
+    }
+    var n: u64 = 0
+    var i: usize = 0
+    for i < text.len {
+        val c = text.ptr[i]
+        if c == '_' as u8 {
+            i = i + 1
+            continue
+        }
+        if c < '0' as u8 || c > '9' as u8 {
+            return 0, false
+        }
+        n = n * 10 + (c - '0' as u8) as u64
+        i = i + 1
+    }
+    return n, true
+}
+
+/**
+ * Resolve a type expression. Parks on names that have unfinished jobs.
+ * @param ck checker
+ * @param job current job
+ * @param node type AST
+ * @context a allocator for interned types
+ * @return the type, or null when the checker stopped
+ */
+fn resolve_type(ck: *Check, job: *CheckJob, node: *parse.Node): *Type? with (a: mem.Allocator) {
+    if ck.stop {
+        return null
+    }
+    if parse.is_type_name(node) {
+        val named = resolve_type_name(ck, job, node)
+        if named == null {
+            return null
+        }
+        if node.flag != "const" {
+            return named
+        }
+        return apply_name_const(ck, job, node, named!!)
+    }
+    if parse.is_type_unit(node) {
+        return unit_ty(ck)
+    }
+    if parse.is_type_ptr(node) || parse.is_type_slice(node) || parse.is_type_option(node) {
+        if node.kids.len == 0 {
+            check_fail(ck, job.file, node.line, node.column, "missing type")
+            return err_ty(ck)
+        }
+        val elem = resolve_type(ck, job, node.kids.get(0))
+        if elem == null {
+            return null
+        }
+        if elem!!.kind == TypeKind.ERROR {
+            return err_ty(ck)
+        }
+        val is_const = node.flag == "const"
+        if parse.is_type_ptr(node) {
+            return type_ptr(&ck.types, elem!!, is_const)
+        }
+        if parse.is_type_slice(node) {
+            return type_slice(&ck.types, elem!!, is_const)
+        }
+        return type_option(&ck.types, elem!!)
+    }
+    if parse.is_type_array(node) {
+        if node.name == "_" {
+            check_fail(ck, job.file, node.line, node.column, "array length is required")
+            return err_ty(ck)
+        }
+        if node.kids.len < 2 {
+            check_fail(ck, job.file, node.line, node.column, "missing type")
+            return err_ty(ck)
+        }
+        val len_node = node.kids.get(0)
+        val elem_node = node.kids.get(1)
+        if !parse.is_int_lit(len_node) {
+            check_fail(ck, job.file, len_node.line, len_node.column, "array length is not a constant")
+            return err_ty(ck)
+        }
+        val (len, ok) = parse_u64_lit(len_node.text)
+        if !ok {
+            check_fail(ck, job.file, len_node.line, len_node.column, "array length is not a constant")
+            return err_ty(ck)
+        }
+        val elem = resolve_type(ck, job, elem_node)
+        if elem == null {
+            return null
+        }
+        if elem!!.kind == TypeKind.ERROR {
+            return err_ty(ck)
+        }
+        return type_array(&ck.types, elem!!, len)
+    }
+    if parse.is_type_tuple(node) {
+        var elems = list.empty<*Type>()
+        var bad = false
+        for kid in node.kids.items() {
+            val elem = resolve_type(ck, job, kid)
+            if elem == null {
+                return null
+            }
+            if elem!!.kind == TypeKind.ERROR {
+                bad = true
+            }
+            elems.push(elem!!)
+        }
+        if bad {
+            return err_ty(ck)
+        }
+        return type_tuple(&ck.types, elems)
+    }
+    if parse.is_type_fn(node) {
+        val nparams = node.head as usize
+        var params = list.empty<*Type>()
+        var contexts = list.empty<*Type>()
+        var bad = false
+        var i: usize = 0
+        for i < nparams && i < node.kids.len {
+            val p = resolve_type(ck, job, node.kids.get(i))
+            if p == null {
+                return null
+            }
+            if p!!.kind == TypeKind.ERROR {
+                bad = true
+            }
+            params.push(p!!)
+            i = i + 1
+        }
+        var ret = unit_ty(ck)
+        if i < node.kids.len {
+            val r = resolve_type(ck, job, node.kids.get(i))
+            if r == null {
+                return null
+            }
+            if r!!.kind == TypeKind.ERROR {
+                bad = true
+            }
+            ret = r!!
+            i = i + 1
+        }
+        for i < node.kids.len {
+            val cty = resolve_type(ck, job, node.kids.get(i))
+            if cty == null {
+                return null
+            }
+            if cty!!.kind == TypeKind.ERROR {
+                bad = true
+            }
+            contexts.push(cty!!)
+            i = i + 1
+        }
+        if bad {
+            return err_ty(ck)
+        }
+        return type_fn(&ck.types, params, ret, contexts, false, node.flag == "escaping", node.flag == "extern")
+    }
+    check_fail(ck, job.file, node.line, node.column, "not a type")
+    return err_ty(ck)
+}
+
+private fn type_decl_target(node: *parse.Node): *parse.Node? {
+    val at = node.head as usize
+    if at >= node.kids.len {
+        return null
+    }
+    return node.kids.get(at)
+}
+
+private fn type_decl_has_params(node: *parse.Node): bool {
+    var i: usize = 0
+    for i < node.head as usize && i < node.kids.len {
+        if parse.is_type_param(node.kids.get(i)) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+private fn demand_uses(ck: *Check, job: *CheckJob, node: *parse.Node) with (a: mem.Allocator) {
+    if ck.stop {
+        return
+    }
+    if parse.is_type_name(node) || parse.is_type_ptr(node) || parse.is_type_slice(node) ||
+        parse.is_type_option(node) || parse.is_type_array(node) || parse.is_type_tuple(node) ||
+        parse.is_type_fn(node) || parse.is_type_unit(node) {
+        if parse.is_type_array(node) && node.name == "_" {
+            if node.kids.len > 0 {
+                demand_uses(ck, job, node.kids.get(0))
+            }
+            return
+        }
+        if resolve_type(ck, job, node) == null {
+            return
+        }
+        return
+    }
+    if parse.is_ident(node) {
+        val sym = lookup_in_file(job, node.name)
+        if sym != null {
+            if !wait_for_symbol(ck, job, sym!!, false) {
+                return
+            }
+        }
+        for kid in node.kids.items() {
+            demand_uses(ck, job, kid)
+        }
+        return
+    }
+    if parse.is_arg(node) {
+        for kid in node.kids.items() {
+            demand_uses(ck, job, kid)
+        }
+        return
+    }
+    for kid in node.kids.items() {
+        demand_uses(ck, job, kid)
+    }
+}
+
+/**
+ * Check a `type` alias or distinct declaration.
+ * @param ck checker
+ * @param job the type decl job
+ * @context a allocator for types
+ * @return the published type, or null when stopped
+ */
+private fn intrinsic_arg_value(arg: *parse.Node): *parse.Node? {
+    if parse.is_arg(arg) {
+        if arg.kids.len == 0 {
+            return null
+        }
+        return arg.kids.get(0) as *parse.Node?
+    }
+    return arg as *parse.Node?
+}
+
+private fn intrinsic_base_ok(target: *parse.Node, bits: u64, is_ptr: bool): bool {
+    if bits == 0 || bits % 8 != 0 {
+        return false
+    }
+    if is_ptr {
+        val (ok, got_ptr, _) = load.byte_array(target)
+        return ok && got_ptr
+    }
+    if bits == 8 {
+        return load.is_byte_name(target)
+    }
+    val (ok, got_ptr, len) = load.byte_array(target)
+    return ok && !got_ptr && len == bits / 8
+}
+
+/**
+ * Validate @intrinsic on a distinct type (C prelude scan_node).
+ * @return true when an intrinsic attr was present (even if it failed)
+ */
+private fn check_type_intrinsic(ck: *Check, job: *CheckJob, node: *parse.Node, distinct: bool, target: *parse.Node?): bool with (a: mem.Allocator) {
+    var saw = false
+    var i: usize = 0
+    for i < node.kids.len {
+        val attr = node.kids.get(i)
+        if !parse.is_attribute(attr) {
+            break
+        }
+        if attr.name != "intrinsic" {
+            i = i + 1
+            continue
+        }
+        saw = true
+        if !distinct {
+            check_fail(ck, job.file, attr.line, attr.column, "@intrinsic is only allowed on a distinct type")
+            i = i + 1
+            continue
+        }
+        // Parse like jog_parse_intrinsic; unknown kind is reported, not malformed.
+        var kind = -1
+        var unknown: str = ""
+        var has_signed = false
+        var has_bits = false
+        var bits_ptr = false
+        var bits: u64 = 0
+        var positionals: i32 = 0
+        var malformed = false
+        for arg in attr.kids.items() {
+            if !parse.is_arg(arg) {
+                malformed = true
+                break
+            }
+            val value = intrinsic_arg_value(arg)
+            if value == null {
+                malformed = true
+                break
+            }
+            if arg.name.len == 0 {
+                positionals = positionals + 1
+                if positionals != 1 {
+                    malformed = true
+                    break
+                }
+                if parse.is_ident(value!!) && value!!.name == "int" {
+                    kind = 0
+                } else if parse.is_ident(value!!) && value!!.name == "float" {
+                    kind = 1
+                } else if parse.is_ident(value!!) && value!!.name == "bool" {
+                    kind = 2
+                } else if parse.is_ident(value!!) {
+                    unknown = value!!.name
+                    kind = 3
+                } else {
+                    malformed = true
+                    break
+                }
+                continue
+            }
+            if arg.name == "signed" {
+                if has_signed || !parse.is_bool_lit(value!!) {
+                    malformed = true
+                    break
+                }
+                has_signed = true
+                continue
+            }
+            if arg.name == "bits" {
+                if has_bits {
+                    malformed = true
+                    break
+                }
+                has_bits = true
+                if parse.is_ident(value!!) && value!!.name == "ptr" {
+                    bits_ptr = true
+                    continue
+                }
+                if parse.is_int_lit(value!!) {
+                    val (n, ok) = texts.parse_u64_dec(value!!.text)
+                    if !ok {
+                        malformed = true
+                        break
+                    }
+                    bits = n
+                    continue
+                }
+                malformed = true
+                break
+            }
+            malformed = true
+            break
+        }
+        if malformed || positionals != 1 {
+            check_fail(ck, job.file, attr.line, attr.column, "@intrinsic is malformed")
+            i = i + 1
+            continue
+        }
+        if kind == 3 {
+            var b = strbuilder.empty()
+            b.append("unknown intrinsic '")
+            b.append(unknown)
+            b.append("'")
+            check_fail(ck, job.file, attr.line, attr.column, b.str())
+            b.free()
+            i = i + 1
+            continue
+        }
+        var width_bits: u64 = 0
+        var is_ptr = false
+        var width_ok = 0
+        if kind == 2 {
+            if has_signed || has_bits {
+                width_ok = 0
+            } else {
+                width_bits = 8
+                width_ok = 1
+            }
+        } else if kind == 1 {
+            if has_signed || !has_bits || bits_ptr {
+                width_ok = 0
+            } else if bits != 32 && bits != 64 {
+                width_ok = -1
+            } else {
+                width_bits = bits
+                width_ok = 1
+            }
+        } else if kind != 0 || !has_signed || !has_bits {
+            width_ok = 0
+        } else if bits_ptr {
+            val ptr_size = ck.types.ptr_size as u64
+            if ptr_size != 4 && ptr_size != 8 {
+                width_ok = -1
+            } else {
+                is_ptr = true
+                width_bits = ptr_size * 8
+                width_ok = 1
+            }
+        } else if bits != 8 && bits != 16 && bits != 32 && bits != 64 {
+            width_ok = -1
+        } else {
+            width_bits = bits
+            width_ok = 1
+        }
+        if width_ok == 0 {
+            check_fail(ck, job.file, attr.line, attr.column, "@intrinsic is malformed")
+            i = i + 1
+            continue
+        }
+        if width_ok < 0 {
+            check_fail(ck, job.file, attr.line, attr.column, "@intrinsic has the wrong width")
+            i = i + 1
+            continue
+        }
+        if target == null || !intrinsic_base_ok(target!!, width_bits, is_ptr) {
+            check_fail(ck, job.file, attr.line, attr.column, "@intrinsic width does not match the base")
+        }
+        i = i + 1
+    }
+    return saw
+}
+
+fn check_type_decl(ck: *Check, job: *CheckJob): *Type? with (a: mem.Allocator) {
+    val node = job.decl
+    val distinct = node.op == lex.kind().COLON
+    if type_decl_has_params(node) && distinct {
+        check_fail(ck, job.file, node.line, node.column, "generic distinct types are not checked yet")
+        return err_ty(ck)
+    }
+    var bad = false
+    if type_decl_has_params(node) {
+        if !generic_bind_alias_params(ck, job, &bad) {
+            return null
+        }
+    }
+    val target = type_decl_target(node)
+    if target == null {
+        check_fail(ck, job.file, node.line, node.column, "missing type")
+        return err_ty(ck)
+    }
+    // Intrinsic attrs are scanned before resolving the target (C scan_node).
+    if check_type_intrinsic(ck, job, node, distinct, target) {
+        // Keep checking so layout errors still surface when needed.
+    }
+    val base = resolve_type(ck, job, target!!)
+    if base == null {
+        // Self-alias cycle: publish an error type so later uses are quiet and
+        // deferred cycle diagnostics can land after other first errors.
+        if !ck.stop {
+            return err_ty(ck)
+        }
+        return null
+    }
+    if base!!.kind == TypeKind.ERROR || bad {
+        return err_ty(ck)
+    }
+    if !distinct {
+        return base
+    }
+    val named = type_new_nominal(&ck.types, TypeKind.DISTINCT, node.name, job.pkg.path)
+    layout_from_base(named, base!!)
+    if !named.has_layout {
+        var b = strbuilder.empty()
+        b.append("type '")
+        if node.name.len > 0 {
+            b.append(node.name)
+        } else {
+            b.append("?")
+        }
+        b.append("' has no layout")
+        check_fail(ck, job.file, node.line, node.column, b.str())
+        b.free()
+        return err_ty(ck)
+    }
+    return named
+}
+
+private fn binding_parts(node: *parse.Node): (*parse.Node?, *parse.Node?) {
+    var i: usize = 0
+    for i < node.kids.len {
+        if !parse.is_attribute(node.kids.get(i)) {
+            break
+        }
+        i = i + 1
+    }
+    var annotated: *parse.Node? = null
+    var init: *parse.Node? = null
+    if node.op == lex.kind().COLON && i < node.kids.len {
+        annotated = node.kids.get(i)
+        i = i + 1
+    }
+    if i < node.kids.len {
+        init = node.kids.get(i)
+    }
+    return annotated, init
+}
+
+/**
+ * Check a top-level val / var / context.
+ * @param ck checker
+ * @param job the binding job
+ * @context a allocator for types
+ * @return the binding type, or null when stopped
+ */
+fn check_binding(ck: *Check, job: *CheckJob): *Type? with (a: mem.Allocator) {
+    val node = job.decl
+    if (parse.is_val(node) || parse.is_var(node)) && binding_is_multi(node) {
+        val (_, init) = binding_parts(node)
+        if init != null {
+            demand_uses(ck, job, init!!)
+            if ck.stop {
+                return null
+            }
+        }
+        return check_error_top_binding(ck, job, node)
+    }
+    val (annotated_node, init) = binding_parts(node)
+    var annotated: *Type? = null
+    if annotated_node != null {
+        annotated = resolve_type(ck, job, annotated_node!!)
+        if annotated == null {
+            return null
+        }
+    }
+    if parse.is_context(node) && init == null {
+        check_fail(ck, job.file, node.line, node.column, "context requires an initializer")
+        return err_ty(ck)
+    }
+    // Publish an annotated context early so calls can match it.
+    if parse.is_context(node) && annotated != null && annotated!!.kind != TypeKind.ERROR {
+        publish_job_type(job, annotated)
+    }
+    if init != null {
+        demand_uses(ck, job, init!!)
+        if ck.stop {
+            return null
+        }
+    }
+    if annotated != null && annotated!!.kind == TypeKind.ERROR {
+        if init != null {
+            check_expr_job(ck, job, init!!, null)
+            if ck.stop {
+                return null
+            }
+        }
+        return annotated
+    }
+    if init != null {
+        var hint: *Type? = null
+        if annotated != null {
+            hint = annotated
+        }
+        val got = check_expr_job(ck, job, init!!, hint)
+        if ck.stop {
+            return null
+        }
+        if got != null && got!!.kind == TypeKind.NULL {
+            check_fail(ck, job.file, node.line, node.column, "null needs an option type")
+            return err_ty(ck)
+        }
+        if annotated != null {
+            return annotated
+        }
+        return got
+    }
+    if parse.is_var(node) && annotated != null && !type_has_zero(annotated!!) {
+        var b = strbuilder.empty()
+        b.append("variable '")
+        b.append(node.name)
+        b.append("' must be initialized")
+        check_fail(ck, job.file, node.line, node.column, b.str())
+        b.free()
+    }
+    return annotated
+}
+
+private fn fn_shape_parts(node: *parse.Node): (i64, i64, bool, bool, bool, bool, i64, i64) {
+    val shape = node.head
+    val nparams = shape % 256
+    val nctx = (shape / 256) % 256
+    val has_recv = (shape / 65536) % 2 == 1
+    val has_ret = (shape / 131072) % 2 == 1
+    val has_body = (shape / 262144) % 2 == 1
+    val expr_body = (shape / 524288) % 2 == 1
+    val ntype = (shape / 1048576) % 256
+    val nattrs = (shape / 268435456) % 256
+    return nparams, nctx, has_recv, has_ret, has_body, expr_body, ntype, nattrs
+}
+
+private fn resolve_param_type(ck: *Check, job: *CheckJob, param: *parse.Node): *Type? with (a: mem.Allocator) {
+    if param.kids.len == 0 {
+        check_fail(ck, job.file, param.line, param.column, "missing type")
+        return err_ty(ck)
+    }
+    val ty = resolve_type(ck, job, param.kids.get(0))
+    if ty == null || ck.stop {
+        return ty
+    }
+    // A pack's local is a slice of the written element (matches check.c).
+    if param.text == "pack" && ty!!.kind != TypeKind.ERROR {
+        return type_slice(&ck.types, ty!!, false)
+    }
+    return ty
+}
+
+/**
+ * Check a function signature. Methods with a receiver are resolved but bodies
+ * are still checked in check_fn_body when present.
+ * @param ck checker
+ * @param job the function job
+ * @context a allocator for types
+ * @return the function type, or null when stopped
+ */
+private fn generic_receiver_kind(
+    job: *CheckJob,
+    recv: *parse.Node,
+): (i32, usize, *load.Symbol?) with (a: mem.Allocator) {
+    var cur = recv as *parse.Node?
+    for cur != null {
+        if parse.is_type_ptr(cur!!) || parse.is_type_slice(cur!!) || parse.is_type_option(cur!!) {
+            if cur!!.kids.len == 0 {
+                return 0, 0, null
+            }
+            cur = cur!!.kids.get(0) as *parse.Node?
+            continue
+        }
+        break
+    }
+    if cur == null || !parse.is_type_name(cur!!) {
+        return 0, 0, null
+    }
+    val label = cur!!.name
+    if path_dot_count(label) > 1 {
+        return 0, 0, null
+    }
+    var sym: *load.Symbol? = null
+    if path_dot_count(label) == 0 {
+        sym = lookup_in_file(job, label)
+    } else {
+        val first = lookup_in_file(job, path_first(label))
+        if first != null && load.is_symbol_package(first!!) && first!!.package != null {
+            sym = load.package_scope_lookup(&first!!.package!!.scope, path_rest(label))
+        }
+    }
+    if sym == null || sym!!.decl == null {
+        return 0, 0, null
+    }
+    val decl = sym!!.decl!!
+    if parse.is_type_decl(decl) {
+        val pc = type_decl_param_count(decl)
+        if pc == 0 {
+            return 0, 0, null
+        }
+        return 2, pc, null
+    }
+    if !parse.is_struct(decl) && !parse.is_enum(decl) {
+        return 0, 0, null
+    }
+    val pc = type_decl_param_count(decl)
+    if pc == 0 {
+        return 0, 0, null
+    }
+    return 1, pc, sym
+}
+
+fn check_fn(ck: *Check, job: *CheckJob): *Type? with (a: mem.Allocator) {
+    val node = job.decl
+    if ck.stop {
+        return null
+    }
+    val (nparams, nctx, has_recv, has_ret, has_body, expr_body, ntype, nattrs) = fn_shape_parts(node)
+    val rejected = context_reject_decl(ck, job)
+    var i: i64 = nattrs
+    var bad = false
+    if !generic_bind_params(ck, job, &bad) {
+        return null
+    }
+    if has_recv {
+        if i >= node.kids.len as i64 {
+            check_fail(ck, job.file, node.line, node.column, "missing receiver")
+            return err_ty(ck)
+        }
+        val recv_node = node.kids.get(i as usize)
+        val (kind, nrecv, owner) = generic_receiver_kind(job, recv_node)
+        var skip_recv = false
+        if kind == 2 {
+            check_fail(ck, job.file, node.line, node.column, "generic methods are not checked yet")
+            bad = true
+        } else if kind == 1 {
+            if !generic_bind_receiver_params(ck, job, owner, nrecv, &bad, &skip_recv) {
+                return null
+            }
+            if !skip_recv {
+                val recv = resolve_type(ck, job, recv_node)
+                if recv == null {
+                    return null
+                }
+                if recv!!.kind == TypeKind.ERROR {
+                    bad = true
+                }
+            }
+        } else {
+            val recv = resolve_type(ck, job, recv_node)
+            if recv == null {
+                return null
+            }
+            if recv!!.kind == TypeKind.ERROR {
+                bad = true
+            }
+        }
+        i = i + 1
+    }
+    i = i + ntype
+    var params = list.empty<*Type>()
+    var p: i64 = 0
+    val params_start = i
+    for p < nparams {
+        if i >= node.kids.len as i64 {
+            break
+        }
+        val param = node.kids.get(i as usize)
+        val pty = resolve_param_type(ck, job, param)
+        if pty == null {
+            return null
+        }
+        if pty!!.kind == TypeKind.ERROR {
+            bad = true
+        }
+        params.push(pty!!)
+        i = i + 1
+        p = p + 1
+    }
+    // Pack must be the last parameter (matches check.c).
+    var pi: i64 = 0
+    for pi < nparams {
+        val at = params_start + pi
+        if at >= node.kids.len as i64 {
+            break
+        }
+        val param = node.kids.get(at as usize)
+        if parse.is_param(param) && param.text == "pack" && pi + 1 != nparams {
+            check_fail(ck, job.file, param.line, param.column, "a pack must be the last parameter")
+            bad = true
+        }
+        pi = pi + 1
+    }
+    var contexts = list.empty<*Type>()
+    var c: i64 = 0
+    for c < nctx {
+        if i >= node.kids.len as i64 {
+            break
+        }
+        val ctx = node.kids.get(i as usize)
+        val cty = resolve_param_type(ck, job, ctx)
+        if cty == null {
+            return null
+        }
+        if cty!!.kind == TypeKind.ERROR {
+            bad = true
+        }
+        contexts.push(cty!!)
+        i = i + 1
+        c = c + 1
+    }
+    if !generic_reject_defaults_on_params(ck, job, node, &bad) {
+        return null
+    }
+    var ret = unit_ty(ck)
+    if has_ret {
+        if i >= node.kids.len as i64 {
+            check_fail(ck, job.file, node.line, node.column, "missing type")
+            return err_ty(ck)
+        }
+        val r = resolve_type(ck, job, node.kids.get(i as usize))
+        if r == null {
+            return null
+        }
+        if r!!.kind == TypeKind.ERROR {
+            bad = true
+        }
+        ret = r!!
+        i = i + 1
+    }
+    if rejected {
+        bad = true
+    }
+    if bad || ck.stop {
+        if ck.stop {
+            return null
+        }
+        return err_ty(ck)
+    }
+    val is_extern = parse.flag_has_word(node.flag, "extern")
+    val variadic = parse.flag_has_word(node.flag, "variadic")
+    return type_fn(&ck.types, params, ret, contexts, variadic, false, is_extern)
+}
+
+/**
+ * Type one declaration. Functions publish the signature then check the body.
+ * @param ck checker
+ * @param job the job
+ * @context a allocator for types
+ */
+fn check_decl_types(ck: *Check, job: *CheckJob) with (a: mem.Allocator) {
+    var ty: *Type? = null
+    if parse.is_type_decl(job.decl) {
+        ty = check_type_decl(ck, job)
+    } else if parse.is_struct(job.decl) {
+        ty = check_struct(ck, job)
+    } else if parse.is_enum(job.decl) {
+        ty = check_enum(ck, job)
+    } else if parse.is_interface(job.decl) {
+        ty = check_interface(ck, job)
+    } else if parse.is_fn(job.decl) {
+        ty = check_fn(ck, job)
+        if ty != null && ty!!.kind == TypeKind.FN && parse.fn_has_receiver(job.decl) {
+            ty = check_method_type(ck, job, ty!!)
+        }
+        if ty != null && ty!!.kind == TypeKind.FN && context_should_infer(job) {
+            ty = context_infer(ck, job, ty!!)
+        }
+    } else if parse.is_val(job.decl) || parse.is_var(job.decl) || parse.is_context(job.decl) {
+        ty = check_binding(ck, job)
+    }
+    if ck.stop {
+        finish_job_typed(job, err_ty(ck))
+        return
+    }
+    finish_job_typed(job, ty)
+    // Publish the signature before the body so mutual calls are not cycles.
+    if parse.is_fn(job.decl) && ty != null && ty!!.kind != TypeKind.ERROR {
+        val shape = job.decl.head
+        val has_body = (shape / 262144) % 2 == 1
+        if has_body {
+            check_fn_body(ck, job)
+        }
+    }
+}

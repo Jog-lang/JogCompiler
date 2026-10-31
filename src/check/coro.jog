@@ -1,0 +1,1015 @@
+// go, Task, Chan, select, and for over channels.
+// Checked against compiler/src/check_coro.c and check_chan_for.c.
+// Subset gate needs yield / scope / go; full corpus is step 13.
+
+import src.load
+import src.parse
+import std.list
+import std.mem
+import std.strbuilder
+
+private fn universe_named(ck: *Check, name: str): *Type? {
+    if ck.prog.packages.len == 0 {
+        return null
+    }
+    val uni = ck.prog.packages.get(0).scope.universe
+    if uni == null {
+        return null
+    }
+    val s = load.package_scope_lookup(uni!!, name)
+    if s == null {
+        return null
+    }
+    return get_sema(s!!)
+}
+
+private fn user_named(env: *Env, name: str): bool {
+    return lookup_name(env, name) != null
+}
+
+private fn concrete_go_int(ck: *Check, ty: *Type): *Type {
+    if ty.kind == TypeKind.UNTYPED_INT {
+        return type_builtin(&ck.types, Builtin.I64)
+    }
+    return ty
+}
+
+private fn error_option(env: *Env): *Type? with (a: mem.Allocator) {
+    val err = universe_named(env.ck, "error")
+    if err == null {
+        return null
+    }
+    return type_option(&env.ck.types, err!!) as *Type?
+}
+
+private fn is_scope_ty(ty: *Type): bool {
+    return ty.kind == TypeKind.DISTINCT && ty.name == "Scope" && ty.package.len == 0 && ty.elems.len == 0 &&
+        ty.decl == null
+}
+
+private fn require_allocator(env: *Env, at: *parse.Node): bool with (a: mem.Allocator) {
+    if context_has_named(env.job, "Allocator") || is_root_main(env) {
+        return true
+    }
+    env_fail(env, at, "missing context Allocator")
+    return !env.ck.stop
+}
+
+/**
+ * Chan.init / Task type methods (C check_type_method).
+ */
+private fn check_coro_type_method(env: *Env, node: *parse.Node): (*Type?, i32) with (a: mem.Allocator) {
+    if node.kids.len == 0 {
+        return null, 0
+    }
+    val callee = node.kids.get(0)
+    if !parse.is_member(callee) || callee.kids.len == 0 || callee.flag == "?." {
+        return null, 0
+    }
+    val base = callee.kids.get(0)
+    if !parse.is_ident(base) {
+        return null, 0
+    }
+    val sym = lookup_name(env, base.name)
+    if sym == null || !load.is_symbol_type(sym!!) {
+        return null, 0
+    }
+    var kind: i32 = 0
+    if is_coro_marker(sym!!, "Chan") {
+        kind = 1
+    } else if is_coro_marker(sym!!, "Task") {
+        kind = 2
+    } else {
+        return null, 0
+    }
+    if base.kids.len != 1 {
+        var b = strbuilder.empty()
+        b.append("missing type arguments for '")
+        b.append(sym!!.name)
+        b.append("'")
+        env_fail(env, base, b.str())
+        b.free()
+        return err_ty(env.ck) as *Type?, if env.ck.stop {
+            -1
+        } else {
+            1
+        }
+    }
+    val elem = resolve_type(env.ck, env.job, base.kids.get(0))
+    if elem == null || env.ck.stop {
+        return null, -1
+    }
+    if type_is_error(elem!!) {
+        return err_ty(env.ck) as *Type?, 1
+    }
+    val inst = coro_instance(env.ck, elem!!, kind)
+    if inst == null {
+        return null, -1
+    }
+    if kind != 1 || callee.name != "init" {
+        var b = strbuilder.empty()
+        b.append("undefined method '")
+        b.append(callee.name)
+        b.append("'")
+        env_fail(env, node, b.str())
+        b.free()
+        return err_ty(env.ck) as *Type?, if env.ck.stop {
+            -1
+        } else {
+            1
+        }
+    }
+    if !require_allocator(env, node) {
+        return null, -1
+    }
+    val arg_end = parse.call_arg_end(node)
+    if arg_end != 2 {
+        env_fail(env, node, "init expects a capacity")
+        return err_ty(env.ck) as *Type?, if env.ck.stop {
+            -1
+        } else {
+            1
+        }
+    }
+    val arg = node.kids.get(1)
+    var value = arg
+    if parse.is_arg(arg) {
+        if arg.name.len > 0 && arg.name != "cap" {
+            env_fail(env, arg, "init expects cap:")
+        }
+        if arg.kids.len > 0 {
+            value = arg.kids.get(0)
+        }
+    }
+    val usize_ty = type_builtin(&env.ck.types, Builtin.USIZE)
+    check_expr(env, value, usize_ty as *Type?)
+    if env.ck.stop {
+        return null, -1
+    }
+    return inst, 1
+}
+
+/**
+ * Chan/Task/Scope value methods (C check_value_method).
+ */
+fn check_coro_method(env: *Env, node: *parse.Node): (*Type?, i32) with (a: mem.Allocator) {
+    if node.kids.len == 0 {
+        return null, 0
+    }
+    val callee = node.kids.get(0)
+    if !parse.is_member(callee) || callee.kids.len == 0 || callee.flag == "?." {
+        return null, 0
+    }
+    val base = callee.kids.get(0)
+    // C only inspects an already-typed base. Do not check_expr packages /
+    // type names — that would report "'c' is not a value" for c.fn(...).
+    if parse.is_ident(base) {
+        val sym = lookup_name(env, base.name)
+        if sym != null && (load.is_symbol_package(sym!!) || load.is_symbol_type(sym!!)) {
+            return null, 0
+        }
+    }
+    val base_ty = check_expr(env, base, null)
+    if base_ty == null || env.ck.stop {
+        return null, -1
+    }
+    if type_is_error(base_ty!!) {
+        return err_ty(env.ck) as *Type?, 1
+    }
+    val method = callee.name
+    val arg_end = parse.call_arg_end(node)
+    val nargs = if arg_end > 0 {
+        arg_end - 1
+    } else {
+        0
+    }
+    if is_scope_ty(base_ty!!) {
+        if method != "cancel" || nargs != 0 {
+            var b = strbuilder.empty()
+            b.append("undefined method '")
+            b.append(method)
+            b.append("'")
+            env_fail(env, node, b.str())
+            b.free()
+            return err_ty(env.ck) as *Type?, if env.ck.stop {
+                -1
+            } else {
+                1
+            }
+        }
+        return unit_ty(env.ck) as *Type?, 1
+    }
+    if !is_chan_inst(base_ty!!) && !is_task_inst(base_ty!!) {
+        return null, 0
+    }
+    val elem = coro_elem_of(base_ty!!)
+    val err_opt = error_option(env)
+    if elem == null || err_opt == null {
+        return null, if env.ck.stop {
+            -1
+        } else {
+            1
+        }
+    }
+    if is_task_inst(base_ty!!) {
+        if method != "join" || nargs != 0 {
+            var b = strbuilder.empty()
+            b.append("undefined method '")
+            b.append(method)
+            b.append("'")
+            env_fail(env, node, b.str())
+            b.free()
+            return err_ty(env.ck) as *Type?, if env.ck.stop {
+                -1
+            } else {
+                1
+            }
+        }
+        return elem, 1
+    }
+    if method == "send" {
+        if nargs != 1 {
+            env_fail(env, node, "send expects a value")
+            return err_ty(env.ck) as *Type?, if env.ck.stop {
+                -1
+            } else {
+                1
+            }
+        }
+        val arg = node.kids.get(1)
+        var value = arg
+        if parse.is_arg(arg) && arg.kids.len > 0 {
+            value = arg.kids.get(0)
+        }
+        check_expr(env, value, elem)
+        if env.ck.stop {
+            return null, -1
+        }
+        return err_opt, 1
+    }
+    if method == "recv" {
+        if nargs != 0 {
+            env_fail(env, node, "recv takes no arguments")
+            return err_ty(env.ck) as *Type?, if env.ck.stop {
+                -1
+            } else {
+                1
+            }
+        }
+        var parts = list.empty<*Type>()
+        parts.push(elem!!)
+        parts.push(err_opt!!)
+        return type_tuple(&env.ck.types, parts) as *Type?, 1
+    }
+    if method == "close" || method == "free" {
+        if nargs != 0 {
+            var b = strbuilder.empty()
+            b.append("undefined method '")
+            b.append(method)
+            b.append("'")
+            env_fail(env, node, b.str())
+            b.free()
+            return err_ty(env.ck) as *Type?, if env.ck.stop {
+                -1
+            } else {
+                1
+            }
+        }
+        return unit_ty(env.ck) as *Type?, 1
+    }
+    var b = strbuilder.empty()
+    b.append("undefined method '")
+    b.append(method)
+    b.append("'")
+    env_fail(env, node, b.str())
+    b.free()
+    return err_ty(env.ck) as *Type?, if env.ck.stop {
+        -1
+    } else {
+        1
+    }
+}
+
+private fn select_case_body(env: *Env, lambda: *parse.Node?, binds: bool, elem: *Type?) with (a: mem.Allocator) {
+    if lambda == null || !parse.is_lambda(lambda!!) {
+        if lambda != null {
+            env_fail(env, lambda!!, "select case needs a block")
+        }
+        return
+    }
+    val lam = lambda!!
+    val (nparams, _, expr_body, implicit_it) = lambda_shape_coro(lam)
+    if binds {
+        if nparams > 1 {
+            env_fail(env, lam, "recv binds one value")
+            return
+        }
+        var name: str = ""
+        var param: *parse.Node? = null
+        if nparams == 1 && lam.kids.len > 0 {
+            param = lam.kids.get(0) as *parse.Node?
+            if param != null && parse.is_param(param!!) {
+                name = param!!.name
+                if param!!.kids.len > 0 && elem != null {
+                    val written = resolve_type(env.ck, env.job, param!!.kids.get(0))
+                    if written != null && !type_is_error(written!!) && written!! != elem!! {
+                        env_fail(env, param!!, "recv binding does not match the channel element")
+                    }
+                }
+            }
+        } else if implicit_it {
+            name = "it"
+        }
+        var body: *parse.Node? = null
+        if expr_body || nparams == 0 {
+            if lam.kids.len > 0 {
+                body = lam.kids.get(lam.kids.len - 1) as *parse.Node?
+            }
+        } else if lam.kids.len > nparams {
+            body = lam.kids.get(nparams) as *parse.Node?
+        }
+        if name.len > 0 && elem != null {
+            val inner = new_scope(env, env.scope)
+            if inner == null {
+                return
+            }
+            var nested = *env
+            nested.scope = inner
+            val bind_at = if param != null {
+                param!!
+            } else {
+                lam
+            }
+            val sym = bind_local(&nested, bind_at, load.kind_parameter(), name, elem!!)
+            if sym != null {
+                note_assigned(sym!!)
+            }
+            if body != null {
+                if parse.is_block(body!!) {
+                    check_block(&nested, body!!)
+                } else {
+                    check_expr(&nested, body!!, null)
+                }
+            }
+            return
+        }
+        if body != null {
+            if parse.is_block(body!!) {
+                check_block(env, body!!)
+            } else {
+                check_expr(env, body!!, null)
+            }
+        }
+        return
+    }
+    if nparams > 0 {
+        env_fail(env, lam, "select case does not bind a value")
+        return
+    }
+    var body: *parse.Node? = null
+    if lam.kids.len > 0 {
+        body = lam.kids.get(lam.kids.len - 1) as *parse.Node?
+    }
+    if body != null {
+        if parse.is_block(body!!) {
+            check_block(env, body!!)
+        } else {
+            check_expr(env, body!!, null)
+        }
+    }
+}
+
+private fn lambda_shape_coro(node: *parse.Node): (usize, bool, bool, bool) {
+    val shape = node.head
+    val nparams = (shape % 256) as usize
+    val has_ret = (shape / 256) % 2 == 1
+    val expr_body = (shape / 512) % 2 == 1
+    val implicit_it = (shape / 1024) % 2 == 1
+    return nparams, has_ret, expr_body, implicit_it
+}
+
+private fn check_select(env: *Env, node: *parse.Node): (*Type?, i32) with (a: mem.Allocator) {
+    val nctx = parse.call_nctx(node)
+    val trailing = parse.call_has_trailing(node)
+    val arg_end = parse.call_arg_end(node)
+    if arg_end != 1 {
+        env_fail(env, node, "select does not take arguments")
+        return err_ty(env.ck) as *Type?, if env.ck.stop {
+            -1
+        } else {
+            1
+        }
+    }
+    if !trailing {
+        env_fail(env, node, "select needs a block")
+        return err_ty(env.ck) as *Type?, if env.ck.stop {
+            -1
+        } else {
+            1
+        }
+    }
+    val lam = node.kids.get(node.kids.len - 1 - nctx)
+    if !parse.is_lambda(lam) || lam.kids.len == 0 {
+        env_fail(env, node, "select needs a block")
+        return err_ty(env.ck) as *Type?, if env.ck.stop {
+            -1
+        } else {
+            1
+        }
+    }
+    val block = lam.kids.get(lam.kids.len - 1)
+    if !parse.is_block(block) {
+        env_fail(env, node, "select needs a block")
+        return err_ty(env.ck) as *Type?, if env.ck.stop {
+            -1
+        } else {
+            1
+        }
+    }
+    if block.kids.len == 0 {
+        env_fail(env, node, "select needs a case")
+        return err_ty(env.ck) as *Type?, if env.ck.stop {
+            -1
+        } else {
+            1
+        }
+    }
+    if block.kids.len > 32 {
+        env_fail(env, node, "too many select cases")
+        return err_ty(env.ck) as *Type?, if env.ck.stop {
+            -1
+        } else {
+            1
+        }
+    }
+    var i: usize = 0
+    for i < block.kids.len && !env.ck.stop {
+        val stmt = block.kids.get(i)
+        var expr = stmt
+        if parse.is_expr_stmt(stmt) && stmt.kids.len > 0 {
+            expr = stmt.kids.get(0)
+        }
+        if !parse.is_call(expr) {
+            env_fail(env, stmt, "select case must be recv, send, timeout, or default")
+            i = i + 1
+            continue
+        }
+        if expr.kids.len == 0 || !parse.is_ident(expr.kids.get(0)) {
+            env_fail(env, expr, "select case must be recv, send, timeout, or default")
+            i = i + 1
+            continue
+        }
+        val name = expr.kids.get(0).name
+        if name != "recv" && name != "send" && name != "timeout" && name != "default" {
+            env_fail(env, expr, "select case must be recv, send, timeout, or default")
+            i = i + 1
+            continue
+        }
+        val cnctx = parse.call_nctx(expr)
+        val ctrail = parse.call_has_trailing(expr)
+        var cend = expr.kids.len
+        if cnctx > 0 && cend >= cnctx {
+            cend = cend - cnctx
+        }
+        var trail: *parse.Node? = null
+        if ctrail && cend > 0 {
+            trail = expr.kids.get(cend - 1) as *parse.Node?
+            cend = cend - 1
+        }
+        val cnargs = if cend > 0 {
+            cend - 1
+        } else {
+            0
+        }
+        if name == "default" {
+            if cnargs != 0 {
+                env_fail(env, expr, "default does not take arguments")
+            }
+            select_case_body(env, trail, false, null)
+            i = i + 1
+            continue
+        }
+        if name == "timeout" {
+            if cnargs != 1 {
+                env_fail(env, expr, "timeout expects milliseconds")
+            } else {
+                val arg = expr.kids.get(1)
+                var value = arg
+                if parse.is_arg(arg) && arg.kids.len > 0 {
+                    value = arg.kids.get(0)
+                }
+                val i64_ty = type_builtin(&env.ck.types, Builtin.I64)
+                check_expr(env, value, i64_ty as *Type?)
+            }
+            select_case_body(env, trail, false, null)
+            i = i + 1
+            continue
+        }
+        if cnargs < 1 {
+            env_fail(env, expr, "channel case needs a channel")
+            i = i + 1
+            continue
+        }
+        val carg = expr.kids.get(1)
+        var cval = carg
+        if parse.is_arg(carg) && carg.kids.len > 0 {
+            cval = carg.kids.get(0)
+        }
+        val chan = check_expr(env, cval, null)
+        if chan == null || env.ck.stop {
+            return null, -1
+        }
+        if !is_chan_inst(chan!!) {
+            env_fail(env, expr, "select case needs a Chan")
+            i = i + 1
+            continue
+        }
+        if name == "recv" {
+            if cnargs != 1 {
+                env_fail(env, expr, "recv expects a channel")
+            }
+            select_case_body(env, trail, true, coro_elem_of(chan!!))
+            i = i + 1
+            continue
+        }
+        if cnargs != 2 {
+            env_fail(env, expr, "send expects a channel and a value")
+            i = i + 1
+            continue
+        }
+        val varg = expr.kids.get(2)
+        var vval = varg
+        if parse.is_arg(varg) && varg.kids.len > 0 {
+            vval = varg.kids.get(0)
+        }
+        check_expr(env, vval, coro_elem_of(chan!!))
+        select_case_body(env, trail, false, null)
+        i = i + 1
+    }
+    if env.ck.stop {
+        return null, -1
+    }
+    val opt = error_option(env)
+    if opt == null {
+        return err_ty(env.ck) as *Type?, 1
+    }
+    return opt, 1
+}
+
+private fn check_sleep(env: *Env, node: *parse.Node): (*Type?, i32) with (a: mem.Allocator) {
+    val trailing = parse.call_has_trailing(node)
+    val arg_end = parse.call_arg_end(node)
+    if trailing || arg_end != 2 {
+        env_fail(env, node, "sleep expects milliseconds")
+        return err_ty(env.ck) as *Type?, if env.ck.stop {
+            -1
+        } else {
+            1
+        }
+    }
+    val arg = node.kids.get(1)
+    var value = arg
+    if parse.is_arg(arg) && arg.kids.len > 0 {
+        value = arg.kids.get(0)
+    }
+    val i64_ty = type_builtin(&env.ck.types, Builtin.I64)
+    check_expr(env, value, i64_ty as *Type?)
+    if env.ck.stop {
+        return null, -1
+    }
+    val opt = error_option(env)
+    if opt == null {
+        return err_ty(env.ck) as *Type?, 1
+    }
+    return opt, 1
+}
+
+/**
+ * Builtin coro calls: scope / yield / select / sleep, plus Chan.init.
+ * Returns (type, 1) handled, (null, 0) not this builtin, (null, -1) stopped.
+ */
+fn check_coro_call(env: *Env, node: *parse.Node): (*Type?, i32) with (a: mem.Allocator) {
+    val (tm_ty, tm_rc) = check_coro_type_method(env, node)
+    if tm_rc != 0 {
+        return tm_ty, tm_rc
+    }
+    if node.kids.len == 0 {
+        return null, 0
+    }
+    val callee = node.kids.get(0)
+    if !parse.is_ident(callee) || callee.kids.len > 0 {
+        return null, 0
+    }
+    if user_named(env, callee.name) {
+        return null, 0
+    }
+    if callee.name == "select" {
+        return check_select(env, node)
+    }
+    if callee.name == "sleep" {
+        return check_sleep(env, node)
+    }
+    if callee.name == "yield" {
+        if node.kids.len != 1 || parse.call_has_trailing(node) || parse.call_nctx(node) != 0 {
+            env_fail(env, node, "yield takes no arguments")
+            return err_ty(env.ck) as *Type?, if env.ck.stop {
+                -1
+            } else {
+                1
+            }
+        }
+        return unit_ty(env.ck) as *Type?, 1
+    }
+    if callee.name == "scope" {
+        val nctx = parse.call_nctx(node)
+        val trailing = parse.call_has_trailing(node)
+        val arg_end = parse.call_arg_end(node)
+        if arg_end != 1 {
+            env_fail(env, node, "scope does not take arguments")
+            return err_ty(env.ck) as *Type?, if env.ck.stop {
+                -1
+            } else {
+                1
+            }
+        }
+        if !trailing {
+            env_fail(env, node, "scope needs a block")
+            return err_ty(env.ck) as *Type?, if env.ck.stop {
+                -1
+            } else {
+                1
+            }
+        }
+        val lam = node.kids.get(node.kids.len - 1 - nctx)
+        if !parse.is_lambda(lam) || lam.kids.len == 0 {
+            env_fail(env, node, "scope needs a block")
+            return err_ty(env.ck) as *Type?, if env.ck.stop {
+                -1
+            } else {
+                1
+            }
+        }
+        val body = lam.kids.get(lam.kids.len - 1)
+        val scope_ty = universe_named(env.ck, "Scope")
+        if scope_ty == null {
+            return null, -1
+        }
+        var types = list.empty<*Type>()
+        types.push(scope_ty!!)
+        val mark = context_mark(env.job)
+        context_push_params(env.job, types)
+        if parse.is_block(body) {
+            check_block(env, body)
+        } else {
+            check_expr(env, body, null)
+        }
+        context_reset(env.job, mark)
+        if env.ck.stop {
+            return null, -1
+        }
+        val err = universe_named(env.ck, "error")
+        if err == null {
+            return err_ty(env.ck) as *Type?, 1
+        }
+        return type_option(&env.ck.types, err!!) as *Type?, 1
+    }
+    return null, 0
+}
+
+private fn block_has_value_tail(block: *parse.Node): bool {
+    if !parse.is_block(block) || block.kids.len == 0 {
+        return false
+    }
+    val last = block.kids.get(block.kids.len - 1)
+    return parse.is_expr_stmt(last) && last.kids.len > 0
+}
+
+private fn check_go_body_block(env: *Env, blk: *parse.Node): *Type? with (a: mem.Allocator) {
+    if block_has_value_tail(blk) {
+        return check_block_value(env, blk, null)
+    }
+    check_block(env, blk)
+    return unit_ty(env.ck) as *Type?
+}
+
+private fn check_go_body(env: *Env, body: *parse.Node): *Type? with (a: mem.Allocator) {
+    val unit = unit_ty(env.ck)
+    val saved_in = env.job.in_go
+    val saved_set = env.job.go_ret_set
+    val saved_ret = env.job.go_ret
+    env.job.in_go = true
+    env.job.go_ret_set = false
+    env.job.go_ret = null
+    var tail: *Type? = null
+    if parse.is_block(body) {
+        tail = check_go_body_block(env, body)
+    } else if parse.is_lambda(body) {
+        // Trailing `{ }` on go is a LAMBDA with a block kid.
+        if body.kids.len > 0 && parse.is_block(body.kids.get(body.kids.len - 1)) {
+            tail = check_go_body_block(env, body.kids.get(body.kids.len - 1))
+        } else {
+            tail = check_lambda(env, body, null)
+        }
+    } else {
+        tail = check_expr(env, body, null)
+    }
+    if env.ck.stop {
+        env.job.in_go = saved_in
+        env.job.go_ret_set = saved_set
+        env.job.go_ret = saved_ret
+        return null
+    }
+    var result: *Type? = null
+    if env.job.go_ret_set {
+        // Returns set the Task result. A statement-block tail of unit must
+        // not fight that (C uses go_ret alone when any return was seen).
+        result = env.job.go_ret
+        if tail != null && !type_is_error(tail!!) && env.job.go_ret != null && !type_is_error(env.job.go_ret!!) &&
+            tail!! != env.job.go_ret!! && !(tail!!.kind == TypeKind.UNIT) {
+            env_fail(env, body, "return type does not match the go result")
+            result = err_ty(env.ck) as *Type?
+        }
+    } else if tail != null {
+        result = tail
+    } else {
+        result = unit as *Type?
+    }
+    if result != null && result!!.kind == TypeKind.UNTYPED_INT {
+        result = type_builtin(&env.ck.types, Builtin.I64) as *Type?
+    }
+    env.job.in_go = saved_in
+    env.job.go_ret_set = saved_set
+    env.job.go_ret = saved_ret
+    if result == null {
+        return unit as *Type?
+    }
+    return result
+}
+
+/**
+ * Check a `go` expression. Returns the Task marker type (C instantiates Task<T>).
+ */
+fn check_coro_go(env: *Env, node: *parse.Node): *Type? with (a: mem.Allocator) {
+    val shape = node.head
+    val nargs = (shape % 256) as usize
+    val nctx = ((shape / 256) % 256) as usize
+    val has_body = (shape / 65536) % 2 == 1
+    if !has_body || node.kids.len == 0 {
+        env_fail(env, node, "go needs a body")
+        return err_ty(env.ck) as *Type?
+    }
+    var i: usize = 0
+    for i < nargs && i < node.kids.len {
+        val arg = node.kids.get(i)
+        if parse.is_arg(arg) && arg.name == "stack" && arg.kids.len > 0 {
+            val usize_ty = type_builtin(&env.ck.types, Builtin.USIZE)
+            check_expr(env, arg.kids.get(0), usize_ty as *Type?)
+        } else if parse.is_arg(arg) && arg.kids.len > 0 {
+            check_expr(env, arg.kids.get(0), null)
+        }
+        i = i + 1
+        if env.ck.stop {
+            return null
+        }
+    }
+    var c: usize = 0
+    for c < nctx && (nargs + c) < node.kids.len {
+        check_expr(env, node.kids.get(nargs + c), null)
+        c = c + 1
+        if env.ck.stop {
+            return null
+        }
+    }
+    val body = node.kids.get(node.kids.len - 1)
+    // Scope is required (except a bare root main, which C exempts).
+    if !context_has_named(env.job, "Scope") && !is_root_main(env) {
+        env_fail(env, node, "missing context Scope")
+    }
+    if !context_has_named(env.job, "Allocator") && !is_root_main(env) {
+        env_fail(env, node, "missing context Allocator")
+    }
+    val result = check_go_body(env, body)
+    if result == null || env.ck.stop {
+        return result
+    }
+    if type_is_error(result!!) {
+        return result
+    }
+    return coro_instance(env.ck, result!!, 2)
+}
+
+private fn is_root_main(env: *Env): bool {
+    if parse.fn_has_receiver(env.job.decl) || env.job.decl.name != "main" {
+        return false
+    }
+    val root = env.ck.prog.root_module
+    return root.len == 0 || env.job.pkg.module_name == root
+}
+
+private fn check_multi_go_return(env: *Env, node: *parse.Node) with (a: mem.Allocator) {
+    val count = node.kids.len
+    var established: *Type? = null
+    val fresh = !env.job.go_ret_set
+    if !fresh && env.job.go_ret != null && !type_is_error(env.job.go_ret!!) {
+        if env.job.go_ret!!.kind != TypeKind.TUPLE || env.job.go_ret!!.elems.len != count {
+            env_fail(env, node, "return type does not match the go result")
+        } else {
+            established = env.job.go_ret
+        }
+    } else if !fresh && env.job.go_ret != null && type_is_error(env.job.go_ret!!) {
+        // keep going
+    }
+    var elems = list.empty<*Type>()
+    var bad = false
+    var i: usize = 0
+    for i < count && !env.ck.stop {
+        var want: *Type? = null
+        if established != null && i < established!!.elems.len {
+            want = established!!.elems.get(i) as *Type?
+        }
+        var got = check_expr(env, node.kids.get(i), want)
+        if got == null || env.ck.stop {
+            return
+        }
+        if fresh {
+            got = concrete_go_int(env.ck, got!!) as *Type?
+        }
+        if type_is_error(got!!) {
+            bad = true
+        }
+        elems.push(got!!)
+        i = i + 1
+    }
+    if env.ck.stop || !fresh {
+        return
+    }
+    if bad {
+        env.job.go_ret = err_ty(env.ck) as *Type?
+        env.job.go_ret_set = true
+        return
+    }
+    env.job.go_ret = type_tuple(&env.ck.types, elems) as *Type?
+    env.job.go_ret_set = true
+}
+
+/**
+ * `return` inside a go body sets / checks the Task result (not the outer fn).
+ */
+fn check_coro_return(env: *Env, node: *parse.Node) with (a: mem.Allocator) {
+    val unit = unit_ty(env.ck)
+    val count = node.kids.len
+    if count > 1 {
+        check_multi_go_return(env, node)
+        return
+    }
+    var got: *Type? = null
+    if count == 0 {
+        got = unit as *Type?
+    } else {
+        var want: *Type? = null
+        if env.job.go_ret_set {
+            want = env.job.go_ret
+        }
+        got = check_expr(env, node.kids.get(0), want)
+        if got == null || env.ck.stop {
+            return
+        }
+        if got!!.kind == TypeKind.UNTYPED_INT && !env.job.go_ret_set {
+            got = type_builtin(&env.ck.types, Builtin.I64) as *Type?
+        }
+    }
+    if !env.job.go_ret_set {
+        env.job.go_ret = got
+        env.job.go_ret_set = true
+        return
+    }
+    if got != null && env.job.go_ret != null && !type_is_error(got!!) && !type_is_error(env.job.go_ret!!) &&
+        got!! != env.job.go_ret!! {
+        env_fail(env, node, "return type does not match the go result")
+    }
+}
+
+private fn is_coro_marker(sym: *load.Symbol, name: str): bool {
+    if !load.is_symbol_type(sym) || sym.name != name {
+        return false
+    }
+    val ty = get_sema(sym)
+    if ty == null || ty!!.kind != TypeKind.DISTINCT {
+        return false
+    }
+    // Universe markers have empty package and no decl.
+    return ty!!.package.len == 0 && sym.decl == null && ty!!.elems.len == 0
+}
+
+fn is_chan_inst(ty: *Type): bool {
+    return ty.kind == TypeKind.DISTINCT && ty.name == "Chan" && ty.package.len == 0 && ty.elems.len == 1
+}
+
+fn is_task_inst(ty: *Type): bool {
+    return ty.kind == TypeKind.DISTINCT && ty.name == "Task" && ty.package.len == 0 && ty.elems.len == 1
+}
+
+fn is_coro_scope_ty(ty: *Type): bool {
+    return is_scope_ty(ty)
+}
+
+fn coro_elem_of(ty: *Type): *Type? {
+    if ty.elems.len != 1 {
+        return null
+    }
+    return ty.elems.get(0) as *Type?
+}
+
+fn coro_instance(ck: *Check, elem: *Type, kind: i32): *Type? with (a: mem.Allocator) {
+    if type_is_error(elem) {
+        return elem as *Type?
+    }
+    for inst in ck.coro_insts.items() {
+        if inst.kind == kind && inst.elem == elem {
+            return inst.typ as *Type?
+        }
+    }
+    val void_ty = universe_named(ck, "void")
+    if void_ty == null {
+        return null
+    }
+    val base = type_ptr(&ck.types, void_ty!!, false)
+    var name = "Chan"
+    if kind == 2 {
+        name = "Task"
+    }
+    val typ = type_new_nominal(&ck.types, TypeKind.DISTINCT, name, "")
+    typ.elem = base as *Type?
+    typ.elems.push(elem)
+    typ.size = base.size
+    typ.align = base.align
+    typ.has_layout = base.has_layout
+    ck.coro_insts.push(CoroInst(kind: kind, elem: elem, typ: typ))
+    return typ as *Type?
+}
+
+/**
+ * Resolve Chan<T> / Task<T> type names. Returns (type, 1) handled, (null, 0) skip, (null, -1) stop.
+ */
+fn check_coro_type(ck: *Check, job: *CheckJob, sym: *load.Symbol, node: *parse.Node): (*Type?, i32) with (a: mem.Allocator) {
+    var kind: i32 = 0
+    if is_coro_marker(sym, "Chan") {
+        kind = 1
+    } else if is_coro_marker(sym, "Task") {
+        kind = 2
+    } else {
+        return null, 0
+    }
+    if node.kids.len != 1 {
+        var b = strbuilder.empty()
+        b.append("missing type arguments for '")
+        b.append(sym.name)
+        b.append("'")
+        check_fail(ck, job.file, node.line, node.column, b.str())
+        b.free()
+        return err_ty(ck) as *Type?, if ck.stop {
+            -1
+        } else {
+            1
+        }
+    }
+    val elem = resolve_type(ck, job, node.kids.get(0))
+    if elem == null || ck.stop {
+        return null, -1
+    }
+    if type_is_error(elem!!) {
+        return elem, 1
+    }
+    val inst = coro_instance(ck, elem!!, kind)
+    if inst == null {
+        return null, -1
+    }
+    return inst, 1
+}
+
+/**
+ * for-in over Chan<T>. Returns (elem, 1) handled, (null, 0) not a channel, (null, -1) stop.
+ */
+fn check_chan_for(env: *Env, node: *parse.Node, base: *Type): (*Type?, i32) with (a: mem.Allocator) {
+    if !is_chan_inst(base) {
+        return null, 0
+    }
+    if node.flag.len > 0 {
+        env_fail(env, node, "for-in over a channel has one name")
+        return err_ty(env.ck) as *Type?, if env.ck.stop {
+            -1
+        } else {
+            1
+        }
+    }
+    val elem = coro_elem_of(base)
+    if elem == null {
+        env_fail(env, node, "channel element has no type")
+        return err_ty(env.ck) as *Type?, if env.ck.stop {
+            -1
+        } else {
+            1
+        }
+    }
+    return elem, 1
+}

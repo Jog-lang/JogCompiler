@@ -1366,7 +1366,7 @@ fn decode_escape(data: bytes, at: usize, line: i64, line_start: usize, buf: *str
     val column = column_at(at, line_start)
     var p = at + 1
     if p >= data.len {
-        push_error(errors, line, column, text.clone("unfinished escape sequence"))
+        push_error(errors, line, column, "unfinished escape sequence".clone())
         return p
     }
     val c = data.ptr[p]
@@ -1385,12 +1385,12 @@ fn decode_escape(data: bytes, at: usize, line: i64, line_start: usize, buf: *str
             buf.append_byte((hex_value(d1) * 16 + hex_value(d2)) as u8)
             return p + 3
         }
-        push_error(errors, line, column, text.clone("'\\x' needs exactly two hex digits"))
+        push_error(errors, line, column, "'\\x' needs exactly two hex digits".clone())
         return p + 1
     }
     if c == 'u' as u8 {
         if peek(data, p + 1) != '{' as u8 {
-            push_error(errors, line, column, text.clone("'\\u' must be followed by '{hex digits}'"))
+            push_error(errors, line, column, "'\\u' must be followed by '{hex digits}'".clone())
             return p + 1
         }
         var q = p + 2
@@ -1402,7 +1402,7 @@ fn decode_escape(data: bytes, at: usize, line: i64, line_start: usize, buf: *str
             digits = digits + 1
         }
         if peek(data, q) != '}' as u8 || digits == 0 || digits > 6 {
-            push_error(errors, line, column, text.clone("'\\u{...}' needs 1 to 6 hex digits and a closing '}'"))
+            push_error(errors, line, column, "'\\u{...}' needs 1 to 6 hex digits and a closing '}'".clone())
             for text.is_hex_digit(peek(data, q)) {
                 q = q + 1
             }
@@ -1420,7 +1420,7 @@ fn decode_escape(data: bytes, at: usize, line: i64, line_start: usize, buf: *str
         return q
     }
     if c == '\n' as u8 {
-        push_error(errors, line, column, text.clone("unfinished escape sequence"))
+        push_error(errors, line, column, "unfinished escape sequence".clone())
         return p
     }
     push_error(errors, line, column, unknown_escape(c))
@@ -1435,7 +1435,7 @@ fn decode_escape(data: bytes, at: usize, line: i64, line_start: usize, buf: *str
  */
 fn take_buf(buf: *strbuilder.StrBuilder): str with (a: mem.Allocator) {
     defer buf.free()
-    return text.clone(buf.str())
+    return buf.str().clone()
 }
 
 /**
@@ -1467,7 +1467,7 @@ fn scan_quoted(data: bytes, at: usize, line: i64, line_start: usize, errors: *li
             if cstring {
                 msg = "unterminated C string literal"
             }
-            push_error(errors, line, column_at(at, line_start), text.clone(msg))
+            push_error(errors, line, column_at(at, line_start), msg.clone())
             break
         }
         val c = data.ptr[p]
@@ -1544,11 +1544,11 @@ fn scan_raw(data: bytes, at: usize, line_in: i64, line_start_in: usize, errors: 
         p = p + 1
     }
     val src = data as str
-    val body = text.slice(src, text_at, p)
+    val body = src.slice(text_at, p)
     if p < data.len {
         p = p + 1
     } else {
-        push_error(errors, line_in, column_at(at, line_start_in), text.clone("unterminated raw string literal"))
+        push_error(errors, line_in, column_at(at, line_start_in), "unterminated raw string literal".clone())
     }
     var lit: Lit
     lit.end = p
@@ -1556,7 +1556,7 @@ fn scan_raw(data: bytes, at: usize, line_in: i64, line_start_in: usize, errors: 
     lit.line_start = line_start
     lit.kind = TokenKind.STRING
     lit.splice = false
-    lit.value = text.clone(body)
+    lit.value = body.clone()
     return lit
 }
 
@@ -1605,9 +1605,9 @@ fn scan_hex(data: bytes, at: usize, line_in: i64, line_start_in: usize, errors: 
         p = p + 1
     }
     if !closed {
-        push_error(errors, line_in, column_at(at, line_start_in), text.clone("unterminated hex blob literal"))
+        push_error(errors, line_in, column_at(at, line_start_in), "unterminated hex blob literal".clone())
     } else if digits % 2 != 0 {
-        push_error(errors, line_in, column_at(at, line_start_in), text.clone("hex blob has an odd number of digits; each byte needs two"))
+        push_error(errors, line_in, column_at(at, line_start_in), "hex blob has an odd number of digits; each byte needs two".clone())
     }
     var lit: Lit
     lit.end = p
@@ -1642,14 +1642,14 @@ fn scan_char(data: bytes, at: usize, line: i64, line_start: usize, errors: *list
             msg = "empty char literal"
             p = p + 1
         }
-        push_error(errors, line, column, text.clone(msg))
+        push_error(errors, line, column, msg.clone())
     } else {
         if data.ptr[p] == '\\' as u8 {
             p = decode_escape(data, p, line, line_start, &buf, errors)
         } else {
             var n = utf8_length(data, p)
             if n == 0 {
-                push_error(errors, line, column, text.clone("char literal is not valid UTF-8"))
+                push_error(errors, line, column, "char literal is not valid UTF-8".clone())
                 n = 1
             }
             var k: usize = 0
@@ -1662,7 +1662,7 @@ fn scan_char(data: bytes, at: usize, line: i64, line_start: usize, errors: *list
         if p < data.len && data.ptr[p] == '\'' as u8 {
             p = p + 1
         } else {
-            push_error(errors, line, column, text.clone("char literal must hold exactly one code point"))
+            push_error(errors, line, column, "char literal must hold exactly one code point".clone())
             for p < data.len && data.ptr[p] != '\'' as u8 && data.ptr[p] != '\n' as u8 {
                 p = p + 1
             }
@@ -1746,7 +1746,7 @@ fn lex(data: bytes, errors: *list.List<LexError>): list.List<Token> with (a: mem
             stack.pop()
             val lit = scan_quoted(data, i, line, line_start, errors, false, true)
             i = lit.end
-            push_value(&tokens, lit.kind, start_line, start_col, text.slice(src, start, i), lit.value)
+            push_value(&tokens, lit.kind, start_line, start_col, src.slice(start, i), lit.value)
             // The next splice's `$` is two bytes before the cursor.
             if lit.splice {
                 push_open(&stack, '$' as u8, line, column_at(lit.end - 2, line_start))
@@ -1762,7 +1762,7 @@ fn lex(data: bytes, errors: *list.List<LexError>): list.List<Token> with (a: mem
             tok.kind = kind
             tok.line = line
             tok.column = column_at(start, line_start)
-            tok.text = text.slice(src, start, i)
+            tok.text = src.slice(start, i)
             tokens.push(tok)
             // An opener hides later newlines and does not end a statement.
             // A closer does end a statement.
@@ -1794,7 +1794,7 @@ fn lex(data: bytes, errors: *list.List<LexError>): list.List<Token> with (a: mem
             line = b.line
             line_start = b.line_start
             if !b.closed {
-                push_error(errors, start_line, start_col, text.clone("unterminated block comment"))
+                push_error(errors, start_line, start_col, "unterminated block comment".clone())
             }
             if b.saw_newline && ends && newline_separates(stack) && !continues_line(data, i) {
                 push_end(&tokens, TokenKind.SEP, start_line, start_col)
@@ -1810,7 +1810,7 @@ fn lex(data: bytes, errors: *list.List<LexError>): list.List<Token> with (a: mem
             tok.kind = m.kind
             tok.line = line
             tok.column = column_at(start, line_start)
-            tok.text = text.slice(src, start, i)
+            tok.text = src.slice(start, i)
             tokens.push(tok)
             ends = punct_ends(m.kind)
             continue
@@ -1829,7 +1829,7 @@ fn lex(data: bytes, errors: *list.List<LexError>): list.List<Token> with (a: mem
             i = lit.end
             line = lit.line
             line_start = lit.line_start
-            push_value(&tokens, lit.kind, start_line, start_col, text.slice(src, start, i), lit.value)
+            push_value(&tokens, lit.kind, start_line, start_col, src.slice(start, i), lit.value)
             ends = true
             continue
         }
@@ -1839,7 +1839,7 @@ fn lex(data: bytes, errors: *list.List<LexError>): list.List<Token> with (a: mem
             for i < data.len && is_ident_char(data.ptr[i]) {
                 i = i + 1
             }
-            var kind = keyword_kind(text.slice(src, start, i))
+            var kind = keyword_kind(src.slice(start, i))
             var ends_tok = keyword_ends(kind)
             // `as?` is one token. `as?.` and `as?:` are not: that `?` starts `?.` or `?:`.
             if kind == TokenKind.KW_AS && i < data.len && data.ptr[i] == '?' as u8 && peek(data, i + 1) != '.' as u8 && peek(data, i + 1) != ':' as u8 {
@@ -1851,7 +1851,7 @@ fn lex(data: bytes, errors: *list.List<LexError>): list.List<Token> with (a: mem
             tok.kind = kind
             tok.line = line
             tok.column = column_at(start, line_start)
-            tok.text = text.slice(src, start, i)
+            tok.text = src.slice(start, i)
             tokens.push(tok)
             ends = ends_tok
             continue
@@ -1864,7 +1864,7 @@ fn lex(data: bytes, errors: *list.List<LexError>): list.List<Token> with (a: mem
             tok.kind = n.kind
             tok.line = line
             tok.column = column_at(start, line_start)
-            tok.text = text.slice(src, start, i)
+            tok.text = src.slice(start, i)
             tokens.push(tok)
             ends = true
             continue
@@ -1884,7 +1884,7 @@ fn lex(data: bytes, errors: *list.List<LexError>): list.List<Token> with (a: mem
             i = lit.end
             line = lit.line
             line_start = lit.line_start
-            push_value(&tokens, lit.kind, start_line, start_col, text.slice(src, start, i), lit.value)
+            push_value(&tokens, lit.kind, start_line, start_col, src.slice(start, i), lit.value)
             if lit.splice {
                 push_open(&stack, '$' as u8, line, column_at(lit.end - 2, line_start))
             }
@@ -1904,7 +1904,7 @@ fn lex(data: bytes, errors: *list.List<LexError>): list.List<Token> with (a: mem
             val col = column_at(i, line_start)
             i = i + 1
             if i >= data.len || !is_ident_start(data.ptr[i]) {
-                push_error(errors, line, col, text.clone("expected an attribute name after '@'"))
+                push_error(errors, line, col, "expected an attribute name after '@'".clone())
                 continue
             }
             i = i + 1
@@ -1915,7 +1915,7 @@ fn lex(data: bytes, errors: *list.List<LexError>): list.List<Token> with (a: mem
             tok.kind = TokenKind.ATTR
             tok.line = line
             tok.column = col
-            tok.text = text.slice(src, start, i)
+            tok.text = src.slice(start, i)
             tokens.push(tok)
             ends = false
             continue
@@ -1929,7 +1929,7 @@ fn lex(data: bytes, errors: *list.List<LexError>): list.List<Token> with (a: mem
     if stack.len > 0 {
         val top = stack.get(stack.len - 1)
         if top.kind == '$' as u8 {
-            push_error(errors, top.line, top.column, text.clone("unterminated string interpolation"))
+            push_error(errors, top.line, top.column, "unterminated string interpolation".clone())
         } else {
             push_error(errors, top.line, top.column, never_closed_message(top.kind))
         }

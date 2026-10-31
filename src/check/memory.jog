@@ -1,0 +1,921 @@
+// Pointers, slices, arrays, bytes, indexing, pointer arithmetic.
+// Checked against compiler/src/check_memory.c.
+// CheckerGuide step 6.
+
+import src.load
+import src.parse
+import std.mem
+import std.strbuilder
+
+enum Place {
+    NO
+    MUT
+    CONST
+}
+
+private fn mem_fail_attr(env: *Env, node: *parse.Node, name: str) with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    b.append("attribute '")
+    b.append(name)
+    b.append("' is not checked yet")
+    env_fail(env, node, b.str())
+    b.free()
+}
+
+/**
+ * Underlying bytes view for str / distinct-over-bytes, else null.
+ */
+fn type_bytes_view(ty: *Type): *Type? {
+    val under = type_peel_distinct(ty)
+    if under.kind == TypeKind.BYTES {
+        return under as *Type?
+    }
+    return null
+}
+
+private fn is_core_str(ck: *Check, ty: *Type): bool {
+    if ty.kind == TypeKind.DISTINCT && ty.name == "str" {
+        return true
+    }
+    if ck.prog.packages.len == 0 {
+        return false
+    }
+    val uni = ck.prog.packages.get(0).scope.universe
+    if uni == null {
+        return false
+    }
+    val s = load.package_scope_lookup(uni!!, "str")
+    if s == null {
+        return false
+    }
+    val st = get_sema(s!!)
+    return st != null && st!! == ty
+}
+
+private fn has_size(ty: *Type): bool {
+    // Type params / open generics are sized at monomorphization (match C).
+    if ty.kind == TypeKind.TYPE_PARAM || generic_has_param(ty as *Type?) {
+        return true
+    }
+    return ty.has_layout && ty.size > 0
+}
+
+private fn lookup_sym(env: *Env, name: str): *load.Symbol? {
+    if name.len == 0 || name == "_" {
+        return null
+    }
+    var block = env.scope
+    for block != null {
+        val found = load.block_scope_lookup_local(block!!, name)
+        if found != null {
+            return found
+        }
+        block = block!!.parent
+    }
+    return load.file_lookup(&env.job.pkg.scope, env.job.file_index, name)
+}
+
+private fn known_ident_type(env: *Env, node: *parse.Node): *Type? {
+    if !parse.is_ident(node) {
+        return null
+    }
+    val sym = lookup_sym(env, node.name)
+    if sym == null {
+        return null
+    }
+    return get_sema(sym!!)
+}
+
+/**
+ * Shallow place: val / *const / []const are const; var []T elements are mutable.
+ */
+fn place_of(env: *Env, node: *parse.Node): Place with (a: mem.Allocator) {
+    if parse.is_ident(node) {
+        val sym = lookup_sym(env, node.name)
+        if sym == null {
+            return Place.NO
+        }
+        val s = sym!!
+        if load.is_symbol_variable(s) || s.kind == load.kind_parameter() {
+            return Place.MUT
+        }
+        if load.is_symbol_constant(s) {
+            return Place.CONST
+        }
+        return Place.NO
+    }
+    if parse.is_member(node) && node.kids.len > 0 {
+        val base = node.kids.get(0)
+        val base_ty = known_ident_type(env, base)
+        if base_ty != null && base_ty!!.kind == TypeKind.PTR {
+            if base_ty!!.is_const {
+                return Place.CONST
+            }
+            return Place.MUT
+        }
+        // Non-ident base (nested member): re-check type for pointer const.
+        if !parse.is_ident(base) {
+            val bt = check_expr(env, base, null)
+            if bt != null && bt!!.kind == TypeKind.PTR {
+                if bt!!.is_const {
+                    return Place.CONST
+                }
+                return Place.MUT
+            }
+        }
+        return place_of(env, base)
+    }
+    if parse.is_index(node) && node.kids.len > 0 {
+        val base = node.kids.get(0)
+        var base_ty = known_ident_type(env, base)
+        if base_ty == null {
+            base_ty = check_expr(env, base, null)
+        }
+        if base_ty == null {
+            return Place.NO
+        }
+        val bt = base_ty!!
+        if bt.kind == TypeKind.PTR || bt.kind == TypeKind.SLICE || bt.kind == TypeKind.BYTES {
+            if bt.is_const {
+                return Place.CONST
+            }
+            return Place.MUT
+        }
+        if bt.kind == TypeKind.ARRAY || bt.kind == TypeKind.BYTES_N {
+            return place_of(env, base)
+        }
+        return Place.NO
+    }
+    if parse.is_unary(node) && node.text == "*" && node.kids.len > 0 {
+        val op = node.kids.get(0)
+        var op_ty = known_ident_type(env, op)
+        if op_ty == null {
+            op_ty = check_expr(env, op, null)
+        }
+        if op_ty != null && op_ty!!.kind == TypeKind.PTR {
+            if op_ty!!.is_const {
+                return Place.CONST
+            }
+            return Place.MUT
+        }
+    }
+    return Place.NO
+}
+
+/**
+ * Match C addressable_node for field stores and &.
+ */
+fn memory_addressable(env: *Env, node: *parse.Node): bool with (a: mem.Allocator) {
+    if parse.is_ident(node) {
+        val sym = lookup_sym(env, node.name)
+        if sym == null {
+            return false
+        }
+        val s = sym!!
+        return load.is_symbol_variable(s) || s.kind == load.kind_parameter()
+    }
+    if parse.is_member(node) && node.kids.len > 0 {
+        val base = node.kids.get(0)
+        var base_ty = known_ident_type(env, base)
+        if base_ty == null && !parse.is_ident(base) {
+            base_ty = check_expr(env, base, null)
+        }
+        if base_ty != null && base_ty!!.kind == TypeKind.PTR {
+            return !base_ty!!.is_const
+        }
+        return memory_addressable(env, base)
+    }
+    if parse.is_unary(node) && node.text == "*" && node.kids.len > 0 {
+        val op = node.kids.get(0)
+        var op_ty = known_ident_type(env, op)
+        if op_ty == null {
+            op_ty = check_expr(env, op, null)
+        }
+        return op_ty != null && op_ty!!.kind == TypeKind.PTR && !op_ty!!.is_const
+    }
+    if parse.is_index(node) && node.kids.len > 0 {
+        val base = node.kids.get(0)
+        var base_ty = known_ident_type(env, base)
+        if base_ty == null {
+            base_ty = check_expr(env, base, null)
+        }
+        if base_ty == null {
+            return false
+        }
+        val bt = base_ty!!
+        if bt.kind == TypeKind.PTR || bt.kind == TypeKind.SLICE || bt.kind == TypeKind.BYTES {
+            return !bt.is_const
+        }
+        if bt.kind == TypeKind.ARRAY || bt.kind == TypeKind.BYTES_N {
+            return memory_addressable(env, base)
+        }
+        return false
+    }
+    return false
+}
+
+/**
+ * .len / .ptr on bytes, const bytes, or []T. Returns (type, handled).
+ */
+fn check_view_member(env: *Env, node: *parse.Node, base_ty: *Type): (*Type?, bool) with (a: mem.Allocator) {
+    if node.name != "len" && node.name != "ptr" {
+        return null, false
+    }
+    var ty = type_peel_distinct(base_ty)
+    val view = type_bytes_view(base_ty)
+    if view != null {
+        ty = view!!
+    }
+    if ty.kind != TypeKind.BYTES && ty.kind != TypeKind.SLICE {
+        return null, false
+    }
+    if node.name == "len" {
+        return type_builtin(&env.ck.types, Builtin.USIZE) as *Type?, true
+    }
+    var elem: *Type? = null
+    if ty.kind == TypeKind.BYTES {
+        elem = type_builtin(&env.ck.types, Builtin.U8) as *Type?
+    } else {
+        elem = ty.elem
+    }
+    if elem == null {
+        return null, true
+    }
+    return type_ptr(&env.ck.types, elem!!, ty.is_const) as *Type?, true
+}
+
+/**
+ * bytes() with no args. Returns (type, 1) handled, (null, 0) not bytes,
+ * (error-or-null, -1) stopped.
+ */
+fn check_memory_call(env: *Env, node: *parse.Node): (*Type?, i32) with (a: mem.Allocator) {
+    if env.ck.stop || node.kids.len == 0 {
+        if env.ck.stop {
+            return null, -1
+        }
+        return null, 0
+    }
+    val callee = node.kids.get(0)
+    if !parse.is_ident(callee) {
+        return null, 0
+    }
+    val sym = lookup_sym(env, callee.name)
+    if sym == null || !load.is_symbol_type(sym!!) {
+        return null, 0
+    }
+    if !wait_for_symbol(env.ck, env.job, sym!!, false) {
+        return null, -1
+    }
+    val ty = get_sema(sym!!)
+    if ty == null || ty!!.kind != TypeKind.BYTES || ty!!.is_const {
+        return null, 0
+    }
+    // Trailing lambda or with-clause: not the bytes() builtin.
+    if parse.call_has_trailing(node) {
+        return null, 0
+    }
+    val nctx = parse.call_nctx(node)
+    if nctx > 0 {
+        return null, 0
+    }
+    if node.kids.len > 1 {
+        env_fail(env, node, "bytes() does not take arguments")
+        var i: usize = 1
+        for i < node.kids.len && !env.ck.stop {
+            val arg = node.kids.get(i)
+            if parse.is_arg(arg) && arg.kids.len > 0 {
+                check_expr(env, arg.kids.get(0), null)
+            }
+            i = i + 1
+        }
+        if env.ck.stop {
+            return null, -1
+        }
+        return err_ty(env.ck) as *Type?, 1
+    }
+    return ty, 1
+}
+
+/**
+ * Unary * and &. Other unaries stay in body.jog.
+ */
+fn check_memory_unary(env: *Env, node: *parse.Node): *Type? with (a: mem.Allocator) {
+    if node.kids.len == 0 {
+        env_fail(env, node, "missing operand")
+        return err_ty(env.ck) as *Type?
+    }
+    val op = node.text
+    val operand = node.kids.get(0)
+    val op_ty = check_expr(env, operand, null)
+    if op_ty == null || env.ck.stop {
+        return op_ty
+    }
+    if type_is_error(op_ty!!) {
+        return op_ty
+    }
+    if op == "*" {
+        if op_ty!!.kind != TypeKind.PTR || op_ty!!.elem == null {
+            fail_op(env, node, op, op_ty!!)
+            return err_ty(env.ck) as *Type?
+        }
+        return op_ty!!.elem
+    }
+    if op != "&" {
+        return null
+    }
+    val place = place_of(env, operand)
+    if place == Place.NO {
+        env_fail(env, node, "cannot take the address of this value")
+        return err_ty(env.ck) as *Type?
+    }
+    return type_ptr(&env.ck.types, op_ty!!, place == Place.CONST) as *Type?
+}
+
+private fn check_bound(env: *Env, bound: *parse.Node?): *Type? with (a: mem.Allocator) {
+    if bound == null {
+        return null
+    }
+    val usize_ty = type_builtin(&env.ck.types, Builtin.USIZE)
+    return check_expr(env, bound!!, usize_ty as *Type?)
+}
+
+/**
+ * a[i] for pointers, arrays, slices, bytes, [N]byte, str.
+ */
+fn check_memory_index(env: *Env, node: *parse.Node): *Type? with (a: mem.Allocator) {
+    if node.kids.len == 0 {
+        env_fail(env, node, "missing index")
+        return err_ty(env.ck) as *Type?
+    }
+    val base_node = node.kids.get(0)
+    var base = check_expr(env, base_node, null)
+    if base == null || env.ck.stop {
+        return base
+    }
+    if type_is_error(base!!) {
+        if node.kids.len > 1 {
+            check_expr(env, node.kids.get(1), null)
+        }
+        return base
+    }
+    val view = type_bytes_view(base!!)
+    if view != null && base!!.kind == TypeKind.DISTINCT {
+        base = view
+    }
+    var elem: *Type? = null
+    var pointer = false
+    val bt = base!!
+    if bt.kind == TypeKind.PTR {
+        pointer = true
+        elem = bt.elem
+        if elem == null || !has_size(elem!!) {
+            env_fail(env, node, "pointer arithmetic needs a size")
+            if node.kids.len > 1 {
+                check_expr(env, node.kids.get(1), null)
+            }
+            return err_ty(env.ck) as *Type?
+        }
+    } else if bt.kind == TypeKind.SLICE || bt.kind == TypeKind.ARRAY {
+        elem = bt.elem
+    } else if bt.kind == TypeKind.BYTES || bt.kind == TypeKind.BYTES_N {
+        elem = type_bytes_n(&env.ck.types, 1) as *Type?
+    } else {
+        var b = strbuilder.empty()
+        b.append("cannot index ")
+        b.append(type_print(base))
+        env_fail(env, node, b.str())
+        b.free()
+        if node.kids.len > 1 {
+            check_expr(env, node.kids.get(1), null)
+        }
+        return err_ty(env.ck) as *Type?
+    }
+    if elem == null || node.kids.len < 2 {
+        env_fail(env, node, "missing index")
+        return err_ty(env.ck) as *Type?
+    }
+    val index_node = node.kids.get(1)
+    var index_ty: *Type? = null
+    if pointer {
+        index_ty = check_expr(env, index_node, null)
+        if index_ty == null || env.ck.stop {
+            return null
+        }
+        if !type_is_error(index_ty!!) && !type_is_host_int(index_ty!!) {
+            var b = strbuilder.empty()
+            b.append("pointer offset must be an integer, got ")
+            b.append(type_print(index_ty))
+            env_fail(env, index_node, b.str())
+            b.free()
+            return err_ty(env.ck) as *Type?
+        }
+    } else {
+        val usize_ty = type_builtin(&env.ck.types, Builtin.USIZE)
+        index_ty = check_expr(env, index_node, usize_ty as *Type?)
+        if index_ty == null || env.ck.stop {
+            return null
+        }
+    }
+    if type_is_error(index_ty!!) {
+        return index_ty
+    }
+    return elem
+}
+
+private fn slice_lo(node: *parse.Node): *parse.Node? {
+    var at: usize = 1
+    if node.head % 2 == 1 && at < node.kids.len {
+        return node.kids.get(at) as *parse.Node?
+    }
+    return null
+}
+
+private fn slice_hi(node: *parse.Node): *parse.Node? {
+    var at: usize = 1
+    if node.head % 2 == 1 {
+        at = at + 1
+    }
+    if (node.head / 2) % 2 == 1 && at < node.kids.len {
+        return node.kids.get(at) as *parse.Node?
+    }
+    return null
+}
+
+/**
+ * a[lo..hi] / a[..] / a[1..] / a[..2].
+ */
+fn check_memory_slice(env: *Env, node: *parse.Node): *Type? with (a: mem.Allocator) {
+    if node.kids.len == 0 {
+        env_fail(env, node, "cannot slice")
+        return err_ty(env.ck) as *Type?
+    }
+    val base_node = node.kids.get(0)
+    var base = check_expr(env, base_node, null)
+    if base == null || env.ck.stop {
+        return base
+    }
+    if type_is_error(base!!) {
+        return base
+    }
+    val slice_is_str = is_core_str(env.ck, base!!)
+    val view = type_bytes_view(base!!)
+    if view != null && base!!.kind == TypeKind.DISTINCT {
+        base = view
+    }
+    val bt = base!!
+    if bt.kind == TypeKind.PTR ||
+        (bt.kind != TypeKind.SLICE && bt.kind != TypeKind.ARRAY && bt.kind != TypeKind.BYTES &&
+            bt.kind != TypeKind.BYTES_N) {
+        var b = strbuilder.empty()
+        b.append("cannot slice ")
+        b.append(type_print(base))
+        env_fail(env, node, b.str())
+        b.free()
+        return err_ty(env.ck) as *Type?
+    }
+    val lo = slice_lo(node)
+    if lo != null {
+        if check_bound(env, lo) == null && !env.ck.stop {
+            return err_ty(env.ck) as *Type?
+        }
+        if env.ck.stop {
+            return null
+        }
+    }
+    val hi = slice_hi(node)
+    if hi != null {
+        if check_bound(env, hi) == null && !env.ck.stop {
+            return err_ty(env.ck) as *Type?
+        }
+        if env.ck.stop {
+            return null
+        }
+    }
+    if bt.kind == TypeKind.SLICE {
+        return base
+    }
+    if bt.kind == TypeKind.BYTES {
+        if slice_is_str {
+            // Prefer universe str when present.
+            if env.ck.prog.packages.len > 0 {
+                val uni = env.ck.prog.packages.get(0).scope.universe
+                if uni != null {
+                    val s = load.package_scope_lookup(uni!!, "str")
+                    if s != null {
+                        val st = get_sema(s!!)
+                        if st != null {
+                            return st
+                        }
+                    }
+                }
+            }
+            return type_builtin(&env.ck.types, Builtin.CONST_BYTES) as *Type?
+        }
+        return base
+    }
+    if bt.kind == TypeKind.BYTES_N {
+        val place = place_of(env, base_node)
+        if place == Place.CONST {
+            return type_builtin(&env.ck.types, Builtin.CONST_BYTES) as *Type?
+        }
+        return type_builtin(&env.ck.types, Builtin.BYTES) as *Type?
+    }
+    val elem = bt.elem
+    if elem == null {
+        return err_ty(env.ck) as *Type?
+    }
+    val place = place_of(env, base_node)
+    return type_slice(&env.ck.types, elem!!, place == Place.CONST) as *Type?
+}
+
+private fn lit_elem_type(
+    env: *Env,
+    type_node: *parse.Node,
+    count: usize,
+): (*Type?, *Type?, bool, u64) with (a: mem.Allocator) {
+    if parse.is_type_array(type_node) && type_node.name == "_" {
+        if type_node.kids.len == 0 {
+            env_fail(env, type_node, "missing type")
+            return null, null, false, 0
+        }
+        val elem = resolve_type(env.ck, env.job, type_node.kids.get(0))
+        if elem == null || env.ck.stop {
+            return null, null, false, 0
+        }
+        if type_is_error(elem!!) {
+            return elem, null, false, 0
+        }
+        val len = count as u64
+        val result = type_array(&env.ck.types, elem!!, len)
+        return elem, result as *Type?, false, len
+    }
+    val resolved = resolve_type(env.ck, env.job, type_node)
+    if resolved == null || env.ck.stop {
+        return null, null, false, 0
+    }
+    if type_is_error(resolved!!) {
+        return resolved, null, false, 0
+    }
+    if resolved!!.kind == TypeKind.BYTES {
+        val byte = type_bytes_n(&env.ck.types, 1)
+        return byte as *Type?, resolved, true, 0
+    }
+    if resolved!!.kind == TypeKind.BYTES_N {
+        val byte = type_bytes_n(&env.ck.types, 1)
+        return byte as *Type?, resolved, false, resolved!!.len
+    }
+    if resolved!!.kind == TypeKind.SLICE {
+        return resolved!!.elem, resolved, true, 0
+    }
+    if resolved!!.kind == TypeKind.ARRAY {
+        return resolved!!.elem, resolved, false, resolved!!.len
+    }
+    env_fail(env, type_node, "array literal type must be an array or a slice")
+    return err_ty(env.ck) as *Type?, null, false, 0
+}
+
+/**
+ * [N]T(...), [_]T(...), []T(...), []const T(...).
+ */
+fn check_memory_array_lit(env: *Env, node: *parse.Node): *Type? with (a: mem.Allocator) {
+    if node.kids.len == 0 {
+        env_fail(env, node, "array literal is missing a type")
+        return err_ty(env.ck) as *Type?
+    }
+    val type_node = node.kids.get(0)
+    var named = false
+    var i: usize = 1
+    for i < node.kids.len {
+        val arg = node.kids.get(i)
+        if parse.is_arg(arg) && arg.name.len > 0 {
+            named = true
+            env_fail(env, arg, "array literals do not take named arguments")
+        }
+        i = i + 1
+    }
+    val count = node.kids.len - 1
+    val (elem, result, is_slice, len) = lit_elem_type(env, type_node, count)
+    if elem == null || env.ck.stop {
+        if elem != null && type_is_error(elem!!) {
+            return elem
+        }
+        return null
+    }
+    if type_is_error(elem!!) {
+        return elem
+    }
+    var bad = false
+    if is_slice && env.scope == null {
+        env_fail(env, node, "slice literal in a global initializer does not outlive initialization")
+        bad = true
+    }
+    if !is_slice && result != null &&
+        (result!!.kind == TypeKind.ARRAY || result!!.kind == TypeKind.BYTES_N) {
+        if count == 0 {
+            if !type_has_zero(result!!) {
+                env_fail(env, node, "array literal has no zero value")
+                bad = true
+            }
+        } else if (count as u64) != len {
+            var b = strbuilder.empty()
+            b.append("array literal length mismatch: expected ")
+            b.append_int(len as i64, 10)
+            b.append(", got ")
+            b.append_int(count as i64, 10)
+            env_fail(env, node, b.str())
+            b.free()
+            bad = true
+        }
+    }
+    i = 1
+    for i < node.kids.len && !env.ck.stop {
+        val arg = node.kids.get(i)
+        i = i + 1
+        if !parse.is_arg(arg) {
+            continue
+        }
+        if arg.kids.len == 0 || named {
+            if arg.kids.len > 0 && named {
+                check_expr(env, arg.kids.get(0), null)
+            }
+            continue
+        }
+        val got = check_expr(env, arg.kids.get(0), elem)
+        if got == null || env.ck.stop {
+            return null
+        }
+    }
+    if env.ck.stop {
+        return null
+    }
+    if bad || named || result == null {
+        return err_ty(env.ck) as *Type?
+    }
+    return result
+}
+
+private fn is_eq_op_mem(op: str): bool {
+    return op == "==" || op == "!="
+}
+
+private fn is_rel_op_mem(op: str): bool {
+    return op == "<" || op == "<=" || op == ">" || op == ">="
+}
+
+private fn is_error_option(ty: *Type): bool {
+    if ty.kind != TypeKind.OPTION || ty.elem == null {
+        return false
+    }
+    var elem = type_peel_distinct(ty.elem!!)
+    return elem.kind == TypeKind.INTERFACE && elem.name == "error"
+}
+
+/**
+ * Pointer arithmetic and compares. Returns (type, 1) handled, (null, 0) not ptr,
+ * (null/-error, -1) stop.
+ */
+fn check_memory_binary(env: *Env, node: *parse.Node, left: *Type, right: *Type): (*Type?, i32) with (a: mem.Allocator) {
+    val lp = left.kind == TypeKind.PTR
+    val rp = right.kind == TypeKind.PTR
+    if !lp && !rp {
+        return null, 0
+    }
+    val op = node.text
+    if lp && rp {
+        if left != right {
+            var b = strbuilder.empty()
+            b.append("mismatched types ")
+            b.append(type_print(left as *Type?))
+            b.append(" and ")
+            b.append(type_print(right as *Type?))
+            env_fail(env, node, b.str())
+            b.free()
+            if env.ck.stop {
+                return null, -1
+            }
+            return err_ty(env.ck) as *Type?, 1
+        }
+        if is_eq_op_mem(op) || is_rel_op_mem(op) {
+            return type_builtin(&env.ck.types, Builtin.BOOL) as *Type?, 1
+        }
+        if op == "-" {
+            if left.elem == null || !has_size(left.elem!!) {
+                env_fail(env, node, "pointer arithmetic needs a size")
+                if env.ck.stop {
+                    return null, -1
+                }
+                return err_ty(env.ck) as *Type?, 1
+            }
+            return type_builtin(&env.ck.types, Builtin.ISIZE) as *Type?, 1
+        }
+        fail_op(env, node, op, left)
+        if env.ck.stop {
+            return null, -1
+        }
+        return err_ty(env.ck) as *Type?, 1
+    }
+    var ptr = left
+    var other = right
+    if rp {
+        ptr = right
+        other = left
+    }
+    if is_eq_op_mem(op) && ((lp && is_error_option(right)) || (rp && is_error_option(left))) {
+        return null, 0
+    }
+    if (op == "+" || (op == "-" && lp)) && type_is_host_int(other) {
+        if ptr.elem == null || !has_size(ptr.elem!!) {
+            env_fail(env, node, "pointer arithmetic needs a size")
+            if env.ck.stop {
+                return null, -1
+            }
+            return err_ty(env.ck) as *Type?, 1
+        }
+        return ptr as *Type?, 1
+    }
+    fail_op(env, node, op, ptr)
+    if env.ck.stop {
+        return null, -1
+    }
+    return err_ty(env.ck) as *Type?, 1
+}
+
+/**
+ * RHS of p += n / p -= n.
+ */
+fn check_memory_ptr_compound(env: *Env, rhs: *parse.Node, ptr_ty: *Type): i32 with (a: mem.Allocator) {
+    if env.ck.stop {
+        return -1
+    }
+    val got = check_expr(env, rhs, null)
+    if got == null || env.ck.stop {
+        return -1
+    }
+    if !type_is_error(got!!) && !type_is_host_int(got!!) {
+        var b = strbuilder.empty()
+        b.append("pointer offset must be an integer, got ")
+        b.append(type_print(got))
+        env_fail(env, rhs, b.str())
+        b.free()
+    }
+    if ptr_ty.kind == TypeKind.PTR && (ptr_ty.elem == null || !has_size(ptr_ty.elem!!)) {
+        env_fail(env, rhs, "pointer arithmetic needs a size")
+    }
+    if env.ck.stop {
+        return -1
+    }
+    return 1
+}
+
+private fn compound_base(op: str): str {
+    if op == "+=" {
+        return "+"
+    }
+    if op == "-=" {
+        return "-"
+    }
+    if op == "*=" {
+        return "*"
+    }
+    if op == "/=" {
+        return "/"
+    }
+    if op == "%=" {
+        return "%"
+    }
+    if op == "&=" {
+        return "&"
+    }
+    if op == "|=" {
+        return "|"
+    }
+    if op == "^=" {
+        return "^"
+    }
+    if op == "<<=" {
+        return "<<"
+    }
+    if op == ">>=" {
+        return ">>"
+    }
+    return ""
+}
+
+/**
+ * Index or dereference assignment, including compound updates.
+ */
+fn check_memory_assign(env: *Env, node: *parse.Node) with (a: mem.Allocator) {
+    if node.kids.len < 2 {
+        env_fail(env, node, "missing assignment")
+        return
+    }
+    val target = node.kids.get(0)
+    val value = node.kids.get(1)
+    var elem: *Type? = null
+    if parse.is_index(target) {
+        elem = check_memory_index(env, target)
+    } else if parse.is_unary(target) && target.text == "*" {
+        elem = check_memory_unary(env, target)
+    } else {
+        env_fail(env, node, "assignment target is not checked yet")
+        check_expr(env, value, null)
+        return
+    }
+    if elem == null || env.ck.stop {
+        return
+    }
+    if !type_is_error(elem!!) {
+        val place = place_of(env, target)
+        if place == Place.NO {
+            env_fail(env, target, "cannot assign to this value")
+        } else if place == Place.CONST {
+            env_fail(env, target, "cannot assign through a const view")
+        }
+    }
+    val base = compound_base(node.text)
+    if base.len > 0 {
+        if !type_is_error(elem!!) && elem!!.kind == TypeKind.PTR && (base == "+" || base == "-") {
+            if check_memory_ptr_compound(env, value, elem!!) < 0 {
+                return
+            }
+        } else if !type_is_error(elem!!) && type_is_host_int(elem!!) {
+            check_expr(env, value, elem)
+        } else if !type_is_error(elem!!) {
+            fail_op(env, node, base, elem!!)
+            check_expr(env, value, null)
+        } else {
+            check_expr(env, value, null)
+        }
+    } else if node.text == "=" {
+        var want: *Type? = null
+        if !type_is_error(elem!!) {
+            want = elem
+        }
+        check_expr(env, value, want)
+    } else {
+        var b = strbuilder.empty()
+        b.append("operator '")
+        b.append(node.text)
+        b.append("' is not checked yet")
+        env_fail(env, node, b.str())
+        b.free()
+        return
+    }
+}
+
+/**
+ * @unchecked (and report unknown attrs). 1 continue, -1 stop.
+ */
+fn check_memory_attr(env: *Env, node: *parse.Node): i32 with (a: mem.Allocator) {
+    if env.ck.stop {
+        return -1
+    }
+    if node.kids.len == 0 {
+        return 1
+    }
+    var i: usize = 0
+    val last = node.kids.len - 1
+    for i < last {
+        val attr = node.kids.get(i)
+        if parse.is_attribute(attr) {
+            if attr.name != "unchecked" {
+                val name = attr.name
+                if name.len == 0 {
+                    mem_fail_attr(env, attr, "?")
+                } else {
+                    mem_fail_attr(env, attr, name)
+                }
+            }
+        }
+        i = i + 1
+    }
+    if env.ck.stop {
+        return -1
+    }
+    return 1
+}
+
+/**
+ * Pointer-to-pointer (and niche option) casts like C jog_check_package_cast.
+ */
+fn memory_ptr_cast_ok(from: *Type, to: *Type): bool {
+    return ptr_like_ty(from) && ptr_like_ty(to)
+}
+
+private fn ptr_like_ty(ty: *Type): bool {
+    val under = type_peel_distinct(ty)
+    if under.kind == TypeKind.PTR {
+        return true
+    }
+    if under.kind != TypeKind.OPTION || under.elem == null {
+        return false
+    }
+    val elem = type_peel_distinct(under.elem!!)
+    if elem.kind == TypeKind.PTR {
+        return true
+    }
+    if elem.kind == TypeKind.FN && elem.fn_extern {
+        return true
+    }
+    return false
+}

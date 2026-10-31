@@ -1,0 +1,127 @@
+// Cross-package checks, @test, unused imports.
+// Checked against compiler/src/check_package.c.
+
+import src.parse
+import std.mem
+
+private fn fn_shape_parts(node: *parse.Node): (i64, i64, bool, bool, bool, bool, i64, i64) {
+    val shape = node.head
+    val nparams = shape % 256
+    val nctx = (shape / 256) % 256
+    val has_recv = (shape / 65536) % 2 == 1
+    val has_ret = (shape / 131072) % 2 == 1
+    val has_body = (shape / 262144) % 2 == 1
+    val expr_body = (shape / 524288) % 2 == 1
+    val ntype = (shape / 1048576) % 256
+    val nattrs = (shape / 268435456) % 256
+    return nparams, nctx, has_recv, has_ret, has_body, expr_body, ntype, nattrs
+}
+
+private fn is_test_attr(attr: *parse.Node): bool {
+    return parse.is_attribute(attr) && attr.name == "test"
+}
+
+private fn test_name_ok(ck: *Check, file: str, attr: *parse.Node): bool with (a: mem.Allocator) {
+    if attr.kids.len == 0 {
+        return true
+    }
+    if attr.kids.len != 1 {
+        check_fail(ck, file, attr.line, attr.column, "@test name must be a string")
+        return false
+    }
+    val arg = attr.kids.get(0)
+    val value = if parse.is_arg(arg) && arg.kids.len > 0 { arg.kids.get(0) } else { arg }
+    if !parse.is_string_lit(value) {
+        check_fail(ck, file, attr.line, attr.column, "@test name must be a string")
+        return false
+    }
+    return true
+}
+
+private fn fn_ast_returns_unit(fndecl: *parse.Node): bool {
+    val (nparams, nctx, has_recv, has_ret, _, _, ntype, nattrs) = fn_shape_parts(fndecl)
+    var i: i64 = nattrs
+    if has_recv {
+        i = i + 1
+    }
+    i = i + ntype + nparams + nctx
+    if !has_ret {
+        return true
+    }
+    if i >= fndecl.kids.len as i64 {
+        return false
+    }
+    return parse.is_type_unit(fndecl.kids.get(i as usize))
+}
+
+private fn check_test_fn(ck: *Check, file: str, fndecl: *parse.Node, in_test_file: bool) with (a: mem.Allocator) {
+    var saw = false
+    val (_, _, _, _, _, _, _, nattrs) = fn_shape_parts(fndecl)
+    var i: i64 = 0
+    for i < nattrs {
+        val attr = fndecl.kids.get(i as usize)
+        if !is_test_attr(attr) {
+            i = i + 1
+            continue
+        }
+        saw = true
+        if !test_name_ok(ck, file, attr) {
+            return
+        }
+        i = i + 1
+    }
+    if !saw || ck.stop {
+        return
+    }
+    if !in_test_file {
+        check_fail(ck, file, fndecl.line, fndecl.column, "@test is only allowed in a test file")
+        return
+    }
+    if parse.flag_has_word(fndecl.flag, "extern") {
+        check_fail(ck, file, fndecl.line, fndecl.column, "@test is not allowed on an extern function")
+        return
+    }
+    val (nparams, _, has_recv, _, _, _, _, _) = fn_shape_parts(fndecl)
+    if has_recv || nparams > 0 {
+        check_fail(ck, file, fndecl.line, fndecl.column, "@test functions take no parameters")
+        return
+    }
+    if !fn_ast_returns_unit(fndecl) {
+        check_fail(ck, file, fndecl.line, fndecl.column, "@test functions return ()")
+    }
+}
+
+private fn check_decl_tests(ck: *Check, file: str, decl: *parse.Node, in_test_file: bool) with (a: mem.Allocator) {
+    if ck.stop {
+        return
+    }
+    if parse.is_fn(decl) {
+        check_test_fn(ck, file, decl, in_test_file)
+        return
+    }
+    if !parse.is_extern_block(decl) {
+        return
+    }
+    for kid in decl.kids.items() {
+        if parse.is_fn(kid) {
+            check_test_fn(ck, file, kid, in_test_file)
+        }
+    }
+}
+
+fn check_package_tests(ck: *Check) with (a: mem.Allocator) {
+    if ck.failed || ck.stop {
+        return
+    }
+    for pkg in ck.prog.packages.items() {
+        for source in pkg.files.items() {
+            if source.ast == null {
+                continue
+            }
+            val root = source.ast!!
+            for decl in root.kids.items() {
+                check_decl_tests(ck, source.path, decl, source.is_test)
+            }
+        }
+    }
+}

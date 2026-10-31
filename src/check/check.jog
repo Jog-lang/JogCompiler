@@ -1,11 +1,46 @@
-// Checker. Checked against compiler/src/check.c.
+// Checker entry. Checked against compiler/src/check.c (jog_check).
 // Study note: JogDocs bootstrap/study/TypeChecking.
+// Steps are JogDocs bootstrap/CheckerGuide.md.
 
+import src.load
 import std.io
+import std.mem
 
-fn run(command: str): i32 {
-    io.eprint("jogc: ")
-    io.eprint(command)
-    io.eprintln(" is not implemented")
-    return 1
+/**
+ * Type-check a loaded program. Step 4 checks core function bodies.
+ * @param prog packages in dependency order from load.run
+ * @context a allocator for the type table and jobs
+ * @return 0 on success; non-zero on failure
+ */
+fn run(prog: load.Program): i32 with (a: mem.Allocator) {
+    if prog.packages.len == 0 {
+        io.eprintln("jogc: check received no packages")
+        return 1
+    }
+    var ck = check_new(prog, 8)
+    if !collect_jobs(&ck) {
+        return 1
+    }
+    if ck.jobs.len > 0 {
+        // run_jobs returns false when failed; still run duplicate-method
+        // checks when the scheduler did not stop (matches jog_check).
+        val ok = run_jobs(&ck)
+        if !ck.stop {
+            check_method_duplicates(&ck)
+        }
+        if !ok || ck.failed || ck.stop {
+            return 1
+        }
+    }
+    if ck.failed || ck.stop {
+        return 1
+    }
+    if !check_platform(&ck) {
+        return 1
+    }
+    check_package_tests(&ck)
+    if ck.failed || ck.stop {
+        return 1
+    }
+    return 0
 }

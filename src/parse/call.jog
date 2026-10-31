@@ -1,0 +1,31 @@
+// Call-shape helpers. CALL head: low byte = context count; bit 8 = trailing lambda.
+
+/**
+ * True when the call's last kid is a trailing lambda.
+ */
+fn call_has_trailing(call: *Node): bool {
+    return (call.head / 256) % 2 == 1
+}
+
+/**
+ * Context-argument count packed in the call head's low byte.
+ */
+fn call_nctx(call: *Node): usize {
+    return (call.head % 256) as usize
+}
+
+/**
+ * End index of ordinary arguments (kids minus contexts minus trailing lambda).
+ * Kid 0 is the callee; arguments occupy `[1, call_arg_end)`.
+ */
+fn call_arg_end(call: *Node): usize {
+    var arg_end = call.kids.len
+    val nctx = call_nctx(call)
+    if nctx > 0 && arg_end >= nctx {
+        arg_end = arg_end - nctx
+    }
+    if call_has_trailing(call) && arg_end > 0 {
+        arg_end = arg_end - 1
+    }
+    return arg_end
+}

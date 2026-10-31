@@ -1,0 +1,282 @@
+// Package and file scopes. Fields match JogSymbol and JogPackageScope
+// in compiler/src/symbols.h. Steps 8–10 bind and look up names.
+
+import src.parse
+import std.list
+import std.mem
+
+/**
+ * What a name binds to. The printer and later the checker use the kind.
+ */
+enum SymbolKind {
+    PACKAGE // an imported package name
+    TYPE // a type declaration
+    FUNCTION // a free function
+    VARIABLE // a var
+    CONSTANT // a val
+    FIELD // a struct field
+    METHOD // a function with a receiver
+    VARIANT // an enum variant
+    PARAMETER // a function parameter
+    CONTEXT // a context binding
+}
+
+/**
+ * One binding. file/line/column locate the declaring node for notes.
+ * decl is the AST node (for the checker job map). package is the owning
+ * package, or the imported target for PACKAGE. referenced tracks whether
+ * an imported package name was used.
+ */
+struct Symbol {
+    kind: SymbolKind
+    name: str
+    referenced: bool
+    // Body checker: definite assignment for locals without a zero value.
+    assigned: bool
+    file: str
+    line: i64
+    column: i64
+    flag: str
+    package: *Package?
+    decl: *parse.Node?
+    // Checker stores *Type here as *u8 so load does not import src.check.
+    sema: *u8?
+    // Generic type parameters and monomorphized struct/enum instances
+    // (*Type as *u8). Empty until the checker binds them.
+    type_params: list.List<*u8>
+    nominal_insts: list.List<*u8>
+}
+
+/**
+ * A block of locals. parent is null at the outermost block of a body.
+ * For a file scope, package points at the PackageScope fallthrough.
+ */
+struct BlockScope {
+    parent: *BlockScope?
+    bindings: list.List<Symbol>
+    package: *PackageScope?
+}
+
+/**
+ * The package map, plus one file scope per source file for imports and
+ * private(file) names. universe is the builtin scope after those; lookup
+ * walks file, then package, then universe in step 9.
+ */
+struct PackageScope {
+    package: *Package?
+    bindings: list.List<Symbol>
+    file_scopes: list.List<*BlockScope>
+    universe: *PackageScope?
+}
+
+/**
+ * An empty package scope. Step 8 fills bindings.
+ * @context a allocator for the lists
+ * @return a scope with empty lists and no universe
+ */
+fn empty_package_scope(): PackageScope with (a: mem.Allocator) {
+    var s: PackageScope
+    s.package = null
+    s.bindings = list.empty<Symbol>()
+    s.file_scopes = list.empty<*BlockScope>()
+    s.universe = null
+    return s
+}
+
+/**
+ * True when the symbol is a type binding. Other packages cannot write
+ * `load.SymbolKind.TYPE` (same limit as NodeKind / TokenKind).
+ * @param symbol any symbol
+ * @return whether kind is TYPE
+ */
+fn is_symbol_type(symbol: *Symbol): bool {
+    return symbol.kind == SymbolKind.TYPE
+}
+
+/**
+ * True when the symbol is an imported package name.
+ * @param symbol any symbol
+ * @return whether kind is PACKAGE
+ */
+fn is_symbol_package(symbol: *Symbol): bool {
+    return symbol.kind == SymbolKind.PACKAGE
+}
+
+/**
+ * True when the symbol is a free function.
+ * @param symbol any symbol
+ * @return whether kind is FUNCTION
+ */
+fn is_symbol_function(symbol: *Symbol): bool {
+    return symbol.kind == SymbolKind.FUNCTION
+}
+
+/**
+ * True when the symbol is a var.
+ * @param symbol any symbol
+ * @return whether kind is VARIABLE
+ */
+fn is_symbol_variable(symbol: *Symbol): bool {
+    return symbol.kind == SymbolKind.VARIABLE
+}
+
+/**
+ * True when the symbol can be used as a value expression.
+ * @param symbol any symbol
+ * @return whether kind is a value kind
+ */
+fn is_symbol_value(symbol: *Symbol): bool {
+    return symbol.kind == SymbolKind.FUNCTION || symbol.kind == SymbolKind.VARIABLE ||
+        symbol.kind == SymbolKind.CONSTANT || symbol.kind == SymbolKind.PARAMETER ||
+        symbol.kind == SymbolKind.CONTEXT
+}
+
+/**
+ * True when the symbol is a method.
+ * @param symbol any symbol
+ * @return whether kind is METHOD
+ */
+fn is_symbol_method(symbol: *Symbol): bool {
+    return symbol.kind == SymbolKind.METHOD
+}
+
+/**
+ * True when the symbol is a field.
+ * @param symbol any symbol
+ * @return whether kind is FIELD
+ */
+fn is_symbol_field(symbol: *Symbol): bool {
+    return symbol.kind == SymbolKind.FIELD
+}
+
+/**
+ * True when the symbol is a constant (val / value receiver self).
+ * @param symbol any symbol
+ * @return whether kind is CONSTANT
+ */
+fn is_symbol_constant(symbol: *Symbol): bool {
+    return symbol.kind == SymbolKind.CONSTANT
+}
+
+/** SymbolKind.CONSTANT for other packages (enum variants are not values across packages). */
+fn kind_constant(): SymbolKind {
+    return SymbolKind.CONSTANT
+}
+
+/** SymbolKind.VARIABLE for other packages. */
+fn kind_variable(): SymbolKind {
+    return SymbolKind.VARIABLE
+}
+
+/** SymbolKind.PARAMETER for other packages. */
+fn kind_parameter(): SymbolKind {
+    return SymbolKind.PARAMETER
+}
+
+/** SymbolKind.FIELD for other packages. */
+fn kind_field(): SymbolKind {
+    return SymbolKind.FIELD
+}
+
+/** SymbolKind.METHOD for other packages. */
+fn kind_method(): SymbolKind {
+    return SymbolKind.METHOD
+}
+
+/** SymbolKind.CONTEXT for other packages. */
+fn kind_context(): SymbolKind {
+    return SymbolKind.CONTEXT
+}
+
+/**
+ * Look up a name in the package map only (not file scopes or universe).
+ * @param scope package scope
+ * @param name interned or ordinary name text
+ * @return the symbol, or null when absent
+ */
+fn package_scope_lookup(scope: *PackageScope, name: str): *Symbol? {
+    for i in 0 as usize..scope.bindings.len {
+        val s = scope.bindings.at(i)
+        if s.name == name {
+            return s
+        }
+    }
+    return null
+}
+
+/**
+ * Look up a name in one block scope's own map (no parent walk).
+ * @param scope file or block scope
+ * @param name name text
+ * @return the symbol, or null when absent
+ */
+fn block_scope_lookup_local(scope: *BlockScope, name: str): *Symbol? {
+    for i in 0 as usize..scope.bindings.len {
+        val s = scope.bindings.at(i)
+        if s.name == name {
+            return s
+        }
+    }
+    return null
+}
+
+/**
+ * Bind a symbol into the package map. Caller checked for duplicates.
+ * @param scope package scope
+ * @param symbol binding to append
+ * @context a allocator for the list growth
+ */
+fn package_scope_bind(scope: *PackageScope, symbol: Symbol) with (a: mem.Allocator) {
+    scope.bindings.push(symbol)
+}
+
+/**
+ * Bind a symbol into a file or block scope. Caller checked for duplicates.
+ * @param scope file or block scope
+ * @param symbol binding to append
+ * @context a allocator for the list growth
+ */
+fn block_scope_bind(scope: *BlockScope, symbol: Symbol) with (a: mem.Allocator) {
+    scope.bindings.push(symbol)
+}
+
+/**
+ * Look up a name in a file scope, then the package map, matching
+ * jog_block_scope_lookup's fallthrough to the package.
+ * @param scope file scope
+ * @param name name text
+ * @return the symbol, or null when absent
+ */
+fn block_scope_lookup(scope: *BlockScope, name: str): *Symbol? {
+    val local = block_scope_lookup_local(scope, name)
+    if local != null {
+        return local
+    }
+    if scope.package == null {
+        return null
+    }
+    return package_scope_lookup(scope.package!!, name)
+}
+
+/**
+ * File scope, then package (via the file block), then universe. Matches
+ * jog_file_lookup. Package names are found through the file block's
+ * fallthrough; universe is last.
+ * @param package_scope the package's scope
+ * @param file_index index into file_scopes
+ * @param name name text
+ * @return the symbol, or null when absent
+ */
+fn file_lookup(package_scope: *PackageScope, file_index: usize, name: str): *Symbol? {
+    if file_index >= package_scope.file_scopes.len {
+        return null
+    }
+    val found = block_scope_lookup(package_scope.file_scopes.get(file_index), name)
+    if found != null {
+        return found
+    }
+    if package_scope.universe == null {
+        return null
+    }
+    return package_scope_lookup(package_scope.universe!!, name)
+}

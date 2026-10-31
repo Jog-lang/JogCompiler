@@ -1,0 +1,2914 @@
+// Enums, when, patterns, exhaustiveness, is.
+// Checked against compiler/src/check_enum.c.
+// CheckerGuide step 7.
+
+import src.load
+import src.lex
+import src.parse
+import std.list
+import std.mem
+import std.strbuilder
+import std.text as texts
+
+private fn enum_fail(ck: *Check, job: *CheckJob, node: *parse.Node, message: str) with (a: mem.Allocator) {
+    check_fail(ck, job.file, node.line, node.column, message)
+}
+
+private fn enum_env_fail(env: *Env, node: *parse.Node, message: str) with (a: mem.Allocator) {
+    check_fail(env.ck, env.job.file, node.line, node.column, message)
+}
+
+private fn peel_ty(ty: *Type?): *Type? {
+    var t = ty
+    for t != null && t!!.kind == TypeKind.DISTINCT && t!!.elem != null {
+        t = t!!.elem
+    }
+    return t
+}
+
+private fn is_err(ty: *Type?): bool {
+    return ty != null && ty!!.kind == TypeKind.ERROR
+}
+
+private fn same_ty(a: *Type, b: *Type): bool {
+    return a == b
+}
+
+private fn type_label(ty: *Type): str with (a: mem.Allocator) {
+    if ty.name.len > 0 {
+        return ty.name
+    }
+    return type_print(ty as *Type?)
+}
+
+private fn enum_member_start(node: *parse.Node): usize {
+    var i = node.head as usize
+    val k = lex.kind()
+    if node.op == k.COLON {
+        i = i + 1
+    }
+    return i
+}
+
+private fn variant_value_node(member: *parse.Node): *parse.Node? {
+    val k = lex.kind()
+    if member.op != k.ASSIGN {
+        return null
+    }
+    val nfields = member.head as usize
+    if nfields >= member.kids.len {
+        return null
+    }
+    return member.kids.get(nfields) as *parse.Node?
+}
+
+private fn is_discard_name(name: str): bool {
+    return name.len == 0 || name == "_"
+}
+
+private fn find_variant(ty: *Type, name: str): i64 {
+    if ty.kind != TypeKind.ENUM || name.len == 0 {
+        return -1
+    }
+    var i: usize = 0
+    for i < type_variant_count(ty) {
+        if ty.variant_names.get(i) == name {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+private fn payload_free_variant(ty: *Type, index: i64): bool {
+    if index < 0 {
+        return false
+    }
+    val v = type_variant_at(ty, index as usize)
+    return v.field_count == 0
+}
+
+private fn variant_is_marked(pat: *parse.Node): bool {
+    return pat.flag == "variant"
+}
+
+private fn mark_variant_pat(pat: *parse.Node) {
+    pat.flag = "variant"
+}
+
+private fn symbol_for_type_decl(pkg: *load.Package, decl: *parse.Node): *load.Symbol? {
+    for i in 0 as usize..pkg.scope.bindings.len {
+        val s = pkg.scope.bindings.at(i)
+        if s.decl != null && s.decl!! == decl {
+            return s as *load.Symbol?
+        }
+    }
+    return null
+}
+
+private fn symbol_for_type_decl_prog(ck: *Check, decl: *parse.Node): *load.Symbol? {
+    for p in ck.prog.packages.items() {
+        val s = symbol_for_type_decl(p, decl)
+        if s != null {
+            return s
+        }
+    }
+    return null
+}
+
+private fn await_enum_layout(ck: *Check, job: *CheckJob, self: *Type, ty: *Type, depth: i64): bool with (a: mem.Allocator) {
+    if ck.stop || depth > 64 {
+        return !ck.stop
+    }
+    if ty.kind == TypeKind.PTR || ty.kind == TypeKind.SLICE || ty.kind == TypeKind.FN || ty.kind == TypeKind.INTERFACE {
+        return true
+    }
+    if ty.kind == TypeKind.ARRAY || ty.kind == TypeKind.OPTION {
+        if ty.elem == null {
+            return true
+        }
+        return await_enum_layout(ck, job, self, ty.elem!!, depth + 1)
+    }
+    if ty.kind == TypeKind.DISTINCT {
+        if ty.elem == null {
+            return true
+        }
+        return await_enum_layout(ck, job, self, ty.elem!!, depth + 1)
+    }
+    if ty.kind == TypeKind.TUPLE {
+        for e in ty.elems.items() {
+            if !await_enum_layout(ck, job, self, e, depth + 1) {
+                return false
+            }
+        }
+        return !ck.stop
+    }
+    if ty.kind != TypeKind.STRUCT && ty.kind != TypeKind.ENUM {
+        return true
+    }
+    if ty == self || ty.has_layout {
+        return true
+    }
+    if self.decl != null && ty.decl != null && self.decl!! == ty.decl!! {
+        return true
+    }
+    if ty.decl == null {
+        return true
+    }
+    var sym = symbol_for_type_decl(job.pkg, ty.decl!!)
+    if sym == null {
+        sym = symbol_for_type_decl_prog(ck, ty.decl!!)
+    }
+    if sym == null {
+        return true
+    }
+    return wait_for_symbol_finished(ck, job, sym!!)
+}
+
+private fn enum_contains_self(self: *Type, ty: *Type, depth: i64): bool {
+    if depth > 64 {
+        return true
+    }
+    if ty == self {
+        return true
+    }
+    if ty.kind == TypeKind.PTR || ty.kind == TypeKind.SLICE || ty.kind == TypeKind.FN || ty.kind == TypeKind.INTERFACE {
+        return false
+    }
+    if ty.kind == TypeKind.ARRAY || ty.kind == TypeKind.OPTION || ty.kind == TypeKind.DISTINCT {
+        if ty.elem == null {
+            return false
+        }
+        return enum_contains_self(self, ty.elem!!, depth + 1)
+    }
+    if ty.kind == TypeKind.TUPLE {
+        for e in ty.elems.items() {
+            if enum_contains_self(self, e, depth + 1) {
+                return true
+            }
+        }
+        return false
+    }
+    if ty.kind == TypeKind.STRUCT {
+        var i: usize = 0
+        for i < ty.field_types.len {
+            if enum_contains_self(self, ty.field_types.get(i), depth + 1) {
+                return true
+            }
+            i = i + 1
+        }
+        return false
+    }
+    if ty.kind == TypeKind.ENUM {
+        if self.kind == TypeKind.ENUM && self.decl != null && ty.decl != null && self.decl!! == ty.decl!! {
+            return true
+        }
+        var vi: usize = 0
+        for vi < type_variant_count(ty) {
+            val v = type_variant_at(ty, vi)
+            var fi: usize = 0
+            for fi < v.field_count {
+                val fld = type_variant_field_at(ty, v, fi)
+                if fld.field_type != null && enum_contains_self(self, fld.field_type!!, depth + 1) {
+                    return true
+                }
+                fi = fi + 1
+            }
+            vi = vi + 1
+        }
+        return false
+    }
+    return false
+}
+
+/**
+ * True when some variant's tag is 0 and that payload has a zero value.
+ */
+fn enum_has_zero(ty: *Type): bool {
+    if ty.kind != TypeKind.ENUM || !ty.has_layout {
+        return false
+    }
+    var found = false
+    var variant: EnumVariant
+    variant.name = ""
+    variant.tag = 0
+    variant.decl = null
+    variant.field_start = 0
+    variant.field_count = 0
+    var i: usize = 0
+    for i < type_variant_count(ty) {
+        val v = type_variant_at(ty, i)
+        if v.tag == 0 {
+            variant = v
+            found = true
+            break
+        }
+        i = i + 1
+    }
+    if !found {
+        return false
+    }
+    var fi: usize = 0
+    for fi < variant.field_count {
+        val fld = type_variant_field_at(ty, variant, fi)
+        if fld.field_type == null || !type_has_zero(fld.field_type!!) {
+            return false
+        }
+        fi = fi + 1
+    }
+    return true
+}
+
+private fn eval_tag_value(ck: *Check, job: *CheckJob, expr: *parse.Node, tag: *Type?): (i64, bool) with (a: mem.Allocator) {
+    var value: i64 = 0
+    if !const_fold_int(ck, job.file, expr, &value) {
+        ck.failed = true
+        return 0, false
+    }
+    if tag != null && tag!!.kind == TypeKind.INT {
+        if !const_int_fits(value, tag!!) {
+            enum_fail(ck, job, expr, "tag value does not fit")
+            return 0, false
+        }
+    } else if value < 0 {
+        enum_fail(ck, job, expr, "tag value does not fit")
+        return 0, false
+    }
+    return value, true
+}
+
+private fn tag_fits_value(tag: *Type?, value: i64): bool {
+    if tag == null || tag!!.kind != TypeKind.INT {
+        return value >= 0
+    }
+    return const_int_fits(value, tag!!)
+}
+
+/**
+ * Fill variants, symbols, the tag type, and C layout.
+ */
+fn check_enum(ck: *Check, job: *CheckJob): *Type? with (a: mem.Allocator) {
+    if ck.stop || !parse.is_enum(job.decl) {
+        return null
+    }
+    val node = job.decl
+    var ename = node.name
+    if ename.len == 0 {
+        ename = "?"
+    }
+    val ety = type_new_nominal(&ck.types, TypeKind.ENUM, ename, job.pkg.path)
+    ety.decl = node as *parse.Node?
+    publish_job_type(job, ety as *Type?)
+    var bad = false
+    if !generic_bind_struct_params(ck, job, &bad) {
+        return null
+    }
+    var tag: *Type? = null
+    val k = lex.kind()
+    if node.op == k.COLON {
+        val ti = node.head as usize
+        if ti >= node.kids.len {
+            enum_fail(ck, job, node, "enum tag must be an integer")
+            bad = true
+        } else {
+            tag = resolve_type(ck, job, node.kids.get(ti))
+            if ck.stop {
+                return null
+            }
+            if tag == null || is_err(tag) {
+                bad = true
+                tag = null
+            } else if tag!!.kind != TypeKind.INT {
+                enum_fail(ck, job, node.kids.get(ti), "enum tag must be an integer")
+                bad = true
+                tag = null
+            } else {
+                ety.elem = tag
+            }
+        }
+    }
+    val start = enum_member_start(node)
+    if start >= node.kids.len {
+        var b = strbuilder.empty()
+        b.append("enum '")
+        b.append(ename)
+        b.append("' needs a variant")
+        enum_fail(ck, job, node, b.str())
+        b.free()
+        return err_ty(ck) as *Type?
+    }
+    var any_payload = false
+    var mi = start
+    for mi < node.kids.len {
+        val member = node.kids.get(mi)
+        if parse.is_variant(member) && (member.head as usize) > 0 {
+            any_payload = true
+        }
+        mi = mi + 1
+    }
+    var vnames = list.empty<str>()
+    var vtags = list.empty<i64>()
+    var vdecls = list.empty<*parse.Node>()
+    var vstarts = list.empty<usize>()
+    var vcounts = list.empty<usize>()
+    var fnames = list.empty<str>()
+    var ftypes = list.empty<*Type>()
+    var fdecls = list.empty<*parse.Node>()
+    var have_prev = false
+    var prev: i64 = 0
+    mi = start
+    for mi < node.kids.len && !ck.stop {
+        val member = node.kids.get(mi)
+        if !parse.is_variant(member) {
+            enum_fail(ck, job, member, "unsupported enum member")
+            bad = true
+            mi = mi + 1
+            continue
+        }
+        var vname = member.name
+        if vname.len == 0 {
+            enum_fail(ck, job, member, "missing variant name")
+            bad = true
+            mi = mi + 1
+            continue
+        }
+        var dup = false
+        for prev_n in vnames.items() {
+            if prev_n == vname {
+                var b = strbuilder.empty()
+                b.append("duplicate variant '")
+                b.append(vname)
+                b.append("'")
+                enum_fail(ck, job, member, b.str())
+                b.free()
+                bad = true
+                dup = true
+                break
+            }
+        }
+        if dup {
+            mi = mi + 1
+            continue
+        }
+        val field_count = member.head as usize
+        var fields_ok = true
+        val field_start = fnames.len
+        var nfields: usize = 0
+        var f: usize = 0
+        for f < field_count && !ck.stop {
+            if f >= member.kids.len {
+                enum_fail(ck, job, member, "expected a variant field")
+                fields_ok = false
+                f = f + 1
+                continue
+            }
+            val param = member.kids.get(f)
+            if !parse.is_param(param) {
+                enum_fail(ck, job, param, "expected a variant field")
+                fields_ok = false
+                f = f + 1
+                continue
+            }
+            if param.name.len == 0 {
+                enum_fail(ck, job, param, "missing field name")
+                fields_ok = false
+                f = f + 1
+                continue
+            }
+            if param.kids.len == 0 {
+                enum_fail(ck, job, param, "missing type")
+                fields_ok = false
+                f = f + 1
+                continue
+            }
+            val field_type = resolve_type(ck, job, param.kids.get(0))
+            if ck.stop {
+                return null
+            }
+            if field_type == null || is_err(field_type) {
+                fields_ok = false
+                f = f + 1
+                continue
+            }
+            var fdup = false
+            var prev_f: usize = 0
+            for prev_f < nfields {
+                if fnames.get(field_start + prev_f) == param.name {
+                    var b = strbuilder.empty()
+                    b.append("duplicate field '")
+                    b.append(param.name)
+                    b.append("'")
+                    enum_fail(ck, job, param, b.str())
+                    b.free()
+                    fields_ok = false
+                    fdup = true
+                    break
+                }
+                prev_f = prev_f + 1
+            }
+            if fdup {
+                f = f + 1
+                continue
+            }
+            if !await_enum_layout(ck, job, ety, field_type!!, 0) {
+                return null
+            }
+            if param.kids.len > 1 {
+                if generic_has_param(field_type) {
+                    enum_fail(ck, job, param, "a type parameter cannot have a default value yet")
+                    fields_ok = false
+                } else {
+                    val got = check_expr_job(ck, job, param.kids.get(1), field_type)
+                    if ck.stop {
+                        return null
+                    }
+                    if got == null || is_err(got) {
+                        fields_ok = false
+                    }
+                }
+            }
+            fnames.push(param.name)
+            ftypes.push(field_type!!)
+            fdecls.push(param)
+            nfields = nfields + 1
+            f = f + 1
+        }
+        if ck.stop {
+            return null
+        }
+        var tag_value: i64 = 0
+        val value_node = variant_value_node(member)
+        if value_node != null {
+            if any_payload {
+                enum_fail(ck, job, member, "a variant cannot have both a payload and a tag value")
+                bad = true
+            } else {
+                val (tv, ok) = eval_tag_value(ck, job, value_node!!, tag)
+                if !ok {
+                    bad = true
+                    tag_value = 0
+                } else {
+                    tag_value = tv
+                }
+            }
+        } else if have_prev {
+            if prev == 9223372036854775807 {
+                enum_fail(ck, job, member, "tag value does not fit")
+                bad = true
+            } else {
+                tag_value = prev + 1
+            }
+        }
+        if !tag_fits_value(tag, tag_value) {
+            enum_fail(ck, job, member, "tag value does not fit")
+            bad = true
+        }
+        if !fields_ok {
+            bad = true
+        }
+        vnames.push(vname)
+        vtags.push(tag_value)
+        vdecls.push(member)
+        vstarts.push(field_start)
+        vcounts.push(nfields)
+        prev = tag_value
+        have_prev = true
+        mi = mi + 1
+    }
+    if ck.stop {
+        return null
+    }
+    if bad || vnames.len == 0 {
+        return err_ty(ck) as *Type?
+    }
+    var i: usize = 0
+    for i < vtags.len {
+        var j = i + 1
+        for j < vtags.len {
+            if vtags.get(i) == vtags.get(j) {
+                var b = strbuilder.empty()
+                b.append("duplicate tag for '")
+                b.append(vnames.get(j))
+                b.append("'")
+                enum_fail(ck, job, vdecls.get(j), b.str())
+                b.free()
+                return err_ty(ck) as *Type?
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    ety.variant_names = vnames
+    ety.variant_tags = vtags
+    ety.variant_decls = vdecls
+    ety.variant_field_starts = vstarts
+    ety.variant_field_counts = vcounts
+    ety.variant_field_names = fnames
+    ety.variant_field_types = ftypes
+    ety.variant_field_decls = fdecls
+    i = 0
+    for i < type_variant_count(ety) {
+        val v = type_variant_at(ety, i)
+        var fi: usize = 0
+        for fi < v.field_count {
+            val fld = type_variant_field_at(ety, v, fi)
+            if fld.field_type != null && enum_contains_self(ety, fld.field_type!!, 0) {
+                var b = strbuilder.empty()
+                b.append("enum '")
+                b.append(ename)
+                b.append("' recursively contains itself")
+                enum_fail(ck, job, node, b.str())
+                b.free()
+                return err_ty(ck) as *Type?
+            }
+            fi = fi + 1
+        }
+        i = i + 1
+    }
+    if enum_type_param_count(node) > 0 {
+        val sym = job_symbol_of(job)
+        if sym != null {
+            if !generic_enum_finish(ck, sym!!) {
+                return null
+            }
+        }
+        return ety as *Type?
+    }
+    if !type_layout(&ck.types, ety) {
+        var b = strbuilder.empty()
+        b.append("enum '")
+        b.append(ename)
+        b.append("' recursively contains itself")
+        enum_fail(ck, job, node, b.str())
+        b.free()
+        return err_ty(ck) as *Type?
+    }
+    return ety as *Type?
+}
+
+private fn enum_type_param_count(node: *parse.Node): usize {
+    var n: usize = 0
+    var i: usize = 0
+    for i < (node.head as usize) && i < node.kids.len {
+        if parse.is_type_param(node.kids.get(i)) {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+private fn finish_enum_type(ck: *Check, job: *CheckJob, ty: *Type): bool with (a: mem.Allocator) {
+    if ty.kind != TypeKind.ENUM {
+        return false
+    }
+    if ty.decl == null {
+        return true
+    }
+    var sym = symbol_for_type_decl(job.pkg, ty.decl!!)
+    if sym == null {
+        sym = symbol_for_type_decl_prog(ck, ty.decl!!)
+    }
+    if sym == null {
+        return true
+    }
+    return wait_for_symbol_finished(ck, job, sym!!)
+}
+
+private fn enum_from_expr_type(ck: *Check, job: *CheckJob, ty: *Type?): *Type? with (a: mem.Allocator) {
+    val peeled = peel_ty(ty)
+    if peeled == null || peeled!!.kind != TypeKind.ENUM {
+        return null
+    }
+    if !finish_enum_type(ck, job, peeled!!) {
+        return null
+    }
+    return peeled
+}
+
+private fn lookup_enum_type(env: *Env, name: str, at: *parse.Node): *Type? with (a: mem.Allocator) {
+    if name.len == 0 {
+        return null
+    }
+    val symbol = lookup_name(env, name)
+    if symbol == null || !load.is_symbol_type(symbol!!) {
+        return null
+    }
+    if !wait_for_symbol_finished(env.ck, env.job, symbol!!) {
+        return null
+    }
+    val sym = symbol!!
+    var args = list.empty<*parse.Node>()
+    if parse.is_ident(at) {
+        args = at.kids
+    }
+    // Generic alias that resolves to an enum (Res<T> = Result<T>).
+    if sym.decl != null && parse.is_type_decl(sym.decl!!) && sym_type_param_count(sym) > 0 {
+        val applied = generic_alias_apply(env.ck, env.job, sym, args, at.line, at.column)
+        if applied == null || env.ck.stop {
+            return null
+        }
+        if is_err(applied) {
+            return applied
+        }
+        val peeled = peel_ty(applied)
+        if peeled == null || peeled!!.kind != TypeKind.ENUM {
+            return null
+        }
+        return peeled
+    }
+    // Generic enum Result<T>.Ok — instantiate before treating as a variant base.
+    if sym.decl != null && parse.is_enum(sym.decl!!) && sym_type_param_count(sym) > 0 {
+        return generic_enum_apply(env.ck, env.job, sym, args, at.line, at.column)
+    }
+    if sym_type_param_count(sym) > 0 {
+        return null
+    }
+    val ty = peel_ty(get_sema(sym))
+    if ty == null || ty!!.kind != TypeKind.ENUM {
+        return null
+    }
+    if parse.is_ident(at) && at.kids.len > 0 {
+        enum_env_fail(env, at, "type arguments are not checked yet")
+        return err_ty(env.ck) as *Type?
+    }
+    return ty
+}
+
+private fn builtin_option_type(env: *Env, base: *parse.Node): *Type? with (a: mem.Allocator) {
+    if !parse.is_ident(base) || base.name != "Option" {
+        return null
+    }
+    val existing = lookup_name(env, "Option")
+    if existing != null && load.is_symbol_type(existing!!) && existing!!.decl != null &&
+        !parse.is_enum(existing!!.decl!!) {
+        return null
+    }
+    if base.kids.len != 1 {
+        enum_env_fail(env, base, "Option takes one type argument")
+        return err_ty(env.ck) as *Type?
+    }
+    val elem = resolve_type(env.ck, env.job, base.kids.get(0))
+    if elem == null || env.ck.stop {
+        return null
+    }
+    if is_err(elem) {
+        return elem
+    }
+    return type_option(&env.ck.types, elem!!)
+}
+
+private fn finish_option_name(env: *Env, node: *parse.Node, opt: *Type, name: str): (*Type?, i32) with (a: mem.Allocator) {
+    if is_err(opt as *Type?) {
+        return opt as *Type?, 1
+    }
+    if opt.kind != TypeKind.OPTION {
+        return null, 0
+    }
+    if name == "None" {
+        return opt as *Type?, 1
+    }
+    if name == "Some" {
+        enum_env_fail(env, node, "variant 'Some' needs arguments")
+        return err_ty(env.ck) as *Type?, 1
+    }
+    var b = strbuilder.empty()
+    b.append("unknown variant '")
+    b.append(name)
+    b.append("'")
+    enum_env_fail(env, node, b.str())
+    b.free()
+    return err_ty(env.ck) as *Type?, 1
+}
+
+private fn variant_value_ty(env: *Env, node: *parse.Node, en: *Type, index: i64, allow_payload: bool): *Type? with (a: mem.Allocator) {
+    if index < 0 {
+        return err_ty(env.ck) as *Type?
+    }
+    if !payload_free_variant(en, index) && !allow_payload {
+        val v = type_variant_at(en, index as usize)
+        var b = strbuilder.empty()
+        b.append("variant '")
+        b.append(v.name)
+        b.append("' needs arguments")
+        enum_env_fail(env, node, b.str())
+        b.free()
+        return err_ty(env.ck) as *Type?
+    }
+    return en as *Type?
+}
+
+/**
+ * 1 when member is a payload-free variant / Option name. 0 when not. -1 stop.
+ */
+fn check_enum_member(env: *Env, node: *parse.Node): (*Type?, i32) with (a: mem.Allocator) {
+    if node.flag == "?." || node.name.len == 0 || node.kids.len == 0 {
+        return null, 0
+    }
+    val base = node.kids.get(0)
+    if !parse.is_ident(base) {
+        return null, 0
+    }
+    val opt = builtin_option_type(env, base)
+    if env.ck.stop {
+        return null, -1
+    }
+    if opt != null {
+        return finish_option_name(env, node, opt!!, node.name)
+    }
+    val en = lookup_enum_type(env, base.name, base)
+    if env.ck.stop {
+        return null, -1
+    }
+    if en == null {
+        return null, 0
+    }
+    if is_err(en) {
+        return en, 1
+    }
+    val index = find_variant(en!!, node.name)
+    if index < 0 {
+        var b = strbuilder.empty()
+        b.append("unknown variant '")
+        b.append(node.name)
+        b.append("'")
+        enum_env_fail(env, node, b.str())
+        b.free()
+        return err_ty(env.ck) as *Type?, 1
+    }
+    return variant_value_ty(env, node, en!!, index, false), 1
+}
+
+/**
+ * `.Empty` / `.None` under a known enum or option target.
+ */
+fn check_enum_dot(env: *Env, node: *parse.Node, target: *Type?): *Type? with (a: mem.Allocator) {
+    val name = node.name
+    val opt = peel_ty(target)
+    if opt != null && opt!!.kind == TypeKind.OPTION {
+        val (got, handled) = finish_option_name(env, node, opt!!, name)
+        if handled == 0 {
+            return null
+        }
+        return got
+    }
+    val en = enum_from_expr_type(env.ck, env.job, target)
+    if env.ck.stop {
+        return null
+    }
+    if en == null {
+        enum_env_fail(env, node, "enum variant needs a known type")
+        return err_ty(env.ck) as *Type?
+    }
+    val index = find_variant(en!!, name)
+    if index < 0 {
+        var b = strbuilder.empty()
+        b.append("unknown variant '")
+        if name.len > 0 {
+            b.append(name)
+        } else {
+            b.append("?")
+        }
+        b.append("'")
+        enum_env_fail(env, node, b.str())
+        b.free()
+        return err_ty(env.ck) as *Type?
+    }
+    return variant_value_ty(env, node, en!!, index, false)
+}
+
+private fn place_arg(en: *Type, variant: EnumVariant, name: str, positional: *usize, filled: *list.List<bool>): i32 {
+    if name.len > 0 {
+        var i: usize = 0
+        for i < variant.field_count {
+            val fld = type_variant_field_at(en, variant, i)
+            if fld.name == name {
+                if filled.get(i) {
+                    return -2
+                }
+                filled.set(i, true)
+                return i as i32
+            }
+            i = i + 1
+        }
+        return -3
+    }
+    for *positional < variant.field_count && filled.get(*positional) {
+        *positional = *positional + 1
+    }
+    if *positional >= variant.field_count {
+        return -4
+    }
+    val slot = *positional
+    filled.set(slot, true)
+    *positional = *positional + 1
+    return slot as i32
+}
+
+private fn variant_field_has_default(fld: StructField): bool {
+    if fld.decl == null {
+        return false
+    }
+    return fld.decl!!.kids.len > 1
+}
+
+private fn check_variant_call(env: *Env, call: *parse.Node, en: *Type, index: i64): *Type? with (a: mem.Allocator) {
+    val variant = type_variant_at(en, index as usize)
+    if call.head > 0 {
+        enum_env_fail(env, call, "variant arguments cannot be a lambda or a context")
+        return err_ty(env.ck) as *Type?
+    }
+    if variant.field_count == 0 {
+        if call.kids.len > 1 {
+            var b = strbuilder.empty()
+            b.append("variant '")
+            b.append(variant.name)
+            b.append("' has no fields")
+            enum_env_fail(env, call, b.str())
+            b.free()
+            return err_ty(env.ck) as *Type?
+        }
+        return en as *Type?
+    }
+    var filled = list.empty<bool>()
+    var i: usize = 0
+    for i < variant.field_count {
+        filled.push(false)
+        i = i + 1
+    }
+    var positional: usize = 0
+    var bad = false
+    i = 1
+    for i < call.kids.len && !env.ck.stop {
+        val arg = call.kids.get(i)
+        if !parse.is_arg(arg) || arg.kids.len == 0 {
+            enum_env_fail(env, arg, "expected an argument")
+            bad = true
+            i = i + 1
+            continue
+        }
+        val slot = place_arg(en, variant, arg.name, &positional, &filled)
+        if slot == -2 {
+            var b = strbuilder.empty()
+            b.append("duplicate argument '")
+            b.append(arg.name)
+            b.append("'")
+            enum_env_fail(env, arg, b.str())
+            b.free()
+            bad = true
+            i = i + 1
+            continue
+        }
+        if slot < 0 {
+            if slot == -3 {
+                var b = strbuilder.empty()
+                b.append("unknown field '")
+                b.append(arg.name)
+                b.append("'")
+                enum_env_fail(env, arg, b.str())
+                b.free()
+            } else {
+                enum_env_fail(env, arg, "too many arguments")
+            }
+            bad = true
+            check_expr(env, arg.kids.get(0), null)
+            i = i + 1
+            continue
+        }
+        val fld = type_variant_field_at(en, variant, slot as usize)
+        val got = check_expr(env, arg.kids.get(0), fld.field_type)
+        if env.ck.stop {
+            return null
+        }
+        if got == null || is_err(got) {
+            bad = true
+        }
+        i = i + 1
+    }
+    i = 0
+    for i < variant.field_count {
+        if !filled.get(i) {
+            val fld = type_variant_field_at(en, variant, i)
+            if variant_field_has_default(fld) {
+                i = i + 1
+                continue
+            }
+            var b = strbuilder.empty()
+            b.append("missing field '")
+            b.append(fld.name)
+            b.append("'")
+            enum_env_fail(env, call, b.str())
+            b.free()
+            bad = true
+        }
+        i = i + 1
+    }
+    if bad {
+        return err_ty(env.ck) as *Type?
+    }
+    return en as *Type?
+}
+
+private fn check_option_call(env: *Env, call: *parse.Node, opt: *Type, name: str): *Type? with (a: mem.Allocator) {
+    if name == "None" {
+        if call.kids.len > 1 {
+            enum_env_fail(env, call, "variant 'None' does not take arguments")
+            return err_ty(env.ck) as *Type?
+        }
+        return opt as *Type?
+    }
+    if name != "Some" {
+        var b = strbuilder.empty()
+        b.append("unknown variant '")
+        b.append(name)
+        b.append("'")
+        enum_env_fail(env, call, b.str())
+        b.free()
+        return err_ty(env.ck) as *Type?
+    }
+    if call.kids.len != 2 {
+        enum_env_fail(env, call, "variant 'Some' takes one argument")
+        return err_ty(env.ck) as *Type?
+    }
+    val arg = call.kids.get(1)
+    var value = arg
+    if parse.is_arg(arg) {
+        if arg.kids.len == 0 {
+            enum_env_fail(env, arg, "expected an argument")
+            return err_ty(env.ck) as *Type?
+        }
+        value = arg.kids.get(0)
+    }
+    val got = check_expr(env, value, opt.elem)
+    if got == null || env.ck.stop {
+        return got
+    }
+    if is_err(got) {
+        return got
+    }
+    return opt as *Type?
+}
+
+/**
+ * 1 when call builds a variant / Option. 0 when not. -1 stop.
+ */
+fn check_enum_call(env: *Env, node: *parse.Node, target: *Type?): (*Type?, i32) with (a: mem.Allocator) {
+    if node.kids.len == 0 {
+        return null, 0
+    }
+    val callee = node.kids.get(0)
+    if parse.is_member(callee) && callee.flag != "?." && callee.name.len > 0 && callee.kids.len > 0 &&
+        parse.is_ident(callee.kids.get(0)) {
+        val base = callee.kids.get(0)
+        val opt = builtin_option_type(env, base)
+        if env.ck.stop {
+            return null, -1
+        }
+        if opt != null {
+            if is_err(opt) {
+                return opt, 1
+            }
+            val built = check_option_call(env, node, opt!!, callee.name)
+            if built == null || env.ck.stop {
+                return null, -1
+            }
+            return built, 1
+        }
+        val en = lookup_enum_type(env, base.name, base)
+        if env.ck.stop {
+            return null, -1
+        }
+        if en == null {
+            return null, 0
+        }
+        if is_err(en) {
+            return en, 1
+        }
+        val index = find_variant(en!!, callee.name)
+        if index < 0 {
+            var b = strbuilder.empty()
+            b.append("unknown variant '")
+            b.append(callee.name)
+            b.append("'")
+            enum_env_fail(env, callee, b.str())
+            b.free()
+            return err_ty(env.ck) as *Type?, 1
+        }
+        val built = check_variant_call(env, node, en!!, index)
+        if env.ck.stop {
+            return null, -1
+        }
+        return built, 1
+    }
+    if parse.is_dot_variant(callee) {
+        val opt = peel_ty(target)
+        if opt == null || opt!!.kind != TypeKind.OPTION {
+            return null, 0
+        }
+        val built = check_option_call(env, node, opt!!, callee.name)
+        if built == null || env.ck.stop {
+            return null, -1
+        }
+        return built, 1
+    }
+    return null, 0
+}
+
+private fn path_last(name: str): str {
+    var i = name.len
+    for i > 0 {
+        i = i - 1
+        if name.ptr[i] == '.' as u8 {
+            return texts.slice(name, i + 1, name.len)
+        }
+    }
+    return name
+}
+
+private fn path_seg_count(name: str): usize {
+    var n: usize = 1
+    var i: usize = 0
+    if name.len == 0 {
+        return 0
+    }
+    for i < name.len {
+        if name.ptr[i] == '.' as u8 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+private fn path_seg_at(name: str, which: usize): str {
+    var start: usize = 0
+    var idx: usize = 0
+    var i: usize = 0
+    for i <= name.len {
+        if i == name.len || name.ptr[i] == '.' as u8 {
+            if idx == which {
+                return texts.slice(name, start, i)
+            }
+            idx = idx + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+private fn is_variant_index(env: *Env, type_node: *parse.Node, en: *Type): (i64, str) with (a: mem.Allocator) {
+    if !parse.is_type_name(type_node) || type_node.name.len == 0 {
+        return -1, "?"
+    }
+    val label = type_node.name
+    val segs = path_seg_count(label)
+    val last = path_last(label)
+    if segs == 1 {
+        return find_variant(en, last), last
+    }
+    if segs == 2 {
+        val first = path_seg_at(label, 0)
+        val sym = lookup_name(env, first)
+        if sym == null || !load.is_symbol_type(sym!!) {
+            return -1, last
+        }
+        if !wait_for_symbol(env.ck, env.job, sym!!, false) {
+            return -2, last
+        }
+        val sema = get_sema(sym!!)
+        if sema == null || !same_ty(sema!!, en) {
+            return -1, last
+        }
+        return find_variant(en, last), last
+    }
+    if segs == 3 {
+        val pkg_name = path_seg_at(label, 0)
+        val ty_name = path_seg_at(label, 1)
+        val pkg = lookup_name(env, pkg_name)
+        if pkg == null || !load.is_symbol_package(pkg!!) || pkg!!.package == null {
+            return -1, last
+        }
+        val sym = load.package_scope_lookup(&pkg!!.package!!.scope, ty_name)
+        if sym == null || !load.is_symbol_type(sym!!) {
+            return -1, last
+        }
+        if !wait_for_symbol(env.ck, env.job, sym!!, false) {
+            return -2, last
+        }
+        val sema = get_sema(sym!!)
+        if sema == null || !same_ty(sema!!, en) {
+            return -1, last
+        }
+        return find_variant(en, last), last
+    }
+    return -1, last
+}
+
+/**
+ * `expr is Variant` — bool.
+ */
+fn check_enum_is(env: *Env, node: *parse.Node): *Type? with (a: mem.Allocator) {
+    if node.kids.len < 2 {
+        enum_env_fail(env, node, "is needs an enum")
+        return err_ty(env.ck) as *Type?
+    }
+    val expr = node.kids.get(0)
+    val type_node = node.kids.get(1)
+    val got = check_expr(env, expr, null)
+    if env.ck.stop {
+        return null
+    }
+    if got == null || is_err(got) {
+        return err_ty(env.ck) as *Type?
+    }
+    val en = enum_from_expr_type(env.ck, env.job, got)
+    if env.ck.stop {
+        return null
+    }
+    if en == null {
+        enum_env_fail(env, node, "is needs an enum")
+        return err_ty(env.ck) as *Type?
+    }
+    val (index, name) = is_variant_index(env, type_node, en!!)
+    if index == -2 {
+        return null
+    }
+    if index < 0 {
+        var b = strbuilder.empty()
+        b.append("'")
+        b.append(name)
+        b.append("' is not a variant of '")
+        b.append(type_label(en!!))
+        b.append("'")
+        enum_env_fail(env, type_node, b.str())
+        b.free()
+        return err_ty(env.ck) as *Type?
+    }
+    return type_builtin(&env.ck.types, Builtin.BOOL) as *Type?
+}
+
+/**
+ * `p!!` — unwrap option.
+ */
+fn check_enum_force(env: *Env, node: *parse.Node): *Type? with (a: mem.Allocator) {
+    if node.kids.len == 0 {
+        enum_env_fail(env, node, "operator '!!' needs an option")
+        return err_ty(env.ck) as *Type?
+    }
+    val got = check_expr(env, node.kids.get(0), null)
+    if env.ck.stop {
+        return null
+    }
+    if got == null || is_err(got) {
+        return err_ty(env.ck) as *Type?
+    }
+    val peeled = peel_ty(got)
+    if peeled == null || peeled!!.kind != TypeKind.OPTION {
+        enum_env_fail(env, node, "operator '!!' needs an option")
+        return err_ty(env.ck) as *Type?
+    }
+    if peeled!!.elem == null {
+        return err_ty(env.ck) as *Type?
+    }
+    return peeled!!.elem
+}
+
+/**
+ * `p ?: fallback`.
+ */
+fn check_enum_elvis(env: *Env, node: *parse.Node): *Type? with (a: mem.Allocator) {
+    if node.kids.len < 2 {
+        enum_env_fail(env, node, "operator '?:' needs an option")
+        return err_ty(env.ck) as *Type?
+    }
+    val left = check_expr(env, node.kids.get(0), null)
+    if env.ck.stop {
+        return null
+    }
+    if left == null || is_err(left) {
+        check_expr(env, node.kids.get(1), null)
+        return err_ty(env.ck) as *Type?
+    }
+    val peeled = peel_ty(left)
+    if peeled == null || peeled!!.kind != TypeKind.OPTION {
+        enum_env_fail(env, node, "operator '?:' needs an option")
+        check_expr(env, node.kids.get(1), null)
+        return err_ty(env.ck) as *Type?
+    }
+    val inner = peeled!!.elem
+    val right = check_expr(env, node.kids.get(1), inner)
+    if env.ck.stop {
+        return null
+    }
+    if right == null || is_err(right) {
+        return err_ty(env.ck) as *Type?
+    }
+    return inner
+}
+
+/**
+ * `b?.n` — option of struct field.
+ */
+fn check_enum_safe(env: *Env, node: *parse.Node): *Type? with (a: mem.Allocator) {
+    if node.name.len == 0 {
+        enum_env_fail(env, node, "operator '?.' needs a field")
+        return err_ty(env.ck) as *Type?
+    }
+    if node.kids.len == 0 {
+        enum_env_fail(env, node, "operator '?.' needs an option")
+        return err_ty(env.ck) as *Type?
+    }
+    val base = check_expr(env, node.kids.get(0), null)
+    if env.ck.stop {
+        return null
+    }
+    if base == null || is_err(base) {
+        return err_ty(env.ck) as *Type?
+    }
+    val peeled = peel_ty(base)
+    if peeled == null || peeled!!.kind != TypeKind.OPTION {
+        enum_env_fail(env, node, "operator '?.' needs an option")
+        return err_ty(env.ck) as *Type?
+    }
+    var inner = peel_ty(peeled!!.elem)
+    var owner = inner
+    if owner != null && owner!!.kind == TypeKind.PTR {
+        owner = peel_ty(owner!!.elem)
+    }
+    var found: *Type? = null
+    if owner != null && owner!!.kind == TypeKind.STRUCT && owner!!.has_layout {
+        var i: usize = 0
+        for i < type_field_count(owner!!) {
+            val fld = type_field_at(owner!!, i)
+            if fld.name == node.name {
+                found = fld.field_type
+                break
+            }
+            i = i + 1
+        }
+        if found == null {
+            var b = strbuilder.empty()
+            b.append("unknown field '")
+            b.append(node.name)
+            b.append("'")
+            enum_env_fail(env, node, b.str())
+            b.free()
+            return err_ty(env.ck) as *Type?
+        }
+    } else if inner != null && (inner!!.kind == TypeKind.BYTES || inner!!.kind == TypeKind.SLICE ||
+        (inner!!.kind == TypeKind.DISTINCT && inner!!.name == "str")) &&
+        (node.name == "len" || node.name == "ptr") {
+        if node.name == "len" {
+            found = type_builtin(&env.ck.types, Builtin.USIZE) as *Type?
+        } else {
+            var elem: *Type? = null
+            var is_const = false
+            if inner!!.kind == TypeKind.BYTES {
+                elem = type_builtin(&env.ck.types, Builtin.U8) as *Type?
+                is_const = inner!!.is_const
+            } else if inner!!.kind == TypeKind.DISTINCT && inner!!.name == "str" {
+                elem = type_builtin(&env.ck.types, Builtin.U8) as *Type?
+                is_const = true
+            } else {
+                elem = inner!!.elem
+                is_const = inner!!.is_const
+            }
+            if elem == null {
+                return null
+            }
+            found = type_ptr(&env.ck.types, elem!!, is_const) as *Type?
+        }
+    } else {
+        enum_env_fail(env, node, "operator '?.' needs a struct field")
+        return err_ty(env.ck) as *Type?
+    }
+    if found == null {
+        return null
+    }
+    return type_option(&env.ck.types, found!!)
+}
+
+private fn field_is_unit(ty: *Type?): bool {
+    val u = peel_ty(ty)
+    return u != null && u!!.kind == TypeKind.UNIT
+}
+
+private fn enum_payload_free(en: *Type): bool {
+    if en.kind != TypeKind.ENUM || en.elem == null || type_variant_count(en) == 0 {
+        return false
+    }
+    var i: usize = 0
+    for i < type_variant_count(en) {
+        val v = type_variant_at(en, i)
+        var fi: usize = 0
+        for fi < v.field_count {
+            val fld = type_variant_field_at(en, v, fi)
+            if !field_is_unit(fld.field_type) {
+                return false
+            }
+            fi = fi + 1
+        }
+        i = i + 1
+    }
+    return true
+}
+
+private fn enum_has_field_named(en: *Type, name: str): bool {
+    var i: usize = 0
+    for i < type_variant_count(en) {
+        val v = type_variant_at(en, i)
+        var fi: usize = 0
+        for fi < v.field_count {
+            if type_variant_field_at(en, v, fi).name == name {
+                return true
+            }
+            fi = fi + 1
+        }
+        i = i + 1
+    }
+    return false
+}
+
+private fn variant_by_tag(en: *Type, bits: i64): i64 {
+    var i: usize = 0
+    for i < type_variant_count(en) {
+        if type_variant_at(en, i).tag == bits {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+private fn check_tag_cast(env: *Env, node: *parse.Node, got: *Type?, dest: *Type): (*Type?, i32) with (a: mem.Allocator) {
+    if got == null || is_err(got) {
+        return null, 0
+    }
+    val en = enum_from_expr_type(env.ck, env.job, dest as *Type?)
+    if env.ck.stop {
+        return null, -1
+    }
+    if en == null || !enum_payload_free(en!!) {
+        return null, 0
+    }
+    val src = peel_ty(got)
+    if src == null || (src!!.kind != TypeKind.INT && src!!.kind != TypeKind.UNTYPED_INT) {
+        return null, 0
+    }
+    if node.kids.len > 0 && is_int_lit_tree(node.kids.get(0)) {
+        var value: i64 = 0
+        val host = en!!.elem
+        if !const_fold_int(env.ck, env.job.file, node.kids.get(0), &value) {
+            env.ck.failed = true
+            return err_ty(env.ck) as *Type?, 1
+        }
+        if host != null && host!!.kind == TypeKind.INT && !const_int_fits(value, host!!) {
+            enum_env_fail(env, node, "constant does not fit")
+            return err_ty(env.ck) as *Type?, 1
+        }
+        if variant_by_tag(en!!, value) < 0 {
+            enum_env_fail(env, node, "constant does not fit")
+            return err_ty(env.ck) as *Type?, 1
+        }
+    } else if src!!.kind != TypeKind.INT {
+        return null, 0
+    }
+    return dest as *Type?, 1
+}
+
+/**
+ * 1 when cast is enum tag / tag->enum. 0 when not. -1 stop.
+ */
+fn check_enum_cast(env: *Env, node: *parse.Node): (*Type?, i32) with (a: mem.Allocator) {
+    if node.kids.len < 2 {
+        return null, 0
+    }
+    val dest = resolve_type(env.ck, env.job, node.kids.get(1))
+    if env.ck.stop {
+        return null, -1
+    }
+    if dest == null {
+        return null, 0
+    }
+    if is_err(dest) {
+        return dest, 1
+    }
+    val got = check_expr(env, node.kids.get(0), null)
+    if env.ck.stop {
+        return null, -1
+    }
+    val en = enum_from_expr_type(env.ck, env.job, got)
+    if env.ck.stop {
+        return null, -1
+    }
+    if en == null {
+        return check_tag_cast(env, node, got, dest!!)
+    }
+    if en!!.elem != null && same_ty(dest!!, en!!.elem!!) {
+        return dest, 1
+    }
+    var b = strbuilder.empty()
+    b.append("cannot cast ")
+    b.append(type_print(got))
+    b.append(" to ")
+    b.append(type_print(dest))
+    enum_env_fail(env, node, b.str())
+    b.free()
+    return err_ty(env.ck) as *Type?, 1
+}
+
+/**
+ * 1 when `.name` is the generated variant name. 0 when not. -1 stop.
+ */
+fn check_enum_name(env: *Env, member: *parse.Node, outer: *Type): (*Type?, i32) with (a: mem.Allocator) {
+    if member.name != "name" {
+        return null, 0
+    }
+    var en = peel_ty(outer as *Type?)
+    if en != null && en!!.kind == TypeKind.PTR {
+        en = peel_ty(en!!.elem)
+    }
+    if en == null || en!!.kind != TypeKind.ENUM || enum_has_field_named(en!!, "name") {
+        return null, 0
+    }
+    return str_ty(env.ck) as *Type?, 1
+}
+
+/**
+ * == / != allowed when every payload is bool/int/float/bytes/str/comparable enum.
+ */
+fn enum_eq_ok(ty: *Type, depth: i64): bool {
+    if depth > 8 || ty.kind != TypeKind.ENUM {
+        return false
+    }
+    var i: usize = 0
+    for i < type_variant_count(ty) {
+        val v = type_variant_at(ty, i)
+        var fi: usize = 0
+        for fi < v.field_count {
+            val fld = type_variant_field_at(ty, v, fi)
+            if fld.field_type == null {
+                return false
+            }
+            val under = peel_ty(fld.field_type)
+            if under == null || under!!.kind == TypeKind.UNIT {
+                fi = fi + 1
+                continue
+            }
+            if under!!.kind == TypeKind.BOOL || under!!.kind == TypeKind.INT || under!!.kind == TypeKind.FLOAT ||
+                under!!.kind == TypeKind.BYTES {
+                fi = fi + 1
+                continue
+            }
+            if under!!.kind == TypeKind.DISTINCT && under!!.name == "str" {
+                fi = fi + 1
+                continue
+            }
+            if under!!.kind == TypeKind.ENUM && enum_eq_ok(under!!, depth + 1) {
+                fi = fi + 1
+                continue
+            }
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// --- patterns / when / exhaustiveness ---
+
+private fn pat_inner(field: *parse.Node): *parse.Node? {
+    if field.kids.len == 0 {
+        return null
+    }
+    return field.kids.get(0) as *parse.Node?
+}
+
+private fn check_payload_fields(
+    env: *Env,
+    pat: *parse.Node,
+    ctor: str,
+    owner: *Type,
+    field_count: usize,
+    is_struct: bool,
+    variant: EnumVariant,
+    depth: i64,
+): bool with (a: mem.Allocator) {
+    if field_count == 0 {
+        if pat.kids.len > 0 {
+            var b = strbuilder.empty()
+            b.append("variant '")
+            b.append(ctor)
+            b.append("' has no fields")
+            enum_env_fail(env, pat, b.str())
+            b.free()
+            return false
+        }
+        return true
+    }
+    var filled = list.empty<bool>()
+    var i: usize = 0
+    for i < field_count {
+        filled.push(false)
+        i = i + 1
+    }
+    var positional: usize = 0
+    var ok = true
+    i = 0
+    for i < pat.kids.len && !env.ck.stop {
+        val field = pat.kids.get(i)
+        if !parse.is_pat_field(field) {
+            ok = false
+            i = i + 1
+            continue
+        }
+        var slot: i64 = -1
+        if field.name.len > 0 {
+            var f: usize = 0
+            for f < field_count {
+                var fname = ""
+                if is_struct {
+                    fname = type_field_at(owner, f).name
+                } else {
+                    fname = type_variant_field_at(owner, variant, f).name
+                }
+                if fname == field.name {
+                    slot = f as i64
+                    break
+                }
+                f = f + 1
+            }
+            if slot < 0 {
+                var b = strbuilder.empty()
+                b.append("unknown field '")
+                b.append(field.name)
+                b.append("'")
+                enum_env_fail(env, field, b.str())
+                b.free()
+                ok = false
+                i = i + 1
+                continue
+            }
+            if filled.get(slot as usize) {
+                var b = strbuilder.empty()
+                b.append("duplicate field '")
+                b.append(field.name)
+                b.append("'")
+                enum_env_fail(env, field, b.str())
+                b.free()
+                ok = false
+                i = i + 1
+                continue
+            }
+        } else {
+            for positional < field_count && filled.get(positional) {
+                positional = positional + 1
+            }
+            if positional >= field_count {
+                enum_env_fail(env, field, "too many fields")
+                ok = false
+                i = i + 1
+                continue
+            }
+            slot = positional as i64
+            positional = positional + 1
+        }
+        filled.set(slot as usize, true)
+        var want: *Type? = null
+        if is_struct {
+            want = type_field_at(owner, slot as usize).field_type
+        } else {
+            want = type_variant_field_at(owner, variant, slot as usize).field_type
+        }
+        val inner = pat_inner(field)
+        if inner == null || !check_pattern(env, inner!!, want, false, depth + 1) {
+            ok = false
+        }
+        i = i + 1
+    }
+    i = 0
+    for i < field_count {
+        if !filled.get(i) {
+            var fname = ""
+            if is_struct {
+                fname = type_field_at(owner, i).name
+            } else {
+                fname = type_variant_field_at(owner, variant, i).name
+            }
+            var b = strbuilder.empty()
+            b.append("missing field '")
+            b.append(fname)
+            b.append("'")
+            enum_env_fail(env, pat, b.str())
+            b.free()
+            ok = false
+        }
+        i = i + 1
+    }
+    return ok
+}
+
+private fn check_pattern(env: *Env, pat: *parse.Node, subject: *Type?, no_subject: bool, depth: i64): bool with (a: mem.Allocator) {
+    if env.ck.stop {
+        return false
+    }
+    if depth > 64 {
+        enum_env_fail(env, pat, "pattern is too deep")
+        return false
+    }
+    val subj_ty = peel_ty(subject)
+    if parse.is_pat_wildcard(pat) {
+        if no_subject {
+            enum_env_fail(env, pat, "wildcard needs a subject")
+            return false
+        }
+        return true
+    }
+    if no_subject {
+        if parse.is_pat_expr(pat) {
+            if pat.kids.len == 0 {
+                return false
+            }
+            val boolean = type_builtin(&env.ck.types, Builtin.BOOL) as *Type?
+            val got = check_expr(env, pat.kids.get(0), boolean)
+            return got != null && !is_err(got) && got!!.kind == TypeKind.BOOL
+        }
+        if parse.is_pat_bind(pat) {
+            val boolean = type_builtin(&env.ck.types, Builtin.BOOL)
+            val sym = lookup_name(env, pat.name)
+            if sym == null || !load.is_symbol_value(sym!!) {
+                return false
+            }
+            if !wait_for_symbol(env.ck, env.job, sym!!, false) {
+                return false
+            }
+            val ty = get_sema(sym!!)
+            return ty != null && !is_err(ty) && same_ty(ty!!, boolean)
+        }
+        enum_env_fail(env, pat, "variant pattern needs a subject")
+        return false
+    }
+    if subj_ty == null || is_err(subj_ty) {
+        return false
+    }
+    if parse.is_pat_bind(pat) {
+        if subj_ty!!.kind == TypeKind.ENUM {
+            val index = find_variant(subj_ty!!, pat.name)
+            if index >= 0 && payload_free_variant(subj_ty!!, index) {
+                mark_variant_pat(pat)
+                return true
+            }
+        }
+        if subj_ty!!.kind == TypeKind.OPTION && pat.name == "None" {
+            return true
+        }
+        return true
+    }
+    if parse.is_pat_expr(pat) {
+        if pat.kids.len == 0 {
+            return false
+        }
+        val got = check_expr(env, pat.kids.get(0), subject)
+        if env.ck.stop {
+            return false
+        }
+        return got != null && !is_err(got)
+    }
+    if parse.is_pat_in(pat) {
+        if subj_ty!!.kind != TypeKind.INT {
+            enum_env_fail(env, pat, "in pattern needs an integer")
+            return false
+        }
+        if pat.kids.len == 0 {
+            enum_env_fail(env, pat, "in pattern needs a range")
+            return false
+        }
+        val range = pat.kids.get(0)
+        if !parse.is_binary(range) || range.text != ".." || range.kids.len < 2 {
+            enum_env_fail(env, pat, "in pattern needs a range")
+            return false
+        }
+        val lo = check_expr(env, range.kids.get(0), subject)
+        val hi = check_expr(env, range.kids.get(1), subject)
+        return lo != null && hi != null && !is_err(lo) && !is_err(hi)
+    }
+    if parse.is_pat_is(pat) {
+        val iface = check_interface_pat_is(env.ck, env.job, pat, subj_ty!!)
+        if iface < 0 || env.ck.stop {
+            return false
+        }
+        if iface > 0 {
+            return true
+        }
+        if subj_ty!!.kind != TypeKind.ENUM {
+            enum_env_fail(env, pat, "is needs an enum")
+            return false
+        }
+        if pat.kids.len == 0 {
+            return false
+        }
+        val type_node = pat.kids.get(0)
+        var name = ""
+        if parse.is_type_name(type_node) {
+            name = path_last(type_node.name)
+        }
+        val index = find_variant(subj_ty!!, name)
+        if index < 0 {
+            var b = strbuilder.empty()
+            b.append("'")
+            if name.len > 0 {
+                b.append(name)
+            } else {
+                b.append("?")
+            }
+            b.append("' is not a variant of '")
+            b.append(type_label(subj_ty!!))
+            b.append("'")
+            enum_env_fail(env, type_node, b.str())
+            b.free()
+            return false
+        }
+        mark_variant_pat(pat)
+        return true
+    }
+    if parse.is_pat_variant(pat) {
+        val name = pat.name
+        if subj_ty!!.kind == TypeKind.OPTION && name == "Some" {
+            if pat.kids.len != 1 {
+                enum_env_fail(env, pat, "Some takes one field")
+                return false
+            }
+            val field = pat.kids.get(0)
+            if !parse.is_pat_field(field) {
+                enum_env_fail(env, field, "Some takes one field")
+                return false
+            }
+            if field.name.len > 0 && field.name != "value" {
+                var b = strbuilder.empty()
+                b.append("unknown field '")
+                b.append(field.name)
+                b.append("'")
+                enum_env_fail(env, field, b.str())
+                b.free()
+                return false
+            }
+            val inner = pat_inner(field)
+            if inner == null {
+                return false
+            }
+            return check_pattern(env, inner!!, subj_ty!!.elem, false, depth + 1)
+        }
+        if subj_ty!!.kind == TypeKind.OPTION && name == "None" {
+            if pat.kids.len != 0 {
+                enum_env_fail(env, pat, "None has no fields")
+                return false
+            }
+            return true
+        }
+        if subj_ty!!.kind == TypeKind.ENUM {
+            val index = find_variant(subj_ty!!, name)
+            if index < 0 {
+                var b = strbuilder.empty()
+                b.append("unknown variant '")
+                if name.len > 0 {
+                    b.append(name)
+                } else {
+                    b.append("?")
+                }
+                b.append("'")
+                enum_env_fail(env, pat, b.str())
+                b.free()
+                return false
+            }
+            mark_variant_pat(pat)
+            val variant = type_variant_at(subj_ty!!, index as usize)
+            return check_payload_fields(env, pat, variant.name, subj_ty!!, variant.field_count, false, variant, depth)
+        }
+        if subj_ty!!.kind == TypeKind.STRUCT && name.len > 0 && subj_ty!!.name == name {
+            var empty: EnumVariant
+            empty.name = ""
+            empty.tag = 0
+            empty.decl = null
+            empty.field_start = 0
+            empty.field_count = 0
+            return check_payload_fields(env, pat, subj_ty!!.name, subj_ty!!, type_field_count(subj_ty!!), true, empty, depth)
+        }
+        var b = strbuilder.empty()
+        b.append("unknown variant '")
+        if name.len > 0 {
+            b.append(name)
+        } else {
+            b.append("?")
+        }
+        b.append("'")
+        enum_env_fail(env, pat, b.str())
+        b.free()
+        return false
+    }
+    enum_env_fail(env, pat, "pattern is not checked yet")
+    return false
+}
+
+private fn field_name_binds(field: *parse.Node): bool {
+    if !parse.is_pat_field(field) || field.name.len == 0 || is_discard_name(field.name) {
+        return false
+    }
+    val inner = pat_inner(field)
+    if inner == null {
+        return false
+    }
+    if parse.is_pat_wildcard(inner!!) || parse.is_pat_bind(inner!!) {
+        return false
+    }
+    return true
+}
+
+private fn arm_has_value_bind(pat: *parse.Node): bool {
+    if parse.is_pat_bind(pat) && !variant_is_marked(pat) {
+        if pat.name == "None" {
+            return false
+        }
+        return true
+    }
+    if parse.is_pat_variant(pat) {
+        for field in pat.kids.items() {
+            if !parse.is_pat_field(field) {
+                continue
+            }
+            if field_name_binds(field) {
+                return true
+            }
+            val inner = pat_inner(field)
+            if inner != null && arm_has_value_bind(inner!!) {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+private fn bind_pattern(env: *Env, pat: *parse.Node, subject: *Type?) with (a: mem.Allocator) {
+    if env.ck.stop {
+        return
+    }
+    val subj_ty = peel_ty(subject)
+    if parse.is_pat_bind(pat) && !variant_is_marked(pat) {
+        if pat.name == "None" && subj_ty != null && subj_ty!!.kind == TypeKind.OPTION {
+            return
+        }
+        if !is_discard_name(pat.name) && subject != null {
+            val s = bind_local(env, pat, load.kind_constant(), pat.name, subject!!)
+            if s != null {
+                note_assigned(s!!)
+            }
+        }
+        return
+    }
+    if parse.is_pat_variant(pat) {
+        if subj_ty == null {
+            return
+        }
+        if subj_ty!!.kind == TypeKind.OPTION && pat.name == "Some" && pat.kids.len == 1 {
+            val field = pat.kids.get(0)
+            val inner = pat_inner(field)
+            if inner != null {
+                bind_pattern(env, inner!!, subj_ty!!.elem)
+            }
+            if field_name_binds(field) && subj_ty!!.elem != null {
+                val s = bind_local(env, field, load.kind_constant(), field.name, subj_ty!!.elem!!)
+                if s != null {
+                    note_assigned(s!!)
+                }
+            }
+            return
+        }
+        if subj_ty!!.kind == TypeKind.ENUM {
+            val index = find_variant(subj_ty!!, pat.name)
+            if index < 0 {
+                return
+            }
+            val variant = type_variant_at(subj_ty!!, index as usize)
+            var filled = list.empty<bool>()
+            var i: usize = 0
+            for i < variant.field_count {
+                filled.push(false)
+                i = i + 1
+            }
+            var positional: usize = 0
+            i = 0
+            for i < pat.kids.len {
+                val field = pat.kids.get(i)
+                if !parse.is_pat_field(field) {
+                    i = i + 1
+                    continue
+                }
+                var slot: i64 = -1
+                if field.name.len > 0 {
+                    var f: usize = 0
+                    for f < variant.field_count {
+                        if type_variant_field_at(subj_ty!!, variant, f).name == field.name {
+                            slot = f as i64
+                            break
+                        }
+                        f = f + 1
+                    }
+                } else {
+                    for positional < variant.field_count && filled.get(positional) {
+                        positional = positional + 1
+                    }
+                    if positional < variant.field_count {
+                        slot = positional as i64
+                        positional = positional + 1
+                    }
+                }
+                if slot < 0 || filled.get(slot as usize) {
+                    i = i + 1
+                    continue
+                }
+                filled.set(slot as usize, true)
+                val fld = type_variant_field_at(subj_ty!!, variant, slot as usize)
+                val inner = pat_inner(field)
+                if inner != null {
+                    bind_pattern(env, inner!!, fld.field_type)
+                }
+                if field_name_binds(field) && fld.field_type != null {
+                    val s = bind_local(env, field, load.kind_constant(), field.name, fld.field_type!!)
+                    if s != null {
+                        note_assigned(s!!)
+                    }
+                }
+                i = i + 1
+            }
+            return
+        }
+        if subj_ty!!.kind == TypeKind.STRUCT && pat.name == subj_ty!!.name {
+            var filled = list.empty<bool>()
+            var i: usize = 0
+            val n = type_field_count(subj_ty!!)
+            for i < n {
+                filled.push(false)
+                i = i + 1
+            }
+            var positional: usize = 0
+            i = 0
+            for i < pat.kids.len {
+                val field = pat.kids.get(i)
+                if !parse.is_pat_field(field) {
+                    i = i + 1
+                    continue
+                }
+                var slot: i64 = -1
+                if field.name.len > 0 {
+                    var f: usize = 0
+                    for f < n {
+                        if type_field_at(subj_ty!!, f).name == field.name {
+                            slot = f as i64
+                            break
+                        }
+                        f = f + 1
+                    }
+                } else {
+                    for positional < n && filled.get(positional) {
+                        positional = positional + 1
+                    }
+                    if positional < n {
+                        slot = positional as i64
+                        positional = positional + 1
+                    }
+                }
+                if slot < 0 || filled.get(slot as usize) {
+                    i = i + 1
+                    continue
+                }
+                filled.set(slot as usize, true)
+                val fld = type_field_at(subj_ty!!, slot as usize)
+                val inner = pat_inner(field)
+                if inner != null {
+                    bind_pattern(env, inner!!, fld.field_type)
+                }
+                if field_name_binds(field) && fld.field_type != null {
+                    val s = bind_local(env, field, load.kind_constant(), field.name, fld.field_type!!)
+                    if s != null {
+                        note_assigned(s!!)
+                    }
+                }
+                i = i + 1
+            }
+        }
+    }
+}
+
+struct CovRow {
+    cols: list.List<*parse.Node?>
+}
+
+private fn col_wild(pat: *parse.Node?, ty: *Type?): bool {
+    if pat == null || parse.is_pat_wildcard(pat!!) {
+        return true
+    }
+    if !parse.is_pat_bind(pat!!) {
+        return false
+    }
+    if variant_is_marked(pat!!) {
+        return false
+    }
+    val peeled = peel_ty(ty)
+    if peeled != null && peeled!!.kind == TypeKind.OPTION && pat!!.name == "None" {
+        return false
+    }
+    return true
+}
+
+private fn pat_ctor_index(pat: *parse.Node?, en: *Type): i64 {
+    if pat == null || en.kind != TypeKind.ENUM {
+        return -1
+    }
+    if parse.is_pat_variant(pat!!) {
+        return find_variant(en, pat!!.name)
+    }
+    if parse.is_pat_is(pat!!) {
+        if pat!!.kids.len == 0 {
+            return -1
+        }
+        val tn = pat!!.kids.get(0)
+        if parse.is_type_name(tn) {
+            return find_variant(en, path_last(tn.name))
+        }
+        return -1
+    }
+    if parse.is_pat_bind(pat!!) && variant_is_marked(pat!!) {
+        return find_variant(en, pat!!.name)
+    }
+    return -1
+}
+
+private fn fill_pat_slots_struct(pat: *parse.Node, owner: *Type, out: *list.List<*parse.Node?>): bool with (a: mem.Allocator) {
+    val count = type_field_count(owner)
+    *out = list.empty<*parse.Node?>()
+    var i: usize = 0
+    for i < count {
+        out.push(null)
+        i = i + 1
+    }
+    if count == 0 {
+        return pat.kids.len == 0
+    }
+    var filled = list.empty<bool>()
+    i = 0
+    for i < count {
+        filled.push(false)
+        i = i + 1
+    }
+    var positional: usize = 0
+    i = 0
+    for i < pat.kids.len {
+        val field = pat.kids.get(i)
+        if !parse.is_pat_field(field) {
+            return false
+        }
+        var slot: i64 = -1
+        if field.name.len > 0 {
+            var f: usize = 0
+            for f < count {
+                if type_field_at(owner, f).name == field.name {
+                    slot = f as i64
+                    break
+                }
+                f = f + 1
+            }
+        } else {
+            for positional < count && filled.get(positional) {
+                positional = positional + 1
+            }
+            if positional < count {
+                slot = positional as i64
+                positional = positional + 1
+            }
+        }
+        if slot < 0 || filled.get(slot as usize) {
+            return false
+        }
+        filled.set(slot as usize, true)
+        out.set(slot as usize, pat_inner(field))
+        i = i + 1
+    }
+    i = 0
+    for i < count {
+        if !filled.get(i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+private fn fill_pat_slots_variant(pat: *parse.Node, en: *Type, variant: EnumVariant, out: *list.List<*parse.Node?>): bool with (a: mem.Allocator) {
+    val count = variant.field_count
+    *out = list.empty<*parse.Node?>()
+    var i: usize = 0
+    for i < count {
+        out.push(null)
+        i = i + 1
+    }
+    if count == 0 {
+        return pat.kids.len == 0
+    }
+    var filled = list.empty<bool>()
+    i = 0
+    for i < count {
+        filled.push(false)
+        i = i + 1
+    }
+    var positional: usize = 0
+    i = 0
+    for i < pat.kids.len {
+        val field = pat.kids.get(i)
+        if !parse.is_pat_field(field) {
+            return false
+        }
+        var slot: i64 = -1
+        if field.name.len > 0 {
+            var f: usize = 0
+            for f < count {
+                if type_variant_field_at(en, variant, f).name == field.name {
+                    slot = f as i64
+                    break
+                }
+                f = f + 1
+            }
+        } else {
+            for positional < count && filled.get(positional) {
+                positional = positional + 1
+            }
+            if positional < count {
+                slot = positional as i64
+                positional = positional + 1
+            }
+        }
+        if slot < 0 || filled.get(slot as usize) {
+            return false
+        }
+        filled.set(slot as usize, true)
+        out.set(slot as usize, pat_inner(field))
+        i = i + 1
+    }
+    i = 0
+    for i < count {
+        if !filled.get(i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+private fn row_cols(prefix: list.List<*parse.Node?>, row: CovRow): list.List<*parse.Node?> with (a: mem.Allocator) {
+    var cols = list.empty<*parse.Node?>()
+    for p in prefix.items() {
+        cols.push(p)
+    }
+    var i: usize = 1
+    for i < row.cols.len {
+        cols.push(row.cols.get(i))
+        i = i + 1
+    }
+    return cols
+}
+
+private fn row_covers_all(row: CovRow, types: list.List<*Type?>): bool {
+    if row.cols.len < types.len {
+        return false
+    }
+    if types.len == 0 {
+        return true
+    }
+    var c: usize = 0
+    for c < types.len {
+        if !col_wild(row.cols.get(c), types.get(c)) {
+            return false
+        }
+        c = c + 1
+    }
+    return true
+}
+
+private fn rows_cover_variant(
+    env: *Env,
+    rows: list.List<CovRow>,
+    en: *Type,
+    index: usize,
+    tail_types: list.List<*Type?>,
+    depth: i64,
+): bool with (a: mem.Allocator) {
+    if env.ck.stop || depth > 64 || index >= type_variant_count(en) {
+        return false
+    }
+    val variant = type_variant_at(en, index)
+    val nf = variant.field_count
+    var out = list.empty<CovRow>()
+    var slots = list.empty<*parse.Node?>()
+    var i: usize = 0
+    for i < rows.len && !env.ck.stop {
+        val row = rows.get(i)
+        if row.cols.len == 0 {
+            i = i + 1
+            continue
+        }
+        val pat = row.cols.get(0)
+        var prefix = list.empty<*parse.Node?>()
+        var nprefix: usize = 0
+        if col_wild(pat, en as *Type?) {
+            var w: usize = 0
+            for w < nf {
+                prefix.push(null)
+                w = w + 1
+            }
+            nprefix = nf
+        } else {
+            val ctor = pat_ctor_index(pat, en)
+            if ctor != index as i64 {
+                i = i + 1
+                continue
+            }
+            if nf == 0 || pat == null || !parse.is_pat_variant(pat!!) {
+                var w: usize = 0
+                for w < nf {
+                    prefix.push(null)
+                    w = w + 1
+                }
+                nprefix = nf
+            } else if !fill_pat_slots_variant(pat!!, en, variant, &slots) {
+                i = i + 1
+                continue
+            } else {
+                nprefix = nf
+                prefix = slots
+            }
+        }
+        var nrow: CovRow
+        nrow.cols = row_cols(prefix, row)
+        out.push(nrow)
+        i = i + 1
+    }
+    if env.ck.stop {
+        return false
+    }
+    var next_types = list.empty<*Type?>()
+    var t: usize = 0
+    for t < nf {
+        next_types.push(type_variant_field_at(en, variant, t).field_type)
+        t = t + 1
+    }
+    for tt in tail_types.items() {
+        next_types.push(tt)
+    }
+    if next_types.len == 0 {
+        return out.len > 0
+    }
+    return rows_cover(env, out, next_types, depth + 1)
+}
+
+private fn rows_cover(env: *Env, rows: list.List<CovRow>, types: list.List<*Type?>, depth: i64): bool with (a: mem.Allocator) {
+    if env.ck.stop {
+        return false
+    }
+    if types.len == 0 {
+        return rows.len > 0
+    }
+    if depth > 64 || rows.len == 0 {
+        return false
+    }
+    for row in rows.items() {
+        if row_covers_all(row, types) {
+            return true
+        }
+    }
+    val type0 = peel_ty(types.get(0))
+    if type0 == null {
+        return false
+    }
+    if type0!!.kind == TypeKind.ENUM {
+        if type_variant_count(type0!!) == 0 {
+            return false
+        }
+        var tail = list.empty<*Type?>()
+        var t: usize = 1
+        for t < types.len {
+            tail.push(types.get(t))
+            t = t + 1
+        }
+        var v: usize = 0
+        for v < type_variant_count(type0!!) {
+            if !rows_cover_variant(env, rows, type0!!, v, tail, depth) {
+                return false
+            }
+            v = v + 1
+        }
+        return !env.ck.stop
+    }
+    if type0!!.kind == TypeKind.OPTION {
+        var some_rows = list.empty<CovRow>()
+        var none_rows = list.empty<CovRow>()
+        var i: usize = 0
+        for i < rows.len && !env.ck.stop {
+            val row = rows.get(i)
+            var pat: *parse.Node? = null
+            if row.cols.len > 0 {
+                pat = row.cols.get(0)
+            }
+            if col_wild(pat, type0) {
+                var prefix = list.empty<*parse.Node?>()
+                prefix.push(null)
+                var srow: CovRow
+                srow.cols = row_cols(prefix, row)
+                some_rows.push(srow)
+                var nrow: CovRow
+                nrow.cols = list.empty<*parse.Node?>()
+                var c: usize = 1
+                for c < row.cols.len {
+                    nrow.cols.push(row.cols.get(c))
+                    c = c + 1
+                }
+                none_rows.push(nrow)
+                i = i + 1
+                continue
+            }
+            if pat != null && parse.is_pat_variant(pat!!) && pat!!.name == "Some" && pat!!.kids.len == 1 {
+                val field = pat!!.kids.get(0)
+                val inner = pat_inner(field)
+                var prefix = list.empty<*parse.Node?>()
+                prefix.push(inner)
+                var srow: CovRow
+                srow.cols = row_cols(prefix, row)
+                some_rows.push(srow)
+                i = i + 1
+                continue
+            }
+            if pat != null &&
+                ((parse.is_pat_bind(pat!!) && pat!!.name == "None" && !variant_is_marked(pat!!)) ||
+                    (parse.is_pat_expr(pat!!) && pat!!.kids.len > 0 && parse.is_null_lit(pat!!.kids.get(0))) ||
+                    (parse.is_pat_variant(pat!!) && pat!!.name == "None" && pat!!.kids.len == 0)) {
+                var nrow: CovRow
+                nrow.cols = list.empty<*parse.Node?>()
+                var c: usize = 1
+                for c < row.cols.len {
+                    nrow.cols.push(row.cols.get(c))
+                    c = c + 1
+                }
+                none_rows.push(nrow)
+            }
+            i = i + 1
+        }
+        if env.ck.stop {
+            return false
+        }
+        var some_types = list.empty<*Type?>()
+        some_types.push(type0!!.elem)
+        var t: usize = 1
+        for t < types.len {
+            some_types.push(types.get(t))
+            t = t + 1
+        }
+        if !rows_cover(env, some_rows, some_types, depth + 1) {
+            return false
+        }
+        var none_types = list.empty<*Type?>()
+        t = 1
+        for t < types.len {
+            none_types.push(types.get(t))
+            t = t + 1
+        }
+        return rows_cover(env, none_rows, none_types, depth + 1)
+    }
+    if type0!!.kind == TypeKind.STRUCT {
+        val nf = type_field_count(type0!!)
+        var out = list.empty<CovRow>()
+        var slots = list.empty<*parse.Node?>()
+        var i: usize = 0
+        for i < rows.len && !env.ck.stop {
+            val row = rows.get(i)
+            var pat: *parse.Node? = null
+            if row.cols.len > 0 {
+                pat = row.cols.get(0)
+            }
+            var prefix = list.empty<*parse.Node?>()
+            if col_wild(pat, type0) {
+                var w: usize = 0
+                for w < nf {
+                    prefix.push(null)
+                    w = w + 1
+                }
+            } else if pat != null && parse.is_pat_variant(pat!!) && type0!!.name.len > 0 && pat!!.name == type0!!.name {
+                if !fill_pat_slots_struct(pat!!, type0!!, &slots) {
+                    i = i + 1
+                    continue
+                }
+                prefix = slots
+            } else {
+                i = i + 1
+                continue
+            }
+            var nrow: CovRow
+            nrow.cols = row_cols(prefix, row)
+            out.push(nrow)
+            i = i + 1
+        }
+        if env.ck.stop {
+            return false
+        }
+        var next_types = list.empty<*Type?>()
+        var t: usize = 0
+        for t < nf {
+            next_types.push(type_field_at(type0!!, t).field_type)
+            t = t + 1
+        }
+        t = 1
+        for t < types.len {
+            next_types.push(types.get(t))
+            t = t + 1
+        }
+        if next_types.len == 0 {
+            return out.len > 0
+        }
+        return rows_cover(env, out, next_types, depth + 1)
+    }
+    var out = list.empty<CovRow>()
+    var i: usize = 0
+    for i < rows.len {
+        val row = rows.get(i)
+        var pat: *parse.Node? = null
+        if row.cols.len > 0 {
+            pat = row.cols.get(0)
+        }
+        if !col_wild(pat, type0) {
+            i = i + 1
+            continue
+        }
+        var nrow: CovRow
+        nrow.cols = list.empty<*parse.Node?>()
+        var c: usize = 1
+        for c < row.cols.len {
+            nrow.cols.push(row.cols.get(c))
+            c = c + 1
+        }
+        out.push(nrow)
+        i = i + 1
+    }
+    var next_types = list.empty<*Type?>()
+    var t: usize = 1
+    for t < types.len {
+        next_types.push(types.get(t))
+        t = t + 1
+    }
+    return rows_cover(env, out, next_types, depth + 1)
+}
+
+private fn rows_from_pats(pats: list.List<*parse.Node>): list.List<CovRow> with (a: mem.Allocator) {
+    var rows = list.empty<CovRow>()
+    for p in pats.items() {
+        var row: CovRow
+        row.cols = list.empty<*parse.Node?>()
+        row.cols.push(p as *parse.Node?)
+        rows.push(row)
+    }
+    return rows
+}
+
+private fn patterns_cover(env: *Env, pats: list.List<*parse.Node>, ty: *Type): bool with (a: mem.Allocator) {
+    if pats.len == 0 {
+        return false
+    }
+    val rows = rows_from_pats(pats)
+    var types = list.empty<*Type?>()
+    types.push(ty as *Type?)
+    return rows_cover(env, rows, types, 0)
+}
+
+private fn patterns_cover_variant(env: *Env, pats: list.List<*parse.Node>, en: *Type, index: usize): bool with (a: mem.Allocator) {
+    if pats.len == 0 {
+        return false
+    }
+    val rows = rows_from_pats(pats)
+    var tail = list.empty<*Type?>()
+    return rows_cover_variant(env, rows, en, index, tail, 0)
+}
+
+private fn when_has_else(node: *parse.Node): bool {
+    for kid in node.kids.items() {
+        if parse.is_when_arm(kid) && kid.head == 0 {
+            return true
+        }
+    }
+    return false
+}
+
+private fn when_patterns(node: *parse.Node): list.List<*parse.Node> with (a: mem.Allocator) {
+    var pats = list.empty<*parse.Node>()
+    for kid in node.kids.items() {
+        if !parse.is_when_arm(kid) {
+            continue
+        }
+        val ncond = kid.head as usize
+        var c: usize = 0
+        for c < ncond && c < kid.kids.len {
+            pats.push(kid.kids.get(c))
+            c = c + 1
+        }
+    }
+    return pats
+}
+
+private fn report_enum_gaps(env: *Env, node: *parse.Node, en: *Type, bad: *bool) with (a: mem.Allocator) {
+    if env.ck.stop || when_has_else(node) {
+        return
+    }
+    val pats = when_patterns(node)
+    var v: usize = 0
+    for v < type_variant_count(en) {
+        if patterns_cover_variant(env, pats, en, v) {
+            v = v + 1
+            continue
+        }
+        if env.ck.stop {
+            return
+        }
+        val variant = type_variant_at(en, v)
+        var b = strbuilder.empty()
+        b.append("when does not cover '")
+        b.append(variant.name)
+        b.append("'")
+        enum_env_fail(env, node, b.str())
+        b.free()
+        *bad = true
+        v = v + 1
+    }
+}
+
+private fn patterns_cover_some(env: *Env, pats: list.List<*parse.Node>, option: *Type): bool with (a: mem.Allocator) {
+    for p in pats.items() {
+        if col_wild(p as *parse.Node?, option as *Type?) {
+            return true
+        }
+    }
+    var inners = list.empty<*parse.Node>()
+    for p in pats.items() {
+        if !parse.is_pat_variant(p) || p.name != "Some" || p.kids.len != 1 {
+            continue
+        }
+        val field = p.kids.get(0)
+        val inner = pat_inner(field)
+        if inner == null {
+            continue
+        }
+        inners.push(inner!!)
+    }
+    if inners.len == 0 || option.elem == null {
+        return false
+    }
+    return patterns_cover(env, inners, option.elem!!)
+}
+
+private fn patterns_cover_none(pats: list.List<*parse.Node>, option: *Type): bool {
+    for p in pats.items() {
+        if col_wild(p as *parse.Node?, option as *Type?) {
+            return true
+        }
+        if parse.is_pat_bind(p) && p.name == "None" && !variant_is_marked(p) {
+            return true
+        }
+        if parse.is_pat_expr(p) && p.kids.len > 0 && parse.is_null_lit(p.kids.get(0)) {
+            return true
+        }
+        if parse.is_pat_variant(p) && p.name == "None" && p.kids.len == 0 {
+            return true
+        }
+    }
+    return false
+}
+
+private fn report_option_gaps(env: *Env, node: *parse.Node, option: *Type, bad: *bool) with (a: mem.Allocator) {
+    if env.ck.stop || when_has_else(node) {
+        return
+    }
+    val pats = when_patterns(node)
+    if !patterns_cover_some(env, pats, option) {
+        if env.ck.stop {
+            return
+        }
+        enum_env_fail(env, node, "when does not cover 'Some'")
+        *bad = true
+    }
+    if !patterns_cover_none(pats, option) {
+        enum_env_fail(env, node, "when does not cover 'None'")
+        *bad = true
+    }
+}
+
+private fn pat_covers_type(pat: *parse.Node, ty: *Type?): bool {
+    val subj_ty = peel_ty(ty)
+    if parse.is_pat_wildcard(pat) {
+        return true
+    }
+    if parse.is_pat_bind(pat) {
+        if variant_is_marked(pat) {
+            return false
+        }
+        if subj_ty != null && subj_ty!!.kind == TypeKind.OPTION && pat.name == "None" {
+            return false
+        }
+        return true
+    }
+    if subj_ty == null {
+        return false
+    }
+    if subj_ty!!.kind == TypeKind.ENUM && parse.is_pat_variant(pat) && type_variant_count(subj_ty!!) == 1 {
+        val index = find_variant(subj_ty!!, pat.name)
+        return index == 0
+    }
+    if subj_ty!!.kind == TypeKind.OPTION && parse.is_pat_variant(pat) && pat.name == "Some" && pat.kids.len == 1 {
+        val field = pat.kids.get(0)
+        val inner = pat_inner(field)
+        if inner == null {
+            return false
+        }
+        return pat_covers_type(inner!!, subj_ty!!.elem)
+    }
+    return false
+}
+
+private fn arm_is_total(arm: *parse.Node, subject: *Type?, no_subject: bool): bool {
+    if arm.head == 0 {
+        return true
+    }
+    if no_subject {
+        return false
+    }
+    val ncond = arm.head as usize
+    var i: usize = 0
+    for i < ncond && i < arm.kids.len {
+        val pat = arm.kids.get(i)
+        if parse.is_pat_wildcard(pat) {
+            return true
+        }
+        if parse.is_pat_bind(pat) && !variant_is_marked(pat) && pat_covers_type(pat, subject) {
+            val peeled = peel_ty(subject)
+            if !(peeled != null && peeled!!.kind == TypeKind.OPTION && pat.name == "None") {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+private fn unify_arm(env: *Env, at: *parse.Node, result: *Type?, got: *Type?, bad: *bool): *Type? with (a: mem.Allocator) {
+    if got == null || is_err(got) {
+        *bad = true
+        return result
+    }
+    if result == null || is_err(result) {
+        return got
+    }
+    if !same_ty(result!!, got!!) {
+        var b = strbuilder.empty()
+        b.append("type mismatch: expected ")
+        b.append(type_print(result))
+        b.append(", got ")
+        b.append(type_print(got))
+        enum_env_fail(env, at, b.str())
+        b.free()
+        *bad = true
+    }
+    return result
+}
+
+private fn when_subject_and_arms(node: *parse.Node): (*parse.Node?, list.List<*parse.Node>) with (a: mem.Allocator) {
+    var arms = list.empty<*parse.Node>()
+    var subject: *parse.Node? = null
+    var i: usize = 0
+    for i < node.kids.len {
+        val kid = node.kids.get(i)
+        if parse.is_when_arm(kid) {
+            arms.push(kid)
+        } else if subject == null && arms.len == 0 {
+            subject = kid as *parse.Node?
+        }
+        i = i + 1
+    }
+    return subject, arms
+}
+
+private fn check_when_arm_body(env: *Env, body: *parse.Node?, target: *Type?, as_value: bool): (*Type?, bool) with (a: mem.Allocator) {
+    if body == null {
+        enum_env_fail(env, env.job.decl, "when arm needs a body")
+        return err_ty(env.ck) as *Type?, true
+    }
+    if !as_value {
+        if parse.is_block(body!!) {
+            check_block(env, body!!)
+        } else {
+            check_expr(env, body!!, null)
+        }
+        return unit_ty(env.ck) as *Type?, env.reachable
+    }
+    if parse.is_block(body!!) {
+        // Value when with block: check as expression block if needed; treat last expr.
+        check_block(env, body!!)
+        return unit_ty(env.ck) as *Type?, env.reachable
+    }
+    val got = check_expr(env, body!!, target)
+    return got, env.reachable
+}
+
+/**
+ * `when` as value or statement.
+ */
+fn check_enum_when(env: *Env, node: *parse.Node, target: *Type?, as_value: bool): *Type? with (a: mem.Allocator) {
+    val (subject_node, arms) = when_subject_and_arms(node)
+    if arms.len == 0 {
+        enum_env_fail(env, node, "when needs an arm")
+        return err_ty(env.ck) as *Type?
+    }
+    var bad = false
+    var subject: *Type? = null
+    val no_subject = subject_node == null
+    if !no_subject {
+        subject = check_expr(env, subject_node!!, null)
+        if env.ck.stop {
+            return null
+        }
+        if subject == null || is_err(subject) {
+            bad = true
+            subject = null
+        }
+    }
+    var result: *Type? = null
+    var all_end = true
+    var saw_else = false
+    var ai: usize = 0
+    val parent = env.scope
+    for ai < arms.len && !env.ck.stop {
+        val arm = arms.get(ai)
+        val ncond = arm.head as usize
+        val is_else = ncond == 0
+        if is_else {
+            if saw_else || ai + 1 != arms.len {
+                enum_env_fail(env, arm, "else must be the last arm")
+                bad = true
+            }
+            saw_else = true
+        }
+        val child = new_scope(env, parent)
+        if child == null {
+            return null
+        }
+        var c: usize = 0
+        var or_bind = false
+        for c < ncond && c < arm.kids.len && !env.ck.stop {
+            val pat = arm.kids.get(c)
+            if !check_pattern(env, pat, subject, no_subject, 0) {
+                bad = true
+            }
+            if ncond > 1 && arm_has_value_bind(pat) {
+                or_bind = true
+            }
+            c = c + 1
+        }
+        if or_bind {
+            enum_env_fail(env, arm, "or-pattern cannot bind a name")
+            bad = true
+        }
+        var nested = *env
+        nested.scope = child
+        nested.reachable = true
+        if !or_bind && ncond == 1 && arm.kids.len > 0 {
+            bind_pattern(&nested, arm.kids.get(0), subject)
+        }
+        var body: *parse.Node? = null
+        if ncond < arm.kids.len {
+            body = arm.kids.get(ncond) as *parse.Node?
+        }
+        var want: *Type? = null
+        if as_value {
+            if result != null {
+                want = result
+            } else {
+                want = target
+            }
+        }
+        var only: *parse.Node? = null
+        if !or_bind && ncond == 1 && arm.kids.len > 0 {
+            only = arm.kids.get(0) as *parse.Node?
+        }
+        var narrow = iface_narrow_pat(&nested, subject_node, only)
+        val (arm_ty, reaches) = check_when_arm_body(&nested, body, want, as_value)
+        iface_narrow_leave(&narrow)
+        if env.ck.stop {
+            return null
+        }
+        env.reachable = nested.reachable
+        if as_value {
+            result = unify_arm(env, arm, result, arm_ty, &bad)
+        }
+        if reaches {
+            all_end = false
+        }
+        ai = ai + 1
+    }
+    if env.ck.stop {
+        return null
+    }
+    val peeled = peel_ty(subject)
+    if peeled != null && peeled!!.kind == TypeKind.ENUM {
+        report_enum_gaps(env, node, peeled!!, &bad)
+        if env.ck.stop {
+            return null
+        }
+    } else if peeled != null && peeled!!.kind == TypeKind.OPTION {
+        report_option_gaps(env, node, peeled!!, &bad)
+        if env.ck.stop {
+            return null
+        }
+    } else if as_value {
+        var total = false
+        for arm in arms.items() {
+            if arm_is_total(arm, subject, no_subject) {
+                total = true
+                break
+            }
+        }
+        if !total {
+            enum_env_fail(env, node, "when needs an else")
+            bad = true
+        }
+    }
+    if bad || !as_value {
+        if !as_value && !bad && all_end {
+            var exhaustive = true
+            if !(peeled != null && (peeled!!.kind == TypeKind.ENUM || peeled!!.kind == TypeKind.OPTION)) {
+                exhaustive = false
+                for arm in arms.items() {
+                    if arm_is_total(arm, subject, no_subject) {
+                        exhaustive = true
+                        break
+                    }
+                }
+            }
+            if exhaustive {
+                env.reachable = false
+            }
+        }
+        if as_value {
+            return err_ty(env.ck) as *Type?
+        }
+        return unit_ty(env.ck) as *Type?
+    }
+    if all_end {
+        env.reachable = false
+    }
+    if result != null {
+        return result
+    }
+    return err_ty(env.ck) as *Type?
+}

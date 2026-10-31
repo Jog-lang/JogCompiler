@@ -1,0 +1,32 @@
+// Shared type predicates used across check modules.
+
+fn type_is_error(t: *Type): bool {
+    return t.kind == TypeKind.ERROR
+}
+
+fn type_is_host_int(t: *Type): bool {
+    return t.kind == TypeKind.INT
+}
+
+fn type_is_host_float(t: *Type): bool {
+    return t.kind == TypeKind.FLOAT
+}
+
+fn type_same(a: *Type, b: *Type): bool {
+    return a == b
+}
+
+fn type_peel_ptr(ty: *Type): (*Type, bool) {
+    if ty.kind == TypeKind.PTR && ty.elem != null {
+        return ty.elem!!, true
+    }
+    return ty, false
+}
+
+fn type_peel_distinct(ty: *Type): *Type {
+    var t = ty
+    for t.kind == TypeKind.DISTINCT && t.elem != null {
+        t = t.elem!!
+    }
+    return t
+}

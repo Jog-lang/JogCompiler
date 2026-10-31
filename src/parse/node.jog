@@ -20,6 +20,347 @@ struct Node {
 }
 
 /**
+ * True when the node is an `import` declaration. Other packages cannot
+ * write `parse.NodeKind.IMPORT` (a variant of another package is not a
+ * value), the same limit that forced `lex.kind()`.
+ * @param node any AST node
+ * @return whether kind is IMPORT
+ */
+fn is_import(node: *Node): bool {
+    return node.kind == NodeKind.IMPORT
+}
+
+fn is_fn(node: *Node): bool {
+    return node.kind == NodeKind.FN
+}
+
+fn is_var(node: *Node): bool {
+    return node.kind == NodeKind.VAR
+}
+
+fn is_val(node: *Node): bool {
+    return node.kind == NodeKind.VAL
+}
+
+fn is_context(node: *Node): bool {
+    return node.kind == NodeKind.CONTEXT
+}
+
+fn is_type_decl(node: *Node): bool {
+    return node.kind == NodeKind.TYPE_DECL
+}
+
+fn is_struct(node: *Node): bool {
+    return node.kind == NodeKind.STRUCT
+}
+
+fn is_interface(node: *Node): bool {
+    return node.kind == NodeKind.INTERFACE
+}
+
+fn is_enum(node: *Node): bool {
+    return node.kind == NodeKind.ENUM
+}
+
+fn is_extern_block(node: *Node): bool {
+    return node.kind == NodeKind.EXTERN_BLOCK
+}
+
+fn is_attribute(node: *Node): bool {
+    return node.kind == NodeKind.ATTRIBUTE
+}
+
+fn is_arg(node: *Node): bool {
+    return node.kind == NodeKind.ARG
+}
+
+fn is_ident(node: *Node): bool {
+    return node.kind == NodeKind.IDENT
+}
+
+fn is_int_lit(node: *Node): bool {
+    return node.kind == NodeKind.INT_LIT
+}
+
+fn is_float_lit(node: *Node): bool {
+    return node.kind == NodeKind.FLOAT_LIT
+}
+
+fn is_char_lit(node: *Node): bool {
+    return node.kind == NodeKind.CHAR_LIT
+}
+
+fn is_bool_lit(node: *Node): bool {
+    return node.kind == NodeKind.BOOL_LIT
+}
+
+fn is_string_lit(node: *Node): bool {
+    return node.kind == NodeKind.STRING_LIT
+}
+
+fn is_cstring_lit(node: *Node): bool {
+    return node.kind == NodeKind.CSTRING_LIT
+}
+
+fn is_null_lit(node: *Node): bool {
+    return node.kind == NodeKind.NULL_LIT
+}
+
+fn is_break(node: *Node): bool {
+    return node.kind == NodeKind.BREAK
+}
+
+fn is_continue(node: *Node): bool {
+    return node.kind == NodeKind.CONTINUE
+}
+
+fn is_type_name(node: *Node): bool {
+    return node.kind == NodeKind.TYPE_NAME
+}
+
+fn is_type_array(node: *Node): bool {
+    return node.kind == NodeKind.TYPE_ARRAY
+}
+
+fn is_type_slice(node: *Node): bool {
+    return node.kind == NodeKind.TYPE_SLICE
+}
+
+fn is_type_ptr(node: *Node): bool {
+    return node.kind == NodeKind.TYPE_PTR
+}
+
+fn is_type_option(node: *Node): bool {
+    return node.kind == NodeKind.TYPE_OPTION
+}
+
+fn is_type_tuple(node: *Node): bool {
+    return node.kind == NodeKind.TYPE_TUPLE
+}
+
+fn is_type_fn(node: *Node): bool {
+    return node.kind == NodeKind.TYPE_FN
+}
+
+fn is_type_unit(node: *Node): bool {
+    return node.kind == NodeKind.TYPE_UNIT
+}
+
+fn is_type_param(node: *Node): bool {
+    return node.kind == NodeKind.TYPE_PARAM
+}
+
+fn is_variant(node: *Node): bool {
+    return node.kind == NodeKind.VARIANT
+}
+
+fn is_param(node: *Node): bool {
+    return node.kind == NodeKind.PARAM
+}
+
+fn is_unary(node: *Node): bool {
+    return node.kind == NodeKind.UNARY
+}
+
+fn is_binary(node: *Node): bool {
+    return node.kind == NodeKind.BINARY
+}
+
+fn is_block(node: *Node): bool {
+    return node.kind == NodeKind.BLOCK
+}
+
+fn is_return(node: *Node): bool {
+    return node.kind == NodeKind.RETURN
+}
+
+fn is_for(node: *Node): bool {
+    return node.kind == NodeKind.FOR
+}
+
+fn is_call(node: *Node): bool {
+    return node.kind == NodeKind.CALL
+}
+
+fn is_member(node: *Node): bool {
+    return node.kind == NodeKind.MEMBER
+}
+
+fn is_field(node: *Node): bool {
+    return node.kind == NodeKind.FIELD
+}
+
+fn is_embed(node: *Node): bool {
+    return node.kind == NodeKind.EMBED
+}
+
+fn is_type_set(node: *Node): bool {
+    return node.kind == NodeKind.TYPE_SET
+}
+
+fn is_cast(node: *Node): bool {
+    return node.kind == NodeKind.CAST
+}
+
+fn is_if(node: *Node): bool {
+    return node.kind == NodeKind.IF
+}
+
+fn is_when(node: *Node): bool {
+    return node.kind == NodeKind.WHEN
+}
+
+fn is_when_arm(node: *Node): bool {
+    return node.kind == NodeKind.WHEN_ARM
+}
+
+fn is_lambda(node: *Node): bool {
+    return node.kind == NodeKind.LAMBDA
+}
+
+fn is_assign_stmt(node: *Node): bool {
+    return node.kind == NodeKind.ASSIGN
+}
+
+fn is_expr_stmt(node: *Node): bool {
+    return node.kind == NodeKind.EXPR_STMT
+}
+
+fn is_pat_bind(node: *Node): bool {
+    return node.kind == NodeKind.PAT_BIND
+}
+
+fn is_pat_variant(node: *Node): bool {
+    return node.kind == NodeKind.PAT_VARIANT
+}
+
+fn is_pat_field(node: *Node): bool {
+    return node.kind == NodeKind.PAT_FIELD
+}
+
+fn is_pat_wildcard(node: *Node): bool {
+    return node.kind == NodeKind.PAT_WILDCARD
+}
+
+fn is_pat_in(node: *Node): bool {
+    return node.kind == NodeKind.PAT_IN
+}
+
+fn is_pat_is(node: *Node): bool {
+    return node.kind == NodeKind.PAT_IS
+}
+
+fn is_pat_expr(node: *Node): bool {
+    return node.kind == NodeKind.PAT_EXPR
+}
+
+fn is_dot_variant(node: *Node): bool {
+    return node.kind == NodeKind.DOT_VARIANT
+}
+
+fn is_defer(node: *Node): bool {
+    return node.kind == NodeKind.DEFER
+}
+
+fn is_errdefer(node: *Node): bool {
+    return node.kind == NodeKind.ERRDEFER
+}
+
+fn is_with(node: *Node): bool {
+    return node.kind == NodeKind.WITH
+}
+
+fn is_destructure(node: *Node): bool {
+    return node.kind == NodeKind.DESTRUCTURE
+}
+
+fn is_attr_block(node: *Node): bool {
+    return node.kind == NodeKind.ATTR_BLOCK
+}
+
+fn is_index(node: *Node): bool {
+    return node.kind == NodeKind.INDEX
+}
+
+fn is_slice_expr(node: *Node): bool {
+    return node.kind == NodeKind.SLICE
+}
+
+fn is_force(node: *Node): bool {
+    return node.kind == NodeKind.FORCE
+}
+
+fn is_interp(node: *Node): bool {
+    return node.kind == NodeKind.INTERP
+}
+
+fn is_tuple(node: *Node): bool {
+    return node.kind == NodeKind.TUPLE
+}
+
+fn is_array_lit(node: *Node): bool {
+    return node.kind == NodeKind.ARRAY_LIT
+}
+
+fn is_builtin(node: *Node): bool {
+    return node.kind == NodeKind.BUILTIN
+}
+
+fn is_go(node: *Node): bool {
+    return node.kind == NodeKind.GO
+}
+
+fn is_is(node: *Node): bool {
+    return node.kind == NodeKind.IS
+}
+
+/**
+ * True when the FN node's packed head says it has a receiver.
+ * @param node a FN node
+ * @return whether this is a method
+ */
+fn fn_has_receiver(node: *Node): bool {
+    return (node.head / 65536) % 2 == 1
+}
+
+/**
+ * True when `word` is a space-separated token in flag (visibility / mode).
+ * @param flag node.flag text
+ * @param word token to find
+ * @return whether the word is present
+ */
+fn flag_has_word(flag: str, word: str): bool {
+    if word.len == 0 {
+        return false
+    }
+    var start: usize = 0
+    var i: usize = 0
+    for i <= flag.len {
+        if i == flag.len || flag.ptr[i] == ' ' as u8 {
+            if i > start {
+                var same = i - start == word.len
+                if same {
+                    var j: usize = 0
+                    for j < word.len {
+                        if flag.ptr[start + j] != word.ptr[j] {
+                            same = false
+                            break
+                        }
+                        j = j + 1
+                    }
+                }
+                if same {
+                    return true
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return false
+}
+
+/**
  * A node in the arena. name, text, and flag are empty. op is EOF.
  * kids is an empty list. head is 0.
  * @param kind node kind
@@ -44,4 +385,12 @@ fn make_node(kind: NodeKind, line: i64, column: i64): *Node with (a: mem.Allocat
     node.head = 0
     node.kids = list.empty<*Node>()
     return node
+}
+
+/**
+ * A PARAM node for the checker (inferred context parameters).
+ * Other packages cannot name NodeKind.PARAM as a value.
+ */
+fn make_param(line: i64, column: i64): *Node with (a: mem.Allocator) {
+    return make_node(NodeKind.PARAM, line, column)
 }

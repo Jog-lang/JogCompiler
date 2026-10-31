@@ -1,0 +1,504 @@
+// Package and file scopes. Matches build_package in
+// compiler/src/resolve_package.c. Step 8 of LoaderGuide.md.
+
+import src.parse
+import std.fs
+import std.list
+import std.mem
+import std.strbuilder
+import std.text as texts
+
+private struct Resolve {
+    root_module: str
+    packages: list.List<*Package>
+    universe: *PackageScope?
+    failed: bool
+}
+
+private fn is_discard(name: str): bool {
+    return name.len == 0 || name == "_"
+}
+
+private fn first_word(flag: str): str {
+    var i: usize = 0
+    for i < flag.len {
+        if flag.ptr[i] == ' ' as u8 {
+            return texts.slice(flag, 0, i)
+        }
+        i = i + 1
+    }
+    return flag
+}
+
+private fn package_visible(flag: str): bool {
+    val vis = first_word(flag)
+    if vis == "private(file)" || vis == "private(scope)" || vis == "private" {
+        return false
+    }
+    return true
+}
+
+private fn alloc_block(pkg_scope: *PackageScope): *BlockScope with (a: mem.Allocator) {
+    val (raw, err) = a.alloc(size(BlockScope), align(BlockScope))
+    if err != null {
+        panic("out of memory")
+    }
+    val b = raw.ptr as *BlockScope
+    b.parent = null
+    b.bindings = list.empty<Symbol>()
+    b.package = pkg_scope as *PackageScope?
+    return b
+}
+
+private fn make_symbol(kind: SymbolKind, name: str, node: *parse.Node, file: str, pkg: *Package?): Symbol with (a: mem.Allocator) {
+    var s: Symbol
+    s.kind = kind
+    s.name = fs.copy_str(name)
+    s.referenced = false
+    s.assigned = false
+    s.file = fs.copy_str(file)
+    s.line = node.line
+    s.column = node.column
+    s.flag = fs.copy_str(node.flag)
+    s.package = pkg
+    s.decl = node as *parse.Node?
+    s.sema = null
+    s.type_params = list.empty<*u8>()
+    s.nominal_insts = list.empty<*u8>()
+    return s
+}
+
+private fn lookup_package(scope: *PackageScope, name: str): *Symbol? {
+    return package_scope_lookup(scope, name)
+}
+
+private fn file_prev(scope: *PackageScope, file_index: usize, name: str): *Symbol? {
+    if file_index >= scope.file_scopes.len {
+        return null
+    }
+    val file_scope = scope.file_scopes.get(file_index)
+    val local = block_scope_lookup_local(file_scope, name)
+    if local != null {
+        return local
+    }
+    return lookup_package(scope, name)
+}
+
+private fn duplicate(r: *Resolve, file: str, node: *parse.Node, name: str, prev: *Symbol?) with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    b.append("duplicate declaration of '")
+    b.append(name)
+    b.append("'")
+    print_pos_error(file, node.line, node.column, b.str())
+    b.free()
+    if prev != null {
+        val p = prev!!
+        print_pos_note(p.file, p.line, p.column, "previous declaration is here")
+    }
+    r.failed = true
+}
+
+private fn bind_named(r: *Resolve, pkg: *Package, file_index: usize, node: *parse.Node, file: str, name: str, kind: SymbolKind) with (a: mem.Allocator) {
+    if is_discard(name) {
+        return
+    }
+    val scope = &pkg.scope
+    val in_package = package_visible(node.flag)
+    if kind == SymbolKind.METHOD {
+        // Methods are not package names; keep a symbol for the checker job.
+        pkg.methods.push(make_symbol(kind, name, node, file, pkg as *Package?))
+        return
+    }
+    var prev: *Symbol? = null
+    if in_package {
+        prev = lookup_package(scope, name)
+    } else {
+        prev = file_prev(scope, file_index, name)
+    }
+    if prev != null {
+        duplicate(r, file, node, name, prev)
+        return
+    }
+    val symbol = make_symbol(kind, name, node, file, pkg as *Package?)
+    if in_package {
+        package_scope_bind(scope, symbol)
+    } else {
+        if file_index >= scope.file_scopes.len {
+            r.failed = true
+            return
+        }
+        block_scope_bind(scope.file_scopes.get(file_index), symbol)
+    }
+}
+
+private fn is_prefixed(canonical: str, prefix: str, path: str): bool {
+    if canonical.len < prefix.len + 1 + path.len {
+        return false
+    }
+    if texts.slice(canonical, 0, prefix.len) != prefix {
+        return false
+    }
+    if canonical.ptr[prefix.len] != '.' as u8 {
+        return false
+    }
+    return texts.slice(canonical, prefix.len + 1, canonical.len) == path
+}
+
+private fn find_package(r: *Resolve, from: *Package, path: str): *Package? {
+    val in_dep = !from.is_std && from.module_name.len > 0 && r.root_module.len > 0 && from.module_name != r.root_module
+    for dep in from.imports.items() {
+        if dep.path == path {
+            return dep as *Package?
+        }
+    }
+    if in_dep {
+        for dep in from.imports.items() {
+            if is_prefixed(dep.path, from.module_name, path) {
+                return dep as *Package?
+            }
+        }
+        return null
+    }
+    for pkg in r.packages.items() {
+        if pkg.path == path {
+            return pkg as *Package?
+        }
+    }
+    return null
+}
+
+private fn bind_import(r: *Resolve, pkg: *Package, file_index: usize, node: *parse.Node, file: str) with (a: mem.Allocator) {
+    val path = node.name
+    if path.len == 0 {
+        print_pos_error(file, node.line, node.column, "empty import path")
+        r.failed = true
+        return
+    }
+    var local = node.text
+    if local.len == 0 {
+        local = last_segment(path)
+    }
+    if is_discard(local) {
+        print_pos_error(file, node.line, node.column, "import has no name")
+        r.failed = true
+        return
+    }
+    val target = find_package(r, pkg, path)
+    if target == null {
+        var b = strbuilder.empty()
+        b.append("cannot find package '")
+        b.append(path)
+        b.append("'")
+        print_pos_error(file, node.line, node.column, b.str())
+        b.free()
+        r.failed = true
+        return
+    }
+    if target!! == pkg {
+        print_pos_error(file, node.line, node.column, "a package cannot import itself")
+        r.failed = true
+        return
+    }
+    val prev = file_prev(&pkg.scope, file_index, local)
+    if prev != null {
+        duplicate(r, file, node, local, prev)
+        return
+    }
+    if file_index >= pkg.scope.file_scopes.len {
+        r.failed = true
+        return
+    }
+    val symbol = make_symbol(SymbolKind.PACKAGE, local, node, file, target)
+    block_scope_bind(pkg.scope.file_scopes.get(file_index), symbol)
+}
+
+private fn last_segment(path: str): str {
+    var i = path.len
+    for i > 0 {
+        if path.ptr[i - 1] == '.' as u8 {
+            return texts.slice(path, i, path.len)
+        }
+        i = i - 1
+    }
+    return path
+}
+
+private fn bind_each_name(r: *Resolve, pkg: *Package, file_index: usize, node: *parse.Node, file: str, kind: SymbolKind) with (a: mem.Allocator) {
+    if node.name.len > 0 {
+        bind_named(r, pkg, file_index, node, file, node.name, kind)
+        return
+    }
+    if node.text.len == 0 {
+        return
+    }
+    var start: usize = 0
+    var i: usize = 0
+    for i <= node.text.len {
+        if i == node.text.len || node.text.ptr[i] == ' ' as u8 {
+            if i > start {
+                bind_named(r, pkg, file_index, node, file, texts.slice(node.text, start, i), kind)
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+}
+
+private fn bind_extern(r: *Resolve, pkg: *Package, file_index: usize, block: *parse.Node, file: str, package_pass: bool) with (a: mem.Allocator) {
+    if package_visible(block.flag) != package_pass {
+        return
+    }
+    for kid in block.kids.items() {
+        if !parse.is_fn(kid) {
+            print_pos_error(file, kid.line, kid.column, "expected a function")
+            r.failed = true
+            continue
+        }
+        kid.flag = block.flag
+        bind_decl(r, pkg, file_index, kid, file, package_pass)
+    }
+}
+
+private fn bind_decl(r: *Resolve, pkg: *Package, file_index: usize, node: *parse.Node, file: str, package_pass: bool) with (a: mem.Allocator) {
+    if parse.is_import(node) {
+        if !package_pass {
+            bind_import(r, pkg, file_index, node, file)
+        }
+        return
+    }
+    if parse.is_extern_block(node) {
+        bind_extern(r, pkg, file_index, node, file, package_pass)
+        return
+    }
+    if parse.is_fn(node) {
+        val is_expect = parse.flag_has_word(node.flag, "expect")
+        val is_actual = parse.flag_has_word(node.flag, "actual")
+        if (is_expect || is_actual) && !parse.fn_has_receiver(node) {
+            return
+        }
+        if package_visible(node.flag) != package_pass {
+            return
+        }
+        var kind = SymbolKind.FUNCTION
+        if parse.fn_has_receiver(node) {
+            kind = SymbolKind.METHOD
+        }
+        bind_named(r, pkg, file_index, node, file, node.name, kind)
+        return
+    }
+    if parse.is_var(node) || parse.is_val(node) || parse.is_context(node) {
+        if package_visible(node.flag) != package_pass {
+            return
+        }
+        var kind = SymbolKind.VARIABLE
+        if parse.is_val(node) {
+            kind = SymbolKind.CONSTANT
+        } else if parse.is_context(node) {
+            kind = SymbolKind.CONTEXT
+        }
+        bind_each_name(r, pkg, file_index, node, file, kind)
+        return
+    }
+    if parse.is_type_decl(node) || parse.is_struct(node) || parse.is_interface(node) || parse.is_enum(node) {
+        if package_visible(node.flag) != package_pass {
+            return
+        }
+        bind_named(r, pkg, file_index, node, file, node.name, SymbolKind.TYPE)
+        return
+    }
+    if package_pass {
+        print_pos_error(file, node.line, node.column, "not a top-level declaration")
+        r.failed = true
+    }
+}
+
+private fn bind_file(r: *Resolve, pkg: *Package, file_index: usize, package_pass: bool) with (a: mem.Allocator) {
+    val source = pkg.files.get(file_index)
+    if source.ast == null {
+        return
+    }
+    val file_node = source.ast!!
+    for kid in file_node.kids.items() {
+        bind_decl(r, pkg, file_index, kid, source.path, package_pass)
+    }
+}
+
+private fn file_base(path: str): str {
+    var i = path.len
+    for i > 0 {
+        val b = path.ptr[i - 1]
+        if b == '/' as u8 || b == '\\' as u8 {
+            return texts.slice(path, i, path.len)
+        }
+        i = i - 1
+    }
+    return path
+}
+
+private fn source_matches_target(source: SourceFile, target: str): bool {
+    val (kept, _) = file_os_kept(file_base(source.path), target)
+    // file_os_kept returns true for untagged files; we need tagged ones only.
+    val name = file_base(source.path)
+    var stem_end = name.len
+    if name.len > 9 {
+        val suf = texts.slice(name, name.len - 9, name.len)
+        if suf == ".test.jog" {
+            stem_end = name.len - 9
+        }
+    }
+    if stem_end > 4 {
+        val jog = texts.slice(name, stem_end - 4, stem_end)
+        if jog == ".jog" {
+            stem_end = stem_end - 4
+        }
+    }
+    var dot: usize = 0
+    var saw = false
+    var p: usize = 0
+    for p < stem_end {
+        if name.ptr[p] == '.' as u8 {
+            dot = p
+            saw = true
+        }
+        p = p + 1
+    }
+    if !saw || dot == 0 {
+        return false
+    }
+    val tag = texts.slice(name, dot + 1, stem_end)
+    if tag != "windows" && tag != "linux" && tag != "macos" && tag != "wasm" && tag != "posix" {
+        return false
+    }
+    return kept
+}
+
+private fn one_actual(pkg: *Package, target: str, name: str): *parse.Node? {
+    var found: *parse.Node? = null
+    for source in pkg.files.items() {
+        if !source_matches_target(source, target) || source.ast == null {
+            continue
+        }
+        for kid in source.ast!!.kids.items() {
+            if !parse.is_fn(kid) || !parse.flag_has_word(kid.flag, "actual") || parse.fn_has_receiver(kid) {
+                continue
+            }
+            if kid.name != name {
+                continue
+            }
+            if found != null {
+                return null
+            }
+            found = kid as *parse.Node?
+        }
+    }
+    return found
+}
+
+private fn core_file(source: SourceFile): bool {
+    val name = file_base(source.path)
+    var stem_end = name.len
+    if name.len >= 4 && texts.slice(name, name.len - 4, name.len) == ".jog" {
+        stem_end = name.len - 4
+    }
+    if name.len >= 9 && texts.slice(name, name.len - 9, name.len) == ".test.jog" {
+        stem_end = name.len - 9
+    }
+    var dot: usize = 0
+    var saw = false
+    var p: usize = 0
+    for p < stem_end {
+        if name.ptr[p] == '.' as u8 {
+            dot = p
+            saw = true
+        }
+        p = p + 1
+    }
+    if !saw || dot == 0 {
+        return true
+    }
+    val tag = texts.slice(name, dot + 1, stem_end)
+    return tag != "windows" && tag != "linux" && tag != "macos" && tag != "wasm" && tag != "posix"
+}
+
+private fn bind_platform(r: *Resolve, pkg: *Package) with (a: mem.Allocator) {
+    val target = host_os()
+    var fi: usize = 0
+    for fi < pkg.files.len {
+        val source = pkg.files.get(fi)
+        if source.ast == null || !core_file(source) {
+            fi = fi + 1
+            continue
+        }
+        for kid in source.ast!!.kids.items() {
+            if !parse.is_fn(kid) || !parse.flag_has_word(kid.flag, "expect") || parse.fn_has_receiver(kid) {
+                continue
+            }
+            if kid.name.len == 0 {
+                continue
+            }
+            val actual = one_actual(pkg, target, kid.name)
+            if actual == null {
+                continue
+            }
+            // Match C: copy visibility from expect; keep the actual marker and body.
+            val vis = first_word(kid.flag)
+            if vis == "private" || vis == "private(file)" || vis == "private(package)" || vis == "private(scope)" {
+                var b = strbuilder.empty()
+                b.append(vis)
+                b.append(" actual")
+                actual!!.flag = b.str()
+            } else {
+                actual!!.flag = "actual"
+            }
+            bind_named(r, pkg, fi, actual!!, source.path, actual!!.name, SymbolKind.FUNCTION)
+        }
+        fi = fi + 1
+    }
+}
+
+private fn build_package(r: *Resolve, pkg: *Package) with (a: mem.Allocator) {
+    pkg.scope = empty_package_scope()
+    pkg.scope.package = pkg as *Package?
+    pkg.scope.universe = r.universe
+    if pkg.files.len == 0 {
+        return
+    }
+    var i: usize = 0
+    for i < pkg.files.len {
+        pkg.scope.file_scopes.push(alloc_block(&pkg.scope))
+        i = i + 1
+    }
+    i = 0
+    for i < pkg.files.len {
+        bind_file(r, pkg, i, true)
+        i = i + 1
+    }
+    i = 0
+    for i < pkg.files.len {
+        bind_file(r, pkg, i, false)
+        i = i + 1
+    }
+    bind_platform(r, pkg)
+}
+
+/**
+ * Build package and file scopes for every loaded package in dependency
+ * order. Reports duplicate declarations. Unused imports are left for a
+ * later step (Friction).
+ * @param root_module name of the root module
+ * @param packages dependency-ordered packages from the loader
+ * @param universe builtin scope after the prelude
+ * @context a allocator for scopes and symbols
+ * @return false when a resolve error was reported
+ */
+fn resolve_packages(root_module: str, packages: list.List<*Package>, universe: *PackageScope): bool with (a: mem.Allocator) {
+    var r: Resolve
+    r.root_module = root_module
+    r.packages = packages
+    r.universe = universe as *PackageScope?
+    r.failed = false
+    for pkg in packages.items() {
+        build_package(&r, pkg)
+    }
+    return !r.failed
+}

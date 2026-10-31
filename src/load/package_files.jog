@@ -1,0 +1,760 @@
+// List, lex, and parse .jog files, then follow imports with the
+// three-color walk. Matches load_files, load_package, and collect_imports
+// in compiler/src/loader.c. Steps 6–7 of LoaderGuide.md.
+
+import src.lex
+import src.parse
+import std.fs
+import std.list
+import std.map
+import std.mem
+import std.strbuilder
+import std.text as texts
+
+/**
+ * Per-package state while the import walk runs. color lives here so a
+ * failed load is not confused with a finished Package.
+ */
+private struct PkgState {
+    pkg: *Package
+    has_mod: bool
+    mod: Module
+    color: PackageColor
+    imports: list.List<*Package>
+}
+
+/**
+ * Loader walk state for one `jogc check` run. by_path maps a canonical
+ * import path to an index in states (map values cannot be null pointers).
+ */
+private struct Walk {
+    roots: Roots
+    root_mod: Module
+    mods: list.List<Module>
+    states: list.List<*PkgState>
+    by_path: map.Map<str, usize>
+    stack: list.List<str>
+    order: list.List<*Package>
+    failed: bool
+}
+
+private fn has_suffix(name: str, suffix: str): bool {
+    if suffix.len > name.len {
+        return false
+    }
+    return texts.slice(name, name.len - suffix.len, name.len) == suffix
+}
+
+private fn is_known_os_tag(tag: str): bool {
+    return tag == "windows" || tag == "linux" || tag == "macos" || tag == "wasm" || tag == "posix"
+}
+
+private fn os_tag_matches(tag: str, target: str): bool {
+    if tag == "posix" {
+        return target == "linux" || target == "macos"
+    }
+    return tag == target
+}
+
+private fn dir_exists(path: str): bool with (a: mem.Allocator) {
+    var (names, ok) = fs.list(path)
+    if ok {
+        fs.free_names(&names)
+        return true
+    }
+    return false
+}
+
+/**
+ * Whether this file name is kept for the current target. is_test is set
+ * when the name ends in .test.jog.
+ * @param name file name in the package folder
+ * @param target current OS target name
+ * @return kept, and whether it is a test file
+ */
+fn source_file_base(path: str): str {
+    var i = path.len
+    for i > 0 {
+        val b = path.ptr[i - 1]
+        if b == '/' as u8 || b == '\\' as u8 {
+            return texts.slice(path, i, path.len)
+        }
+        i = i - 1
+    }
+    return path
+}
+
+private fn stem_end(name: str): usize {
+    var stem_end = name.len
+    if has_suffix(name, ".test.jog") {
+        stem_end = name.len - 9
+    } else if has_suffix(name, ".jog") {
+        stem_end = name.len - 4
+    }
+    return stem_end
+}
+
+/**
+ * OS tag in a file name (e.g. list.linux.jog -> linux), or empty when none.
+ */
+fn file_stem_os_tag(name: str): str {
+    val stem_end = stem_end(name)
+    var dot: usize = 0
+    var saw_dot = false
+    var p: usize = 0
+    for p < stem_end {
+        if name.ptr[p] == '.' as u8 {
+            dot = p
+            saw_dot = true
+        }
+        p = p + 1
+    }
+    if !saw_dot || dot == 0 {
+        return ""
+    }
+    val tag = texts.slice(name, dot + 1, stem_end)
+    if !is_known_os_tag(tag) {
+        return ""
+    }
+    return tag
+}
+
+fn file_os_kept(name: str, target: str): (bool, bool) {
+    var is_test = false
+    var stem_end = name.len
+    if has_suffix(name, ".test.jog") {
+        is_test = true
+        stem_end = name.len - 9
+    } else if has_suffix(name, ".jog") {
+        stem_end = name.len - 4
+    } else {
+        return true, false
+    }
+    var dot: usize = 0
+    var saw_dot = false
+    var p: usize = 0
+    for p < stem_end {
+        if name.ptr[p] == '.' as u8 {
+            dot = p
+            saw_dot = true
+        }
+        p = p + 1
+    }
+    if !saw_dot || dot == 0 {
+        return true, is_test
+    }
+    val tag = texts.slice(name, dot + 1, stem_end)
+    if !is_known_os_tag(tag) {
+        return true, is_test
+    }
+    return os_tag_matches(tag, target), is_test
+}
+
+private fn collect_file_imports(file_path: str, file: *parse.Node, out: *list.List<ImportRef>) with (a: mem.Allocator) {
+    for kid in file.kids.items() {
+        if parse.is_import(kid) {
+            var ref: ImportRef
+            ref.path = fs.copy_str(kid.name)
+            ref.file = fs.copy_str(file_path)
+            ref.line = kid.line
+            ref.column = kid.column
+            out.push(ref)
+        }
+    }
+}
+
+private fn load_source_ast(full: str, is_test: bool, imports: *list.List<ImportRef>, out: *SourceFile): bool with (a: mem.Allocator) {
+    var (data, err) = fs.read_all(full)
+    if err != null {
+        print_path_error(full, "cannot read source file")
+        return false
+    }
+    var ok = true
+    var errors: list.List<lex.LexError>
+    var tokens = lex.lex(data, &errors)
+    var p: parse.Parser
+    p.tokens = tokens
+    p.path = full
+    p.errors = list.empty<parse.ParseError>()
+    val file = parse.parse_file(&p)
+    collect_file_imports(full, file, imports)
+    out.path = fs.copy_str(full)
+    out.is_test = is_test
+    out.ast = file as *parse.Node?
+    if errors.len > 0 {
+        for e in errors.items() {
+            lex.print_error(full, e)
+        }
+        ok = false
+    }
+    if p.errors.len > 0 {
+        for e in p.errors.items() {
+            parse.print_parse_error(full, e)
+        }
+        ok = false
+    }
+    return ok
+}
+
+private fn load_one_source(full: str, is_test: bool, pkg: *Package, imports: *list.List<ImportRef>): bool with (a: mem.Allocator) {
+    var sf: SourceFile
+    sf.path = ""
+    sf.is_test = false
+    sf.ast = null
+    if !load_source_ast(full, is_test, imports, &sf) {
+        return false
+    }
+    pkg.files.push(sf)
+    return true
+}
+
+private fn load_platform_source(full: str, is_test: bool, pkg: *Package, imports: *list.List<ImportRef>): bool with (a: mem.Allocator) {
+    var sf: SourceFile
+    sf.path = ""
+    sf.is_test = false
+    sf.ast = null
+    if !load_source_ast(full, is_test, imports, &sf) {
+        return false
+    }
+    pkg.platform_files.push(sf)
+    return true
+}
+
+/**
+ * Load every kept .jog file in pkg.dir into pkg.files.
+ * @param pkg package being filled
+ * @param include_tests whether *.test.jog files are kept
+ * @param allow_empty whether zero files is allowed
+ * @param err_path path printed for the empty-package diagnostic
+ * @param err_line line for that diagnostic
+ * @param err_column column for that diagnostic
+ * @param imports IMPORT refs from loaded files
+ * @context a allocator
+ * @return false on empty package, list failure, or lex/parse error
+ */
+fn load_files(pkg: *Package, include_tests: bool, allow_empty: bool, err_path: str, err_line: i64, err_column: i64, imports: *list.List<ImportRef>): bool with (a: mem.Allocator) {
+    val target = host_os()
+    var (names, listed) = fs.list(pkg.dir)
+    if !listed {
+        print_pos_error(err_path, err_line, err_column, "cannot list package folder")
+        return false
+    }
+    var ok = true
+    for name in names.items() {
+        if !has_suffix(name, ".jog") {
+            continue
+        }
+        val (kept, is_test) = file_os_kept(name, target)
+        if !kept {
+            continue
+        }
+        if is_test && !include_tests {
+            continue
+        }
+        val full = fs.join(pkg.dir, name)
+        if !load_one_source(full, is_test, pkg, imports) {
+            ok = false
+        }
+        fs.free_str(full)
+    }
+    fs.free_names(&names)
+    if pkg.files.len == 0 {
+        if allow_empty {
+            return ok
+        }
+        if pkg.path.len == 0 {
+            print_pos_error(err_path, err_line, err_column, "the root package has no source files")
+        } else {
+            var b = strbuilder.empty()
+            b.append("package '")
+            b.append(pkg.path)
+            b.append("' has no source files")
+            print_pos_error(err_path, err_line, err_column, b.str())
+            b.free()
+        }
+        return false
+    }
+    return ok
+}
+
+private fn source_index_by_base(sources: list.List<SourceFile>, base: str): i64 {
+    var i: usize = 0
+    for src in sources.items() {
+        if source_file_base(src.path) == base {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+/**
+ * Parse OS-suffixed files for every jog.mod target (matches attach_target_lists).
+ */
+private fn attach_target_sources(
+    pkg: *Package,
+    include_tests: bool,
+    manifest: Manifest,
+    err_path: str,
+    err_line: i64,
+    err_column: i64,
+): bool with (a: mem.Allocator) {
+    if !manifest.has_targets || manifest.targets.len == 0 {
+        return true
+    }
+    for t in manifest.targets.items() {
+        pkg.targets.push(fs.copy_str(t))
+    }
+    var (names, listed) = fs.list(pkg.dir)
+    if !listed {
+        print_pos_error(err_path, err_line, err_column, "cannot list package folder")
+        return false
+    }
+    var ok = true
+    var refs = list.empty<ImportRef>()
+    for os in manifest.targets.items() {
+        var group: TargetGroup
+        group.os = fs.copy_str(os)
+        group.files = list.empty<SourceFile>()
+        for name in names.items() {
+            if !has_suffix(name, ".jog") {
+                continue
+            }
+            val tag = file_stem_os_tag(name)
+            if tag.len == 0 || !os_tag_matches(tag, os) {
+                continue
+            }
+            var is_test = false
+            if has_suffix(name, ".test.jog") {
+                is_test = true
+            }
+            if is_test && !include_tests {
+                continue
+            }
+            if source_index_by_base(pkg.files, name) >= 0 {
+                var fi: usize = 0
+                for fi < pkg.files.len {
+                    if source_file_base(pkg.files.get(fi).path) == name {
+                        group.files.push(pkg.files.get(fi))
+                        break
+                    }
+                    fi = fi + 1
+                }
+                continue
+            }
+            if source_index_by_base(pkg.platform_files, name) >= 0 {
+                var pi: usize = 0
+                for pi < pkg.platform_files.len {
+                    if source_file_base(pkg.platform_files.get(pi).path) == name {
+                        group.files.push(pkg.platform_files.get(pi))
+                        break
+                    }
+                    pi = pi + 1
+                }
+                continue
+            }
+            val full = fs.join(pkg.dir, name)
+            if !load_platform_source(full, is_test, pkg, &refs) {
+                ok = false
+            } else {
+                group.files.push(pkg.platform_files.get(pkg.platform_files.len - 1))
+            }
+            fs.free_str(full)
+        }
+        pkg.target_groups.push(group)
+    }
+    refs.free()
+    fs.free_names(&names)
+    return ok
+}
+
+private fn join_segments(base: str, path: str, skip_first: bool): str with (a: mem.Allocator) {
+    var dir = fs.copy_str(base)
+    var start: usize = 0
+    var i: usize = 0
+    var seg_i: usize = 0
+    for i <= path.len {
+        if i == path.len || path.ptr[i] == '.' as u8 {
+            if !(skip_first && seg_i == 0) {
+                val seg = texts.slice(path, start, i)
+                val next = fs.join(dir, seg)
+                fs.free_str(dir)
+                dir = next
+            }
+            start = i + 1
+            seg_i = seg_i + 1
+        }
+        i = i + 1
+    }
+    return dir
+}
+
+private fn first_segment(path: str): str {
+    var i: usize = 0
+    for i < path.len {
+        if path.ptr[i] == '.' as u8 {
+            return texts.slice(path, 0, i)
+        }
+        i = i + 1
+    }
+    return path
+}
+
+private fn last_segment(path: str): str {
+    var i = path.len
+    for i > 0 {
+        if path.ptr[i - 1] == '.' as u8 {
+            return texts.slice(path, i, path.len)
+        }
+        i = i - 1
+    }
+    return path
+}
+
+private fn rest_after_first(path: str): str {
+    var i: usize = 0
+    for i < path.len {
+        if path.ptr[i] == '.' as u8 {
+            if i + 1 >= path.len {
+                return ""
+            }
+            return texts.slice(path, i + 1, path.len)
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+private fn prefixed_path(prefix: str, path: str): str with (a: mem.Allocator) {
+    if path.len == 0 {
+        return fs.copy_str(prefix)
+    }
+    var b = strbuilder.empty()
+    b.append(prefix)
+    b.append(".")
+    b.append(path)
+    val out = fs.copy_str(b.str())
+    b.free()
+    return out
+}
+
+private fn has_require(mod: Module, name: str): bool {
+    for line in mod.manifest.requires.items() {
+        if line.text == name {
+            return true
+        }
+    }
+    return false
+}
+
+private fn is_exported(mod: Module, rest: str): bool {
+    if rest.len == 0 || mod.manifest.exports.len == 0 {
+        return true
+    }
+    for line in mod.manifest.exports.items() {
+        if line.text == rest {
+            return true
+        }
+    }
+    return false
+}
+
+private fn find_mapped(mods: list.List<Module>, name: str): (Module, bool) {
+    for m in mods.items() {
+        if m.name == name {
+            return m, true
+        }
+    }
+    return empty_module(), false
+}
+
+private fn already_imports(imports: list.List<*Package>, dep: *Package): bool {
+    for p in imports.items() {
+        if p == dep {
+            return true
+        }
+    }
+    return false
+}
+
+private fn report_cycle(stack: list.List<str>, target: str, file: str, line: i64, column: i64) with (a: mem.Allocator) {
+    var start: usize = 0
+    var found = false
+    var i: usize = 0
+    for i < stack.len {
+        if stack.get(i) == target {
+            start = i
+            found = true
+            break
+        }
+        i = i + 1
+    }
+    var b = strbuilder.empty()
+    b.append("import cycle: ")
+    if !found {
+        start = 0
+    }
+    i = start
+    for i < stack.len {
+        if i > start {
+            b.append(" -> ")
+        }
+        b.append(stack.get(i))
+        i = i + 1
+    }
+    b.append(" -> ")
+    b.append(target)
+    print_pos_error(file, line, column, b.str())
+    b.free()
+}
+
+private fn alloc_package(): *Package with (a: mem.Allocator) {
+    val (raw, err) = a.alloc(size(Package), align(Package))
+    if err != null {
+        panic("out of memory")
+    }
+    val pkg = raw.ptr as *Package
+    pkg[0] = empty_package()
+    return pkg
+}
+
+private fn alloc_state(pkg: *Package, has_mod: bool, mod: Module): *PkgState with (a: mem.Allocator) {
+    val (raw, err) = a.alloc(size(PkgState), align(PkgState))
+    if err != null {
+        panic("out of memory")
+    }
+    val state = raw.ptr as *PkgState
+    state.pkg = pkg
+    state.has_mod = has_mod
+    state.mod = mod
+    state.color = PackageColor.GRAY
+    state.imports = list.empty<*Package>()
+    return state
+}
+
+private fn follow_imports(w: *Walk, state: *PkgState, refs: list.List<ImportRef>) with (a: mem.Allocator) {
+    for ref in refs.items() {
+        if ref.path.len == 0 {
+            print_pos_error(ref.file, ref.line, ref.column, "empty import path")
+            w.failed = true
+            continue
+        }
+        val first = first_segment(ref.path)
+        var ipath = fs.copy_str(ref.path)
+        var idir = ""
+        var iname = last_segment(ref.path)
+        var has_mod = state.has_mod
+        var target = state.mod
+        var is_std = first == "std"
+
+        if is_std {
+            if w.roots.std_root.len == 0 {
+                print_pos_error(ref.file, ref.line, ref.column, "standard library was not found")
+                w.failed = true
+                fs.free_str(ipath)
+                continue
+            }
+            has_mod = false
+            target = empty_module()
+            idir = join_segments(w.roots.std_root, ref.path, true)
+        } else if state.has_mod && has_require(state.mod, first) {
+            val (mapped, found) = find_mapped(w.mods, first)
+            if !found {
+                var b = strbuilder.empty()
+                b.append("module '")
+                b.append(first)
+                b.append("' is required by jog.mod but was not given with --module; build with jog-build, or pass --module ")
+                b.append(first)
+                b.append("=<dir>")
+                print_pos_error(ref.file, ref.line, ref.column, b.str())
+                b.free()
+                w.failed = true
+                fs.free_str(ipath)
+                continue
+            }
+            if mapped.bad {
+                fs.free_str(ipath)
+                continue
+            }
+            val rest = rest_after_first(ref.path)
+            if !is_exported(mapped, rest) {
+                var b = strbuilder.empty()
+                b.append("package '")
+                b.append(ref.path)
+                b.append("' is not exported by module '")
+                b.append(mapped.name)
+                b.append("'")
+                print_pos_error(ref.file, ref.line, ref.column, b.str())
+                b.free()
+                w.failed = true
+                fs.free_str(ipath)
+                continue
+            }
+            has_mod = true
+            target = mapped
+            idir = join_segments(mapped.root, ref.path, true)
+        } else {
+            if state.has_mod && !state.mod.is_root {
+                val pref = prefixed_path(state.mod.name, ref.path)
+                fs.free_str(ipath)
+                ipath = pref
+            }
+            var base = w.root_mod.root
+            if state.has_mod {
+                base = state.mod.root
+            }
+            idir = join_segments(base, ref.path, false)
+        }
+
+        if !dir_exists(idir) {
+            var b = strbuilder.empty()
+            b.append("cannot find package '")
+            b.append(ipath)
+            b.append("'")
+            print_pos_error(ref.file, ref.line, ref.column, b.str())
+            b.free()
+            w.failed = true
+            fs.free_str(idir)
+            fs.free_str(ipath)
+            continue
+        }
+
+        var back = false
+        val dep = load_package(w, has_mod, target, ipath, iname, idir, ref.file, ref.line, ref.column, &back)
+        if back {
+            report_cycle(w.stack, ipath, ref.file, ref.line, ref.column)
+            w.failed = true
+            fs.free_str(idir)
+            fs.free_str(ipath)
+            continue
+        }
+        if dep == null {
+            fs.free_str(idir)
+            fs.free_str(ipath)
+            continue
+        }
+        if !already_imports(state.imports, dep!!) {
+            state.imports.push(dep!!)
+        }
+        fs.free_str(idir)
+        // ipath is the map key; keep it alive.
+    }
+}
+
+private fn load_package(w: *Walk, has_mod: bool, mod: Module, path: str, name: str, dir: str, err_file: str, err_line: i64, err_column: i64, back_edge: *bool): *Package? with (a: mem.Allocator) {
+    back_edge[0] = false
+    var idx: usize = 0
+    if w.by_path.get(path, map.fnv1a(path), &idx) {
+        val found = w.states.get(idx)
+        if found.color == PackageColor.GRAY {
+            back_edge[0] = true
+            return found.pkg as *Package?
+        }
+        if found.color == PackageColor.DONE {
+            return found.pkg as *Package?
+        }
+        return null
+    }
+
+    val pkg = alloc_package()
+    pkg.path = fs.copy_str(path)
+    pkg.name = fs.copy_str(name)
+    pkg.dir = fs.copy_str(dir)
+    pkg.is_std = !has_mod
+    if has_mod {
+        pkg.module_name = fs.copy_str(mod.name)
+        pkg.module_root = fs.copy_str(mod.root)
+    } else {
+        pkg.module_name = fs.copy_str("std")
+        pkg.module_root = fs.copy_str(w.roots.std_root)
+    }
+    pkg.color = PackageColor.GRAY
+
+    val state = alloc_state(pkg, has_mod, mod)
+    w.by_path.insert(pkg.path, map.fnv1a(pkg.path), w.states.len)
+    w.states.push(state)
+    w.stack.push(pkg.path)
+
+    val include_tests = false
+    val allow_empty = has_mod && mod.is_library && mod.manifest.exports.len > 0 && dir == mod.root
+    var refs = list.empty<ImportRef>()
+    var files_ok = load_files(pkg, include_tests, allow_empty, err_file, err_line, err_column, &refs)
+    if files_ok && has_mod && mod.manifest.has_targets {
+        if !attach_target_sources(pkg, include_tests, mod.manifest, err_file, err_line, err_column) {
+            files_ok = false
+        }
+    }
+    if files_ok {
+        follow_imports(w, state, refs)
+        for dep in state.imports.items() {
+            pkg.imports.push(dep)
+        }
+    }
+    refs.free()
+
+    if w.stack.len > 0 {
+        w.stack.pop()
+    }
+    if !files_ok {
+        state.color = PackageColor.FAIL
+        pkg.color = PackageColor.FAIL
+        w.failed = true
+        return null
+    }
+    state.color = PackageColor.DONE
+    pkg.color = PackageColor.DONE
+    w.order.push(pkg)
+    return pkg as *Package?
+}
+
+/**
+ * Load the root package and every import reachable from it. On success,
+ * returns a Program whose packages list is the dependency order. std,
+ * cycles, and --module imports are followed here. The checker takes that
+ * Program; do not free the package list on success.
+ * @param root_mod the root module
+ * @param man_path root jog.mod path
+ * @param roots std/core/runtime roots
+ * @param mods --module libraries
+ * @context a allocator
+ * @return the program and true, or an empty program and false on error
+ */
+fn load_root_sources(root_mod: Module, man_path: str, roots: Roots, mods: list.List<Module>): (Program, bool) with (a: mem.Allocator) {
+    var w: Walk
+    w.roots = roots
+    w.root_mod = root_mod
+    w.mods = mods
+    w.states = list.empty<*PkgState>()
+    w.by_path = map.empty<str, usize>()
+    w.stack = list.empty<str>()
+    w.order = list.empty<*Package>()
+    w.failed = false
+
+    var back = false
+    val root = load_package(&w, true, root_mod, "", root_mod.name, root_mod.root, man_path, root_mod.manifest.name_line, root_mod.manifest.name_column, &back)
+    if back {
+        w.failed = true
+    }
+    var ok = !w.failed && root != null
+    if ok {
+        val universe = universe_scope()
+        if !bind_prelude(universe, roots.core_root) {
+            ok = false
+        } else if !resolve_packages(root_mod.name, w.order, universe) {
+            ok = false
+        } else if !resolve_bodies(w.order) {
+            ok = false
+        }
+    }
+    w.stack.free()
+    w.states.free()
+    w.by_path.free()
+    if !ok {
+        w.order.free()
+        return empty_program(), false
+    }
+    var prog = empty_program()
+    prog.packages = w.order
+    prog.root_module = root_mod.name
+    return prog, true
+}

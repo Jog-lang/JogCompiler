@@ -1,0 +1,3 @@
+actual fn host_os(): str {
+    return "linux"
+}

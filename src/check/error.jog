@@ -1,0 +1,1109 @@
+// Tuples, error?, null, defer/errdefer, panic.
+// Checked against compiler/src/check_error.c.
+// CheckerGuide step 8.
+
+import src.load
+import src.lex
+import src.parse
+import std.list
+import std.mem
+import std.strbuilder
+import std.text as texts
+
+private fn err_fail_ck(ck: *Check, job: *CheckJob, node: *parse.Node, message: str) with (a: mem.Allocator) {
+    check_fail(ck, job.file, node.line, node.column, message)
+}
+
+private fn is_poison(ty: *Type?): bool {
+    return ty != null && ty!!.kind == TypeKind.ERROR
+}
+
+private fn is_discard(name: str): bool {
+    return name.len == 0 || name == "_"
+}
+
+private fn is_error_interface(ty: *Type?): bool {
+    if ty == null {
+        return false
+    }
+    val u = type_peel_distinct(ty!!)
+    return u.kind == TypeKind.INTERFACE && u.name == "error"
+}
+
+private fn is_error_option(ty: *Type?): bool {
+    if ty == null || ty!!.kind != TypeKind.OPTION || ty!!.elem == null {
+        return false
+    }
+    return is_error_interface(ty!!.elem)
+}
+
+private fn last_result(ret: *Type?): *Type? {
+    if ret == null {
+        return null
+    }
+    if ret!!.kind == TypeKind.TUPLE && ret!!.elems.len > 0 {
+        return ret!!.elems.get(ret!!.elems.len - 1) as *Type?
+    }
+    return ret
+}
+
+/**
+ * Space-separated names on a parenthesized binding (`val (a, b)`), else one name.
+ */
+fn binding_name_count(node: *parse.Node): usize {
+    if node.name.len > 0 {
+        return 1
+    }
+    if node.text.len == 0 {
+        return 0
+    }
+    var n: usize = 1
+    var i: usize = 0
+    for i < node.text.len {
+        if node.text.ptr[i] == ' ' as u8 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+/**
+ * Name at index for a binding (single `name` or space-separated `text`).
+ */
+fn binding_name_at(node: *parse.Node, index: usize): str {
+    if node.name.len > 0 {
+        if index == 0 {
+            return node.name
+        }
+        return ""
+    }
+    var start: usize = 0
+    var at: usize = 0
+    var i: usize = 0
+    for i <= node.text.len {
+        val end = i == node.text.len || node.text.ptr[i] == ' ' as u8
+        if end {
+            if at == index {
+                return texts.slice(node.text, start, i)
+            }
+            at = at + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+/**
+ * True when the binding used parentheses with two or more names.
+ */
+fn binding_is_multi(node: *parse.Node): bool {
+    return node.name.len == 0 && node.text.len > 0 && binding_name_count(node) > 1
+}
+
+private fn parse_tuple_index(text: str): i64 {
+    var acc: i64 = 0
+    var any = false
+    var i: usize = 0
+    for i < text.len {
+        val c = text.ptr[i]
+        if c < '0' as u8 || c > '9' as u8 {
+            return 0
+        }
+        any = true
+        acc = acc * 10 + ((c as i64) - ('0' as i64))
+        i = i + 1
+    }
+    if !any {
+        return 0
+    }
+    return acc
+}
+
+private fn require_tuple(env: *Env, node: *parse.Node, ty: *Type?, expect: usize): *Type? with (a: mem.Allocator) {
+    if ty == null || env.ck.stop {
+        return ty
+    }
+    if is_poison(ty) {
+        return ty
+    }
+    if ty!!.kind != TypeKind.TUPLE {
+        var b = strbuilder.empty()
+        b.append("destructuring expects a tuple, got ")
+        b.append(type_print(ty))
+        env_fail(env, node, b.str())
+        b.free()
+        return err_ty(env.ck) as *Type?
+    }
+    if ty!!.elems.len != expect {
+        var b = strbuilder.empty()
+        b.append("destructuring expects ")
+        b.append_int(expect as i64, 10)
+        b.append(" values, got ")
+        b.append_int(ty!!.elems.len as i64, 10)
+        env_fail(env, node, b.str())
+        b.free()
+        return err_ty(env.ck) as *Type?
+    }
+    return ty
+}
+
+/**
+ * `null` literal — takes the option target when present.
+ */
+fn check_error_null(env: *Env, node: *parse.Node, target: *Type?): *Type? with (a: mem.Allocator) {
+    if target != null && is_poison(target) {
+        return target
+    }
+    if target != null && target!!.kind == TypeKind.OPTION {
+        return target
+    }
+    if target == null {
+        return type_builtin(&env.ck.types, Builtin.NULL) as *Type?
+    }
+    fail_mismatch(env, node, target!!, type_builtin(&env.ck.types, Builtin.NULL))
+    return err_ty(env.ck) as *Type?
+}
+
+private fn message_ok(env: *Env, elem: *Type): i32 with (a: mem.Allocator) {
+    if elem.kind != TypeKind.STRUCT && elem.kind != TypeKind.ENUM {
+        return 0
+    }
+    val want_pkg = elem.package
+    val str = str_ty(env.ck)
+    for pkg in env.ck.prog.packages.items() {
+        for mi in 0 as usize..pkg.methods.len {
+            val sym = pkg.methods.at(mi)
+            if sym.name != "message" || sym.decl == null {
+                continue
+            }
+            val have_pkg = if sym.package != null { sym.package!!.path } else { "" }
+            if want_pkg != have_pkg {
+                continue
+            }
+            if get_sema(sym) == null {
+                if !wait_for_symbol(env.ck, env.job, sym, false) {
+                    return -1
+                }
+            }
+            val fn_ty = get_sema(sym)
+            if fn_ty == null || fn_ty!!.kind != TypeKind.FN {
+                continue
+            }
+            if fn_ty!!.fn_variadic || fn_ty!!.contexts.len != 0 || fn_ty!!.elems.len != 1 {
+                continue
+            }
+            var recv = fn_ty!!.elems.get(0)
+            if recv.kind == TypeKind.PTR && recv.elem != null {
+                recv = recv.elem!!
+            }
+            if recv != elem {
+                continue
+            }
+            if fn_ty!!.elem == null || fn_ty!!.elem!! != str {
+                continue
+            }
+            return 1
+        }
+    }
+    if env.ck.stop {
+        return -1
+    }
+    return 0
+}
+
+private fn sentinel_type(env: *Env, ty: *Type?): i32 with (a: mem.Allocator) {
+    if is_error_interface(ty) {
+        return 1
+    }
+    if ty == null || ty!!.kind != TypeKind.PTR || ty!!.elem == null {
+        return 0
+    }
+    val elem = ty!!.elem!!
+    if elem.kind != TypeKind.STRUCT && elem.kind != TypeKind.ENUM {
+        return 0
+    }
+    return message_ok(env, elem)
+}
+
+private fn sentinel_cmp(env: *Env, left: *Type, right: *Type): i32 with (a: mem.Allocator) {
+    if is_error_option(left as *Type?) && !is_error_option(right as *Type?) {
+        return sentinel_type(env, right as *Type?)
+    }
+    if is_error_option(right as *Type?) && !is_error_option(left as *Type?) {
+        return sentinel_type(env, left as *Type?)
+    }
+    return 0
+}
+
+/**
+ * Option / null / error? sentinel `==` / `!=`. Tri-state: 0 = not this, 1 = handled, -1 = stop.
+ */
+fn check_error_compare(env: *Env, node: *parse.Node, left: *Type, right: *Type): (*Type?, i32) with (a: mem.Allocator) {
+    val left_null = left.kind == TypeKind.NULL
+    val right_null = right.kind == TypeKind.NULL
+    val left_opt = left.kind == TypeKind.OPTION
+    val right_opt = right.kind == TypeKind.OPTION
+    if !left_null && !right_null && !left_opt && !right_opt {
+        return null, 0
+    }
+    val boolean = type_builtin(&env.ck.types, Builtin.BOOL) as *Type?
+    if left_null && right_null {
+        env_fail(env, node, "null needs an option type")
+        return err_ty(env.ck) as *Type?, 1
+    }
+    if (left_null && right_opt) || (right_null && left_opt) {
+        return boolean, 1
+    }
+    if left_opt && right_opt && type_same(left, right) && type_option_is_niche(left) {
+        return boolean, 1
+    }
+    val sent = sentinel_cmp(env, left, right)
+    if sent < 0 {
+        return null, -1
+    }
+    if sent > 0 {
+        return boolean, 1
+    }
+    if left_opt || right_opt || left_null || right_null {
+        if left_opt && right_opt && !type_same(left, right) {
+            fail_types(env, node, "mismatched types", left, right)
+        } else if (left_null && !right_opt) || (right_null && !left_opt) {
+            fail_types(env, node, "mismatched types", left, right)
+        } else {
+            val shown = if left_opt { left } else { right }
+            var b = strbuilder.empty()
+            b.append("operator '")
+            b.append(node.text)
+            b.append("' does not apply to ")
+            b.append(type_print(shown as *Type?))
+            env_fail(env, node, b.str())
+            b.free()
+        }
+        return err_ty(env.ck) as *Type?, 1
+    }
+    return null, 0
+}
+
+/**
+ * Convert concrete error / sentinel pointer into error or error?.
+ * 1 handled (*out = want), 0 keep checking, -1 stop.
+ */
+fn check_error_expect(env: *Env, got: *Type, want: *Type): (*Type?, i32) with (a: mem.Allocator) {
+    if is_poison(got as *Type?) || is_poison(want as *Type?) {
+        return null, 0
+    }
+    if is_error_option(want as *Type?) && is_error_interface(got as *Type?) {
+        return want as *Type?, 1
+    }
+    if !is_error_option(want as *Type?) && !is_error_interface(want as *Type?) {
+        return null, 0
+    }
+    if got.kind != TypeKind.PTR {
+        return null, 0
+    }
+    val sent = sentinel_type(env, got as *Type?)
+    if sent < 0 {
+        return null, -1
+    }
+    if sent == 0 {
+        return null, 0
+    }
+    return want as *Type?, 1
+}
+
+/**
+ * Builtin `panic(str)`. 1 handled, 0 not panic, -1 stop.
+ */
+fn check_error_call(env: *Env, node: *parse.Node, target: *Type?): i32 with (a: mem.Allocator) {
+    if env.ck.stop {
+        return -1
+    }
+    if node.kids.len == 0 {
+        return 0
+    }
+    val callee = node.kids.get(0)
+    if !parse.is_ident(callee) || callee.name != "panic" {
+        return 0
+    }
+    if lookup_name(env, "panic") != null {
+        return 0
+    }
+    val nctx = parse.call_nctx(node)
+    var arg_end = node.kids.len
+    if nctx > 0 && arg_end >= nctx {
+        arg_end = arg_end - nctx
+    }
+    val nargs = if arg_end > 1 { arg_end - 1 } else { 0 }
+    if nctx > 0 || nargs != 1 {
+        env_fail(env, node, "panic expects 1 argument")
+        return if env.ck.stop { -1 } else { 1 }
+    }
+    val arg = node.kids.get(1)
+    if !parse.is_arg(arg) || arg.name.len > 0 || arg.kids.len == 0 {
+        env_fail(env, if parse.is_arg(arg) { arg } else { node }, "panic expects 1 argument")
+        return if env.ck.stop { -1 } else { 1 }
+    }
+    val value = arg.kids.get(0)
+    val want = str_ty(env.ck) as *Type?
+    val got = check_expr(env, value, want)
+    if got == null || env.ck.stop {
+        return -1
+    }
+    if is_poison(got) {
+        return 1
+    }
+    if target != null && !is_poison(target) {
+        // adopt expected type (diverges)
+    }
+    env.reachable = false
+    return if env.ck.stop { -1 } else { 1 }
+}
+
+/**
+ * Tuple literal `(a, b, ...)`.
+ */
+fn check_error_tuple(env: *Env, node: *parse.Node, target: *Type?): *Type? with (a: mem.Allocator) {
+    val count = node.kids.len
+    if count < 2 {
+        env_fail(env, node, "a tuple needs at least 2 elements")
+        return err_ty(env.ck) as *Type?
+    }
+    var hint: *Type? = null
+    if target != null && target!!.kind == TypeKind.TUPLE && target!!.elems.len == count {
+        hint = target
+    }
+    var elems = list.empty<*Type>()
+    var bad = false
+    var i: usize = 0
+    for i < count && !env.ck.stop {
+        val elem = node.kids.get(i)
+        var want: *Type? = null
+        if hint != null {
+            want = hint!!.elems.get(i) as *Type?
+        }
+        val got = check_expr(env, elem, want)
+        if got == null {
+            return null
+        }
+        if is_poison(got) {
+            bad = true
+        }
+        elems.push(got!!)
+        i = i + 1
+    }
+    if env.ck.stop {
+        return null
+    }
+    if bad {
+        return err_ty(env.ck) as *Type?
+    }
+    if hint != null {
+        return hint
+    }
+    return type_tuple(&env.ck.types, elems) as *Type?
+}
+
+/**
+ * Tuple field `.0` / `.1` (member with empty name). 1 handled, 0 named field, -1 stop.
+ */
+fn check_error_field(env: *Env, member: *parse.Node): (*Type?, i32) with (a: mem.Allocator) {
+    if !parse.is_member(member) || member.name.len > 0 {
+        return null, 0
+    }
+    if member.flag == "?." {
+        env_fail(env, member, "operator '?.' is not checked yet")
+        return err_ty(env.ck) as *Type?, 1
+    }
+    if member.kids.len == 0 {
+        return err_ty(env.ck) as *Type?, 1
+    }
+    val base_node = member.kids.get(0)
+    var base = check_expr(env, base_node, null)
+    if base == null || env.ck.stop {
+        return null, -1
+    }
+    if is_poison(base) {
+        return base, 1
+    }
+    if base!!.kind == TypeKind.PTR && base!!.elem != null {
+        base = base!!.elem
+    }
+    if base!!.kind != TypeKind.TUPLE {
+        var b = strbuilder.empty()
+        b.append("tuple field on ")
+        b.append(type_print(base))
+        env_fail(env, member, b.str())
+        b.free()
+        return err_ty(env.ck) as *Type?, 1
+    }
+    val index = parse_tuple_index(member.text)
+    if index < 0 || (index as usize) >= base!!.elems.len {
+        var b = strbuilder.empty()
+        b.append("tuple field ")
+        b.append_int(index, 10)
+        b.append(" is out of range")
+        env_fail(env, member, b.str())
+        b.free()
+        return err_ty(env.ck) as *Type?, 1
+    }
+    return base!!.elems.get(index as usize) as *Type?, 1
+}
+
+private fn compound_base_op(op: str): str {
+    if op == "+=" {
+        return "+"
+    }
+    if op == "-=" {
+        return "-"
+    }
+    if op == "*=" {
+        return "*"
+    }
+    if op == "/=" {
+        return "/"
+    }
+    if op == "%=" {
+        return "%"
+    }
+    if op == "&=" {
+        return "&"
+    }
+    if op == "|=" {
+        return "|"
+    }
+    if op == "^=" {
+        return "^"
+    }
+    if op == "<<=" {
+        return "<<"
+    }
+    if op == ">>=" {
+        return ">>"
+    }
+    return ""
+}
+
+/**
+ * Assignment to a tuple field (`t.0 = …`, `p.1 += …`).
+ */
+fn check_error_tuple_assign(env: *Env, node: *parse.Node) with (a: mem.Allocator) {
+    if node.kids.len < 2 {
+        env_fail(env, node, "missing assignment")
+        return
+    }
+    val target = node.kids.get(0)
+    val value = node.kids.get(1)
+    val (field_ty, rc) = check_error_field(env, target)
+    if rc < 0 || env.ck.stop {
+        return
+    }
+    if rc == 0 || field_ty == null || is_poison(field_ty) {
+        if rc == 0 {
+            env_fail(env, node, "assignment target is not checked yet")
+        }
+        check_expr(env, value, null)
+        return
+    }
+    val place = place_of(env, target)
+    if place != Place.MUT {
+        if place == Place.CONST {
+            env_fail(env, target, "cannot assign through a const view")
+        } else {
+            env_fail(env, target, "cannot assign to this value")
+        }
+        check_expr(env, value, field_ty)
+        return
+    }
+    val base = compound_base_op(node.text)
+    if base.len > 0 {
+        if field_ty!!.kind == TypeKind.PTR && (base == "+" || base == "-") {
+            check_memory_ptr_compound(env, value, field_ty!!)
+            return
+        }
+        check_expr(env, value, field_ty)
+        return
+    }
+    if node.text == "=" {
+        check_expr(env, value, field_ty)
+        return
+    }
+    var b = strbuilder.empty()
+    b.append("operator '")
+    b.append(node.text)
+    b.append("' is not checked yet")
+    env_fail(env, node, b.str())
+    b.free()
+}
+
+private fn bind_elements(
+    env: *Env,
+    node: *parse.Node,
+    tuple: *Type,
+    from_init: bool,
+) with (a: mem.Allocator) {
+    if tuple.kind != TypeKind.TUPLE || env.ck.stop {
+        return
+    }
+    val count = binding_name_count(node)
+    var kind = load.kind_constant()
+    if parse.is_var(node) {
+        kind = load.kind_variable()
+    }
+    var i: usize = 0
+    for i < count && !env.ck.stop {
+        val name = binding_name_at(node, i)
+        var elem: *Type? = null
+        if i < tuple.elems.len {
+            elem = tuple.elems.get(i) as *Type?
+        }
+        if is_discard(name) || elem == null {
+            i = i + 1
+            continue
+        }
+        val symbol = bind_local(env, node, kind, name, elem!!)
+        if symbol != null {
+            if from_init || type_has_zero(elem!!) {
+                note_assigned(symbol!!)
+            }
+        }
+        i = i + 1
+    }
+}
+
+/**
+ * Local `val (a, b) = …` / `var (a, b): (T, U)`.
+ */
+fn check_error_binding(env: *Env, node: *parse.Node) with (a: mem.Allocator) {
+    val count = binding_name_count(node)
+    var annotated_node: *parse.Node? = null
+    var init: *parse.Node? = null
+    var i: usize = 0
+    for i < node.kids.len {
+        if !parse.is_attribute(node.kids.get(i)) {
+            break
+        }
+        i = i + 1
+    }
+    if node.op == lex.kind().COLON && i < node.kids.len {
+        annotated_node = node.kids.get(i) as *parse.Node?
+        i = i + 1
+    }
+    if i < node.kids.len {
+        init = node.kids.get(i) as *parse.Node?
+    }
+    var annotated: *Type? = null
+    if annotated_node != null {
+        annotated = resolve_type(env.ck, env.job, annotated_node!!)
+        if annotated == null || env.ck.stop {
+            return
+        }
+        annotated = require_tuple(env, annotated_node!!, annotated, count)
+        if annotated == null || env.ck.stop {
+            return
+        }
+    }
+    if parse.is_val(node) && init == null {
+        env_fail(env, node, "val requires an initializer")
+    }
+    if annotated == null && init == null {
+        env_fail(env, node, "missing type")
+        return
+    }
+    var got: *Type? = null
+    if init != null {
+        var hint: *Type? = null
+        if annotated != null && !is_poison(annotated) {
+            hint = annotated
+        }
+        got = check_expr(env, init!!, hint)
+        if got == null || env.ck.stop {
+            return
+        }
+        if annotated == null {
+            got = require_tuple(env, init!!, got, count)
+        } else if !is_poison(got) && !is_poison(annotated) && !type_same(got!!, annotated!!) {
+            fail_mismatch(env, init!!, annotated!!, got!!)
+            got = err_ty(env.ck) as *Type?
+        }
+        if got == null || env.ck.stop {
+            return
+        }
+    }
+    if annotated != null && !is_poison(annotated) {
+        bind_elements(env, node, annotated!!, init != null)
+        return
+    }
+    if got != null && !is_poison(got) {
+        bind_elements(env, node, got!!, true)
+        return
+    }
+}
+
+/**
+ * Top-level multi binding. Returns the tuple type.
+ */
+fn check_error_top_binding(ck: *Check, job: *CheckJob, node: *parse.Node): *Type? with (a: mem.Allocator) {
+    val count = binding_name_count(node)
+    var annotated_node: *parse.Node? = null
+    var init: *parse.Node? = null
+    var i: usize = 0
+    for i < node.kids.len {
+        if !parse.is_attribute(node.kids.get(i)) {
+            break
+        }
+        i = i + 1
+    }
+    if node.op == lex.kind().COLON && i < node.kids.len {
+        annotated_node = node.kids.get(i) as *parse.Node?
+        i = i + 1
+    }
+    if i < node.kids.len {
+        init = node.kids.get(i) as *parse.Node?
+    }
+    var annotated: *Type? = null
+    if annotated_node != null {
+        annotated = resolve_type(ck, job, annotated_node!!)
+        if annotated == null || ck.stop {
+            return null
+        }
+        if !is_poison(annotated) {
+            var env = Env(ck: ck, job: job, scope: null, ret: null, reachable: true, loop_depth: 0)
+            annotated = require_tuple(&env, annotated_node!!, annotated, count)
+            if annotated == null || ck.stop {
+                return null
+            }
+        }
+    }
+    if parse.is_val(node) && init == null {
+        err_fail_ck(ck, job, node, "val requires an initializer")
+    }
+    if annotated == null && init == null {
+        err_fail_ck(ck, job, node, "missing type")
+        return err_ty(ck) as *Type?
+    }
+    var got: *Type? = null
+    if init != null {
+        var hint: *Type? = null
+        if annotated != null && !is_poison(annotated) {
+            hint = annotated
+        }
+        got = check_expr_job(ck, job, init!!, hint)
+        if ck.stop {
+            return null
+        }
+        if annotated == null {
+            var env = Env(ck: ck, job: job, scope: null, ret: null, reachable: true, loop_depth: 0)
+            got = require_tuple(&env, init!!, got, count)
+        } else if got != null && !is_poison(got) && annotated != null && !is_poison(annotated) &&
+            !type_same(got!!, annotated!!) {
+            var env = Env(ck: ck, job: job, scope: null, ret: null, reachable: true, loop_depth: 0)
+            fail_mismatch(&env, init!!, annotated!!, got!!)
+            got = err_ty(ck) as *Type?
+        }
+        if ck.stop {
+            return null
+        }
+    }
+    var tuple = annotated
+    if tuple == null || is_poison(tuple) {
+        tuple = got
+    }
+    if tuple == null || is_poison(tuple) || tuple!!.kind != TypeKind.TUPLE {
+        if tuple != null && is_poison(tuple) {
+            return tuple
+        }
+        return err_ty(ck) as *Type?
+    }
+    // Publish element types onto job symbols gathered by name.
+    var j: usize = 0
+    for j < count {
+        val name = binding_name_at(node, j)
+        if is_discard(name) {
+            j = j + 1
+            continue
+        }
+        val sym = load.file_lookup(&job.pkg.scope, job.file_index, name)
+        if sym == null {
+            var b = strbuilder.empty()
+            b.append("undefined name '")
+            b.append(name)
+            b.append("'")
+            err_fail_ck(ck, job, node, b.str())
+            b.free()
+            j = j + 1
+            continue
+        }
+        if j < tuple!!.elems.len {
+            set_sema(sym!!, tuple!!.elems.get(j) as *Type?)
+        }
+        j = j + 1
+    }
+    return tuple
+}
+
+struct Expect {
+    target: *parse.Node?
+    ty: *Type?
+    discard: bool
+    writable: bool
+    nested: bool
+    checked: bool
+    kids: list.List<*Expect>
+}
+
+private fn alloc_expect(a: mem.Allocator): *Expect {
+    val (raw, err) = a.alloc(size(Expect), align(Expect))
+    if err != null {
+        panic("out of memory")
+    }
+    val e = raw.ptr as *Expect
+    e.target = null
+    e.ty = null
+    e.discard = false
+    e.writable = false
+    e.nested = false
+    e.checked = false
+    e.kids = list.empty<*Expect>()
+    return e
+}
+
+private fn reject_place(env: *Env, target: *parse.Node?, place: Place) with (a: mem.Allocator) {
+    if place == Place.MUT {
+        return
+    }
+    if target != null && parse.is_ident(target!!) {
+        val name = target!!.name
+        var b = strbuilder.empty()
+        b.append("cannot assign to '")
+        b.append(name)
+        b.append("'")
+        env_fail(env, target!!, b.str())
+        b.free()
+        return
+    }
+    if target != null && parse.is_member(target!!) && target!!.name.len > 0 {
+        var b = strbuilder.empty()
+        b.append("cannot assign to field '")
+        b.append(target!!.name)
+        b.append("'")
+        env_fail(env, target!!, b.str())
+        b.free()
+        return
+    }
+    if place == Place.CONST {
+        if target != null {
+            env_fail(env, target!!, "cannot assign through a const view")
+        }
+        return
+    }
+    if target != null {
+        env_fail(env, target!!, "cannot assign to this value")
+    }
+}
+
+private fn fill_expect(env: *Env, target: *parse.Node?, out: *Expect): i32 with (a: mem.Allocator) {
+    out.target = target
+    out.ty = null
+    out.discard = false
+    out.writable = false
+    out.nested = false
+    out.checked = false
+    out.kids = list.empty<*Expect>()
+    if target == null || env.ck.stop {
+        if env.ck.stop {
+            return -1
+        }
+        return 1
+    }
+    if parse.is_ident(target!!) && is_discard(target!!.name) {
+        out.discard = true
+        return 1
+    }
+    if parse.is_ident(target!!) {
+        val symbol = lookup_name(env, target!!.name)
+        if symbol == null {
+            var b = strbuilder.empty()
+            b.append("undefined name '")
+            b.append(target!!.name)
+            b.append("'")
+            env_fail(env, target!!, b.str())
+            b.free()
+            return if env.ck.stop { -1 } else { 1 }
+        }
+        if !wait_for_symbol(env.ck, env.job, symbol!!, false) {
+            return -1
+        }
+        out.ty = get_sema(symbol!!)
+        if !load.is_symbol_variable(symbol!!) && symbol!!.kind != load.kind_parameter() {
+            var b = strbuilder.empty()
+            b.append("cannot assign to '")
+            b.append(symbol!!.name)
+            b.append("'")
+            env_fail(env, target!!, b.str())
+            b.free()
+            return if env.ck.stop { -1 } else { 1 }
+        }
+        out.writable = true
+        return 1
+    }
+    if parse.is_tuple(target!!) {
+        val n = target!!.kids.len
+        if n < 2 {
+            env_fail(env, target!!, "a tuple needs at least 2 elements")
+            return if env.ck.stop { -1 } else { 1 }
+        }
+        out.nested = true
+        var complete = true
+        var elems = list.empty<*Type>()
+        var i: usize = 0
+        for i < n && !env.ck.stop {
+            val kid = alloc_expect(a)
+            if fill_expect(env, target!!.kids.get(i) as *parse.Node?, kid) < 0 {
+                return -1
+            }
+            out.kids.push(kid)
+            if kid.discard || kid.ty == null || is_poison(kid.ty) {
+                complete = false
+            } else {
+                elems.push(kid.ty!!)
+            }
+            i = i + 1
+        }
+        if env.ck.stop {
+            return -1
+        }
+        if complete {
+            out.ty = type_tuple(&env.ck.types, elems) as *Type?
+        }
+        return 1
+    }
+    out.ty = check_expr(env, target!!, null)
+    if out.ty == null || env.ck.stop {
+        return -1
+    }
+    if !is_poison(out.ty) {
+        val place = place_of(env, target!!)
+        if place != Place.MUT {
+            reject_place(env, target, place)
+            return if env.ck.stop { -1 } else { 1 }
+        }
+        out.writable = true
+    }
+    return if env.ck.stop { -1 } else { 1 }
+}
+
+private fn want_of(slot: *Expect): *Type? {
+    if slot.discard || !slot.writable || slot.ty == null || is_poison(slot.ty) {
+        return null
+    }
+    return slot.ty
+}
+
+private fn check_against(
+    env: *Env,
+    node: *parse.Node,
+    slots: list.List<*Expect>,
+    n: usize,
+): *Type? with (a: mem.Allocator) {
+    if env.ck.stop {
+        return null
+    }
+    if parse.is_tuple(node) && node.kids.len == n {
+        var elems = list.empty<*Type>()
+        var i: usize = 0
+        for i < n && !env.ck.stop {
+            val child = node.kids.get(i)
+            val slot = slots.get(i)
+            var got: *Type? = null
+            if slot.nested {
+                slot.checked = parse.is_tuple(child) && child.kids.len == slot.kids.len
+                got = check_against(env, child, slot.kids, slot.kids.len)
+            } else {
+                got = check_expr(env, child, want_of(slot))
+            }
+            if got == null || env.ck.stop {
+                return null
+            }
+            elems.push(got!!)
+            i = i + 1
+        }
+        if env.ck.stop {
+            return null
+        }
+        return type_tuple(&env.ck.types, elems) as *Type?
+    }
+    val built = check_expr(env, node, null)
+    if built == null || env.ck.stop {
+        return null
+    }
+    return require_tuple(env, node, built, n)
+}
+
+private fn accept_slots(
+    env: *Env,
+    slots: list.List<*Expect>,
+    n: usize,
+    tuple: *Type,
+    checked: bool,
+) with (a: mem.Allocator) {
+    if is_poison(tuple as *Type?) || tuple.kind != TypeKind.TUPLE || env.ck.stop {
+        return
+    }
+    var i: usize = 0
+    for i < n && !env.ck.stop {
+        var elem: *Type? = null
+        if i < tuple.elems.len {
+            elem = tuple.elems.get(i) as *Type?
+        }
+        val slot = slots.get(i)
+        val target = slot.target
+        if slot.discard {
+            i = i + 1
+            continue
+        }
+        if slot.nested {
+            if elem == null || is_poison(elem) {
+                i = i + 1
+                continue
+            }
+            if elem!!.kind != TypeKind.TUPLE || elem!!.elems.len != slot.kids.len {
+                if !checked {
+                    if elem!!.kind != TypeKind.TUPLE {
+                        var b = strbuilder.empty()
+                        b.append("destructuring expects a tuple, got ")
+                        b.append(type_print(elem))
+                        if target != null {
+                            env_fail(env, target!!, b.str())
+                        }
+                        b.free()
+                    } else {
+                        var b = strbuilder.empty()
+                        b.append("destructuring expects ")
+                        b.append_int(slot.kids.len as i64, 10)
+                        b.append(" values, got ")
+                        b.append_int(elem!!.elems.len as i64, 10)
+                        if target != null {
+                            env_fail(env, target!!, b.str())
+                        }
+                        b.free()
+                    }
+                }
+                i = i + 1
+                continue
+            }
+            accept_slots(env, slot.kids, slot.kids.len, elem!!, slot.checked)
+            i = i + 1
+            continue
+        }
+        if !slot.writable || slot.ty == null || elem == null || is_poison(slot.ty) || is_poison(elem) {
+            i = i + 1
+            continue
+        }
+        if !type_same(slot.ty!!, elem!!) {
+            if !checked && target != null {
+                fail_mismatch(env, target!!, slot.ty!!, elem!!)
+            }
+            i = i + 1
+            continue
+        }
+        if target != null && parse.is_ident(target!!) {
+            val sym = lookup_name(env, target!!.name)
+            if sym != null {
+                note_assigned(sym!!)
+            }
+        }
+        i = i + 1
+    }
+}
+
+/**
+ * `(a, b) = …` destructuring assignment.
+ */
+fn check_error_destructure(env: *Env, node: *parse.Node) with (a: mem.Allocator) {
+    // Kids: targets…, then value. head = target count.
+    val count = node.head as usize
+    if count < 2 {
+        env_fail(env, node, "a tuple needs at least 2 elements")
+        return
+    }
+    if node.kids.len <= count {
+        env_fail(env, node, "missing assignment")
+        return
+    }
+    var slots = list.empty<*Expect>()
+    var i: usize = 0
+    for i < count && !env.ck.stop {
+        val slot = alloc_expect(a)
+        if fill_expect(env, node.kids.get(i) as *parse.Node?, slot) < 0 {
+            return
+        }
+        slots.push(slot)
+        i = i + 1
+    }
+    if env.ck.stop {
+        return
+    }
+    val value = node.kids.get(count)
+    val literal = parse.is_tuple(value) && value.kids.len == count
+    val got = check_against(env, value, slots, count)
+    if got == null || env.ck.stop {
+        return
+    }
+    if !is_poison(got) {
+        accept_slots(env, slots, count, got!!, literal)
+    }
+}
+
+/**
+ * Multi-value `return a, b`.
+ */
+fn check_error_return(env: *Env, node: *parse.Node, ret: *Type?) with (a: mem.Allocator) {
+    val count = node.kids.len
+    var expect: usize = 0
+    if ret != null && ret!!.kind == TypeKind.TUPLE {
+        expect = ret!!.elems.len
+    } else if ret != null && ret!!.kind != TypeKind.UNIT && !is_poison(ret) {
+        expect = 1
+    }
+    if ret == null || ret!!.kind != TypeKind.TUPLE || ret!!.elems.len != count {
+        if expect == 1 {
+            var b = strbuilder.empty()
+            b.append("return expects 1 value, got ")
+            b.append_int(count as i64, 10)
+            env_fail(env, node, b.str())
+            b.free()
+        } else {
+            var b = strbuilder.empty()
+            b.append("return expects ")
+            b.append_int(expect as i64, 10)
+            b.append(" values, got ")
+            b.append_int(count as i64, 10)
+            env_fail(env, node, b.str())
+            b.free()
+        }
+        return
+    }
+    var i: usize = 0
+    for i < count && !env.ck.stop {
+        var want: *Type? = null
+        if i < ret!!.elems.len {
+            want = ret!!.elems.get(i) as *Type?
+        }
+        check_expr(env, node.kids.get(i), want)
+        i = i + 1
+    }
+}
+
+/**
+ * `defer` / `errdefer`. errdefer needs a trailing error? result.
+ */
+fn check_error_defer(env: *Env, node: *parse.Node) with (a: mem.Allocator) {
+    if parse.is_errdefer(node) && !is_error_option(last_result(env.ret)) {
+        env_fail(env, node, "errdefer requires a function that returns error?")
+    }
+    if node.kids.len > 0 {
+        check_stmt_isolated(env, node.kids.get(0))
+    }
+}

@@ -1,0 +1,77 @@
+// A loaded module: the root, or one given with --module. Fields match
+// Module in compiler/src/loader.c and JogProgram's module roots.
+
+import std.mem
+import std.text as texts
+
+/**
+ * One --module <name>=<dir> mapping from the command line.
+ */
+struct ModuleArg {
+    name: str
+    dir: str
+}
+
+/**
+ * Library roots from jog_locate_roots. Empty strings mean the folder
+ * was not found. Step 3 fills these; a missing core is fine until the
+ * prelude runs.
+ */
+struct Roots {
+    std_root: str
+    core_root: str
+    runtime_root: str
+}
+
+/**
+ * A module whose jog.mod has been opened. root is the folder that holds
+ * that file. std is not a Module; it lives at std_root on the program.
+ * bad is set when --module validation already reported an error for it.
+ */
+struct Module {
+    name: str
+    root: str
+    arg_dir: str
+    is_root: bool
+    is_library: bool
+    required: bool
+    bad: bool
+    manifest: Manifest
+}
+
+/**
+ * An empty module. Step 3 onwards fills roots and mappings.
+ * @context a allocator for the manifest lists
+ * @return a module with empty fields
+ */
+fn empty_module(): Module with (a: mem.Allocator) {
+    var m: Module
+    m.name = ""
+    m.root = ""
+    m.arg_dir = ""
+    m.is_root = false
+    m.is_library = false
+    m.required = false
+    m.bad = false
+    m.manifest = empty_manifest()
+    return m
+}
+
+/**
+ * Split one `--module` value `name=dir`.
+ * @param value the text after `--module` or `--module=`
+ * @return name, dir, and false when the shape is wrong
+ */
+fn split_module_flag(value: str): (str, str, bool) {
+    var i: usize = 0
+    for i < value.len {
+        if value.ptr[i] == '=' as u8 {
+            if i == 0 || i + 1 >= value.len {
+                return "", "", false
+            }
+            return texts.slice(value, 0, i), texts.slice(value, i + 1, value.len), true
+        }
+        i = i + 1
+    }
+    return "", "", false
+}

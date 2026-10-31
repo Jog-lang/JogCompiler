@@ -11,7 +11,9 @@
 #
 # lex and parse compare stdout and the exit code on every .jog file under
 # std/, tests/jog, tests/parse, tests/check, playground/, examples/, and
-# src/, including the stage stubs. Line endings are normalized to LF.
+# src/, including the stage stubs. An exact -Filter path is also compared
+# when that .jog file exists outside those trees (core/ is not scanned
+# unless the filter names it). Line endings are normalized to LF.
 # check compares the first diagnostic's line and column on each tests/check
 # case (a directory that has jog.mod, or a loose .jog file staged into a
 # temporary module). ir runs emit-ir on each top-level tests/jog program
@@ -269,6 +271,17 @@ if ($Stage -eq 'lex' -or $Stage -eq 'parse') {
                 continue
             }
             if (Test-Filter $rel) {
+                [void]$rels.Add($rel)
+            }
+        }
+    }
+    # -Filter can name a .jog file outside those trees, such as core/scalar.jog.
+    # The default scan stays the same when -Filter is omitted.
+    if ($Filter -and ($Filter -notmatch '[\*\?]')) {
+        $named = Join-Path $Repo ($Filter -replace '/', '\')
+        if ((Test-Path -LiteralPath $named -PathType Leaf) -and $named.EndsWith('.jog', [System.StringComparison]::OrdinalIgnoreCase)) {
+            $rel = Get-RelPath $named
+            if (-not $rels.Contains($rel)) {
                 [void]$rels.Add($rel)
             }
         }

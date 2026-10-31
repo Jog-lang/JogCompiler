@@ -1,0 +1,1004 @@
+// with clauses and context inference.
+// Checked against compiler/src/check_context.c.
+// CheckerGuide step 9.
+
+import src.load
+import src.parse
+import std.list
+import std.mem
+import std.strbuilder
+
+struct CtxSrc {
+    ty: *Type
+    expr: *parse.Node?
+}
+
+struct CtxLevel {
+    srcs: list.List<CtxSrc>
+    outer: *CtxLevel?
+}
+
+struct Need {
+    ty: *Type
+    chain: str
+}
+
+struct Edge {
+    callee: *CheckJob
+    provided: list.List<*Type>
+}
+
+struct InferState {
+    needs: list.List<Need>
+    edges: list.List<Edge>
+}
+
+private fn types_match(ck: *Check, have: *Type, want: *Type): bool with (a: mem.Allocator) {
+    if have == want {
+        return true
+    }
+    return iface_converts(ck, have, want)
+}
+
+private fn fn_shape_parts(node: *parse.Node): (i64, i64, bool, bool, bool, bool, i64, i64) {
+    val shape = node.head
+    val nparams = shape % 256
+    val nctx = (shape / 256) % 256
+    val has_recv = (shape / 65536) % 2 == 1
+    val has_ret = (shape / 131072) % 2 == 1
+    val has_body = (shape / 262144) % 2 == 1
+    val expr_body = (shape / 524288) % 2 == 1
+    val ntype = (shape / 1048576) % 256
+    val nattrs = (shape / 268435456) % 256
+    return nparams, nctx, has_recv, has_ret, has_body, expr_body, ntype, nattrs
+}
+
+private fn fn_has_attr(node: *parse.Node, name: str): bool {
+    val (_, _, _, _, _, _, _, nattrs) = fn_shape_parts(node)
+    var i: i64 = 0
+    for i < nattrs {
+        if (i as usize) >= node.kids.len {
+            break
+        }
+        val attr = node.kids.get(i as usize)
+        if parse.is_attribute(attr) && attr.name == name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+private fn fn_is_private(node: *parse.Node): bool {
+    return parse.flag_has_word(node.flag, "private") || parse.flag_has_word(node.flag, "private(file)") ||
+        parse.flag_has_word(node.flag, "private(scope)") || parse.flag_has_word(node.flag, "private(package)")
+}
+
+private fn fn_has_body(node: *parse.Node): bool {
+    val (_, _, _, _, has_body, _, _, _) = fn_shape_parts(node)
+    return has_body
+}
+
+private fn fn_nctx(node: *parse.Node): i64 {
+    val (_, nctx, _, _, _, _, _, _) = fn_shape_parts(node)
+    return nctx
+}
+
+private fn fn_ntype(node: *parse.Node): i64 {
+    val (_, _, _, _, _, _, ntype, _) = fn_shape_parts(node)
+    return ntype
+}
+
+private fn context_param_start(node: *parse.Node): usize {
+    val (nparams, _, has_recv, _, _, _, ntype, nattrs) = fn_shape_parts(node)
+    var i: i64 = nattrs
+    if has_recv {
+        i = i + 1
+    }
+    i = i + ntype + nparams
+    return i as usize
+}
+
+private fn stack_of(job: *CheckJob): *CtxLevel? {
+    return job.ctx_stack
+}
+
+private fn alloc_level(): *CtxLevel with (a: mem.Allocator) {
+    val (raw, err) = a.alloc(size(CtxLevel), align(CtxLevel))
+    if err != null {
+        panic("out of memory")
+    }
+    val level = raw.ptr as *CtxLevel
+    level.srcs = list.empty<CtxSrc>()
+    level.outer = null
+    return level
+}
+
+private fn alloc_infer_state(): *InferState with (a: mem.Allocator) {
+    val (raw, err) = a.alloc(size(InferState), align(InferState))
+    if err != null {
+        panic("out of memory")
+    }
+    val st = raw.ptr as *InferState
+    st.needs = list.empty<Need>()
+    st.edges = list.empty<Edge>()
+    return st
+}
+
+private fn state_of(job: *CheckJob): *InferState with (a: mem.Allocator) {
+    if job.infer_state != null {
+        return job.infer_state!!
+    }
+    val st = alloc_infer_state()
+    job.infer_state = st as *InferState?
+    return st
+}
+
+private fn push_level(job: *CheckJob, srcs: list.List<CtxSrc>): i32 with (a: mem.Allocator) {
+    if srcs.len == 0 {
+        return 0
+    }
+    val level = alloc_level()
+    level.srcs = srcs
+    level.outer = stack_of(job)
+    job.ctx_stack = level as *CtxLevel?
+    return 1
+}
+
+private fn match_level(ck: *Check, srcs: list.List<CtxSrc>, want: *Type): (i32, usize) with (a: mem.Allocator) {
+    var n: i32 = 0
+    var first: usize = 0
+    var i: usize = 0
+    for i < srcs.len {
+        val src = srcs.get(i)
+        if types_match(ck, src.ty, want) {
+            if n == 0 {
+                first = i
+            }
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n, first
+}
+
+private fn stack_has(ck: *Check, job: *CheckJob, want: *Type): bool with (a: mem.Allocator) {
+    var level = stack_of(job)
+    for level != null {
+        val (n, _) = match_level(ck, level!!.srcs, want)
+        if n > 0 {
+            return true
+        }
+        level = level!!.outer
+    }
+    return false
+}
+
+private fn type_in(ck: *Check, types: list.List<*Type>, want: *Type): bool with (a: mem.Allocator) {
+    for t in types.items() {
+        if types_match(ck, t, want) {
+            return true
+        }
+    }
+    return false
+}
+
+private fn fn_name(node: *parse.Node): str {
+    if node.name.len > 0 {
+        return node.name
+    }
+    return "?"
+}
+
+private fn chain_has_name(inner: str, name: str): bool {
+    if name.len == 0 || name.len > inner.len {
+        return false
+    }
+    var i: usize = 0
+    val last = inner.len - name.len
+    for i <= last {
+        var same = true
+        var j: usize = 0
+        for j < name.len {
+            if inner.ptr[i + j] != name.ptr[j] {
+                same = false
+                break
+            }
+            j = j + 1
+        }
+        if same {
+            return true
+        }
+        if i == last {
+            break
+        }
+        i = i + 1
+    }
+    return false
+}
+
+private fn join_chain(name: str, inner: str): str with (a: mem.Allocator) {
+    var n = name
+    if n.len == 0 {
+        n = "?"
+    }
+    if inner.len == 0 || chain_has_name(inner, n) {
+        return n
+    }
+    var b = strbuilder.empty()
+    b.append(n)
+    b.append(" -> ")
+    b.append(inner)
+    val out = b.str()
+    b.free()
+    return out
+}
+
+private fn chain_on_job(job: *CheckJob, want: *Type): str {
+    var i: usize = 0
+    for i < job.inferred_contexts.len {
+        if job.inferred_contexts.get(i) == want {
+            if i < job.infer_chains.len {
+                return job.infer_chains.get(i)
+            }
+            return ""
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+private fn via_chain(callee: *CheckJob?, want: *Type): str with (a: mem.Allocator) {
+    var name = "?"
+    var inner = ""
+    if callee != null {
+        name = fn_name(callee!!.decl)
+        inner = chain_on_job(callee!!, want)
+    }
+    return join_chain(name, inner)
+}
+
+private fn add_need(st: *InferState, ty: *Type, chain: str) {
+    if type_is_error(ty) {
+        return
+    }
+    for need in st.needs.items() {
+        if need.ty == ty {
+            return
+        }
+    }
+    st.needs.push(Need(ty: ty, chain: chain))
+}
+
+private fn record_need(job: *CheckJob, callee: *CheckJob?, ty: *Type) with (a: mem.Allocator) {
+    val st = state_of(job)
+    val chain = via_chain(callee, ty)
+    add_need(st, ty, chain)
+}
+
+private fn record_edge(job: *CheckJob, callee: *CheckJob, provided: list.List<*Type>) with (a: mem.Allocator) {
+    // Self-recursive calls during collecting must not become wait edges:
+    // this job is not done until infer finishes, so a self-edge deadlocks.
+    if callee == job {
+        return
+    }
+    val st = state_of(job)
+    st.edges.push(Edge(callee: callee, provided: provided))
+}
+
+private fn snapshot_types(job: *CheckJob, extra: list.List<CtxSrc>): list.List<*Type> with (a: mem.Allocator) {
+    var out = list.empty<*Type>()
+    for src in extra.items() {
+        if !type_is_error(src.ty) {
+            out.push(src.ty)
+        }
+    }
+    var level = stack_of(job)
+    for level != null {
+        for src in level!!.srcs.items() {
+            if !type_is_error(src.ty) {
+                out.push(src.ty)
+            }
+        }
+        level = level!!.outer
+    }
+    return out
+}
+
+private fn callee_pending(other: *CheckJob?): bool {
+    return other != null && other!!.infer_contexts && !other!!.done && !other!!.infer_solved
+}
+
+private fn job_symbol(job: *CheckJob): *load.Symbol? {
+    val pkg = job.pkg
+    for i in 0 as usize..pkg.scope.bindings.len {
+        val s = pkg.scope.bindings.at(i)
+        if s.decl != null && s.decl!! == job.decl {
+            return s
+        }
+    }
+    if job.file_index < pkg.scope.file_scopes.len {
+        val file_scope = pkg.scope.file_scopes.get(job.file_index)
+        for i in 0 as usize..file_scope.bindings.len {
+            val s = file_scope.bindings.at(i)
+            if s.decl != null && s.decl!! == job.decl {
+                return s
+            }
+        }
+    }
+    for i in 0 as usize..pkg.methods.len {
+        val s = pkg.methods.at(i)
+        if s.decl != null && s.decl!! == job.decl {
+            return s
+        }
+    }
+    return null
+}
+
+private fn ctx_fail(env: *Env, node: *parse.Node, message: str) with (a: mem.Allocator) {
+    check_fail(env.ck, env.job.file, node.line, node.column, message)
+}
+
+/**
+ * True when a private body omitted `with` and should have contexts inferred.
+ */
+fn context_should_infer(job: *CheckJob): bool {
+    if !parse.is_fn(job.decl) {
+        return false
+    }
+    val node = job.decl
+    if !fn_is_private(node) || parse.flag_has_word(node.flag, "extern") || !fn_has_body(node) {
+        return false
+    }
+    if fn_nctx(node) > 0 || fn_ntype(node) > 0 {
+        return false
+    }
+    if fn_has_attr(node, "export") || fn_has_attr(node, "test") {
+        return false
+    }
+    return true
+}
+
+/**
+ * Reject contexts on root `main` and `@export`.
+ */
+fn context_reject_decl(ck: *Check, job: *CheckJob): bool with (a: mem.Allocator) {
+    if !parse.is_fn(job.decl) {
+        return false
+    }
+    val node = job.decl
+    if fn_nctx(node) == 0 {
+        return false
+    }
+    var bad = false
+    if fn_has_attr(node, "export") {
+        check_fail(ck, job.file, node.line, node.column, "an exported function cannot declare contexts")
+        bad = true
+    }
+    if !parse.fn_has_receiver(node) && node.name == "main" {
+        val root = ck.prog.root_module
+        if root.len == 0 || job.pkg.module_name == root {
+            check_fail(ck, job.file, node.line, node.column, "fn main cannot declare contexts yet")
+            bad = true
+        }
+    }
+    return bad
+}
+
+/**
+ * Drop the context stack at the start of a function body.
+ */
+fn context_begin(job: *CheckJob) {
+    job.ctx_stack = null
+}
+
+/**
+ * Remember the stack pointer for a block.
+ */
+fn context_mark(job: *CheckJob): *CtxLevel? {
+    return job.ctx_stack
+}
+
+/**
+ * Restore the stack pointer, dropping nested levels.
+ */
+fn context_reset(job: *CheckJob, mark: *CtxLevel?) {
+    job.ctx_stack = mark
+}
+
+/**
+ * Pop one with-block level.
+ */
+fn context_pop(job: *CheckJob) {
+    val level = stack_of(job)
+    if level == null {
+        return
+    }
+    job.ctx_stack = level!!.outer
+}
+
+/**
+ * Push context parameter types onto the stack.
+ */
+fn context_push_params(job: *CheckJob, types: list.List<*Type>) with (a: mem.Allocator) {
+    if types.len == 0 {
+        return
+    }
+    var srcs = list.empty<CtxSrc>()
+    for ty in types.items() {
+        if type_is_error(ty) {
+            continue
+        }
+        srcs.push(CtxSrc(ty: ty, expr: null))
+    }
+    push_level(job, srcs)
+}
+
+/**
+ * Bind FN context params into the body scope and push them on the stack.
+ */
+fn context_bind_params(env: *Env, fn_node: *parse.Node, fn_ty: *Type) with (a: mem.Allocator) {
+    context_begin(env.job)
+    val n = fn_ty.contexts.len
+    if n == 0 || env.ck.stop {
+        return
+    }
+    val start = context_param_start(fn_node)
+    var types = list.empty<*Type>()
+    var i: usize = 0
+    for i < n {
+        val ty = fn_ty.contexts.get(i)
+        types.push(ty)
+        val at = start + i
+        if at < fn_node.kids.len {
+            val param = fn_node.kids.get(at)
+            if parse.is_param(param) && param.name.len > 0 && param.name != "_" {
+                val sym = bind_local(env, param, load.kind_context(), param.name, ty)
+                if sym != null {
+                    note_assigned(sym!!)
+                }
+            }
+        }
+        i = i + 1
+    }
+    if !env.ck.stop {
+        context_push_params(env.job, types)
+    }
+}
+
+/**
+ * `context name [: T] = expr` inside a body.
+ */
+fn context_binding(env: *Env, stmt: *parse.Node): i32 with (a: mem.Allocator) {
+    if env.ck.stop {
+        return -1
+    }
+    val (annotated_node, init, name) = local_binding_parts(stmt)
+    if init == null {
+        ctx_fail(env, stmt, "context requires an initializer")
+        return 0
+    }
+    var annotated: *Type? = null
+    if annotated_node != null {
+        annotated = resolve_type(env.ck, env.job, annotated_node!!)
+        if annotated == null || env.ck.stop {
+            if env.ck.stop {
+                return -1
+            }
+            return 0
+        }
+    }
+    var hint: *Type? = null
+    if annotated != null && !type_is_error(annotated!!) {
+        hint = annotated
+    }
+    val got = check_expr(env, init!!, hint)
+    if env.ck.stop {
+        return -1
+    }
+    var ty = annotated
+    if ty == null {
+        ty = got
+    }
+    if ty == null {
+        ty = err_ty(env.ck) as *Type?
+    }
+    val sym = bind_local(env, stmt, load.kind_context(), name, ty!!)
+    if sym == null {
+        if env.ck.stop {
+            return -1
+        }
+        return 0
+    }
+    note_assigned(sym!!)
+    var srcs = list.empty<CtxSrc>()
+    srcs.push(CtxSrc(ty: ty!!, expr: init))
+    return push_level(env.job, srcs)
+}
+
+private fn with_values_and_body(stmt: *parse.Node): (usize, *parse.Node?) {
+    if stmt.kids.len == 0 {
+        return 0, null
+    }
+    val last = stmt.kids.get(stmt.kids.len - 1)
+    if parse.is_block(last) {
+        return stmt.kids.len - 1, last as *parse.Node?
+    }
+    return stmt.kids.len, null
+}
+
+/**
+ * Typecheck with values and push one level. 1 when pushed, 0 when not, -1 on stop.
+ */
+fn context_push_with(env: *Env, stmt: *parse.Node): i32 with (a: mem.Allocator) {
+    if env.ck.stop {
+        return -1
+    }
+    val (nvals, _) = with_values_and_body(stmt)
+    var srcs = list.empty<CtxSrc>()
+    var i: usize = 0
+    for i < nvals && !env.ck.stop {
+        val value = stmt.kids.get(i)
+        val ty = check_expr(env, value, null)
+        if env.ck.stop {
+            return -1
+        }
+        if ty != null && !type_is_error(ty!!) {
+            srcs.push(CtxSrc(ty: ty!!, expr: value as *parse.Node?))
+        }
+        i = i + 1
+    }
+    if srcs.len == 0 {
+        return 0
+    }
+    return push_level(env.job, srcs)
+}
+
+/**
+ * Body of a `with (...) { }` statement after values were pushed.
+ */
+fn context_with_body(stmt: *parse.Node): *parse.Node? {
+    val (_, body) = with_values_and_body(stmt)
+    return body
+}
+
+private fn type_explicit(env: *Env, call: *parse.Node): list.List<CtxSrc> with (a: mem.Allocator) {
+    var out = list.empty<CtxSrc>()
+    // CALL head: low byte = context count; bit 8 = trailing lambda.
+    val nctx = parse.call_nctx(call)
+    val trailing: usize = if parse.call_has_trailing(call) {
+        1
+    } else {
+        0
+    }
+    if nctx == 0 || call.kids.len < nctx + trailing {
+        return out
+    }
+    val start = call.kids.len - nctx - trailing
+    var i: usize = 0
+    for i < nctx && !env.ck.stop {
+        val expr = call.kids.get(start + i)
+        val ty = check_expr(env, expr, null)
+        if env.ck.stop {
+            return out
+        }
+        if ty != null && !type_is_error(ty!!) {
+            out.push(CtxSrc(ty: ty!!, expr: expr as *parse.Node?))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+private fn search_top(env: *Env, want: *Type): (i32, bool) with (a: mem.Allocator) {
+    var matches: i32 = 0
+    for other in env.ck.jobs.items() {
+        if other == env.job || !parse.is_context(other.decl) {
+            continue
+        }
+        val sym = job_symbol(other)
+        if sym == null || sym!!.kind != load.kind_context() {
+            continue
+        }
+        if !wait_for_symbol(env.ck, env.job, sym!!, false) {
+            return -1, false
+        }
+        val ty = get_sema(sym!!)
+        if ty == null || !types_match(env.ck, ty!!, want) {
+            continue
+        }
+        matches = matches + 1
+    }
+    if matches > 1 {
+        return 1, true
+    }
+    if matches == 1 {
+        return 1, false
+    }
+    return 0, false
+}
+
+/**
+ * Resolve callee context parameters for a call. 0 ok, -1 stopped.
+ */
+fn context_resolve(env: *Env, call: *parse.Node, fn_ty: *Type?, callee_sym: *load.Symbol?): i32 with (a: mem.Allocator) {
+    if env.ck.stop {
+        return -1
+    }
+    val collecting = env.job.infer_collecting
+    var callee_job: *CheckJob? = null
+    if callee_sym != null {
+        callee_job = job_for_symbol(env.ck, callee_sym!!)
+    }
+    val explicit = type_explicit(env, call)
+    if env.ck.stop {
+        return -1
+    }
+    if collecting && callee_pending(callee_job) {
+        val provided = snapshot_types(env.job, explicit)
+        record_edge(env.job, callee_job!!, provided)
+        if env.ck.stop {
+            return -1
+        }
+        return 0
+    }
+    if fn_ty == null || fn_ty!!.kind != TypeKind.FN {
+        return 0
+    }
+    val need_n = fn_ty!!.contexts.len
+    if need_n == 0 {
+        if !collecting && explicit.len > 0 {
+            ctx_fail(env, call, "this function takes no contexts")
+        }
+        return 0
+    }
+    var i: usize = 0
+    for i < need_n && !env.ck.stop {
+        val want = fn_ty!!.contexts.get(i)
+        if type_is_error(want) {
+            i = i + 1
+            continue
+        }
+        var found = false
+        val (em, _) = match_level(env.ck, explicit, want)
+        if em > 1 {
+            found = true
+            if !collecting {
+                var b = strbuilder.empty()
+                b.append("ambiguous context ")
+                b.append(type_print(want as *Type?))
+                ctx_fail(env, call, b.str())
+                b.free()
+            }
+        } else if em == 1 {
+            found = true
+        }
+        if !found {
+            var level = stack_of(env.job)
+            for level != null && !found {
+                val (sm, _) = match_level(env.ck, level!!.srcs, want)
+                if sm > 1 {
+                    found = true
+                    if !collecting {
+                        var b = strbuilder.empty()
+                        b.append("ambiguous context ")
+                        b.append(type_print(want as *Type?))
+                        ctx_fail(env, call, b.str())
+                        b.free()
+                    }
+                } else if sm == 1 {
+                    found = true
+                }
+                level = level!!.outer
+            }
+        }
+        if !found {
+            val (top, amb) = search_top(env, want)
+            if top < 0 {
+                return -1
+            }
+            if amb {
+                found = true
+                if !collecting {
+                    var b = strbuilder.empty()
+                    b.append("ambiguous context ")
+                    b.append(type_print(want as *Type?))
+                    ctx_fail(env, call, b.str())
+                    b.free()
+                }
+            } else if top > 0 {
+                found = true
+            }
+        }
+        if !found {
+            if collecting {
+                if !stack_has(env.ck, env.job, want) {
+                    record_need(env.job, callee_job, want)
+                }
+            } else {
+                var b = strbuilder.empty()
+                b.append("missing context ")
+                b.append(type_print(want as *Type?))
+                var inner = ""
+                if callee_job != null {
+                    inner = chain_on_job(callee_job!!, want)
+                }
+                if callee_job != null && callee_job!!.infer_contexts && inner.len > 0 {
+                    b.append(" (")
+                    b.append(fn_name(callee_job!!.decl))
+                    b.append(" -> ")
+                    b.append(inner)
+                    b.append(")")
+                }
+                ctx_fail(env, call, b.str())
+                b.free()
+            }
+        }
+        i = i + 1
+    }
+    if !collecting && explicit.len > 0 {
+        var ei: usize = 0
+        for ei < explicit.len && !env.ck.stop {
+            val src = explicit.get(ei)
+            var used = false
+            var k: usize = 0
+            for k < need_n {
+                val want = fn_ty!!.contexts.get(k)
+                if types_match(env.ck, src.ty, want) {
+                    used = true
+                    break
+                }
+                k = k + 1
+            }
+            if !used {
+                var at = call
+                if src.expr != null {
+                    at = src.expr!!
+                }
+                ctx_fail(env, at, "context value matches no parameter")
+            }
+            ei = ei + 1
+        }
+    }
+    if env.ck.stop {
+        return -1
+    }
+    return 0
+}
+
+/**
+ * Distinct <-> base cast for context-related `as`.
+ */
+fn context_cast(got: *Type, dest: *Type): bool {
+    if type_is_error(got) || type_is_error(dest) {
+        return false
+    }
+    if got.kind == TypeKind.DISTINCT && got.elem != null && got.elem!! == dest {
+        return true
+    }
+    if dest.kind == TypeKind.DISTINCT && dest.elem != null && dest.elem!! == got {
+        return true
+    }
+    return false
+}
+
+private fn name_taken(fn_node: *parse.Node, name: str): bool {
+    if parse.fn_has_receiver(fn_node) && name == "self" {
+        return true
+    }
+    val (nparams, _, has_recv, _, _, _, ntype, nattrs) = fn_shape_parts(fn_node)
+    var i: i64 = nattrs
+    if has_recv {
+        i = i + 1
+    }
+    i = i + ntype
+    var p: i64 = 0
+    for p < nparams {
+        if (i as usize) >= fn_node.kids.len {
+            break
+        }
+        val param = fn_node.kids.get(i as usize)
+        if param.name == name {
+            return true
+        }
+        i = i + 1
+        p = p + 1
+    }
+    return false
+}
+
+private fn fresh_ctx_name(fn_node: *parse.Node, index: i64): str with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    b.append("ctx")
+    b.append_int(index, 10)
+    var name = b.str()
+    b.free()
+    if name_taken(fn_node, name) {
+        var b2 = strbuilder.empty()
+        b2.append("ctx")
+        b2.append_int(index, 10)
+        b2.append("_")
+        name = b2.str()
+        b2.free()
+    }
+    return name
+}
+
+private fn install_params(job: *CheckJob) with (a: mem.Allocator) {
+    val n = job.inferred_contexts.len
+    if n == 0 {
+        return
+    }
+    val node = job.decl
+    val (nparams, nctx, has_recv, has_ret, has_body, expr_body, ntype, nattrs) = fn_shape_parts(node)
+    // Idempotent: a second infer pass must not insert another batch (flat kids).
+    if nctx > 0 {
+        return
+    }
+    val at = context_param_start(node)
+    var i: usize = 0
+    for i < n {
+        val param = parse.make_param(node.line, node.column)
+        param.name = fresh_ctx_name(node, i as i64)
+        node.kids.insert(at + i, param)
+        i = i + 1
+    }
+    node.head = parse.fn_shape(nparams, n as i64, has_recv, has_ret, has_body, expr_body, ntype, nattrs)
+}
+
+private fn copy_needs_to_job(job: *CheckJob, needs: list.List<Need>) with (a: mem.Allocator) {
+    job.inferred_contexts = list.empty<*Type>()
+    job.infer_chains = list.empty<str>()
+    for need in needs.items() {
+        job.inferred_contexts.push(need.ty)
+        job.infer_chains.push(need.chain)
+    }
+}
+
+private fn materialize(ck: *Check, job: *CheckJob) with (a: mem.Allocator) {
+    if job.infer_solved {
+        return
+    }
+    var needs = list.empty<Need>()
+    if job.infer_state != null {
+        for need in job.infer_state!!.needs.items() {
+            needs.push(need)
+        }
+        for edge in job.infer_state!!.edges.items() {
+            if !edge.callee.done {
+                continue
+            }
+            val sym = job_symbol(edge.callee)
+            var contexts = list.empty<*Type>()
+            if sym != null {
+                val ty = get_sema(sym!!)
+                if ty != null && ty!!.kind == TypeKind.FN {
+                    contexts = ty!!.contexts
+                }
+            }
+            for cty in contexts.items() {
+                if type_is_error(cty) || type_in(ck, edge.provided, cty) {
+                    continue
+                }
+                var have = false
+                for need in needs.items() {
+                    if need.ty == cty {
+                        have = true
+                        break
+                    }
+                }
+                if have {
+                    continue
+                }
+                needs.push(Need(ty: cty, chain: via_chain(edge.callee as *CheckJob?, cty)))
+            }
+        }
+    }
+    copy_needs_to_job(job, needs)
+}
+
+private fn rebuild(ck: *Check, partial: *Type, job: *CheckJob): *Type with (a: mem.Allocator) {
+    if partial.kind != TypeKind.FN {
+        return partial
+    }
+    if job.inferred_contexts.len == 0 {
+        return partial
+    }
+    var params = list.empty<*Type>()
+    for p in partial.elems.items() {
+        params.push(p)
+    }
+    var ret = unit_ty(ck)
+    if partial.elem != null {
+        ret = partial.elem!!
+    }
+    return type_fn(&ck.types, params, ret, job.inferred_contexts, partial.fn_variadic, partial.fn_escaping, partial.fn_extern)
+}
+
+private fn edges_done(job: *CheckJob): bool {
+    if job.infer_state == null {
+        return true
+    }
+    for edge in job.infer_state!!.edges.items() {
+        if edge.callee == job {
+            continue
+        }
+        if !edge.callee.done {
+            return false
+        }
+    }
+    return true
+}
+
+/**
+ * Infer a private function's with clause from calls in its body.
+ */
+fn context_infer(ck: *Check, job: *CheckJob, partial: *Type): *Type? with (a: mem.Allocator) {
+    if ck.stop || partial.kind != TypeKind.FN {
+        if ck.stop {
+            return null
+        }
+        return partial as *Type?
+    }
+    job.infer_contexts = true
+    publish_job_type(job, partial as *Type?)
+    job.sig_ready = true
+    job.infer_collecting = true
+    ck.current = job as *CheckJob?
+    check_fn_body(ck, job)
+    job.infer_collecting = false
+    ck.current = job as *CheckJob?
+    if ck.stop {
+        return null
+    }
+    if !edges_done(job) {
+        for !ck.stop && !job.infer_solved && !edges_done(job) {
+            var wait: *CheckJob? = null
+            if job.infer_state != null {
+                for edge in job.infer_state!!.edges.items() {
+                    if edge.callee != job && !edge.callee.done {
+                        wait = edge.callee as *CheckJob?
+                        break
+                    }
+                }
+            }
+            job.infer_parked = true
+            job.parked = true
+            job.waiting_for = wait
+            yield()
+            ck.current = job as *CheckJob?
+            job.parked = false
+            job.infer_parked = false
+            job.waiting_for = null
+        }
+    }
+    if ck.stop {
+        return null
+    }
+    if !job.infer_solved {
+        materialize(ck, job)
+    }
+    if ck.stop {
+        return null
+    }
+    install_params(job)
+    return rebuild(ck, partial, job) as *Type?
+}
+
+/**
+ * Call-site helper: resolve using the callee expression's symbol when present.
+ */
+fn context_resolve_call(env: *Env, call: *parse.Node, fn_ty: *Type, callee: *parse.Node): i32 with (a: mem.Allocator) {
+    var sym: *load.Symbol? = null
+    if parse.is_ident(callee) {
+        sym = lookup_name(env, callee.name)
+    }
+    return context_resolve(env, call, fn_ty as *Type?, sym)
+}
+
+/**
+ * Method-call helper with an explicit callee symbol.
+ */
+fn context_resolve_method(env: *Env, call: *parse.Node, fn_ty: *Type, sym: *load.Symbol?): i32 with (a: mem.Allocator) {
+    return context_resolve(env, call, fn_ty as *Type?, sym)
+}

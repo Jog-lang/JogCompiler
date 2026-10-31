@@ -263,6 +263,8 @@ fn parse_visibility(p: *Parser): str {
         p.advance()
         if level == "file" {
             word = "private(file)"
+        } else if level == "package" {
+            word = "private(package)"
         } else if level == "scope" {
             word = "private(scope)"
         }
@@ -1378,7 +1380,7 @@ fn join_word(left: str, right: str): str with (a: mem.Allocator) {
  */
 fn is_overload(kind: lex.TokenKind): bool {
     val k = lex.kind()
-    return kind == k.PLUS || kind == k.MINUS || kind == k.STAR || kind == k.SLASH || kind == k.PERCENT || kind == k.AMP || kind == k.PIPE || kind == k.CARET || kind == k.SHL || kind == k.SHR || kind == k.TILDE || kind == k.BANG || kind == k.EQ || kind == k.CMP3 || kind == k.PLUS_ASSIGN || kind == k.MINUS_ASSIGN || kind == k.STAR_ASSIGN || kind == k.SLASH_ASSIGN
+    return kind == k.PLUS || kind == k.MINUS || kind == k.STAR || kind == k.SLASH || kind == k.PERCENT || kind == k.AMP || kind == k.PIPE || kind == k.CARET || kind == k.SHL || kind == k.SHR || kind == k.TILDE || kind == k.BANG || kind == k.EQ || kind == k.NEQ || kind == k.LT || kind == k.LE || kind == k.GT || kind == k.GE || kind == k.CMP3 || kind == k.PLUS_ASSIGN || kind == k.MINUS_ASSIGN || kind == k.STAR_ASSIGN || kind == k.SLASH_ASSIGN
 }
 
 /**

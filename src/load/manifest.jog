@@ -1,0 +1,796 @@
+// One jog.mod after it is read. Fields match Module in
+// compiler/src/loader.c. parse_manifest matches that function.
+// JOG_VERSION matches compiler/src/version.h.
+
+import std.fs
+import std.list
+import std.mem
+import std.strbuilder
+import std.text as texts
+
+private fn jog_version(): str {
+    return "0.0.1"
+}
+
+/**
+ * A require or export line: the text and where it was written.
+ */
+struct ModLine {
+    text: str
+    line: i64
+    column: i64
+}
+
+/**
+ * The contents of one jog.mod. Defaults match parse_manifest: version
+ * 0.0.0, kind executable, no jog floor, empty requires and links.
+ */
+struct Manifest {
+    name: str
+    version: str
+    is_library: bool
+    jog: str
+    name_line: i64
+    name_column: i64
+    requires: list.List<ModLine>
+    exports: list.List<ModLine>
+    links: list.List<str>
+    targets: list.List<str>
+    has_targets: bool
+    targets_line: i64
+    targets_column: i64
+}
+
+/**
+ * One word on a jog.mod line. text is a view of the file bytes.
+ */
+private struct Tok {
+    text: str
+    column: i64
+}
+
+/**
+ * An empty manifest. name and version are empty until parse fills them.
+ * @context a allocator for the lists
+ * @return a manifest with empty lists
+ */
+fn empty_manifest(): Manifest with (a: mem.Allocator) {
+    var m: Manifest
+    m.name = ""
+    m.version = ""
+    m.is_library = false
+    m.jog = ""
+    m.name_line = 0
+    m.name_column = 0
+    m.requires = list.empty<ModLine>()
+    m.exports = list.empty<ModLine>()
+    m.links = list.empty<str>()
+    m.targets = list.empty<str>()
+    m.has_targets = false
+    m.targets_line = 0
+    m.targets_column = 0
+    return m
+}
+
+private fn is_ident_start(c: u8): bool {
+    if c >= 'a' as u8 && c <= 'z' as u8 {
+        return true
+    }
+    if c >= 'A' as u8 && c <= 'Z' as u8 {
+        return true
+    }
+    return c == '_' as u8
+}
+
+private fn is_ident_char(c: u8): bool {
+    if is_ident_start(c) {
+        return true
+    }
+    return c >= '0' as u8 && c <= '9' as u8
+}
+
+private fn is_digit(c: u8): bool {
+    return c >= '0' as u8 && c <= '9' as u8
+}
+
+/**
+ * True when text is a jog.mod / --module identifier.
+ * @param text the word
+ * @return true when it is an identifier
+ */
+fn is_ident_str(text: str): bool {
+    if text.len == 0 || !is_ident_start(text.ptr[0]) {
+        return false
+    }
+    var i: usize = 1
+    for i < text.len {
+        if !is_ident_char(text.ptr[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+private fn is_ident_token(tok: Tok): bool {
+    return is_ident_str(tok.text)
+}
+
+private fn tok_is(tok: Tok, word: str): bool {
+    return tok.text == word
+}
+
+private fn all_digits(text: str): bool {
+    if text.len == 0 {
+        return false
+    }
+    var i: usize = 0
+    for i < text.len {
+        if !is_digit(text.ptr[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+private fn numeric_ident(text: str): bool {
+    return all_digits(text) && (text.len == 1 || text.ptr[0] != '0' as u8)
+}
+
+/**
+ * MAJOR.MINOR.PATCH with an optional -prerelease. No leading v and no
+ * +build metadata.
+ * @param text the version word
+ * @return true when the text is a valid semver
+ */
+private fn semver_valid(text: str): bool {
+    var i: usize = 0
+    var part: i64 = 0
+    for part < 3 {
+        val start = i
+        for i < text.len && is_digit(text.ptr[i]) {
+            i = i + 1
+        }
+        if !numeric_ident(texts.slice(text, start, i)) {
+            return false
+        }
+        if part < 2 {
+            if i >= text.len || text.ptr[i] != '.' as u8 {
+                return false
+            }
+            i = i + 1
+        }
+        part = part + 1
+    }
+    if i == text.len {
+        return true
+    }
+    if text.ptr[i] != '-' as u8 {
+        return false
+    }
+    i = i + 1
+    for {
+        val start = i
+        for i < text.len && text.ptr[i] != '.' as u8 {
+            val c = text.ptr[i]
+            if !is_digit(c) && !(c >= 'a' as u8 && c <= 'z' as u8) &&
+                !(c >= 'A' as u8 && c <= 'Z' as u8) && c != '-' as u8 {
+                return false
+            }
+            i = i + 1
+        }
+        val seg = texts.slice(text, start, i)
+        if i == start || (all_digits(seg) && !numeric_ident(seg)) {
+            return false
+        }
+        if i == text.len {
+            return true
+        }
+        i = i + 1
+    }
+}
+
+private fn cmp_numeric(a: str, b: str): i64 {
+    if a.len != b.len {
+        if a.len < b.len {
+            return -1
+        }
+        return 1
+    }
+    var i: usize = 0
+    for i < a.len {
+        if a.ptr[i] < b.ptr[i] {
+            return -1
+        }
+        if a.ptr[i] > b.ptr[i] {
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+/**
+ * Semantic Versioning precedence of two valid versions.
+ * @param a left version
+ * @param b right version
+ * @return negative when a < b, zero when equal, positive when a > b
+ */
+private fn semver_cmp(a: str, b: str): i64 {
+    var ai: usize = 0
+    var bi: usize = 0
+    var part: i64 = 0
+    for part < 3 {
+        val a_start = ai
+        val b_start = bi
+        for ai < a.len && is_digit(a.ptr[ai]) {
+            ai = ai + 1
+        }
+        for bi < b.len && is_digit(b.ptr[bi]) {
+            bi = bi + 1
+        }
+        val c = cmp_numeric(texts.slice(a, a_start, ai), texts.slice(b, b_start, bi))
+        if c != 0 {
+            return c
+        }
+        if part < 2 {
+            ai = ai + 1
+            bi = bi + 1
+        }
+        part = part + 1
+    }
+    val a_pre = ai < a.len
+    val b_pre = bi < b.len
+    if !a_pre || !b_pre {
+        if a_pre == b_pre {
+            return 0
+        }
+        if a_pre {
+            return -1
+        }
+        return 1
+    }
+    ai = ai + 1
+    bi = bi + 1
+    for {
+        val a_start = ai
+        val b_start = bi
+        for ai < a.len && a.ptr[ai] != '.' as u8 {
+            ai = ai + 1
+        }
+        for bi < b.len && b.ptr[bi] != '.' as u8 {
+            bi = bi + 1
+        }
+        val a_seg = texts.slice(a, a_start, ai)
+        val b_seg = texts.slice(b, b_start, bi)
+        val a_num = all_digits(a_seg)
+        val b_num = all_digits(b_seg)
+        var c: i64 = 0
+        if a_num && b_num {
+            c = cmp_numeric(a_seg, b_seg)
+        } else if a_num != b_num {
+            if a_num {
+                c = -1
+            } else {
+                c = 1
+            }
+        } else {
+            var n = a_seg.len
+            if b_seg.len < n {
+                n = b_seg.len
+            }
+            var k: usize = 0
+            for k < n {
+                if a_seg.ptr[k] < b_seg.ptr[k] {
+                    c = -1
+                    break
+                }
+                if a_seg.ptr[k] > b_seg.ptr[k] {
+                    c = 1
+                    break
+                }
+                k = k + 1
+            }
+            if c == 0 && a_seg.len != b_seg.len {
+                if a_seg.len < b_seg.len {
+                    c = -1
+                } else {
+                    c = 1
+                }
+            }
+        }
+        if c != 0 {
+            return c
+        }
+        val a_more = ai < a.len
+        val b_more = bi < b.len
+        if !a_more || !b_more {
+            if a_more == b_more {
+                return 0
+            }
+            if a_more {
+                return 1
+            }
+            return -1
+        }
+        ai = ai + 1
+        bi = bi + 1
+    }
+}
+
+private fn is_path_spec(tok: Tok): bool {
+    if tok.text.len >= 1 && (tok.text.ptr[0] == '/' as u8 || tok.text.ptr[0] == '\\' as u8) {
+        return true
+    }
+    if tok.text.len >= 2 && tok.text.ptr[0] == '.' as u8 && tok.text.ptr[1] == '/' as u8 {
+        return true
+    }
+    if tok.text.len >= 3 && tok.text.ptr[0] == '.' as u8 && tok.text.ptr[1] == '.' as u8 &&
+        tok.text.ptr[2] == '/' as u8 {
+        return true
+    }
+    if tok.text.len >= 2 && tok.text.ptr[1] == ':' as u8 {
+        val c = tok.text.ptr[0]
+        if c >= 'a' as u8 && c <= 'z' as u8 {
+            return true
+        }
+        if c >= 'A' as u8 && c <= 'Z' as u8 {
+            return true
+        }
+    }
+    return false
+}
+
+private fn is_dotted_path(tok: Tok): bool {
+    var start: usize = 0
+    var i: usize = 0
+    for i <= tok.text.len {
+        if i == tok.text.len || tok.text.ptr[i] == '.' as u8 {
+            var seg: Tok
+            seg.text = texts.slice(tok.text, start, i)
+            seg.column = tok.column
+            if !is_ident_token(seg) {
+                return false
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return true
+}
+
+private fn word_eq(text: str, word: str): bool {
+    return text == word
+}
+
+private fn is_reserved_directive(tok: Tok): bool {
+    var base: usize = 0
+    for base < tok.text.len && tok.text.ptr[base] != '.' as u8 {
+        base = base + 1
+    }
+    val head = texts.slice(tok.text, 0, base)
+    if word_eq(head, "libdir") || word_eq(head, "source") || word_eq(head, "replace") ||
+        word_eq(head, "config") || word_eq(head, "include") || word_eq(head, "exclude") ||
+        word_eq(head, "provides") || word_eq(head, "needs") {
+        return true
+    }
+    if base < tok.text.len {
+        if word_eq(head, "module") || word_eq(head, "version") || word_eq(head, "kind") ||
+            word_eq(head, "jog") || word_eq(head, "require") || word_eq(head, "export") ||
+            word_eq(head, "link") || word_eq(head, "targets") {
+            return true
+        }
+    }
+    return false
+}
+
+private fn find_line(lines: list.List<ModLine>, text: str): bool {
+    for line in lines.items() {
+        if line.text == text {
+            return true
+        }
+    }
+    return false
+}
+
+private fn find_target(targets: list.List<str>, text: str): bool {
+    for name in targets.items() {
+        if name == text {
+            return true
+        }
+    }
+    return false
+}
+
+private fn is_os_target(text: str): bool {
+    return text == "windows" || text == "linux" || text == "macos" || text == "wasm"
+}
+
+/**
+ * Next word on a jog.mod line. Skips spaces and stops at `#`.
+ * @param line the line text
+ * @param index byte offset into the line
+ * @return the token, the new index, and false at end of line
+ */
+private fn next_tok(line: str, index: usize): (Tok, usize, bool) {
+    var i = index
+    for i < line.len && (line.ptr[i] == ' ' as u8 || line.ptr[i] == '\t' as u8) {
+        i = i + 1
+    }
+    if i >= line.len || line.ptr[i] == '#' as u8 {
+        var empty: Tok
+        empty.text = ""
+        empty.column = 0
+        return empty, line.len, false
+    }
+    val start = i
+    for i < line.len && line.ptr[i] != ' ' as u8 && line.ptr[i] != '\t' as u8 &&
+        line.ptr[i] != '#' as u8 {
+        i = i + 1
+    }
+    var tok: Tok
+    tok.text = texts.slice(line, start, i)
+    tok.column = (start as i64) + 1
+    return tok, i, true
+}
+
+private fn emit(path: str, line: i64, column: i64, message: str) with (a: mem.Allocator) {
+    print_pos_error(path, line, column, message)
+}
+
+private fn emit_fmt(path: str, line: i64, column: i64, prefix: str, mid: str, suffix: str) with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    b.append(prefix)
+    b.append(mid)
+    b.append(suffix)
+    emit(path, line, column, b.str())
+    b.free()
+}
+
+private fn one_word(path: str, line_no: i64, first_col: i64, third_col: i64, n: usize, what: str): bool with (a: mem.Allocator) {
+    if n < 2 {
+        var b = strbuilder.empty()
+        b.append("jog.mod: missing ")
+        b.append(what)
+        emit(path, line_no, first_col, b.str())
+        b.free()
+        return false
+    }
+    if n > 2 {
+        var b = strbuilder.empty()
+        b.append("jog.mod: extra tokens after the ")
+        b.append(what)
+        emit(path, line_no, third_col, b.str())
+        b.free()
+        return false
+    }
+    return true
+}
+
+private fn copy_tok(tok: Tok): str with (a: mem.Allocator) {
+    return fs.copy_str(tok.text)
+}
+
+/**
+ * Read jog.mod v2 into a Manifest. Matches parse_manifest in loader.c.
+ * Diagnostics use path:line:column. A failed parse still fills what it can.
+ * @param path absolute path of the jog.mod file, as printed in diagnostics
+ * @param data file bytes
+ * @context a allocator for strings and lists
+ * @return the manifest and true when the file is acceptable
+ */
+fn parse_manifest(path: str, data: str): (Manifest, bool) with (a: mem.Allocator) {
+    var mod = empty_manifest()
+    var at: usize = 0
+    var line_no: i64 = 1
+    var saw_module = false
+    var saw_version = false
+    var saw_kind = false
+    var saw_jog = false
+    var any_directive = false
+    var ok = true
+    var any_export = false
+    var first_export_line: i64 = 0
+    var first_export_column: i64 = 0
+    val host = host_os()
+
+    for at < data.len {
+        val line_start = at
+        for at < data.len && data.ptr[at] != '\n' as u8 && data.ptr[at] != '\r' as u8 {
+            at = at + 1
+        }
+        val line = texts.slice(data, line_start, at)
+        if at < data.len && data.ptr[at] == '\r' as u8 {
+            at = at + 1
+        }
+        if at < data.len && data.ptr[at] == '\n' as u8 {
+            at = at + 1
+        }
+
+        var toks: [8]Tok
+        var n: usize = 0
+        var cursor: usize = 0
+        for n < 8 {
+            val (tok, next, got) = next_tok(line, cursor)
+            if !got {
+                break
+            }
+            toks[n] = tok
+            cursor = next
+            n = n + 1
+        }
+        var third_col: i64 = 0
+        if n > 2 {
+            third_col = toks[2].column
+        }
+        if n == 0 {
+            line_no = line_no + 1
+            continue
+        }
+        val first = toks[0]
+        val pos_col = first.column
+
+        var quoted = false
+        var qi: usize = 0
+        for qi < n {
+            if toks[qi].text.len > 0 && toks[qi].text.ptr[0] == '"' as u8 {
+                emit(path, line_no, toks[qi].column, "jog.mod: quoted words are reserved for a later version")
+                quoted = true
+                break
+            }
+            qi = qi + 1
+        }
+        if quoted {
+            ok = false
+            any_directive = true
+            line_no = line_no + 1
+            continue
+        }
+
+        if tok_is(first, "module") {
+            if saw_module {
+                emit(path, line_no, pos_col, "jog.mod: duplicate module declaration")
+                ok = false
+            } else if any_directive {
+                emit(path, line_no, pos_col, "jog.mod: module name must be the first declaration")
+                ok = false
+            } else if n < 2 {
+                emit(path, line_no, pos_col, "jog.mod: missing module name")
+                ok = false
+            } else if n > 2 || !is_ident_token(toks[1]) {
+                if n > 2 {
+                    emit(path, line_no, toks[2].column, "jog.mod: extra tokens after the module name")
+                } else {
+                    emit_fmt(path, line_no, toks[1].column, "jog.mod: module name '", toks[1].text,
+                        "' is not an identifier")
+                }
+                ok = false
+            } else if tok_is(toks[1], "std") {
+                emit(path, line_no, toks[1].column,
+                    "jog.mod: module name 'std' is reserved for the standard library")
+                ok = false
+            } else {
+                mod.name = copy_tok(toks[1])
+                mod.name_line = line_no
+                mod.name_column = toks[1].column
+            }
+            saw_module = true
+            any_directive = true
+            line_no = line_no + 1
+            continue
+        }
+
+        any_directive = true
+        if !saw_module {
+            emit(path, line_no, pos_col, "jog.mod: expected 'module <name>' as the first declaration")
+            ok = false
+            line_no = line_no + 1
+            continue
+        }
+
+        if tok_is(first, "link") || (first.text.len > 5 && texts.slice(first.text, 0, 5) == "link.") {
+            var keep = true
+            if first.text.len > 4 {
+                var target: Tok
+                target.text = texts.slice(first.text, 5, first.text.len)
+                target.column = first.column + 5
+                if !tok_is(target, "windows") && !tok_is(target, "linux") && !tok_is(target, "macos") {
+                    emit_fmt(path, line_no, target.column, "jog.mod: unknown target '", target.text,
+                        "'; expected windows, linux, or macos")
+                    ok = false
+                    line_no = line_no + 1
+                    continue
+                }
+                keep = tok_is(target, host)
+            }
+            if !one_word(path, line_no, pos_col, third_col, n, "library name") {
+                ok = false
+            } else if keep {
+                mod.links.push(copy_tok(toks[1]))
+            }
+        } else if tok_is(first, "targets") {
+            if mod.has_targets {
+                emit(path, line_no, pos_col, "jog.mod: duplicate targets declaration")
+                ok = false
+            } else if n < 2 {
+                emit(path, line_no, pos_col, "jog.mod: missing target name")
+                ok = false
+            } else {
+                mod.has_targets = true
+                mod.targets_line = line_no
+                mod.targets_column = pos_col
+                var t: usize = 1
+                for t < n {
+                    if !is_os_target(toks[t].text) {
+                        emit_fmt(path, line_no, toks[t].column, "jog.mod: unknown target '", toks[t].text,
+                            "'; expected windows, linux, macos, or wasm")
+                        ok = false
+                        t = t + 1
+                        continue
+                    }
+                    if find_target(mod.targets, toks[t].text) {
+                        emit_fmt(path, line_no, toks[t].column, "jog.mod: target '", toks[t].text,
+                            "' is listed twice")
+                        ok = false
+                        t = t + 1
+                        continue
+                    }
+                    mod.targets.push(copy_tok(toks[t]))
+                    t = t + 1
+                }
+            }
+        } else if tok_is(first, "version") {
+            if saw_version {
+                emit(path, line_no, pos_col, "jog.mod: duplicate version declaration")
+                ok = false
+            } else if !one_word(path, line_no, pos_col, third_col, n, "version") {
+                ok = false
+            } else if !semver_valid(toks[1].text) {
+                emit_fmt(path, line_no, toks[1].column, "jog.mod: '", toks[1].text,
+                    "' is not a version; expected MAJOR.MINOR.PATCH")
+                ok = false
+            } else {
+                mod.version = copy_tok(toks[1])
+            }
+            saw_version = true
+        } else if tok_is(first, "kind") {
+            if saw_kind {
+                emit(path, line_no, pos_col, "jog.mod: duplicate kind declaration")
+                ok = false
+            } else if !one_word(path, line_no, pos_col, third_col, n, "kind") {
+                ok = false
+            } else if tok_is(toks[1], "library") {
+                mod.is_library = true
+            } else if !tok_is(toks[1], "executable") {
+                emit_fmt(path, line_no, toks[1].column, "jog.mod: unknown kind '", toks[1].text,
+                    "'; expected executable or library")
+                ok = false
+            }
+            saw_kind = true
+        } else if tok_is(first, "jog") {
+            if saw_jog {
+                emit(path, line_no, pos_col, "jog.mod: duplicate jog declaration")
+                ok = false
+            } else if !one_word(path, line_no, pos_col, third_col, n, "compiler version") {
+                ok = false
+            } else if !semver_valid(toks[1].text) {
+                emit_fmt(path, line_no, toks[1].column, "jog.mod: '", toks[1].text,
+                    "' is not a version; expected MAJOR.MINOR.PATCH")
+                ok = false
+            } else {
+                mod.jog = copy_tok(toks[1])
+                if semver_cmp(jog_version(), mod.jog) < 0 {
+                    var b = strbuilder.empty()
+                    b.append("jog.mod: module '")
+                    b.append(mod.name)
+                    b.append("' needs jog ")
+                    b.append(mod.jog)
+                    b.append(" or later; this is jog ")
+                    b.append(jog_version())
+                    emit(path, line_no, toks[1].column, b.str())
+                    b.free()
+                    ok = false
+                }
+            }
+            saw_jog = true
+        } else if tok_is(first, "require") {
+            var name_col = first.column
+            if n > 1 {
+                name_col = toks[1].column
+            }
+            if n < 2 {
+                emit(path, line_no, pos_col, "jog.mod: missing module name")
+                ok = false
+            } else if !is_ident_token(toks[1]) {
+                emit_fmt(path, line_no, name_col, "jog.mod: module name '", toks[1].text,
+                    "' is not an identifier")
+                ok = false
+            } else if n < 3 {
+                emit_fmt(path, line_no, name_col, "jog.mod: missing the path or version of module '",
+                    toks[1].text, "'")
+                ok = false
+            } else if n > 3 {
+                emit(path, line_no, toks[3].column, "jog.mod: extra tokens after the path or version")
+                ok = false
+            } else if tok_is(toks[1], "std") {
+                emit(path, line_no, name_col, "jog.mod: std is built in and cannot be required")
+                ok = false
+            } else if mod.name.len > 0 && tok_is(toks[1], mod.name) {
+                emit_fmt(path, line_no, name_col, "jog.mod: module '", mod.name, "' cannot require itself")
+                ok = false
+            } else if find_line(mod.requires, toks[1].text) {
+                emit_fmt(path, line_no, name_col, "jog.mod: module '", toks[1].text, "' is required twice")
+                ok = false
+            } else if !is_path_spec(toks[2]) && !semver_valid(toks[2].text) {
+                emit_fmt(path, line_no, toks[2].column, "jog.mod: '", toks[2].text,
+                    "' is neither a path nor a version")
+                ok = false
+            } else {
+                var line: ModLine
+                line.text = copy_tok(toks[1])
+                line.line = line_no
+                line.column = name_col
+                mod.requires.push(line)
+            }
+        } else if tok_is(first, "export") {
+            var path_col = first.column
+            if n > 1 {
+                path_col = toks[1].column
+            }
+            if !one_word(path, line_no, pos_col, third_col, n, "package path") {
+                ok = false
+            } else if !is_dotted_path(toks[1]) || tok_is(toks[1], "std") ||
+                (toks[1].text.len > 4 && texts.slice(toks[1].text, 0, 4) == "std.") {
+                emit_fmt(path, line_no, path_col, "jog.mod: export '", toks[1].text,
+                    "' is not a package path of this module")
+                ok = false
+            } else if find_line(mod.exports, toks[1].text) {
+                emit_fmt(path, line_no, path_col, "jog.mod: package '", toks[1].text, "' is exported twice")
+                ok = false
+            } else {
+                var line: ModLine
+                line.text = copy_tok(toks[1])
+                line.line = line_no
+                line.column = path_col
+                mod.exports.push(line)
+                if !any_export {
+                    any_export = true
+                    first_export_line = line_no
+                    first_export_column = path_col
+                }
+            }
+        } else if is_reserved_directive(first) {
+            emit_fmt(path, line_no, pos_col, "jog.mod: '", first.text, "' is reserved for a later version")
+            ok = false
+        } else {
+            emit_fmt(path, line_no, pos_col, "jog.mod: unknown declaration '", first.text, "'")
+            ok = false
+        }
+        line_no = line_no + 1
+    }
+
+    if mod.name.len == 0 && !saw_module {
+        emit(path, 1, 1, "jog.mod: missing module name")
+        ok = false
+    }
+    if any_export && !mod.is_library {
+        emit(path, first_export_line, first_export_column,
+            "jog.mod: only a library can export packages; add 'kind library'")
+        ok = false
+    }
+    if mod.has_targets && mod.targets.len > 0 && mod.name.len > 0 {
+        if !find_target(mod.targets, host) {
+            var b = strbuilder.empty()
+            b.append("module '")
+            b.append(mod.name)
+            b.append("' does not support target '")
+            b.append(host)
+            b.append("'")
+            emit(path, mod.targets_line, mod.targets_column, b.str())
+            b.free()
+            ok = false
+        }
+    }
+    return mod, ok && mod.name.len > 0
+}

@@ -1,0 +1,493 @@
+// Resolve names in function bodies. Matches the lookup chain in
+// check_body.c (check_ident / lookup_name): block locals, then file,
+// package, universe. Fields and methods on a typed left side are not
+// resolved here. Step 10 of LoaderGuide.md.
+
+import src.parse
+import std.fs
+import std.list
+import std.mem
+import std.strbuilder
+import std.text as texts
+
+private struct BodyEnv {
+    pkg: *Package
+    file_index: usize
+    file: str
+    scope: *BlockScope?
+    failed: bool
+}
+
+private fn is_discard(name: str): bool {
+    return name.len == 0 || name == "_"
+}
+
+private fn alloc_block(parent: *BlockScope?, pkg_scope: *PackageScope): *BlockScope with (a: mem.Allocator) {
+    val (raw, err) = a.alloc(size(BlockScope), align(BlockScope))
+    if err != null {
+        panic("out of memory")
+    }
+    val b = raw.ptr as *BlockScope
+    b.parent = parent
+    b.bindings = list.empty<Symbol>()
+    b.package = pkg_scope as *PackageScope?
+    return b
+}
+
+private fn lookup_local_chain(scope: *BlockScope?, name: str): *Symbol? {
+    var block = scope
+    for block != null {
+        val found = block_scope_lookup_local(block!!, name)
+        if found != null {
+            return found
+        }
+        block = block!!.parent
+    }
+    return null
+}
+
+private fn lookup_name(env: *BodyEnv, name: str): *Symbol? {
+    if is_discard(name) {
+        return null
+    }
+    val local = lookup_local_chain(env.scope, name)
+    if local != null {
+        return local
+    }
+    return file_lookup(&env.pkg.scope, env.file_index, name)
+}
+
+private fn bind_local(env: *BodyEnv, node: *parse.Node, kind: SymbolKind, name: str) with (a: mem.Allocator) {
+    if env.scope == null || is_discard(name) {
+        return
+    }
+    if block_scope_lookup_local(env.scope!!, name) != null {
+        var b = strbuilder.empty()
+        b.append("duplicate declaration of '")
+        b.append(name)
+        b.append("'")
+        print_pos_error(env.file, node.line, node.column, b.str())
+        b.free()
+        env.failed = true
+        return
+    }
+    var s: Symbol
+    s.kind = kind
+    s.name = fs.copy_str(name)
+    s.referenced = false
+    s.assigned = false
+    s.file = fs.copy_str(env.file)
+    s.line = node.line
+    s.column = node.column
+    s.flag = ""
+    s.package = env.pkg as *Package?
+    s.decl = null
+    s.sema = null
+    s.type_params = list.empty<*u8>()
+    s.nominal_insts = list.empty<*u8>()
+    block_scope_bind(env.scope!!, s)
+}
+
+private fn undef(env: *BodyEnv, node: *parse.Node, name: str) with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    b.append("undefined name '")
+    if name.len > 0 {
+        b.append(name)
+    } else {
+        b.append("?")
+    }
+    b.append("'")
+    print_pos_error(env.file, node.line, node.column, b.str())
+    b.free()
+    env.failed = true
+}
+
+private fn is_builtin_name(name: str): bool {
+    // Builtins when no binding of that name is in scope. panic/size/align:
+    // design/language/Types, Errors. scope/yield/select/sleep: coroutines
+    // (design/language/Coroutines). recv/send/timeout/default are select-case
+    // heads (checker validates placement). They are not universe symbols.
+    return name == "panic" || name == "size" || name == "align" || name == "scope" ||
+        name == "yield" || name == "select" || name == "sleep" || name == "fmt" ||
+        name == "recv" || name == "send" || name == "timeout" || name == "default"
+}
+
+private fn resolve_ident(env: *BodyEnv, node: *parse.Node) with (a: mem.Allocator) {
+    if is_discard(node.name) {
+        return
+    }
+    if lookup_name(env, node.name) == null {
+        if is_builtin_name(node.name) {
+            return
+        }
+        undef(env, node, node.name)
+    }
+}
+
+private fn bind_pattern(env: *BodyEnv, node: *parse.Node) with (a: mem.Allocator) {
+    if parse.is_pat_bind(node) {
+        bind_local(env, node, SymbolKind.CONSTANT, node.name)
+        return
+    }
+    // `code: in 1..10` / `code: 1` bind the field name. `h: height` binds only
+    // `height` (the inner PAT_BIND). `_` and a wildcard field bind nothing.
+    if parse.is_pat_field(node) {
+        var inner: *parse.Node? = null
+        if node.kids.len > 0 {
+            inner = node.kids.get(0) as *parse.Node?
+        }
+        if node.name.len > 0 && node.name != "_" {
+            var bind_name = true
+            if inner != null && (parse.is_pat_bind(inner!!) || parse.is_pat_wildcard(inner!!)) {
+                bind_name = false
+            }
+            if bind_name {
+                bind_local(env, node, SymbolKind.CONSTANT, node.name)
+            }
+        }
+        if inner != null {
+            bind_pattern(env, inner!!)
+        }
+        return
+    }
+    for kid in node.kids.items() {
+        bind_pattern(env, kid)
+    }
+}
+
+private fn resolve_pattern_exprs(env: *BodyEnv, node: *parse.Node) with (a: mem.Allocator) {
+    if parse.is_pat_bind(node) {
+        return
+    }
+    for kid in node.kids.items() {
+        if parse.is_pat_bind(kid) {
+            continue
+        }
+        if parse.is_ident(kid) || parse.is_binary(kid) || parse.is_unary(kid) || parse.is_call(kid) ||
+            parse.is_member(kid) || parse.is_cast(kid) || parse.is_int_lit(kid) || parse.is_bool_lit(kid) {
+            resolve_node(env, kid)
+        } else {
+            resolve_pattern_exprs(env, kid)
+        }
+    }
+}
+
+private fn bind_binding_names(env: *BodyEnv, node: *parse.Node, kind: SymbolKind) with (a: mem.Allocator) {
+    if node.name.len > 0 {
+        bind_local(env, node, kind, node.name)
+        return
+    }
+    if node.text.len == 0 {
+        return
+    }
+    // Multi-name `val (a, b)`. A duplicate such as `val (a, a)` is left for
+    // the checker (same message), so load does not abort before type errors.
+    var start: usize = 0
+    var i: usize = 0
+    for i <= node.text.len {
+        if i == node.text.len || node.text.ptr[i] == ' ' as u8 {
+            if i > start {
+                val name = texts.slice(node.text, start, i)
+                if env.scope != null && !is_discard(name) &&
+                    block_scope_lookup_local(env.scope!!, name) != null {
+                    // skip; check_error_binding reports duplicate declaration
+                } else {
+                    bind_local(env, node, kind, name)
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+}
+
+/**
+ * Destructure lvalue: resolve subexpressions, but not a bare name as a use.
+ */
+private fn resolve_destructure_target(env: *BodyEnv, node: *parse.Node) with (a: mem.Allocator) {
+    if parse.is_ident(node) {
+        return
+    }
+    if parse.is_tuple(node) {
+        for kid in node.kids.items() {
+            resolve_destructure_target(env, kid)
+        }
+        return
+    }
+    resolve_node(env, node)
+}
+
+private fn resolve_node(env: *BodyEnv, node: *parse.Node) with (a: mem.Allocator) {
+    if parse.is_ident(node) {
+        resolve_ident(env, node)
+        for kid in node.kids.items() {
+            resolve_node(env, kid)
+        }
+        return
+    }
+    if parse.is_member(node) {
+        for kid in node.kids.items() {
+            resolve_node(env, kid)
+        }
+        return
+    }
+    if parse.is_val(node) || parse.is_var(node) || parse.is_context(node) {
+        for kid in node.kids.items() {
+            resolve_node(env, kid)
+        }
+        var kind = SymbolKind.VARIABLE
+        if parse.is_val(node) {
+            kind = SymbolKind.CONSTANT
+        } else if parse.is_context(node) {
+            kind = SymbolKind.CONTEXT
+        }
+        bind_binding_names(env, node, kind)
+        return
+    }
+    if parse.is_for(node) {
+        // kids: optional seq/cond, then body. Bind loop vars around the body.
+        var body_i = node.kids.len
+        if body_i > 0 && parse.is_block(node.kids.get(body_i - 1)) {
+            body_i = body_i - 1
+        }
+        var i: usize = 0
+        for i < body_i {
+            resolve_node(env, node.kids.get(i))
+            i = i + 1
+        }
+        val parent = env.scope
+        env.scope = alloc_block(parent, &env.pkg.scope) as *BlockScope?
+        if node.text == "in" {
+            // Skip a duplicate second name; the checker reports
+            // `duplicate declaration` (same as multi-name val bindings).
+            if node.name.len > 0 {
+                bind_local(env, node, SymbolKind.CONSTANT, node.name)
+            }
+            if node.flag.len > 0 &&
+                (env.scope == null || block_scope_lookup_local(env.scope!!, node.flag) == null) {
+                bind_local(env, node, SymbolKind.CONSTANT, node.flag)
+            }
+        }
+        if body_i < node.kids.len {
+            resolve_node(env, node.kids.get(body_i))
+        }
+        env.scope = parent
+        return
+    }
+    if parse.is_when_arm(node) {
+        val parent = env.scope
+        env.scope = alloc_block(parent, &env.pkg.scope) as *BlockScope?
+        val ncond = node.head as usize
+        var c: usize = 0
+        for c < ncond && c < node.kids.len {
+            bind_pattern(env, node.kids.get(c))
+            resolve_pattern_exprs(env, node.kids.get(c))
+            c = c + 1
+        }
+        var i = ncond
+        for i < node.kids.len {
+            resolve_node(env, node.kids.get(i))
+            i = i + 1
+        }
+        env.scope = parent
+        return
+    }
+    if parse.is_block(node) {
+        val parent = env.scope
+        env.scope = alloc_block(parent, &env.pkg.scope) as *BlockScope?
+        for kid in node.kids.items() {
+            resolve_node(env, kid)
+        }
+        env.scope = parent
+        return
+    }
+    if parse.is_lambda(node) {
+        resolve_lambda(env, node)
+        return
+    }
+    if parse.is_fn(node) {
+        resolve_fn_like(env, node)
+        return
+    }
+    if parse.is_with(node) {
+        val parent = env.scope
+        env.scope = alloc_block(parent, &env.pkg.scope) as *BlockScope?
+        for kid in node.kids.items() {
+            resolve_node(env, kid)
+        }
+        env.scope = parent
+        return
+    }
+    if parse.is_destructure(node) {
+        // Targets are lvalues (existing names / places). Resolve nested
+        // expressions inside them, but not bare idents as uses. The value
+        // is the last kid; head is the target count (check_error.c).
+        val ntargets = node.head as usize
+        var i: usize = 0
+        for i < ntargets && i < node.kids.len {
+            resolve_destructure_target(env, node.kids.get(i))
+            i = i + 1
+        }
+        if ntargets < node.kids.len {
+            resolve_node(env, node.kids.get(ntargets))
+        }
+        return
+    }
+    for kid in node.kids.items() {
+        resolve_node(env, kid)
+    }
+}
+
+private fn resolve_lambda(env: *BodyEnv, node: *parse.Node) with (a: mem.Allocator) {
+    val parent = env.scope
+    env.scope = alloc_block(parent, &env.pkg.scope) as *BlockScope?
+    val nparams = node.head % 256
+    val it = (node.head / 1024) % 2 == 1
+    var i: i64 = 0
+    if it {
+        bind_local(env, node, SymbolKind.PARAMETER, "it")
+    }
+    var pcount = nparams
+    for pcount > 0 {
+        if (i as usize) < node.kids.len {
+            val param = node.kids.get(i as usize)
+            if parse.is_param(param) && param.name.len > 0 {
+                bind_local(env, param, SymbolKind.PARAMETER, param.name)
+            }
+        }
+        i = i + 1
+        pcount = pcount - 1
+    }
+    if (i as usize) < node.kids.len {
+        resolve_node(env, node.kids.get(i as usize))
+    }
+    env.scope = parent
+}
+
+// `fn *List<T>.m` puts T on the receiver TYPE_NAME as a bare type arg, not
+// as an FN TYPE_PARAM (ntype is 0). Bind those leaf names so size(T) / as *T
+// resolve. Concrete args like i32 also bind; that only shadows the universe.
+private fn bind_recv_type_args(env: *BodyEnv, recv: *parse.Node) with (a: mem.Allocator) {
+    for kid in recv.kids.items() {
+        if parse.is_type_name(kid) && kid.name.len > 0 && kid.kids.len == 0 {
+            if block_scope_lookup_local(env.scope!!, kid.name) == null {
+                bind_local(env, kid, SymbolKind.TYPE, kid.name)
+            }
+        }
+    }
+}
+
+private fn resolve_fn_like(env: *BodyEnv, node: *parse.Node) with (a: mem.Allocator) {
+    val parent = env.scope
+    env.scope = alloc_block(parent, &env.pkg.scope) as *BlockScope?
+    val shape = node.head
+    val nparams = shape % 256
+    val nctx = (shape / 256) % 256
+    val has_recv = (shape / 65536) % 2 == 1
+    val has_ret = (shape / 131072) % 2 == 1
+    val has_body = (shape / 262144) % 2 == 1
+    val ntype = (shape / 1048576) % 256
+    val nattrs = (shape / 268435456) % 256
+    var i: i64 = 0
+    var acount = nattrs
+    for acount > 0 {
+        i = i + 1
+        acount = acount - 1
+    }
+    if has_recv {
+        // Methods have an implicit `self`; it is not a PARAM child.
+        bind_local(env, node, SymbolKind.PARAMETER, "self")
+        if (i as usize) < node.kids.len {
+            bind_recv_type_args(env, node.kids.get(i as usize))
+        }
+        i = i + 1
+    }
+    var tcount = ntype
+    for tcount > 0 {
+        if (i as usize) < node.kids.len {
+            val tp = node.kids.get(i as usize)
+            // Receiver args already bind leaf names (Box<T>.dup<T>); checker
+            // reports "duplicate type parameter" — don't fail load here.
+            if parse.is_type_param(tp) && tp.name.len > 0 &&
+                block_scope_lookup_local(env.scope!!, tp.name) == null {
+                bind_local(env, tp, SymbolKind.TYPE, tp.name)
+            }
+        }
+        i = i + 1
+        tcount = tcount - 1
+    }
+    var pcount = nparams
+    for pcount > 0 {
+        if (i as usize) < node.kids.len {
+            val param = node.kids.get(i as usize)
+            if parse.is_param(param) && param.name.len > 0 {
+                bind_local(env, param, SymbolKind.PARAMETER, param.name)
+            }
+            for kid in param.kids.items() {
+                resolve_node(env, kid)
+            }
+        }
+        i = i + 1
+        pcount = pcount - 1
+    }
+    var ccount = nctx
+    for ccount > 0 {
+        if (i as usize) < node.kids.len {
+            val ctx = node.kids.get(i as usize)
+            if ctx.name.len > 0 {
+                bind_local(env, ctx, SymbolKind.CONTEXT, ctx.name)
+            }
+            for kid in ctx.kids.items() {
+                resolve_node(env, kid)
+            }
+        }
+        i = i + 1
+        ccount = ccount - 1
+    }
+    if has_ret {
+        i = i + 1
+    }
+    if has_body && (i as usize) < node.kids.len {
+        resolve_node(env, node.kids.get(i as usize))
+    }
+    env.scope = parent
+}
+
+private fn resolve_file_fns(env: *BodyEnv, file_node: *parse.Node) with (a: mem.Allocator) {
+    for kid in file_node.kids.items() {
+        if parse.is_fn(kid) && !parse.flag_has_word(kid.flag, "expect") {
+            val has_body = (kid.head / 262144) % 2 == 1
+            if has_body {
+                resolve_fn_like(env, kid)
+            }
+        }
+    }
+}
+
+/**
+ * Resolve names in every function body of the loaded packages. Reports
+ * `undefined name` and duplicate locals. Does not type-check.
+ * @param packages dependency-ordered packages
+ * @context a allocator for block scopes
+ * @return false when a name error was reported
+ */
+fn resolve_bodies(packages: list.List<*Package>): bool with (a: mem.Allocator) {
+    var ok = true
+    for pkg in packages.items() {
+        var fi: usize = 0
+        for fi < pkg.files.len {
+            val source = pkg.files.get(fi)
+            if source.ast == null {
+                fi = fi + 1
+                continue
+            }
+            var env = BodyEnv(pkg: pkg, file_index: fi, file: source.path, scope: null, failed: false)
+            resolve_file_fns(&env, source.ast!!)
+            if env.failed {
+                ok = false
+            }
+            fi = fi + 1
+        }
+    }
+    return ok
+}

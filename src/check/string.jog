@@ -1,0 +1,423 @@
+// String interpolation and fmt.
+// Checked against compiler/src/check_string.c.
+
+import src.load
+import src.parse
+import std.list
+import std.mem
+import std.strbuilder
+
+private fn peel_under(ty: *Type): *Type {
+    var t = ty
+    for t.kind == TypeKind.DISTINCT && t.elem != null {
+        t = t.elem!!
+    }
+    return t
+}
+
+private fn formattable(ty: *Type): bool {
+    val base = peel_under(ty)
+    return base.kind == TypeKind.BOOL || base.kind == TypeKind.BYTES || base.kind == TypeKind.INT ||
+        base.kind == TypeKind.UNTYPED_INT
+}
+
+private fn context_type_named(ty: *Type, name: str): bool {
+    var t = ty
+    if t.kind == TypeKind.PTR && t.elem != null {
+        t = t.elem!!
+    }
+    if t.kind == TypeKind.DISTINCT && t.name == name {
+        return true
+    }
+    t = peel_under(t)
+    if t.kind != TypeKind.INTERFACE && t.kind != TypeKind.STRUCT && t.kind != TypeKind.ENUM &&
+        t.kind != TypeKind.DISTINCT {
+        return false
+    }
+    return t.name == name
+}
+
+fn context_has_named(job: *CheckJob, name: str): bool {
+    var level = job.ctx_stack
+    for level != null {
+        for src in level!!.srcs.items() {
+            if context_type_named(src.ty, name) {
+                return true
+            }
+        }
+        level = level!!.outer
+    }
+    return false
+}
+
+private fn format_owner(ty: *Type): *Type {
+    if ty.kind == TypeKind.PTR && ty.elem != null {
+        return ty.elem!!
+    }
+    return ty
+}
+
+private fn nominal_user(ty: *Type): bool {
+    return ty.kind == TypeKind.STRUCT || ty.kind == TypeKind.ENUM || ty.kind == TypeKind.DISTINCT
+}
+
+private fn type_owned_by(ty: *Type, pkg_path: str): bool {
+    if ty.package.len == 0 || pkg_path.len == 0 {
+        return false
+    }
+    return ty.package == pkg_path
+}
+
+private fn same_nominal(a: *Type, b: *Type): bool {
+    if a == b {
+        return true
+    }
+    if a.kind != b.kind {
+        return false
+    }
+    if a.decl != null && b.decl != null && a.decl == b.decl {
+        return a.elems.len == b.elems.len
+    }
+    return false
+}
+
+private fn is_core_str(ck: *Check, ty: *Type): bool {
+    if ty.kind == TypeKind.DISTINCT && ty.name == "str" && ty.package.len == 0 {
+        return true
+    }
+    return false
+}
+
+private fn is_mut_bytes(ty: *Type): bool {
+    val base = peel_under(ty)
+    return base.kind == TypeKind.BYTES && !base.is_const
+}
+
+private fn universe_error(ck: *Check): *Type? {
+    if ck.prog.packages.len == 0 {
+        return null
+    }
+    val uni = ck.prog.packages.get(0).scope.universe
+    if uni == null {
+        return null
+    }
+    val s = load.package_scope_lookup(uni!!, "error")
+    if s == null {
+        return null
+    }
+    return get_sema(s!!)
+}
+
+private fn is_error_iface(ty: *Type, universe: *Type?): bool {
+    val base = peel_under(ty)
+    if universe != null && base == universe!! {
+        return true
+    }
+    return base.kind == TypeKind.INTERFACE && base.name == "error" && base.package.len == 0
+}
+
+private fn format_signature(ck: *Check, fn_ty: *Type): bool {
+    if fn_ty.kind != TypeKind.FN {
+        return false
+    }
+    if fn_ty.contexts.len > 0 || fn_ty.elems.len != 2 || fn_ty.fn_variadic {
+        return false
+    }
+    if !is_mut_bytes(fn_ty.elems.get(1)) {
+        return false
+    }
+    val ret = fn_ty.elem
+    if ret == null || ret!!.kind != TypeKind.TUPLE || ret!!.elems.len != 2 {
+        return false
+    }
+    if !is_core_str(ck, ret!!.elems.get(0)) {
+        return false
+    }
+    val opt = ret!!.elems.get(1)
+    if opt.kind != TypeKind.OPTION || opt.elem == null {
+        return false
+    }
+    return is_error_iface(opt.elem!!, universe_error(ck))
+}
+
+private fn method_receiver_ty(fn_ty: *Type): *Type? {
+    if fn_ty.kind != TypeKind.FN || fn_ty.elems.len == 0 {
+        return null
+    }
+    return fn_ty.elems.get(0) as *Type?
+}
+
+private fn take_format(
+    best_len: *i64,
+    count: *i64,
+    path_len: i64,
+) {
+    if count[0] == 0 || path_len < best_len[0] {
+        best_len[0] = path_len
+        count[0] = 1
+        return
+    }
+    if path_len == best_len[0] {
+        count[0] = count[0] + 1
+    }
+}
+
+/**
+ * @return 0 none, 1 ok, 2 bad signature, 3 ambiguous, -1 stopped
+ */
+private fn string_format_method(
+    ck: *Check,
+    job: *CheckJob,
+    ty: *Type,
+): i32 with (a: mem.Allocator) {
+    val owner = format_owner(ty)
+    if !nominal_user(owner) {
+        return 0
+    }
+    var count: i64 = 0
+    var best_len: i64 = 999
+    var direct_bad = false
+    var embed_bad = false
+    for pkg in ck.prog.packages.items() {
+        for mi in 0 as usize..pkg.methods.len {
+            val sym = pkg.methods.at(mi)
+            if sym.name != "format" || sym.decl == null {
+                continue
+            }
+            if !wait_for_symbol_finished(ck, job, sym) {
+                return -1
+            }
+            val fn_ty = get_sema(sym)
+            if fn_ty == null || fn_ty!!.kind != TypeKind.FN {
+                continue
+            }
+            val recv = method_receiver_ty(fn_ty!!)
+            if recv == null {
+                continue
+            }
+            var on = format_owner(recv!!)
+            if !nominal_user(on) || on.elems.len > 0 {
+                continue
+            }
+            var matched = false
+            var path_len: i64 = 0
+            if same_nominal(on, owner) {
+                matched = true
+                path_len = 0
+            } else if owner.kind == TypeKind.STRUCT {
+                val (n, depth) = struct_embed_match(owner, on)
+                if n == 1 && depth > 0 {
+                    matched = true
+                    path_len = depth
+                }
+            }
+            if !matched {
+                continue
+            }
+            if !format_signature(ck, fn_ty!!) {
+                if path_len == 0 {
+                    direct_bad = true
+                } else {
+                    embed_bad = true
+                }
+                continue
+            }
+            take_format(&best_len, &count, path_len)
+        }
+    }
+    if ck.stop {
+        return -1
+    }
+    if count > 1 {
+        return 3
+    }
+    if direct_bad && (count == 0 || best_len > 0) {
+        return 2
+    }
+    if count == 1 {
+        return 1
+    }
+    if embed_bad || direct_bad {
+        return 2
+    }
+    return 0
+}
+
+private fn check_interp_hole(env: *Env, node: *parse.Node): *Type? with (a: mem.Allocator) {
+    if parse.is_string_lit(node) || parse.is_cstring_lit(node) || parse.is_char_lit(node) {
+        return str_ty(env.ck) as *Type?
+    }
+    val got = check_expr(env, node, null)
+    if got == null || env.ck.stop {
+        return got
+    }
+    if got!!.kind == TypeKind.ERROR {
+        return got
+    }
+    if formattable(got!!) {
+        return got
+    }
+    val status = string_format_method(env.ck, env.job, got!!)
+    if status < 0 {
+        return null
+    }
+    if status == 1 {
+        return got
+    }
+    if status == 2 {
+        check_fail(env.ck, env.job.file, node.line, node.column, "format method must be fn format(buf: bytes): (str, error?)")
+        return err_ty(env.ck) as *Type?
+    }
+    if status == 3 {
+        check_fail(env.ck, env.job.file, node.line, node.column, "ambiguous format method")
+        return err_ty(env.ck) as *Type?
+    }
+    var b = strbuilder.empty()
+    b.append("type ")
+    b.append(type_print(got))
+    b.append(" cannot be formatted")
+    check_fail(env.ck, env.job.file, node.line, node.column, b.str())
+    b.free()
+    return err_ty(env.ck) as *Type?
+}
+
+private fn check_template(env: *Env, node: *parse.Node, need_alloc: bool): (bool, bool) with (a: mem.Allocator) {
+    if parse.is_string_lit(node) {
+        val got = check_expr(env, node, null)
+        if got == null || env.ck.stop {
+            return false, false
+        }
+        return got!!.kind != TypeKind.ERROR, true
+    }
+    if !parse.is_interp(node) {
+        check_fail(env.ck, env.job.file, node.line, node.column, "fmt template must be a string")
+        return false, true
+    }
+    var good = true
+    for part in node.kids.items() {
+        val got = check_interp_hole(env, part)
+        if got == null || env.ck.stop {
+            return false, false
+        }
+        if got!!.kind == TypeKind.ERROR {
+            good = false
+        }
+    }
+    if need_alloc && !env.job.infer_collecting && !context_has_named(env.job, "Allocator") {
+        check_fail(env.ck, env.job.file, node.line, node.column, "string interpolation needs an Allocator context")
+        good = false
+    }
+    return good, true
+}
+
+fn check_string_interp(env: *Env, node: *parse.Node): *Type? with (a: mem.Allocator) {
+    val (ok, _) = check_template(env, node, true)
+    if !ok || env.ck.stop {
+        return err_ty(env.ck) as *Type?
+    }
+    return str_ty(env.ck) as *Type?
+}
+
+private fn fmt_result(ck: *Check, job: *CheckJob): *Type? with (a: mem.Allocator) {
+    val str = str_ty(ck)
+    val err = universe_error(ck)
+    if err == null {
+        check_fail(ck, job.file, 0, 0, "out of memory")
+        return null
+    }
+    val opt = type_option(&ck.types, err!!)
+    var elems = list.empty<*Type>()
+    elems.push(str)
+    elems.push(opt)
+    return type_tuple(&ck.types, elems)
+}
+
+private fn user_fmt_in_scope(env: *Env): bool {
+    var block = env.scope
+    for block != null {
+        if load.block_scope_lookup_local(block!!, "fmt") != null {
+            return true
+        }
+        block = block!!.parent
+    }
+    return false
+}
+
+/**
+ * Builtin fmt(buf, template) when no user fmt is in scope.
+ * @return 1 handled, 0 not fmt, -1 stopped
+ */
+fn check_string_call(env: *Env, node: *parse.Node): (*Type?, i32) with (a: mem.Allocator) {
+    if env.ck.stop {
+        return null, -1
+    }
+    if node.kids.len == 0 {
+        return null, 0
+    }
+    val callee = node.kids.get(0)
+    if !parse.is_ident(callee) || callee.name != "fmt" {
+        return null, 0
+    }
+    if user_fmt_in_scope(env) {
+        return null, 0
+    }
+    val nctx = parse.call_nctx(node)
+    if parse.call_has_trailing(node) || nctx > 0 {
+        check_fail(env.ck, env.job.file, node.line, node.column, "fmt expects a buffer and a template")
+        if env.ck.stop {
+            return null, -1
+        }
+        return err_ty(env.ck) as *Type?, 1
+    }
+    if node.kids.len != 3 {
+        check_fail(env.ck, env.job.file, node.line, node.column, "fmt expects a buffer and a template")
+        if env.ck.stop {
+            return null, -1
+        }
+        return err_ty(env.ck) as *Type?, 1
+    }
+    val buf_arg = node.kids.get(1)
+    val tmpl_arg = node.kids.get(2)
+    if !parse.is_arg(buf_arg) || buf_arg.name.len > 0 || buf_arg.kids.len == 0 {
+        check_fail(env.ck, env.job.file, node.line, node.column, "fmt expects a buffer and a template")
+        if env.ck.stop {
+            return null, -1
+        }
+        return err_ty(env.ck) as *Type?, 1
+    }
+    if !parse.is_arg(tmpl_arg) || tmpl_arg.name.len > 0 || tmpl_arg.kids.len == 0 {
+        check_fail(env.ck, env.job.file, node.line, node.column, "fmt expects a buffer and a template")
+        if env.ck.stop {
+            return null, -1
+        }
+        return err_ty(env.ck) as *Type?, 1
+    }
+    val buf = buf_arg.kids.get(0)
+    val tmpl = tmpl_arg.kids.get(0)
+    var buf_ty = check_expr(env, buf, null)
+    if buf_ty == null || env.ck.stop {
+        return null, -1
+    }
+    if buf_ty!!.kind != TypeKind.ERROR {
+        val base = peel_under(buf_ty!!)
+        if base.kind != TypeKind.BYTES || base.is_const {
+            check_fail(env.ck, env.job.file, buf.line, buf.column, "fmt buffer must be bytes")
+            buf_ty = err_ty(env.ck) as *Type?
+        }
+    }
+    val (tmpl_ok, _) = check_template(env, tmpl, false)
+    if env.ck.stop {
+        return null, -1
+    }
+    if buf_ty!!.kind == TypeKind.ERROR || !tmpl_ok {
+        if env.ck.stop {
+            return null, -1
+        }
+        return err_ty(env.ck) as *Type?, 1
+    }
+    val result = fmt_result(env.ck, env.job)
+    if result == null || env.ck.stop {
+        return null, -1
+    }
+    return result, 1
+}

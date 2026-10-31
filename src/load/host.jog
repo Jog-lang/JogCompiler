@@ -1,0 +1,8 @@
+// The host OS name for link.<target> and targets checks. Matches
+// jog_host_os in compiler/src/os_suffix.h.
+
+/**
+ * The OS this compiler binary was built for: windows, linux, or macos.
+ * @return the host target name
+ */
+expect fn host_os(): str

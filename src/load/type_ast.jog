@@ -1,0 +1,41 @@
+// Shared AST helpers for byte / byte-array type shapes used by the
+// prelude intrinsic bind and the checker @intrinsic scan.
+
+import src.parse
+import std.text as texts
+
+/**
+ * True when node is the non-const type name `byte` with no kids.
+ * @param node type AST node
+ * @return true when it is bare `byte`
+ */
+fn is_byte_name(node: *parse.Node): bool {
+    return parse.is_type_name(node) && node.name == "byte" && node.flag != "const" && node.kids.len == 0
+}
+
+/**
+ * Match `[ptr]byte` or `[N]byte` where N is a decimal int lit.
+ * @param node type AST node
+ * @return (ok, is_ptr, len) — len is 0 when is_ptr
+ */
+fn byte_array(node: *parse.Node): (bool, bool, u64) {
+    if !parse.is_type_array(node) || node.kids.len < 2 {
+        return false, false, 0
+    }
+    val len_node = node.kids.get(0)
+    val elem = node.kids.get(1)
+    if !is_byte_name(elem) {
+        return false, false, 0
+    }
+    if parse.is_ident(len_node) && len_node.name == "ptr" {
+        return true, true, 0
+    }
+    if parse.is_int_lit(len_node) {
+        val (n, ok) = texts.parse_u64_dec(len_node.text)
+        if !ok {
+            return false, false, 0
+        }
+        return true, false, n
+    }
+    return false, false, 0
+}

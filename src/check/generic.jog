@@ -1,0 +1,1944 @@
+// Monomorphization for functions, structs, enums, aliases, methods.
+// Checked against compiler/src/check_generic.c.
+// CheckerGuide step 10.
+
+import src.load
+import src.parse
+import std.list
+import std.mem
+import std.strbuilder
+
+private fn ptr_eq_type(a: *Type?, b: *Type?): bool {
+    if a == null && b == null {
+        return true
+    }
+    if a == null || b == null {
+        return false
+    }
+    return (a!! as *u8) == (b!! as *u8)
+}
+
+private fn ptr_eq_node(a: *parse.Node?, b: *parse.Node?): bool {
+    if a == null && b == null {
+        return true
+    }
+    if a == null || b == null {
+        return false
+    }
+    return (a!! as *u8) == (b!! as *u8)
+}
+
+struct Solved {
+    ty: *Type?
+    soft: bool
+    soft_float: bool
+}
+
+fn sym_type_param_count(sym: *load.Symbol): usize {
+    return sym.type_params.len
+}
+
+fn sym_type_param_at(sym: *load.Symbol, i: usize): *Type? {
+    if i >= sym.type_params.len {
+        return null
+    }
+    return sym.type_params.get(i) as *Type?
+}
+
+fn sym_clear_type_params(sym: *load.Symbol) with (a: mem.Allocator) {
+    sym.type_params = list.empty<*u8>()
+}
+
+fn sym_push_type_param(sym: *load.Symbol, ty: *Type) with (a: mem.Allocator) {
+    sym.type_params.push(ty as *u8)
+}
+
+fn sym_set_type_params(sym: *load.Symbol, params: list.List<*Type>) with (a: mem.Allocator) {
+    sym.type_params = list.empty<*u8>()
+    for p in params.items() {
+        sym.type_params.push(p as *u8)
+    }
+}
+
+/** Write type params onto every symbol that shares this decl (package + file). */
+fn publish_type_params(job: *CheckJob, params: list.List<*Type>) with (a: mem.Allocator) {
+    val pkg = job.pkg
+    for i in 0 as usize..pkg.scope.bindings.len {
+        val s = pkg.scope.bindings.at(i)
+        if ptr_eq_node(s.decl, job.decl as *parse.Node?) {
+            sym_set_type_params(s, params)
+        }
+    }
+    if job.file_index < pkg.scope.file_scopes.len {
+        val file_scope = pkg.scope.file_scopes.get(job.file_index)
+        for i in 0 as usize..file_scope.bindings.len {
+            val s = file_scope.bindings.at(i)
+            if ptr_eq_node(s.decl, job.decl as *parse.Node?) {
+                sym_set_type_params(s, params)
+            }
+        }
+    }
+    for i in 0 as usize..pkg.methods.len {
+        val s = pkg.methods.at(i)
+        if ptr_eq_node(s.decl, job.decl as *parse.Node?) {
+            sym_set_type_params(s, params)
+        }
+    }
+}
+
+fn sym_push_nominal(sym: *load.Symbol, ty: *Type) with (a: mem.Allocator) {
+    sym.nominal_insts.push(ty as *u8)
+}
+
+fn sym_nominal_at(sym: *load.Symbol, i: usize): *Type? {
+    if i >= sym.nominal_insts.len {
+        return null
+    }
+    return sym.nominal_insts.get(i) as *Type?
+}
+
+fn job_symbol_of(job: *CheckJob): *load.Symbol? {
+    val pkg = job.pkg
+    for i in 0 as usize..pkg.scope.bindings.len {
+        val s = pkg.scope.bindings.at(i)
+        if ptr_eq_node(s.decl, job.decl as *parse.Node?) {
+            return s
+        }
+    }
+    if job.file_index < pkg.scope.file_scopes.len {
+        val file_scope = pkg.scope.file_scopes.get(job.file_index)
+        for i in 0 as usize..file_scope.bindings.len {
+            val s = file_scope.bindings.at(i)
+            if ptr_eq_node(s.decl, job.decl as *parse.Node?) {
+                return s
+            }
+        }
+    }
+    for i in 0 as usize..pkg.methods.len {
+        val s = pkg.methods.at(i)
+        if ptr_eq_node(s.decl, job.decl as *parse.Node?) {
+            return s
+        }
+    }
+    return null
+}
+
+fn generic_has_param(typ: *Type?): bool {
+    return has_param_depth(typ, 0)
+}
+
+private fn has_param_depth(typ: *Type?, depth: i64): bool {
+    if typ == null || depth > 64 {
+        return false
+    }
+    val t = typ!!
+    when t.kind {
+        TYPE_PARAM -> {
+            return true
+        }
+        PTR, SLICE, OPTION, ARRAY -> {
+            return has_param_depth(t.elem, depth + 1)
+        }
+        TUPLE -> {
+            for e in t.elems.items() {
+                if has_param_depth(e as *Type?, depth + 1) {
+                    return true
+                }
+            }
+            return false
+        }
+        FN -> {
+            for e in t.elems.items() {
+                if has_param_depth(e as *Type?, depth + 1) {
+                    return true
+                }
+            }
+            for e in t.contexts.items() {
+                if has_param_depth(e as *Type?, depth + 1) {
+                    return true
+                }
+            }
+            return has_param_depth(t.elem, depth + 1)
+        }
+        STRUCT, ENUM, INTERFACE, DISTINCT -> {
+            for e in t.elems.items() {
+                if has_param_depth(e as *Type?, depth + 1) {
+                    return true
+                }
+            }
+            return false
+        }
+        else -> {
+            return false
+        }
+    }
+}
+
+fn generic_lookup_param(job: *CheckJob, name: str): *Type? {
+    val sym = job_symbol_of(job)
+    if sym == null {
+        return null
+    }
+    var i: usize = 0
+    for i < sym!!.type_params.len {
+        val param = sym_type_param_at(sym!!, i)
+        if !(param == null) && param!!.kind == TypeKind.TYPE_PARAM && param!!.name == name {
+            return param
+        }
+        i = i + 1
+    }
+    return null
+}
+
+fn generic_subst(
+    ck: *Check,
+    typ: *Type?,
+    params: list.List<*Type>,
+    args: list.List<*Type>,
+): *Type? with (a: mem.Allocator) {
+    if typ == null || params.len == 0 || args.len == 0 {
+        return typ
+    }
+    val t = typ!!
+    if t.kind == TypeKind.TYPE_PARAM {
+        var i: usize = 0
+        for i < params.len {
+            if ptr_eq_type(params.get(i) as *Type?, t as *Type?) {
+                if i < args.len {
+                    return args.get(i) as *Type?
+                }
+                return typ
+            }
+            i = i + 1
+        }
+        return typ
+    }
+    if !generic_has_param(typ) {
+        return typ
+    }
+    when t.kind {
+        PTR, SLICE, OPTION -> {
+            val elem = generic_subst(ck, t.elem, params, args)
+            if ptr_eq_type(elem, t.elem) {
+                return typ
+            }
+            if elem == null {
+                return null
+            }
+            if t.kind == TypeKind.PTR {
+                return type_ptr(&ck.types, elem!!, t.is_const) as *Type?
+            }
+            if t.kind == TypeKind.SLICE {
+                return type_slice(&ck.types, elem!!, t.is_const) as *Type?
+            }
+            return type_option(&ck.types, elem!!) as *Type?
+        }
+        ARRAY -> {
+            val elem = generic_subst(ck, t.elem, params, args)
+            if ptr_eq_type(elem, t.elem) {
+                return typ
+            }
+            if elem == null {
+                return null
+            }
+            return type_array(&ck.types, elem!!, t.len) as *Type?
+        }
+        TUPLE -> {
+            var next = list.empty<*Type>()
+            var changed = false
+            for e in t.elems.items() {
+                val part = generic_subst(ck, e as *Type?, params, args)
+                if part == null {
+                    return null
+                }
+                if !ptr_eq_type(part, e as *Type?) {
+                    changed = true
+                }
+                next.push(part!!)
+            }
+            if !changed {
+                return typ
+            }
+            return type_tuple(&ck.types, next) as *Type?
+        }
+        FN -> {
+            var next_p = list.empty<*Type>()
+            var next_c = list.empty<*Type>()
+            var changed = false
+            for e in t.elems.items() {
+                val part = generic_subst(ck, e as *Type?, params, args)
+                if part == null {
+                    return null
+                }
+                if !ptr_eq_type(part, e as *Type?) {
+                    changed = true
+                }
+                next_p.push(part!!)
+            }
+            for e in t.contexts.items() {
+                val part = generic_subst(ck, e as *Type?, params, args)
+                if part == null {
+                    return null
+                }
+                if !ptr_eq_type(part, e as *Type?) {
+                    changed = true
+                }
+                next_c.push(part!!)
+            }
+            val ret = generic_subst(ck, t.elem, params, args)
+            if ret == null {
+                return null
+            }
+            if !ptr_eq_type(ret, t.elem) {
+                changed = true
+            }
+            if !changed {
+                return typ
+            }
+            return type_fn(&ck.types, next_p, ret!!, next_c, t.fn_variadic, t.fn_escaping, t.fn_extern) as *Type?
+        }
+        STRUCT, ENUM -> {
+            if t.elems.len == 0 {
+                return typ
+            }
+            var next = list.empty<*Type>()
+            var changed = false
+            for e in t.elems.items() {
+                val part = generic_subst(ck, e as *Type?, params, args)
+                if part == null {
+                    return null
+                }
+                if !ptr_eq_type(part, e as *Type?) {
+                    changed = true
+                }
+                next.push(part!!)
+            }
+            if !changed {
+                return typ
+            }
+            val sym = nominal_symbol(ck, t)
+            if sym == null || sym_type_param_count(sym!!) != t.elems.len {
+                return null
+            }
+            if t.kind == TypeKind.STRUCT {
+                return generic_struct_instance(ck, sym!!, next)
+            }
+            return generic_enum_instance(ck, sym!!, next)
+        }
+        else -> {
+            return typ
+        }
+    }
+}
+
+private fn nominal_symbol(ck: *Check, ty: *Type): *load.Symbol? {
+    if ty.decl == null {
+        return null
+    }
+    val decl = ty.decl
+    for pkg in ck.prog.packages.items() {
+        for i in 0 as usize..pkg.scope.bindings.len {
+            val s = pkg.scope.bindings.at(i)
+            if ptr_eq_node(s.decl, decl) {
+                return s
+            }
+        }
+        for fi in 0 as usize..pkg.scope.file_scopes.len {
+            val fs = pkg.scope.file_scopes.get(fi)
+            for i in 0 as usize..fs.bindings.len {
+                val s = fs.bindings.at(i)
+                if ptr_eq_node(s.decl, decl) {
+                    return s
+                }
+            }
+        }
+    }
+    return null
+}
+
+private fn fn_has_attr(node: *parse.Node, name: str): bool {
+    val shape = node.head
+    val nattrs = (shape / 268435456) % 256
+    var i: i64 = 0
+    for i < nattrs && (i as usize) < node.kids.len {
+        val attr = node.kids.get(i as usize)
+        if parse.is_attribute(attr) && attr.name == name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+private fn type_param_nodes(node: *parse.Node): list.List<*parse.Node> with (a: mem.Allocator) {
+    var out = list.empty<*parse.Node>()
+    if parse.is_fn(node) {
+        val shape = node.head
+        val ntype = (shape / 1048576) % 256
+        val nattrs = (shape / 268435456) % 256
+        val has_recv = (shape / 65536) % 2 == 1
+        var i: i64 = nattrs
+        if has_recv {
+            i = i + 1
+        }
+        var n: i64 = 0
+        for n < ntype && (i as usize) < node.kids.len {
+            out.push(node.kids.get(i as usize))
+            i = i + 1
+            n = n + 1
+        }
+        return out
+    }
+    // STRUCT / ENUM / TYPE_DECL: type params are kids[0..head), skipping attrs.
+    var i: usize = 0
+    for i < (node.head as usize) && i < node.kids.len {
+        val kid = node.kids.get(i)
+        if parse.is_attribute(kid) {
+            i = i + 1
+            continue
+        }
+        if parse.is_type_param(kid) {
+            out.push(kid)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+private fn bind_param_list(
+    ck: *Check,
+    job: *CheckJob,
+    owner: *parse.Node,
+    params_nodes: list.List<*parse.Node>,
+    bad: *bool,
+): bool with (a: mem.Allocator) {
+    val n = params_nodes.len
+    if n == 0 {
+        return true
+    }
+    var sym = job_symbol_of(job)
+    _ = owner
+    var params = list.empty<*Type>()
+    var i: usize = 0
+    for i < n && !ck.stop {
+        val param = params_nodes.get(i)
+        if !parse.is_type_param(param) || param.name.len == 0 {
+            check_fail(ck, job.file, param.line, param.column, "expected a type parameter")
+            *bad = true
+            i = i + 1
+            continue
+        }
+        var prev: usize = 0
+        for prev < params.len {
+            val earlier = params.get(prev)
+            if earlier.name == param.name {
+                var b = strbuilder.empty()
+                b.append("duplicate type parameter '")
+                b.append(param.name)
+                b.append("'")
+                check_fail(ck, job.file, param.line, param.column, b.str())
+                b.free()
+                *bad = true
+            }
+            prev = prev + 1
+        }
+        var constraint_bad = false
+        val (cbind_ok, constraint) = constraint_bind(ck, job, param, &constraint_bad)
+        if !cbind_ok {
+            return false
+        }
+        if constraint_bad {
+            *bad = true
+        }
+        val pty = type_new_param(&ck.types, param.name, constraint)
+        pty.decl = param as *parse.Node?
+        params.push(pty)
+        i = i + 1
+    }
+    publish_type_params(job, params)
+    _ = sym
+    return !ck.stop
+}
+
+fn generic_bind_params(ck: *Check, job: *CheckJob, bad: *bool): bool with (a: mem.Allocator) {
+    if ck.stop || !parse.is_fn(job.decl) {
+        return !ck.stop
+    }
+    val fndecl = job.decl
+    val params_nodes = type_param_nodes(fndecl)
+    if params_nodes.len == 0 {
+        return true
+    }
+    if parse.flag_has_word(fndecl.flag, "extern") {
+        check_fail(ck, job.file, fndecl.line, fndecl.column, "an extern function cannot have type parameters")
+        *bad = true
+    }
+    if fn_has_attr(fndecl, "export") {
+        check_fail(ck, job.file, fndecl.line, fndecl.column, "an exported function cannot have type parameters")
+        *bad = true
+    }
+    if fn_has_attr(fndecl, "test") {
+        check_fail(ck, job.file, fndecl.line, fndecl.column, "@test functions cannot have type parameters")
+        *bad = true
+    }
+    if !parse.fn_has_receiver(fndecl) && fndecl.name == "main" {
+        val root = ck.prog.root_module
+        if root.len == 0 || job.pkg.module_name == root {
+            check_fail(ck, job.file, fndecl.line, fndecl.column, "fn main cannot have type parameters")
+            *bad = true
+        }
+    }
+    return bind_param_list(ck, job, fndecl, params_nodes, bad)
+}
+
+fn generic_bind_struct_params(ck: *Check, job: *CheckJob, bad: *bool): bool with (a: mem.Allocator) {
+    if ck.stop {
+        return false
+    }
+    if !parse.is_struct(job.decl) && !parse.is_enum(job.decl) {
+        return true
+    }
+    return bind_param_list(ck, job, job.decl, type_param_nodes(job.decl), bad)
+}
+
+fn generic_bind_alias_params(ck: *Check, job: *CheckJob, bad: *bool): bool with (a: mem.Allocator) {
+    if ck.stop || !parse.is_type_decl(job.decl) {
+        return !ck.stop
+    }
+    return bind_param_list(ck, job, job.decl, type_param_nodes(job.decl), bad)
+}
+
+private fn receiver_nominal_node(recv: *parse.Node?): *parse.Node? {
+    var cur = recv
+    for cur != null {
+        if parse.is_type_ptr(cur!!) || parse.is_type_slice(cur!!) || parse.is_type_option(cur!!) {
+            if cur!!.kids.len == 0 {
+                return null
+            }
+            cur = cur!!.kids.get(0) as *parse.Node?
+            continue
+        }
+        break
+    }
+    if !(cur == null) && parse.is_type_name(cur!!) {
+        return cur
+    }
+    return null
+}
+
+private fn receiver_binder_name(arg: *parse.Node?): str {
+    if arg == null || !parse.is_type_name(arg!!) {
+        return ""
+    }
+    if arg!!.kids.len != 0 {
+        return ""
+    }
+    if path_dot_count_local(arg!!.name) != 0 {
+        return ""
+    }
+    return arg!!.name
+}
+
+private fn path_dot_count_local(name: str): usize {
+    var n: usize = 0
+    var i: usize = 0
+    for i < name.len {
+        if name.ptr[i] == '.' as u8 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn generic_bind_receiver_params(
+    ck: *Check,
+    job: *CheckJob,
+    owner: *load.Symbol?,
+    expect: usize,
+    bad: *bool,
+    skip_recv: *bool,
+): bool with (a: mem.Allocator) {
+    *skip_recv = false
+    if ck.stop || !parse.is_fn(job.decl) {
+        return !ck.stop
+    }
+    val fndecl = job.decl
+    val sym = job_symbol_of(job)
+    val own = if !(sym == null) { sym_type_param_count(sym!!) } else { 0 as usize }
+    val shape = fndecl.head
+    val nattrs = (shape / 268435456) % 256
+    var recv_node: *parse.Node? = null
+    if parse.fn_has_receiver(fndecl) && (nattrs as usize) < fndecl.kids.len {
+        recv_node = fndecl.kids.get(nattrs as usize) as *parse.Node?
+    }
+    val recv = receiver_nominal_node(recv_node)
+    var n: usize = 0
+    if !(recv == null) {
+        n = recv!!.kids.len
+    }
+    if !(recv == null || n == expect) {
+        var b = strbuilder.empty()
+        b.append("expected ")
+        b.append_int(expect as i64, 10)
+        b.append(" type parameters on the receiver, found ")
+        b.append_int(n as i64, 10)
+        check_fail(ck, job.file, fndecl.line, fndecl.column, b.str())
+        b.free()
+        *bad = true
+        *skip_recv = true
+    }
+    if n == 0 {
+        return !ck.stop
+    }
+    if !(owner == null) && (owner!!.type_params.len < n) {
+        if !wait_for_symbol_finished(ck, job, owner!!) {
+            return false
+        }
+    }
+    var recv_params = list.empty<*Type>()
+    var i: usize = 0
+    for i < n && !ck.stop {
+        val arg = recv!!.kids.get(i)
+        val name = receiver_binder_name(arg as *parse.Node?)
+        if name.len == 0 {
+            check_fail(ck, job.file, arg.line, arg.column, "expected a type parameter")
+            *bad = true
+            *skip_recv = true
+            i = i + 1
+            continue
+        }
+        var prev: usize = 0
+        for prev < recv_params.len {
+            if recv_params.get(prev).name == name {
+                var b = strbuilder.empty()
+                b.append("duplicate type parameter '")
+                b.append(name)
+                b.append("'")
+                check_fail(ck, job.file, arg.line, arg.column, b.str())
+                b.free()
+                *bad = true
+            }
+            prev = prev + 1
+        }
+        if !(sym == null) {
+            prev = 0
+            for prev < own {
+                val earlier = sym_type_param_at(sym!!, prev)
+                if !(earlier == null) && earlier!!.name == name {
+                    var b = strbuilder.empty()
+                    b.append("duplicate type parameter '")
+                    b.append(name)
+                    b.append("'")
+                    check_fail(ck, job.file, arg.line, arg.column, b.str())
+                    b.free()
+                    *bad = true
+                }
+                prev = prev + 1
+            }
+        }
+        var constraint: *Type? = null
+        if !(owner == null) {
+            val src = sym_type_param_at(owner!!, i)
+            if !(src == null) && src!!.kind == TypeKind.TYPE_PARAM {
+                constraint = src!!.elem
+            }
+        }
+        val typ = type_new_param(&ck.types, name, constraint)
+        typ.decl = arg as *parse.Node?
+        recv_params.push(typ)
+        i = i + 1
+    }
+    if ck.stop {
+        return false
+    }
+    if n > 0 && own == 0 {
+        if fn_has_attr(fndecl, "export") {
+            check_fail(ck, job.file, fndecl.line, fndecl.column, "an exported function cannot have type parameters")
+            *bad = true
+        }
+        if fn_has_attr(fndecl, "test") {
+            check_fail(ck, job.file, fndecl.line, fndecl.column, "@test functions cannot have type parameters")
+            *bad = true
+        }
+    }
+    if sym == null {
+        check_fail(ck, job.file, fndecl.line, fndecl.column, "missing receiver")
+        *bad = true
+        return !ck.stop
+    }
+    var combined = list.empty<*Type>()
+    for p in recv_params.items() {
+        combined.push(p)
+    }
+    var j: usize = 0
+    for j < own {
+        val p = sym_type_param_at(sym!!, j)
+        if !(p == null) {
+            combined.push(p!!)
+        }
+        j = j + 1
+    }
+    publish_type_params(job, combined)
+    return !ck.stop
+}
+
+fn generic_method_recv_params(sym: *load.Symbol): usize {
+    if sym.decl == null || !parse.is_fn(sym.decl!!) || !parse.fn_has_receiver(sym.decl!!) {
+        return 0
+    }
+    val on_ty = get_sema(sym)
+    // Receiver type is first FN param after check; stored on method typ.
+    if on_ty == null || on_ty!!.kind != TypeKind.FN || on_ty!!.elems.len == 0 {
+        return 0
+    }
+    var on = on_ty!!.elems.get(0)
+    if on.kind == TypeKind.PTR && on.elem != null {
+        on = on.elem!!
+    }
+    if on.kind != TypeKind.STRUCT && on.kind != TypeKind.ENUM {
+        return 0
+    }
+    val n = on.elems.len
+    if n == 0 || n > sym_type_param_count(sym) {
+        return 0
+    }
+    var i: usize = 0
+    for i < n {
+        if !ptr_eq_type(on.elems.get(i) as *Type?, sym_type_param_at(sym, i)) {
+            return 0
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn generic_reject_defaults_on_params(
+    ck: *Check,
+    job: *CheckJob,
+    fndecl: *parse.Node,
+    bad: *bool,
+): bool with (a: mem.Allocator) {
+    val sym = job_symbol_of(job)
+    if sym == null || sym_type_param_count(sym!!) == 0 {
+        return true
+    }
+    val shape = fndecl.head
+    val nparams = shape % 256
+    val nctx = (shape / 256) % 256
+    val has_recv = (shape / 65536) % 2 == 1
+    val ntype = (shape / 1048576) % 256
+    val nattrs = (shape / 268435456) % 256
+    var i: i64 = nattrs
+    if has_recv {
+        i = i + 1
+    }
+    i = i + ntype
+    var p: i64 = 0
+    for p < nparams + nctx && (i as usize) < fndecl.kids.len {
+        val param = fndecl.kids.get(i as usize)
+        if parse.is_param(param) && param.kids.len > 1 {
+            val pty = resolve_type(ck, job, param.kids.get(0))
+            if !(pty == null) && generic_has_param(pty) {
+                check_fail(ck, job.file, param.line, param.column, "a type parameter cannot have a default value yet")
+                *bad = true
+            }
+        }
+        i = i + 1
+        p = p + 1
+    }
+    return !ck.stop
+}
+
+private fn same_args(left: list.List<*Type>, right: list.List<*Type>): bool {
+    if !(left.len == right.len) {
+        return false
+    }
+    var i: usize = 0
+    for i < left.len {
+        if !ptr_eq_type(left.get(i) as *Type?, right.get(i) as *Type?) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+private fn find_nominal(sym: *load.Symbol, args: list.List<*Type>): *Type? {
+    var i: usize = 0
+    for i < sym.nominal_insts.len {
+        val inst = sym_nominal_at(sym, i)
+        if !(inst == null) && same_args(inst!!.elems, args) {
+            return inst
+        }
+        i = i + 1
+    }
+    return null
+}
+
+private fn nominal_hold(typ: *Type): bool {
+    return typ.kind == TypeKind.STRUCT && typ.field_names.len == 1 && typ.field_names.get(0).len == 0 &&
+        typ.field_types.len == 0
+}
+
+private fn template_ready(typ: *Type?): bool {
+    return typ != null && typ!!.kind == TypeKind.STRUCT && !nominal_hold(typ!!)
+}
+
+private fn enum_hold(typ: *Type): bool {
+    return typ.kind == TypeKind.ENUM && typ.variant_names.len == 1 && typ.variant_names.get(0).len == 0
+}
+
+private fn enum_ready(typ: *Type?): bool {
+    return typ != null && typ!!.kind == TypeKind.ENUM && typ!!.variant_names.len > 0 && !enum_hold(typ!!)
+}
+
+private fn fill_nominal(ck: *Check, sym: *load.Symbol, inst: *Type): bool with (a: mem.Allocator) {
+    val tmpl = get_sema(sym)
+    if !template_ready(tmpl) || sym.type_params.len == 0 {
+        return true
+    }
+    val template = tmpl!!
+    var params = list.empty<*Type>()
+    var i: usize = 0
+    for i < sym.type_params.len {
+        val p = sym_type_param_at(sym, i)
+        if !(p == null) {
+            params.push(p!!)
+        }
+        i = i + 1
+    }
+    var names = list.empty<str>()
+    var types = list.empty<*Type>()
+    var embedded = list.empty<bool>()
+    var decls = list.empty<*parse.Node>()
+    i = 0
+    for i < template.field_names.len {
+        val src_ty = template.field_types.get(i)
+        val field_type = generic_subst(ck, src_ty as *Type?, params, inst.elems)
+        if field_type == null {
+            return false
+        }
+        names.push(template.field_names.get(i))
+        types.push(field_type!!)
+        if i < template.field_embedded.len {
+            embedded.push(template.field_embedded.get(i))
+        } else {
+            embedded.push(false)
+        }
+        if i < template.field_decls.len {
+            decls.push(template.field_decls.get(i))
+        }
+        i = i + 1
+    }
+    type_set_fields(inst, names, types, embedded, decls)
+    if !generic_has_param(inst as *Type?) {
+        _ = type_layout(&ck.types, inst)
+    }
+    return true
+}
+
+fn generic_struct_instance(ck: *Check, sym: *load.Symbol, args: list.List<*Type>): *Type? with (a: mem.Allocator) {
+    if !(sym_type_param_count(sym) == args.len) {
+        return null
+    }
+    val found = find_nominal(sym, args)
+    if !(found == null) {
+        if nominal_hold(found!!) && template_ready(get_sema(sym)) {
+            if !fill_nominal(ck, sym, found!!) {
+                return null
+            }
+        }
+        return found
+    }
+    val tmpl = get_sema(sym)
+    if tmpl == null || tmpl!!.kind != TypeKind.STRUCT {
+        return null
+    }
+    val inst = type_new_nominal(&ck.types, TypeKind.STRUCT, tmpl!!.name, tmpl!!.package)
+    inst.decl = tmpl!!.decl
+    for arg in args.items() {
+        inst.elems.push(arg)
+    }
+    sym_push_nominal(sym, inst)
+    if !template_ready(tmpl) {
+        type_hold_open(inst)
+        return inst as *Type?
+    }
+    if !fill_nominal(ck, sym, inst) {
+        return null
+    }
+    return inst as *Type?
+}
+
+fn generic_struct_finish(ck: *Check, sym: *load.Symbol): bool with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < sym.nominal_insts.len {
+        val inst = sym_nominal_at(sym, i)
+        if !(inst == null) && nominal_hold(inst!!) {
+            if !fill_nominal(ck, sym, inst!!) {
+                return false
+            }
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn generic_struct_apply(
+    ck: *Check,
+    job: *CheckJob,
+    sym: *load.Symbol,
+    arg_nodes: list.List<*parse.Node>,
+    line: i64,
+    column: i64,
+): *Type? with (a: mem.Allocator) {
+    if ck.stop {
+        return null
+    }
+    var name = sym.name
+    if name.len == 0 {
+        name = "?"
+    }
+    val n = sym_type_param_count(sym)
+    if !(arg_nodes.len == n) {
+        if arg_nodes.len == 0 {
+            var b = strbuilder.empty()
+            b.append("missing type arguments for '")
+            b.append(name)
+            b.append("'")
+            check_fail(ck, job.file, line, column, b.str())
+            b.free()
+        } else {
+            var b = strbuilder.empty()
+            b.append("expected ")
+            b.append_int(n as i64, 10)
+            b.append(" type arguments, found ")
+            b.append_int(arg_nodes.len as i64, 10)
+            check_fail(ck, job.file, line, column, b.str())
+            b.free()
+        }
+        return err_ty(ck) as *Type?
+    }
+    var solved = list.empty<*Type>()
+    var i: usize = 0
+    for i < n && !ck.stop {
+        val arg = arg_nodes.get(i)
+        val typ = resolve_type(ck, job, arg)
+        if typ == null {
+            return null
+        }
+        if typ!!.kind == TypeKind.ERROR {
+            return typ
+        }
+        solved.push(typ!!)
+        i = i + 1
+    }
+    if ck.stop {
+        return null
+    }
+    val cerr = constraint_check_args(ck, job, sym, solved, line, column)
+    if ck.stop {
+        return null
+    }
+    if !(cerr == null) {
+        return cerr
+    }
+    val inst = generic_struct_instance(ck, sym, solved)
+    if inst == null {
+        return null
+    }
+    if !nominal_hold(inst!!) && !generic_has_param(inst) && !inst!!.has_layout {
+        var b = strbuilder.empty()
+        b.append("struct '")
+        b.append(name)
+        b.append("' recursively contains itself")
+        check_fail(ck, job.file, line, column, b.str())
+        b.free()
+        return err_ty(ck) as *Type?
+    }
+    return inst
+}
+
+private fn fill_enum(ck: *Check, sym: *load.Symbol, inst: *Type): bool with (a: mem.Allocator) {
+    val tmpl = get_sema(sym)
+    if !enum_ready(tmpl) || sym.type_params.len == 0 {
+        return true
+    }
+    val template = tmpl!!
+    inst.elem = template.elem
+    var params = list.empty<*Type>()
+    var i: usize = 0
+    for i < sym.type_params.len {
+        val p = sym_type_param_at(sym, i)
+        if !(p == null) {
+            params.push(p!!)
+        }
+        i = i + 1
+    }
+    var names = list.empty<str>()
+    var tags = list.empty<i64>()
+    var decls = list.empty<*parse.Node>()
+    var starts = list.empty<usize>()
+    var counts = list.empty<usize>()
+    var fnames = list.empty<str>()
+    var ftypes = list.empty<*Type>()
+    var fdecls = list.empty<*parse.Node>()
+    i = 0
+    for i < template.variant_names.len {
+        names.push(template.variant_names.get(i))
+        tags.push(template.variant_tags.get(i))
+        decls.push(template.variant_decls.get(i))
+        val start = fnames.len
+        starts.push(start)
+        val vstart = template.variant_field_starts.get(i)
+        val vcount = template.variant_field_counts.get(i)
+        var f: usize = 0
+        for f < vcount {
+            val at = vstart + f
+            fnames.push(template.variant_field_names.get(at))
+            val src = template.variant_field_types.get(at)
+            val ft = generic_subst(ck, src as *Type?, params, inst.elems)
+            if ft == null {
+                return false
+            }
+            ftypes.push(ft!!)
+            fdecls.push(template.variant_field_decls.get(at))
+            f = f + 1
+        }
+        counts.push(vcount)
+        i = i + 1
+    }
+    inst.variant_names = names
+    inst.variant_tags = tags
+    inst.variant_decls = decls
+    inst.variant_field_starts = starts
+    inst.variant_field_counts = counts
+    inst.variant_field_names = fnames
+    inst.variant_field_types = ftypes
+    inst.variant_field_decls = fdecls
+    if !generic_has_param(inst as *Type?) {
+        _ = type_layout(&ck.types, inst)
+    }
+    return true
+}
+
+fn generic_enum_instance(ck: *Check, sym: *load.Symbol, args: list.List<*Type>): *Type? with (a: mem.Allocator) {
+    if !(sym_type_param_count(sym) == args.len) {
+        return null
+    }
+    val found = find_nominal(sym, args)
+    if !(found == null) {
+        if enum_hold(found!!) && enum_ready(get_sema(sym)) {
+            if !fill_enum(ck, sym, found!!) {
+                return null
+            }
+        }
+        return found
+    }
+    val tmpl = get_sema(sym)
+    if tmpl == null || tmpl!!.kind != TypeKind.ENUM {
+        return null
+    }
+    val inst = type_new_nominal(&ck.types, TypeKind.ENUM, tmpl!!.name, tmpl!!.package)
+    inst.decl = tmpl!!.decl
+    inst.elem = tmpl!!.elem
+    for arg in args.items() {
+        inst.elems.push(arg)
+    }
+    sym_push_nominal(sym, inst)
+    if !enum_ready(tmpl) {
+        inst.variant_names.push("")
+        inst.variant_tags.push(0)
+                inst.variant_field_starts.push(0)
+        inst.variant_field_counts.push(0)
+        return inst as *Type?
+    }
+    if !fill_enum(ck, sym, inst) {
+        return null
+    }
+    return inst as *Type?
+}
+
+fn generic_enum_finish(ck: *Check, sym: *load.Symbol): bool with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < sym.nominal_insts.len {
+        val inst = sym_nominal_at(sym, i)
+        if !(inst == null) && enum_hold(inst!!) {
+            if !fill_enum(ck, sym, inst!!) {
+                return false
+            }
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn generic_enum_apply(
+    ck: *Check,
+    job: *CheckJob,
+    sym: *load.Symbol,
+    arg_nodes: list.List<*parse.Node>,
+    line: i64,
+    column: i64,
+): *Type? with (a: mem.Allocator) {
+    if ck.stop {
+        return null
+    }
+    var name = sym.name
+    if name.len == 0 {
+        name = "?"
+    }
+    val n = sym_type_param_count(sym)
+    if !(arg_nodes.len == n) {
+        if arg_nodes.len == 0 {
+            var b = strbuilder.empty()
+            b.append("missing type arguments for '")
+            b.append(name)
+            b.append("'")
+            check_fail(ck, job.file, line, column, b.str())
+            b.free()
+        } else {
+            var b = strbuilder.empty()
+            b.append("expected ")
+            b.append_int(n as i64, 10)
+            b.append(" type arguments, found ")
+            b.append_int(arg_nodes.len as i64, 10)
+            check_fail(ck, job.file, line, column, b.str())
+            b.free()
+        }
+        return err_ty(ck) as *Type?
+    }
+    var solved = list.empty<*Type>()
+    var i: usize = 0
+    for i < n && !ck.stop {
+        val typ = resolve_type(ck, job, arg_nodes.get(i))
+        if typ == null {
+            return null
+        }
+        if typ!!.kind == TypeKind.ERROR {
+            return typ
+        }
+        solved.push(typ!!)
+        i = i + 1
+    }
+    if ck.stop {
+        return null
+    }
+    val cerr = constraint_check_args(ck, job, sym, solved, line, column)
+    if ck.stop {
+        return null
+    }
+    if !(cerr == null) {
+        return cerr
+    }
+    val inst = generic_enum_instance(ck, sym, solved)
+    if inst == null {
+        return null
+    }
+    if !enum_hold(inst!!) && !generic_has_param(inst) && !inst!!.has_layout {
+        var b = strbuilder.empty()
+        b.append("enum '")
+        b.append(name)
+        b.append("' recursively contains itself")
+        check_fail(ck, job.file, line, column, b.str())
+        b.free()
+        return err_ty(ck) as *Type?
+    }
+    return inst
+}
+
+fn generic_alias_apply(
+    ck: *Check,
+    job: *CheckJob,
+    sym: *load.Symbol,
+    arg_nodes: list.List<*parse.Node>,
+    line: i64,
+    column: i64,
+): *Type? with (a: mem.Allocator) {
+    if ck.stop {
+        return null
+    }
+    var name = sym.name
+    if name.len == 0 {
+        name = "?"
+    }
+    val n = sym_type_param_count(sym)
+    if !(arg_nodes.len == n) {
+        if arg_nodes.len == 0 {
+            var b = strbuilder.empty()
+            b.append("missing type arguments for '")
+            b.append(name)
+            b.append("'")
+            check_fail(ck, job.file, line, column, b.str())
+            b.free()
+        } else {
+            var b = strbuilder.empty()
+            b.append("expected ")
+            b.append_int(n as i64, 10)
+            b.append(" type arguments, found ")
+            b.append_int(arg_nodes.len as i64, 10)
+            check_fail(ck, job.file, line, column, b.str())
+            b.free()
+        }
+        return err_ty(ck) as *Type?
+    }
+    var solved = list.empty<*Type>()
+    var i: usize = 0
+    for i < n && !ck.stop {
+        val typ = resolve_type(ck, job, arg_nodes.get(i))
+        if typ == null {
+            return null
+        }
+        if typ!!.kind == TypeKind.ERROR {
+            return typ
+        }
+        solved.push(typ!!)
+        i = i + 1
+    }
+    if ck.stop {
+        return null
+    }
+    val target = get_sema(sym)
+    if target == null || sym.type_params.len == 0 {
+        var b = strbuilder.empty()
+        b.append("'")
+        b.append(name)
+        b.append("' has no type")
+        check_fail(ck, job.file, line, column, b.str())
+        b.free()
+        return err_ty(ck) as *Type?
+    }
+    val cerr = constraint_check_args(ck, job, sym, solved, line, column)
+    if ck.stop {
+        return null
+    }
+    if !(cerr == null) {
+        return cerr
+    }
+    var params = list.empty<*Type>()
+    i = 0
+    for i < sym.type_params.len {
+        val p = sym_type_param_at(sym, i)
+        if !(p == null) {
+            params.push(p!!)
+        }
+        i = i + 1
+    }
+    return generic_subst(ck, target, params, solved)
+}
+
+private fn param_index_of(params: list.List<*Type>, param: *Type): usize {
+    var i: usize = 0
+    for i < params.len {
+        if ptr_eq_type(params.get(i) as *Type?, param as *Type?) {
+            return i
+        }
+        i = i + 1
+    }
+    return params.len
+}
+
+private fn bind_solved(
+    ck: *Check,
+    file: str,
+    line: i64,
+    column: i64,
+    name: str,
+    solved: *Solved,
+    arg: *Type?,
+): bool with (a: mem.Allocator) {
+    if arg == null || arg!!.kind == TypeKind.ERROR {
+        return true
+    }
+    var nm = name
+    if nm.len == 0 {
+        nm = "?"
+    }
+    if arg!!.kind == TypeKind.UNTYPED_INT {
+        if solved.soft_float {
+            var b = strbuilder.empty()
+            b.append("conflicting types for type parameter '")
+            b.append(nm)
+            b.append("'")
+            check_fail(ck, file, line, column, b.str())
+            b.free()
+            return false
+        }
+        if !(solved.ty == null) {
+            if solved.ty!!.kind == TypeKind.INT {
+                return true
+            }
+            var b = strbuilder.empty()
+            b.append("conflicting types for type parameter '")
+            b.append(nm)
+            b.append("'")
+            check_fail(ck, file, line, column, b.str())
+            b.free()
+            return false
+        }
+        solved.soft = true
+        return true
+    }
+    if arg!!.kind == TypeKind.UNTYPED_FLOAT {
+        if solved.soft {
+            var b = strbuilder.empty()
+            b.append("conflicting types for type parameter '")
+            b.append(nm)
+            b.append("'")
+            check_fail(ck, file, line, column, b.str())
+            b.free()
+            return false
+        }
+        if !(solved.ty == null) {
+            if solved.ty!!.kind == TypeKind.FLOAT {
+                return true
+            }
+            var b = strbuilder.empty()
+            b.append("conflicting types for type parameter '")
+            b.append(nm)
+            b.append("'")
+            check_fail(ck, file, line, column, b.str())
+            b.free()
+            return false
+        }
+        solved.soft_float = true
+        return true
+    }
+    if !(solved.ty == null) {
+        if ptr_eq_type(solved.ty, arg) {
+            return true
+        }
+        var b = strbuilder.empty()
+        b.append("conflicting types for type parameter '")
+        b.append(nm)
+        b.append("'")
+        check_fail(ck, file, line, column, b.str())
+        b.free()
+        return false
+    }
+    if (solved.soft && arg!!.kind != TypeKind.INT) || (solved.soft_float && arg!!.kind != TypeKind.FLOAT) {
+        var b = strbuilder.empty()
+        b.append("conflicting types for type parameter '")
+        b.append(nm)
+        b.append("'")
+        check_fail(ck, file, line, column, b.str())
+        b.free()
+        return false
+    }
+    solved.ty = arg
+    return true
+}
+
+private fn unify(
+    ck: *Check,
+    file: str,
+    line: i64,
+    column: i64,
+    param: *Type?,
+    arg: *Type?,
+    solved: list.List<*Solved>,
+    params: list.List<*Type>,
+): bool with (a: mem.Allocator) {
+    // Skip when missing param, or when the arg already failed (match C unify).
+    if param == null || (!(arg == null) && arg!!.kind == TypeKind.ERROR) {
+        return true
+    }
+    if param!!.kind == TypeKind.TYPE_PARAM {
+        val index = param_index_of(params, param!!)
+        if index < params.len {
+            return bind_solved(ck, file, line, column, param!!.name, solved.get(index), arg)
+        }
+    }
+    if arg == null {
+        return false
+    }
+    if arg!!.kind == TypeKind.UNTYPED_INT && param!!.kind == TypeKind.INT {
+        return true
+    }
+    if arg!!.kind == TypeKind.UNTYPED_FLOAT && param!!.kind == TypeKind.FLOAT {
+        return true
+    }
+    if param!!.kind == TypeKind.PTR || param!!.kind == TypeKind.SLICE {
+        if arg!!.kind != param!!.kind || arg!!.is_const != param!!.is_const {
+            fail_unify_mismatch(ck, file, line, column, param!!, arg!!)
+            return false
+        }
+        return unify(ck, file, line, column, param!!.elem, arg!!.elem, solved, params)
+    }
+    if param!!.kind == TypeKind.OPTION {
+        if arg!!.kind != TypeKind.OPTION {
+            fail_unify_mismatch(ck, file, line, column, param!!, arg!!)
+            return false
+        }
+        return unify(ck, file, line, column, param!!.elem, arg!!.elem, solved, params)
+    }
+    if param!!.kind == TypeKind.ARRAY {
+        if arg!!.kind != TypeKind.ARRAY || arg!!.len != param!!.len {
+            fail_unify_mismatch(ck, file, line, column, param!!, arg!!)
+            return false
+        }
+        return unify(ck, file, line, column, param!!.elem, arg!!.elem, solved, params)
+    }
+    if param!!.kind == TypeKind.TUPLE {
+        if arg!!.kind != TypeKind.TUPLE || arg!!.elems.len != param!!.elems.len {
+            fail_unify_mismatch(ck, file, line, column, param!!, arg!!)
+            return false
+        }
+        var i: usize = 0
+        for i < param!!.elems.len {
+            if !unify(ck, file, line, column, param!!.elems.get(i) as *Type?, arg!!.elems.get(i) as *Type?, solved, params) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    if param!!.kind == TypeKind.FN {
+        if arg!!.kind != TypeKind.FN || arg!!.elems.len != param!!.elems.len ||
+            arg!!.contexts.len != param!!.contexts.len || arg!!.fn_variadic != param!!.fn_variadic {
+            fail_unify_mismatch(ck, file, line, column, param!!, arg!!)
+            return false
+        }
+        var i: usize = 0
+        for i < param!!.elems.len {
+            if !unify(ck, file, line, column, param!!.elems.get(i) as *Type?, arg!!.elems.get(i) as *Type?, solved, params) {
+                return false
+            }
+            i = i + 1
+        }
+        i = 0
+        for i < param!!.contexts.len {
+            if !unify(ck, file, line, column, param!!.contexts.get(i) as *Type?, arg!!.contexts.get(i) as *Type?, solved, params) {
+                return false
+            }
+            i = i + 1
+        }
+        return unify(ck, file, line, column, param!!.elem, arg!!.elem, solved, params)
+    }
+    if (param!!.kind == TypeKind.STRUCT || param!!.kind == TypeKind.ENUM || param!!.kind == TypeKind.INTERFACE ||
+        param!!.kind == TypeKind.DISTINCT) && arg!!.kind == param!!.kind && param!!.decl != null &&
+        ptr_eq_node(param!!.decl, arg!!.decl) && param!!.elems.len > 0 && param!!.elems.len == arg!!.elems.len {
+        var i: usize = 0
+        for i < param!!.elems.len {
+            if !unify(ck, file, line, column, param!!.elems.get(i) as *Type?, arg!!.elems.get(i) as *Type?, solved, params) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    if ptr_eq_type(param, arg) {
+        return true
+    }
+    fail_unify_mismatch(ck, file, line, column, param!!, arg!!)
+    return false
+}
+
+private fn fail_unify_mismatch(
+    ck: *Check,
+    file: str,
+    line: i64,
+    column: i64,
+    param: *Type,
+    arg: *Type,
+) with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    b.append("mismatched types ")
+    b.append(type_print(param as *Type?))
+    b.append(" and ")
+    b.append(type_print(arg as *Type?))
+    check_fail(ck, file, line, column, b.str())
+    b.free()
+}
+
+private fn soft_kind_node(node: *parse.Node?): i32 {
+    if node == null {
+        return 0
+    }
+    if parse.is_char_lit(node!!) || is_int_tree(node!!) {
+        return 1
+    }
+    if is_float_tree(node!!) {
+        return 2
+    }
+    return 0
+}
+
+private fn is_int_tree(node: *parse.Node): bool {
+    if parse.is_int_lit(node) {
+        return true
+    }
+    if parse.is_unary(node) && (node.text == "-" || node.text == "~") && node.kids.len > 0 {
+        return is_int_tree(node.kids.get(0))
+    }
+    if !parse.is_binary(node) || node.kids.len < 2 {
+        return false
+    }
+    val op = node.text
+    if op != "+" && op != "-" && op != "*" && op != "/" && op != "%" && op != "&" && op != "|" && op != "^" &&
+        op != "<<" && op != ">>" {
+        return false
+    }
+    return is_int_tree(node.kids.get(0)) && is_int_tree(node.kids.get(1))
+}
+
+private fn is_float_tree(node: *parse.Node): bool {
+    if parse.is_float_lit(node) {
+        return true
+    }
+    if parse.is_unary(node) && node.text == "-" && node.kids.len > 0 {
+        return is_float_tree(node.kids.get(0))
+    }
+    if parse.is_binary(node) && node.kids.len >= 2 {
+        val op = node.text
+        if op == "+" || op == "-" || op == "*" || op == "/" {
+            return is_float_tree(node.kids.get(0)) && is_float_tree(node.kids.get(1))
+        }
+    }
+    return false
+}
+
+private fn finish_solved(
+    ck: *Check,
+    file: str,
+    line: i64,
+    column: i64,
+    solved: list.List<*Solved>,
+    params: list.List<*Type>,
+): *Type? with (a: mem.Allocator) {
+    val i64t = type_builtin(&ck.types, Builtin.I64)
+    val f64t = type_builtin(&ck.types, Builtin.F64)
+    var i: usize = 0
+    for i < solved.len {
+        var name = "?"
+        if i < params.len && params.get(i).name.len > 0 {
+            name = params.get(i).name
+        }
+        val s = solved.get(i)
+        if s.ty == null {
+            if s.soft && s.soft_float {
+                var b = strbuilder.empty()
+                b.append("conflicting types for type parameter '")
+                b.append(name)
+                b.append("'")
+                check_fail(ck, file, line, column, b.str())
+                b.free()
+                return err_ty(ck) as *Type?
+            }
+            if s.soft {
+                s.ty = i64t as *Type?
+            } else if s.soft_float {
+                s.ty = f64t as *Type?
+            } else {
+                var b = strbuilder.empty()
+                b.append("cannot infer type parameter '")
+                b.append(name)
+                b.append("'")
+                check_fail(ck, file, line, column, b.str())
+                b.free()
+                return err_ty(ck) as *Type?
+            }
+        }
+        if s.ty!!.kind == TypeKind.ERROR {
+            return s.ty
+        }
+        i = i + 1
+    }
+    return null
+}
+
+private fn alloc_solved(n: usize): list.List<*Solved> with (a: mem.Allocator) {
+    var out = list.empty<*Solved>()
+    var i: usize = 0
+    for i < n {
+        val (raw, err) = a.alloc(size(Solved), align(Solved))
+        if !(err == null) {
+            panic("out of memory")
+        }
+        val s = raw.ptr as *Solved
+        s.ty = null
+        s.soft = false
+        s.soft_float = false
+        out.push(s)
+        i = i + 1
+    }
+    return out
+}
+
+private fn expr_type_arg_nodes(callee: *parse.Node): list.List<*parse.Node> with (a: mem.Allocator) {
+    var out = list.empty<*parse.Node>()
+    if parse.is_ident(callee) {
+        for kid in callee.kids.items() {
+            out.push(kid)
+        }
+        return out
+    }
+    if parse.is_member(callee) {
+        // kids[0] is base; remaining are type args
+        var i: usize = 1
+        for i < callee.kids.len {
+            out.push(callee.kids.get(i))
+            i = i + 1
+        }
+    }
+    return out
+}
+
+/**
+ * Substitute a generic function call's type parameters. Returns the
+ * instantiated FN type, or the error type / null on failure.
+ */
+fn generic_instantiate(
+    ck: *Check,
+    job: *CheckJob,
+    env: *Env,
+    call: *parse.Node,
+    callee: *parse.Node,
+    fn_type: *Type,
+    sym: *load.Symbol,
+): *Type? with (a: mem.Allocator) {
+    if ck.stop {
+        return null
+    }
+    val n = sym_type_param_count(sym)
+    if n == 0 {
+        return fn_type as *Type?
+    }
+    if !(fn_type.kind == TypeKind.FN) {
+        return err_ty(ck) as *Type?
+    }
+    var params = list.empty<*Type>()
+    var i: usize = 0
+    for i < n {
+        val p = sym_type_param_at(sym, i)
+        if !(p == null) {
+            params.push(p!!)
+        }
+        i = i + 1
+    }
+    var args = list.empty<*Type>()
+    val written = expr_type_arg_nodes(callee)
+    if written.len > 0 {
+        if !(written.len == n) {
+            var b = strbuilder.empty()
+            b.append("expected ")
+            b.append_int(n as i64, 10)
+            b.append(" type arguments, found ")
+            b.append_int(written.len as i64, 10)
+            check_fail(ck, job.file, callee.line, callee.column, b.str())
+            b.free()
+            return err_ty(ck) as *Type?
+        }
+        i = 0
+        for i < n && !ck.stop {
+            val typ = resolve_type(ck, job, written.get(i))
+            if typ == null {
+                return null
+            }
+            if typ!!.kind == TypeKind.ERROR {
+                return typ
+            }
+            args.push(typ!!)
+            i = i + 1
+        }
+        if ck.stop {
+            return null
+        }
+    } else {
+        val solved = alloc_solved(n)
+        val nvalue = fn_type.elems.len
+        var positional: usize = 0
+        var seen_named = false
+        var ai: usize = 1
+        val arg_end = parse.call_arg_end(call)
+        for ai < arg_end && !ck.stop {
+            val arg = call.kids.get(ai)
+            if !parse.is_arg(arg) {
+                ai = ai + 1
+                continue
+            }
+            var value: *parse.Node? = null
+            if arg.kids.len > 0 {
+                value = arg.kids.get(0) as *parse.Node?
+            }
+            var index: i64 = -1
+            if arg.name.len > 0 {
+                seen_named = true
+                index = param_named_index(sym.decl, arg.name, nvalue)
+                if index < 0 {
+                    ai = ai + 1
+                    continue
+                }
+            } else {
+                if seen_named || positional >= nvalue {
+                    ai = ai + 1
+                    continue
+                }
+                index = positional as i64
+                positional = positional + 1
+            }
+            val untyped = soft_kind_node(value)
+            var got: *Type? = null
+            if !(untyped == 0) {
+                if untyped == 2 {
+                    got = type_builtin(&ck.types, Builtin.UNTYPED_FLOAT) as *Type?
+                } else {
+                    got = type_builtin(&ck.types, Builtin.UNTYPED_INT) as *Type?
+                }
+            } else if !(value == null) && !parse.is_null_lit(value!!) {
+                got = check_expr(env, value!!, null)
+                if ck.stop {
+                    return null
+                }
+            }
+            val want = fn_type.elems.get(index as usize)
+            if !(got == null) && got!!.kind == TypeKind.ERROR {
+                return got
+            }
+            if !(got == null) {
+                if !unify(ck, job.file, arg.line, arg.column, want as *Type?, got, solved, params) {
+                    return err_ty(ck) as *Type?
+                }
+            }
+            ai = ai + 1
+        }
+        if ck.stop {
+            return null
+        }
+        val failed = finish_solved(ck, job.file, call.line, call.column, solved, params)
+        if ck.stop {
+            return null
+        }
+        if !(failed == null) {
+            return failed
+        }
+        i = 0
+        for i < n {
+            args.push(solved.get(i).ty!!)
+            i = i + 1
+        }
+    }
+    val cerr = constraint_check_args(ck, job, sym, args, call.line, call.column)
+    if ck.stop {
+        return null
+    }
+    if !(cerr == null) {
+        return cerr
+    }
+    return generic_subst(ck, fn_type as *Type?, params, args)
+}
+
+private fn param_named_index(decl: *parse.Node?, name: str, count: usize): i64 {
+    if decl == null || !parse.is_fn(decl!!) {
+        return -1
+    }
+    val shape = decl!!.head
+    val nparams = shape % 256
+    val has_recv = (shape / 65536) % 2 == 1
+    val ntype = (shape / 1048576) % 256
+    val nattrs = (shape / 268435456) % 256
+    var i: i64 = nattrs
+    if has_recv {
+        i = i + 1
+    }
+    i = i + ntype
+    var idx: i64 = 0
+    for idx < (nparams as i64) && idx < (count as i64) && (i as usize) < decl!!.kids.len {
+        val p = decl!!.kids.get(i as usize)
+        if p.name == name {
+            return idx
+        }
+        i = i + 1
+        idx = idx + 1
+    }
+    return -1
+}
+
+/**
+ * Instantiate a generic method call. Receiver type args come from recv;
+ * the method's own type parameters are inferred or taken from callee.
+ */
+fn generic_instantiate_method(
+    ck: *Check,
+    job: *CheckJob,
+    env: *Env,
+    call: *parse.Node,
+    callee: *parse.Node,
+    recv: *Type?,
+    implicit: bool,
+    sym: *load.Symbol,
+    fn_type: *Type,
+): *Type? with (a: mem.Allocator) {
+    if ck.stop {
+        return null
+    }
+    val n = sym_type_param_count(sym)
+    if n == 0 {
+        return fn_type as *Type?
+    }
+    var recv_n = generic_method_recv_params(sym)
+    if recv_n > n {
+        recv_n = 0
+    }
+    val own_n = n - recv_n
+    var params = list.empty<*Type>()
+    var i: usize = 0
+    for i < n {
+        val p = sym_type_param_at(sym, i)
+        if !(p == null) {
+            params.push(p!!)
+        }
+        i = i + 1
+    }
+    var args = list.empty<*Type>()
+    // Pre-fill with placeholders
+    i = 0
+    for i < n {
+        args.push(err_ty(ck))
+        i = i + 1
+    }
+    if recv_n > 0 {
+        if recv == null || (recv!!.kind != TypeKind.STRUCT && recv!!.kind != TypeKind.ENUM) ||
+            recv!!.elems.len != recv_n {
+            check_fail(ck, job.file, call.line, call.column, "generic type was not instantiated")
+            return err_ty(ck) as *Type?
+        }
+        i = 0
+        for i < recv_n {
+            val arg = recv!!.elems.get(i)
+            if arg.kind == TypeKind.ERROR {
+                return arg as *Type?
+            }
+            args.set(i, arg)
+            i = i + 1
+        }
+    }
+    val written = expr_type_arg_nodes(callee)
+    if written.len > 0 || own_n == 0 {
+        if !(written.len == own_n) {
+            var b = strbuilder.empty()
+            b.append("expected ")
+            b.append_int(own_n as i64, 10)
+            b.append(" type arguments, found ")
+            b.append_int(written.len as i64, 10)
+            check_fail(ck, job.file, callee.line, callee.column, b.str())
+            b.free()
+            return err_ty(ck) as *Type?
+        }
+        i = 0
+        for i < own_n && !ck.stop {
+            val typ = resolve_type(ck, job, written.get(i))
+            if typ == null {
+                return null
+            }
+            if typ!!.kind == TypeKind.ERROR {
+                return typ
+            }
+            args.set(recv_n + i, typ!!)
+            i = i + 1
+        }
+        if ck.stop {
+            return null
+        }
+    } else {
+        val solved = alloc_solved(n)
+        i = 0
+        for i < recv_n {
+            solved.get(i).ty = args.get(i) as *Type?
+            i = i + 1
+        }
+        val nparam = fn_type.elems.len
+        var positional: usize = 0
+        var seen_named = false
+        var ai: usize = 1
+        val arg_end = parse.call_arg_end(call)
+        for ai < arg_end && !ck.stop {
+            val arg = call.kids.get(ai)
+            if !parse.is_arg(arg) {
+                ai = ai + 1
+                continue
+            }
+            var slot: i64 = -1
+            if arg.name.len > 0 {
+                seen_named = true
+                val user = param_named_index(sym.decl, arg.name, if !(sym.decl == null) {
+                    (sym.decl!!.head % 256) as usize
+                } else {
+                    0
+                })
+                if user < 0 {
+                    ai = ai + 1
+                    continue
+                }
+                slot = user + 1
+            } else {
+                if seen_named {
+                    ai = ai + 1
+                    continue
+                }
+                if implicit {
+                    slot = (positional + 1) as i64
+                } else {
+                    slot = positional as i64
+                }
+                positional = positional + 1
+            }
+            if slot < 0 || (slot as usize) >= nparam {
+                ai = ai + 1
+                continue
+            }
+            var value: *parse.Node? = null
+            if arg.kids.len > 0 {
+                value = arg.kids.get(0) as *parse.Node?
+            }
+            val untyped = soft_kind_node(value)
+            var got: *Type? = null
+            if !(untyped == 0) {
+                if untyped == 2 {
+                    got = type_builtin(&ck.types, Builtin.UNTYPED_FLOAT) as *Type?
+                } else {
+                    got = type_builtin(&ck.types, Builtin.UNTYPED_INT) as *Type?
+                }
+            } else if !(value == null) && !parse.is_null_lit(value!!) {
+                got = check_expr(env, value!!, null)
+                if ck.stop {
+                    return null
+                }
+            }
+            val want = fn_type.elems.get(slot as usize)
+            if !(got == null) && got!!.kind == TypeKind.ERROR {
+                return got
+            }
+            if !(got == null) {
+                if !unify(ck, job.file, arg.line, arg.column, want as *Type?, got, solved, params) {
+                    return err_ty(ck) as *Type?
+                }
+            }
+            ai = ai + 1
+        }
+        if ck.stop {
+            return null
+        }
+        val failed = finish_solved(ck, job.file, call.line, call.column, solved, params)
+        if ck.stop {
+            return null
+        }
+        if !(failed == null) {
+            return failed
+        }
+        i = 0
+        for i < n {
+            args.set(i, solved.get(i).ty!!)
+            i = i + 1
+        }
+    }
+    val cerr = constraint_check_args(ck, job, sym, args, call.line, call.column)
+    if ck.stop {
+        return null
+    }
+    if !(cerr == null) {
+        return cerr
+    }
+    return generic_subst(ck, fn_type as *Type?, params, args)
+}

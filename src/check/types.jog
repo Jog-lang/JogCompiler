@@ -1,0 +1,1186 @@
+// Type kinds, interning, print, and the poison type.
+// Checked against compiler/src/types.h and types.c.
+// CheckerGuide step 1.
+
+import src.parse
+import std.fs
+import std.list
+import std.map
+import std.mem
+import std.strbuilder
+
+/**
+ * Semantic type kind. Matches JogTypeKind in types.h.
+ */
+enum TypeKind {
+    ERROR
+    UNIT
+    BOOL
+    INT
+    FLOAT
+    UNTYPED_INT
+    UNTYPED_FLOAT
+    NULL
+    BYTES_N
+    BYTES
+    PTR
+    SLICE
+    ARRAY
+    OPTION
+    TUPLE
+    FN
+    STRUCT
+    ENUM
+    INTERFACE
+    DISTINCT
+    TYPE_PARAM
+}
+
+/**
+ * Index into TypeTable.builtins. Matches JogBuiltin.
+ */
+enum Builtin {
+    I8
+    I16
+    I32
+    I64
+    U8
+    U16
+    U32
+    U64
+    ISIZE
+    USIZE
+    F32
+    F64
+    BOOL
+    UNIT
+    BYTES
+    CONST_BYTES
+    UNTYPED_INT
+    UNTYPED_FLOAT
+    NULL
+    ERROR
+}
+
+/**
+ * One semantic type. Structural types are interned; nominal types are
+ * unique per declaration. Equality of interned types is pointer equality.
+ *
+ * STRUCT fields and ENUM variants are parallel lists (nested structs with
+ * *Type cannot sit inside Type before Type is defined). An unfinished struct
+ * has field_names.len == 1 with an empty name (hold-open sentinel).
+ * ENUM tag type lives in elem (like C as.nominal.base).
+ */
+struct Type {
+    kind: TypeKind
+    id: u32
+    is_const: bool
+    has_layout: bool
+    size: u64
+    align: u32
+    // INT
+    int_bits: u8
+    int_signed: bool
+    int_is_size: bool
+    // FLOAT
+    float_bits: u8
+    // BYTES_N / ARRAY
+    len: u64
+    // PTR, SLICE, OPTION, ARRAY elem; DISTINCT base; FN ret; ENUM tag
+    elem: *Type?
+    // TUPLE elems, FN params / contexts, nominal type_args
+    elems: list.List<*Type>
+    // FN
+    contexts: list.List<*Type>
+    fn_variadic: bool
+    fn_escaping: bool
+    fn_extern: bool
+    // nominal / type param
+    name: str
+    package: str
+    // STRUCT fields (parallel arrays)
+    field_names: list.List<str>
+    field_types: list.List<*Type>
+    field_offsets: list.List<u64>
+    field_embedded: list.List<bool>
+    field_decls: list.List<*parse.Node>
+    // ENUM variants (parallel arrays) + flat payload fields
+    variant_names: list.List<str>
+    variant_tags: list.List<i64>
+    variant_decls: list.List<*parse.Node>
+    variant_field_starts: list.List<usize>
+    variant_field_counts: list.List<usize>
+    variant_field_names: list.List<str>
+    variant_field_types: list.List<*Type>
+    variant_field_decls: list.List<*parse.Node>
+    payload_offset: u64
+    // STRUCT/ENUM/INTERFACE/DISTINCT declaring AST node
+    decl: *parse.Node?
+}
+
+/**
+ * One struct field view. Built from Type's parallel field lists.
+ */
+struct StructField {
+    name: str
+    field_type: *Type?
+    offset: u64
+    embedded: bool
+    decl: *parse.Node?
+}
+
+/**
+ * One enum variant view. Built from Type's parallel variant lists.
+ */
+struct EnumVariant {
+    name: str
+    tag: i64
+    decl: *parse.Node?
+    field_start: usize
+    field_count: usize
+}
+
+/**
+ * Intern table and builtins. ptr_size is 8 on x64, 4 on wasm32.
+ */
+struct TypeTable {
+    ptr_size: u32
+    next_id: u32
+    builtins: list.List<*Type>
+    interned: map.Map<str, *Type>
+    key: strbuilder.StrBuilder
+}
+
+private fn alloc_type(table: *TypeTable, kind: TypeKind): *Type with (a: mem.Allocator) {
+    val (raw, err) = a.alloc(size(Type), align(Type))
+    if err != null {
+        panic("out of memory")
+    }
+    val t = raw.ptr as *Type
+    t.kind = kind
+    t.id = table.next_id
+    table.next_id = table.next_id + 1
+    t.is_const = false
+    t.has_layout = false
+    t.size = 0
+    t.align = 1
+    t.int_bits = 0
+    t.int_signed = false
+    t.int_is_size = false
+    t.float_bits = 0
+    t.len = 0
+    t.elem = null
+    t.elems = list.empty<*Type>()
+    t.contexts = list.empty<*Type>()
+    t.fn_variadic = false
+    t.fn_escaping = false
+    t.fn_extern = false
+    t.name = ""
+    t.package = ""
+    t.field_names = list.empty<str>()
+    t.field_types = list.empty<*Type>()
+    t.field_offsets = list.empty<u64>()
+    t.field_embedded = list.empty<bool>()
+    t.field_decls = list.empty<*parse.Node>()
+    t.variant_names = list.empty<str>()
+    t.variant_tags = list.empty<i64>()
+    t.variant_decls = list.empty<*parse.Node>()
+    t.variant_field_starts = list.empty<usize>()
+    t.variant_field_counts = list.empty<usize>()
+    t.variant_field_names = list.empty<str>()
+    t.variant_field_types = list.empty<*Type>()
+    t.variant_field_decls = list.empty<*parse.Node>()
+    t.payload_offset = 0
+    t.decl = null
+    return t
+}
+
+/**
+ * Number of struct fields (0 for non-structs).
+ */
+fn type_field_count(ty: *Type): usize {
+    return ty.field_names.len
+}
+
+/**
+ * Read one struct field by index.
+ */
+fn type_field_at(ty: *Type, i: usize): StructField {
+    var f: StructField
+    f.name = ""
+    f.field_type = null
+    f.offset = 0
+    f.embedded = false
+    f.decl = null
+    if i >= ty.field_names.len {
+        return f
+    }
+    f.name = ty.field_names.get(i)
+    if i < ty.field_types.len {
+        f.field_type = ty.field_types.get(i) as *Type?
+    }
+    if i < ty.field_offsets.len {
+        f.offset = ty.field_offsets.get(i)
+    }
+    if i < ty.field_embedded.len {
+        f.embedded = ty.field_embedded.get(i)
+    }
+    if i < ty.field_decls.len {
+        f.decl = ty.field_decls.get(i) as *parse.Node?
+    }
+    return f
+}
+
+/**
+ * Number of enum variants (0 for non-enums).
+ */
+fn type_variant_count(ty: *Type): usize {
+    return ty.variant_names.len
+}
+
+/**
+ * Read one enum variant by index.
+ */
+fn type_variant_at(ty: *Type, i: usize): EnumVariant {
+    var v: EnumVariant
+    v.name = ""
+    v.tag = 0
+    v.decl = null
+    v.field_start = 0
+    v.field_count = 0
+    if i >= ty.variant_names.len {
+        return v
+    }
+    v.name = ty.variant_names.get(i)
+    if i < ty.variant_tags.len {
+        v.tag = ty.variant_tags.get(i)
+    }
+    if i < ty.variant_decls.len {
+        v.decl = ty.variant_decls.get(i) as *parse.Node?
+    }
+    if i < ty.variant_field_starts.len {
+        v.field_start = ty.variant_field_starts.get(i)
+    }
+    if i < ty.variant_field_counts.len {
+        v.field_count = ty.variant_field_counts.get(i)
+    }
+    return v
+}
+
+/**
+ * One payload field of a variant, as a StructField view (offset unused).
+ */
+fn type_variant_field_at(ty: *Type, variant: EnumVariant, fi: usize): StructField {
+    var f: StructField
+    f.name = ""
+    f.field_type = null
+    f.offset = 0
+    f.embedded = false
+    f.decl = null
+    if fi >= variant.field_count {
+        return f
+    }
+    val at = variant.field_start + fi
+    if at >= ty.variant_field_names.len {
+        return f
+    }
+    f.name = ty.variant_field_names.get(at)
+    if at < ty.variant_field_types.len {
+        f.field_type = ty.variant_field_types.get(at) as *Type?
+    }
+    if at < ty.variant_field_decls.len {
+        f.decl = ty.variant_field_decls.get(at) as *parse.Node?
+    }
+    return f
+}
+
+/**
+ * Hold-open sentinel: unfinished struct identity published before fields.
+ */
+fn type_hold_open(ty: *Type) with (a: mem.Allocator) {
+    ty.field_names.push("")
+}
+
+/**
+ * Replace hold-open / prior fields with the finished list.
+ */
+fn type_set_fields(
+    ty: *Type,
+    names: list.List<str>,
+    types: list.List<*Type>,
+    embedded: list.List<bool>,
+    decls: list.List<*parse.Node>,
+) with (a: mem.Allocator) {
+    ty.field_names = names
+    ty.field_types = types
+    ty.field_embedded = embedded
+    ty.field_decls = decls
+    ty.field_offsets = list.empty<u64>()
+    var i: usize = 0
+    for i < names.len {
+        ty.field_offsets.push(0)
+        i = i + 1
+    }
+}
+
+private fn set_layout(t: *Type, size_bytes: u64, align_bytes: u32) {
+    t.size = size_bytes
+    t.align = align_bytes
+    t.has_layout = true
+}
+
+private fn make_int(table: *TypeTable, bits: u8, is_signed: bool, is_size: bool): *Type with (a: mem.Allocator) {
+    val t = alloc_type(table, TypeKind.INT)
+    t.int_bits = bits
+    t.int_signed = is_signed
+    t.int_is_size = is_size
+    set_layout(t, (bits as u64) / 8, bits as u32 / 8)
+    return t
+}
+
+private fn key_clear(table: *TypeTable) with (a: mem.Allocator) {
+    table.key.clear()
+}
+
+private fn key_byte(table: *TypeTable, b: u8) with (a: mem.Allocator) {
+    table.key.append_byte(b)
+}
+
+private fn key_id(table: *TypeTable, t: *Type) with (a: mem.Allocator) {
+    table.key.append_byte(',' as u8)
+    table.key.append_int(t.id as i64, 10)
+}
+
+private fn key_cstr(table: *TypeTable, text: str) with (a: mem.Allocator) {
+    table.key.append(text)
+}
+
+private fn intern_lookup(table: *TypeTable): *Type? with (a: mem.Allocator) {
+    val k = table.key.str()
+    var found = type_builtin(table, Builtin.ERROR)
+    if table.interned.get(k, map.fnv1a(k), &found) {
+        return found as *Type?
+    }
+    return null
+}
+
+private fn intern_remember(table: *TypeTable, t: *Type): *Type with (a: mem.Allocator) {
+    val owned = fs.copy_str(table.key.str())
+    table.interned.insert(owned, map.fnv1a(owned), t)
+    return t
+}
+
+/**
+ * Create a type table with builtins. ptr_size must be 4 or 8.
+ * @param ptr_size target pointer size in bytes
+ * @context a allocator for types and the intern map
+ * @return a filled table
+ */
+fn type_table_create(ptr_size: u32): TypeTable with (a: mem.Allocator) {
+    if ptr_size != 4 && ptr_size != 8 {
+        panic("ptr_size must be 4 or 8")
+    }
+    var table: TypeTable
+    table.ptr_size = ptr_size
+    table.next_id = 0
+    table.builtins = list.empty<*Type>()
+    table.interned = map.empty<str, *Type>()
+    table.key = strbuilder.empty()
+
+    val ptr_bits = (ptr_size * 8) as u8
+    table.builtins.push(make_int(&table, 8, true, false))
+    table.builtins.push(make_int(&table, 16, true, false))
+    table.builtins.push(make_int(&table, 32, true, false))
+    table.builtins.push(make_int(&table, 64, true, false))
+    table.builtins.push(make_int(&table, 8, false, false))
+    table.builtins.push(make_int(&table, 16, false, false))
+    table.builtins.push(make_int(&table, 32, false, false))
+    table.builtins.push(make_int(&table, 64, false, false))
+    table.builtins.push(make_int(&table, ptr_bits, true, true))
+    table.builtins.push(make_int(&table, ptr_bits, false, true))
+
+    val f32t = alloc_type(&table, TypeKind.FLOAT)
+    f32t.float_bits = 32
+    set_layout(f32t, 4, 4)
+    table.builtins.push(f32t)
+    val f64t = alloc_type(&table, TypeKind.FLOAT)
+    f64t.float_bits = 64
+    set_layout(f64t, 8, 8)
+    table.builtins.push(f64t)
+
+    val boolt = alloc_type(&table, TypeKind.BOOL)
+    set_layout(boolt, 1, 1)
+    table.builtins.push(boolt)
+    val unit = alloc_type(&table, TypeKind.UNIT)
+    set_layout(unit, 0, 1)
+    table.builtins.push(unit)
+
+    val bytes = alloc_type(&table, TypeKind.BYTES)
+    set_layout(bytes, 2 as u64 * ptr_size as u64, ptr_size)
+    table.builtins.push(bytes)
+    val cbytes = alloc_type(&table, TypeKind.BYTES)
+    cbytes.is_const = true
+    set_layout(cbytes, 2 as u64 * ptr_size as u64, ptr_size)
+    table.builtins.push(cbytes)
+
+    val ui = alloc_type(&table, TypeKind.UNTYPED_INT)
+    set_layout(ui, 0, 1)
+    table.builtins.push(ui)
+    val uf = alloc_type(&table, TypeKind.UNTYPED_FLOAT)
+    set_layout(uf, 0, 1)
+    table.builtins.push(uf)
+    val nullt = alloc_type(&table, TypeKind.NULL)
+    set_layout(nullt, 0, 1)
+    table.builtins.push(nullt)
+    val err = alloc_type(&table, TypeKind.ERROR)
+    set_layout(err, 0, 1)
+    table.builtins.push(err)
+    return table
+}
+
+/**
+ * Builtin type by index.
+ * @param table type table
+ * @param which builtin
+ * @return the type
+ */
+private fn builtin_index(which: Builtin): usize {
+    return when which {
+        I8 -> 0 as usize
+        I16 -> 1 as usize
+        I32 -> 2 as usize
+        I64 -> 3 as usize
+        U8 -> 4 as usize
+        U16 -> 5 as usize
+        U32 -> 6 as usize
+        U64 -> 7 as usize
+        ISIZE -> 8 as usize
+        USIZE -> 9 as usize
+        F32 -> 10 as usize
+        F64 -> 11 as usize
+        BOOL -> 12 as usize
+        UNIT -> 13 as usize
+        BYTES -> 14 as usize
+        CONST_BYTES -> 15 as usize
+        UNTYPED_INT -> 16 as usize
+        UNTYPED_FLOAT -> 17 as usize
+        NULL -> 18 as usize
+        ERROR -> 19 as usize
+    }
+}
+
+fn type_builtin(table: *TypeTable, which: Builtin): *Type {
+    return table.builtins.get(builtin_index(which))
+}
+
+/**
+ * Poison / error type.
+ * @param table type table
+ * @return the ERROR builtin
+ */
+fn type_error(table: *TypeTable): *Type {
+    return type_builtin(table, Builtin.ERROR)
+}
+
+private fn type_is_byte(t: *Type): bool {
+    return t.kind == TypeKind.BYTES_N && t.len == 1
+}
+
+private fn layout_elem(table: *TypeTable, t: *Type) {
+    val ptr = table.ptr_size
+    when t.kind {
+        PTR -> {
+            set_layout(t, ptr as u64, ptr)
+        }
+        SLICE -> {
+            set_layout(t, 2 as u64 * ptr as u64, ptr)
+        }
+        FN -> {
+            if t.fn_extern {
+                set_layout(t, ptr as u64, ptr)
+            } else {
+                set_layout(t, 2 as u64 * ptr as u64, ptr)
+            }
+        }
+        ARRAY -> {
+            val elem = t.elem!!
+            set_layout(t, elem.size * t.len, elem.align)
+        }
+        OPTION -> {
+            val elem = t.elem!!
+            // Niche layout for *T? comes later; step 1 uses the tagged shape.
+            var align_b = elem.align
+            if align_b < 1 {
+                align_b = 1
+            }
+            val value_off = (1 as u64 + (align_b as u64) - 1) / (align_b as u64) * (align_b as u64)
+            val total = (value_off + elem.size + (align_b as u64) - 1) / (align_b as u64) * (align_b as u64)
+            set_layout(t, total, align_b)
+        }
+        TUPLE -> {
+            var offset: u64 = 0
+            var max_align: u32 = 1
+            for e in t.elems.items() {
+                val al = e.align
+                offset = (offset + (al as u64) - 1) / (al as u64) * (al as u64)
+                offset = offset + e.size
+                if al > max_align {
+                    max_align = al
+                }
+            }
+            if max_align < 1 {
+                max_align = 1
+            }
+            offset = (offset + (max_align as u64) - 1) / (max_align as u64) * (max_align as u64)
+            set_layout(t, offset, max_align)
+        }
+        else -> {}
+    }
+}
+
+private fn elem_type(table: *TypeTable, kind: TypeKind, tag: u8, elem: *Type, is_const: bool): *Type with (a: mem.Allocator) {
+    key_clear(table)
+    key_byte(table, tag)
+    key_id(table, elem)
+    if is_const {
+        key_byte(table, 'c' as u8)
+    } else {
+        key_byte(table, 'm' as u8)
+    }
+    val hit = intern_lookup(table)
+    if hit != null {
+        return hit!!
+    }
+    val t = alloc_type(table, kind)
+    t.elem = elem as *Type?
+    t.is_const = is_const
+    layout_elem(table, t)
+    return intern_remember(table, t)
+}
+
+/**
+ * Interned [N]byte.
+ * @param table type table
+ * @param n length
+ * @context a allocator
+ * @return the type
+ */
+fn type_bytes_n(table: *TypeTable, n: u64): *Type with (a: mem.Allocator) {
+    key_clear(table)
+    key_byte(table, 'b' as u8)
+    key_byte(table, ',' as u8)
+    table.key.append_int(n as i64, 10)
+    val hit = intern_lookup(table)
+    if hit != null {
+        return hit!!
+    }
+    val t = alloc_type(table, TypeKind.BYTES_N)
+    t.len = n
+    set_layout(t, n, 1)
+    return intern_remember(table, t)
+}
+
+/**
+ * Interned *T or *const T.
+ * @param table type table
+ * @param elem pointee
+ * @param is_const const pointer
+ * @context a allocator
+ * @return the type
+ */
+fn type_ptr(table: *TypeTable, elem: *Type, is_const: bool): *Type with (a: mem.Allocator) {
+    return elem_type(table, TypeKind.PTR, 'p' as u8, elem, is_const)
+}
+
+/**
+ * Interned []T or []const T. []byte folds to the bytes builtin.
+ * @param table type table
+ * @param elem element
+ * @param is_const const slice
+ * @context a allocator
+ * @return the type
+ */
+fn type_slice(table: *TypeTable, elem: *Type, is_const: bool): *Type with (a: mem.Allocator) {
+    if type_is_byte(elem) {
+        if is_const {
+            return type_builtin(table, Builtin.CONST_BYTES)
+        }
+        return type_builtin(table, Builtin.BYTES)
+    }
+    return elem_type(table, TypeKind.SLICE, 's' as u8, elem, is_const)
+}
+
+/**
+ * Interned T?.
+ * @param table type table
+ * @param elem inner type
+ * @context a allocator
+ * @return the type
+ */
+fn type_option(table: *TypeTable, elem: *Type): *Type with (a: mem.Allocator) {
+    return elem_type(table, TypeKind.OPTION, 'o' as u8, elem, false)
+}
+
+/**
+ * Interned [N]T. [N]byte folds to BYTES_N.
+ * @param table type table
+ * @param elem element
+ * @param len length
+ * @context a allocator
+ * @return the type
+ */
+fn type_array(table: *TypeTable, elem: *Type, len: u64): *Type with (a: mem.Allocator) {
+    if type_is_byte(elem) {
+        return type_bytes_n(table, len)
+    }
+    key_clear(table)
+    key_byte(table, 'a' as u8)
+    key_id(table, elem)
+    key_byte(table, ',' as u8)
+    table.key.append_int(len as i64, 10)
+    val hit = intern_lookup(table)
+    if hit != null {
+        return hit!!
+    }
+    val t = alloc_type(table, TypeKind.ARRAY)
+    t.elem = elem as *Type?
+    t.len = len
+    layout_elem(table, t)
+    return intern_remember(table, t)
+}
+
+/**
+ * Interned tuple of element types.
+ * @param table type table
+ * @param elems elements in order
+ * @context a allocator
+ * @return the type
+ */
+fn type_tuple(table: *TypeTable, elems: list.List<*Type>): *Type with (a: mem.Allocator) {
+    key_clear(table)
+    key_byte(table, 't' as u8)
+    for e in elems.items() {
+        key_id(table, e)
+    }
+    val hit = intern_lookup(table)
+    if hit != null {
+        return hit!!
+    }
+    val t = alloc_type(table, TypeKind.TUPLE)
+    for e in elems.items() {
+        t.elems.push(e)
+    }
+    layout_elem(table, t)
+    return intern_remember(table, t)
+}
+
+/**
+ * Interned function type.
+ * @param table type table
+ * @param params parameter types
+ * @param ret result type
+ * @param contexts with-clause types
+ * @param variadic C variadic
+ * @param is_escaping escaping closure
+ * @param is_extern plain C function pointer
+ * @context a allocator
+ * @return the type
+ */
+fn type_fn(
+    table: *TypeTable,
+    params: list.List<*Type>,
+    ret: *Type,
+    contexts: list.List<*Type>,
+    variadic: bool,
+    is_escaping: bool,
+    is_extern: bool,
+): *Type with (a: mem.Allocator) {
+    key_clear(table)
+    key_byte(table, 'f' as u8)
+    for p in params.items() {
+        key_id(table, p)
+    }
+    key_cstr(table, ";r")
+    key_id(table, ret)
+    key_cstr(table, ";c")
+    for c in contexts.items() {
+        key_id(table, c)
+    }
+    key_byte(table, ';' as u8)
+    if variadic {
+        key_byte(table, '1' as u8)
+    } else {
+        key_byte(table, '0' as u8)
+    }
+    if is_escaping {
+        key_byte(table, '1' as u8)
+    } else {
+        key_byte(table, '0' as u8)
+    }
+    if is_extern {
+        key_byte(table, '1' as u8)
+    } else {
+        key_byte(table, '0' as u8)
+    }
+    val hit = intern_lookup(table)
+    if hit != null {
+        return hit!!
+    }
+    val t = alloc_type(table, TypeKind.FN)
+    for p in params.items() {
+        t.elems.push(p)
+    }
+    t.elem = ret as *Type?
+    for c in contexts.items() {
+        t.contexts.push(c)
+    }
+    t.fn_variadic = variadic
+    t.fn_escaping = is_escaping
+    t.fn_extern = is_extern
+    layout_elem(table, t)
+    return intern_remember(table, t)
+}
+
+/**
+ * Fresh nominal type (struct, enum, interface, or distinct). Not interned.
+ * @param table type table
+ * @param kind STRUCT, ENUM, INTERFACE, or DISTINCT
+ * @param name declared name
+ * @param package package path
+ * @context a allocator
+ * @return the type
+ */
+fn type_new_nominal(table: *TypeTable, kind: TypeKind, name: str, package: str): *Type with (a: mem.Allocator) {
+    val t = alloc_type(table, kind)
+    t.name = fs.copy_str(name)
+    t.package = fs.copy_str(package)
+    return t
+}
+
+/**
+ * Fresh type parameter.
+ * @param table type table
+ * @param name parameter name
+ * @context a allocator
+ * @return the type
+ */
+fn type_new_param(table: *TypeTable, name: str, constraint: *Type?): *Type with (a: mem.Allocator) {
+    val t = alloc_type(table, TypeKind.TYPE_PARAM)
+    t.name = fs.copy_str(name)
+    // Constraint lives in elem (C: as.param.constraint).
+    t.elem = constraint
+    return t
+}
+
+private fn append_list(items: list.List<*Type>, out: *strbuilder.StrBuilder) with (a: mem.Allocator) {
+    var i: usize = 0
+    for e in items.items() {
+        if i > 0 {
+            out.append(", ")
+        }
+        type_append(e, out)
+        i = i + 1
+    }
+}
+
+/**
+ * Append the Jog spelling of a type, matching jog_type_print.
+ * @param ty type to print; null prints as `<null type>`
+ * @param out string builder
+ * @context a allocator for the builder
+ */
+fn type_append(ty: *Type?, out: *strbuilder.StrBuilder) with (a: mem.Allocator) {
+    if ty == null {
+        out.append("<null type>")
+        return
+    }
+    val t = ty!!
+    when t.kind {
+        ERROR -> {
+            out.append("<error>")
+        }
+        UNIT -> {
+            out.append("()")
+        }
+        BOOL -> {
+            out.append("bool")
+        }
+        INT -> {
+            if t.int_is_size {
+                if t.int_signed {
+                    out.append("isize")
+                } else {
+                    out.append("usize")
+                }
+            } else {
+                if t.int_signed {
+                    out.append_byte('i' as u8)
+                } else {
+                    out.append_byte('u' as u8)
+                }
+                out.append_int(t.int_bits as i64, 10)
+            }
+        }
+        FLOAT -> {
+            out.append_byte('f' as u8)
+            out.append_int(t.float_bits as i64, 10)
+        }
+        UNTYPED_INT -> {
+            out.append("untyped int")
+        }
+        UNTYPED_FLOAT -> {
+            out.append("untyped float")
+        }
+        NULL -> {
+            out.append("null")
+        }
+        BYTES_N -> {
+            out.append_byte('[' as u8)
+            out.append_int(t.len as i64, 10)
+            out.append("]byte")
+        }
+        BYTES -> {
+            if t.is_const {
+                out.append("const bytes")
+            } else {
+                out.append("bytes")
+            }
+        }
+        PTR -> {
+            if t.is_const {
+                out.append("*const ")
+            } else {
+                out.append("*")
+            }
+            type_append(t.elem, out)
+        }
+        SLICE -> {
+            if t.is_const {
+                out.append("[]const ")
+            } else {
+                out.append("[]")
+            }
+            type_append(t.elem, out)
+        }
+        ARRAY -> {
+            out.append_byte('[' as u8)
+            out.append_int(t.len as i64, 10)
+            out.append_byte(']' as u8)
+            type_append(t.elem, out)
+        }
+        OPTION -> {
+            val elem = t.elem
+            var paren = false
+            if elem != null && elem!!.kind == TypeKind.FN {
+                paren = true
+            }
+            if paren {
+                out.append_byte('(' as u8)
+            }
+            type_append(elem, out)
+            if paren {
+                out.append(")?")
+            } else {
+                out.append("?")
+            }
+        }
+        TUPLE -> {
+            out.append_byte('(' as u8)
+            append_list(t.elems, out)
+            out.append_byte(')' as u8)
+        }
+        FN -> {
+            if t.fn_extern {
+                out.append("extern ")
+            } else if t.fn_escaping {
+                out.append("escaping ")
+            }
+            out.append_byte('(' as u8)
+            append_list(t.elems, out)
+            if t.fn_variadic {
+                if t.elems.len > 0 {
+                    out.append(", ...")
+                } else {
+                    out.append("...")
+                }
+            }
+            out.append(") -> ")
+            type_append(t.elem, out)
+            if t.contexts.len > 0 {
+                out.append(" with ")
+                append_list(t.contexts, out)
+            }
+        }
+        STRUCT, ENUM, INTERFACE, DISTINCT -> {
+            if t.name.len > 0 {
+                out.append(t.name)
+            } else {
+                out.append("<anonymous>")
+            }
+            if t.elems.len > 0 {
+                out.append_byte('<' as u8)
+                append_list(t.elems, out)
+                out.append_byte('>' as u8)
+            }
+        }
+        TYPE_PARAM -> {
+            if t.name.len > 0 {
+                out.append(t.name)
+            } else {
+                out.append("T")
+            }
+        }
+        else -> {}
+    }
+}
+
+/**
+ * Owned Jog spelling of a type.
+ * @param ty type to print
+ * @context a allocator
+ * @return a copied string
+ */
+fn type_print(ty: *Type?): str with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    type_append(ty, &b)
+    val s = fs.copy_str(b.str())
+    b.free()
+    return s
+}
+
+private fn is_universe_void(t: *Type): bool {
+    return t.kind == TypeKind.STRUCT && !t.has_layout && t.field_names.len == 0 && t.name == "void" &&
+        t.package.len == 0 && t.decl == null
+}
+
+private fn round_up_u64(n: u64, align_b: u32): u64 {
+    if align_b <= 1 {
+        return n
+    }
+    val a = align_b as u64
+    return (n + a - 1) / a * a
+}
+
+private fn smallest_enum_tag(table: *TypeTable, ty: *Type): *Type {
+    var max_tag: i64 = 0
+    var i: usize = 0
+    for i < ty.variant_tags.len {
+        val t = ty.variant_tags.get(i)
+        if t > max_tag {
+            max_tag = t
+        }
+        i = i + 1
+    }
+    if max_tag <= 255 {
+        return type_builtin(table, Builtin.U8)
+    }
+    if max_tag <= 65535 {
+        return type_builtin(table, Builtin.U16)
+    }
+    if max_tag <= 4294967295 {
+        return type_builtin(table, Builtin.U32)
+    }
+    return type_builtin(table, Builtin.U64)
+}
+
+private fn layout_variant_payload(table: *TypeTable, ty: *Type, variant: EnumVariant): (u64, u32, bool) with (a: mem.Allocator) {
+    var offset: u64 = 0
+    var max_align: u32 = 1
+    var fi: usize = 0
+    for fi < variant.field_count {
+        val fld = type_variant_field_at(ty, variant, fi)
+        if fld.field_type == null {
+            return 0, 1, false
+        }
+        val ft = fld.field_type!!
+        if !type_layout(table, ft) {
+            return 0, 1, false
+        }
+        offset = round_up_u64(offset, ft.align)
+        offset = offset + ft.size
+        if ft.align > max_align {
+            max_align = ft.align
+        }
+        fi = fi + 1
+    }
+    if max_align < 1 {
+        max_align = 1
+    }
+    return round_up_u64(offset, max_align), max_align, true
+}
+
+/**
+ * Compute size/align for a type that does not have layout yet. Structs use
+ * fields laid out like C jog_type_layout. Enums use tag + max payload.
+ * @param table type table
+ * @param ty type to lay out
+ * @return false when layout failed (recursive incomplete struct/enum)
+ */
+fn type_layout(table: *TypeTable, ty: *Type): bool with (a: mem.Allocator) {
+    if ty.has_layout {
+        return true
+    }
+    if ty.kind == TypeKind.PTR || ty.kind == TypeKind.SLICE || ty.kind == TypeKind.FN ||
+        ty.kind == TypeKind.ARRAY || ty.kind == TypeKind.OPTION || ty.kind == TypeKind.TUPLE {
+        // Already laid out at construction for these kinds in step 1.
+        return ty.has_layout
+    }
+    if ty.kind == TypeKind.INTERFACE {
+        val ptr = table.ptr_size as u64
+        set_layout(ty, 2 * ptr, table.ptr_size)
+        return true
+    }
+    if ty.kind == TypeKind.DISTINCT {
+        if ty.elem == null {
+            return false
+        }
+        if !type_layout(table, ty.elem!!) {
+            return false
+        }
+        set_layout(ty, ty.elem!!.size, ty.elem!!.align)
+        return true
+    }
+    if ty.kind == TypeKind.ENUM {
+        if ty.elem == null {
+            ty.elem = smallest_enum_tag(table, ty) as *Type?
+        }
+        val tag = ty.elem!!
+        if !type_layout(table, tag) {
+            return false
+        }
+        var payload_size: u64 = 0
+        var payload_align: u32 = 1
+        var vi: usize = 0
+        for vi < type_variant_count(ty) {
+            val variant = type_variant_at(ty, vi)
+            val (sz, al, ok) = layout_variant_payload(table, ty, variant)
+            if !ok {
+                return false
+            }
+            if sz > payload_size {
+                payload_size = sz
+            }
+            if al > payload_align {
+                payload_align = al
+            }
+            vi = vi + 1
+        }
+        var align_b = tag.align
+        if payload_align > align_b {
+            align_b = payload_align
+        }
+        var payload_off = tag.size
+        if payload_size > 0 {
+            payload_off = round_up_u64(tag.size, payload_align)
+        }
+        ty.payload_offset = payload_off
+        set_layout(ty, round_up_u64(payload_off + payload_size, align_b), align_b)
+        return true
+    }
+    if ty.kind != TypeKind.STRUCT || is_universe_void(ty) {
+        return false
+    }
+    var offset: u64 = 0
+    var max_align: u32 = 1
+    var i: usize = 0
+    for i < ty.field_names.len {
+        if i >= ty.field_types.len {
+            return false
+        }
+        val ft = ty.field_types.get(i)
+        if !type_layout(table, ft) {
+            return false
+        }
+        offset = round_up_u64(offset, ft.align)
+        if i < ty.field_offsets.len {
+            ty.field_offsets.set(i, offset)
+        } else {
+            ty.field_offsets.push(offset)
+        }
+        offset = offset + ft.size
+        if ft.align > max_align {
+            max_align = ft.align
+        }
+        i = i + 1
+    }
+    if max_align < 1 {
+        max_align = 1
+    }
+    set_layout(ty, round_up_u64(offset, max_align), max_align)
+    return true
+}
+
+/**
+ * Whether a type has a zero value (can omit an initializer / struct field).
+ * Matches jog_check_type_has_zero for V1 fixtures.
+ * @param ty type
+ * @return whether a zero value exists
+ */
+fn type_has_zero(ty: *Type): bool {
+    if ty.kind == TypeKind.ERROR || ty.kind == TypeKind.UNIT || ty.kind == TypeKind.BOOL ||
+        ty.kind == TypeKind.INT || ty.kind == TypeKind.FLOAT || ty.kind == TypeKind.UNTYPED_INT ||
+        ty.kind == TypeKind.UNTYPED_FLOAT || ty.kind == TypeKind.BYTES_N || ty.kind == TypeKind.BYTES ||
+        ty.kind == TypeKind.SLICE || ty.kind == TypeKind.OPTION || ty.kind == TypeKind.NULL {
+        return true
+    }
+    if ty.kind == TypeKind.ARRAY {
+        if ty.elem == null {
+            return false
+        }
+        return type_has_zero(ty.elem!!)
+    }
+    if ty.kind == TypeKind.TUPLE {
+        for e in ty.elems.items() {
+            if !type_has_zero(e) {
+                return false
+            }
+        }
+        return true
+    }
+    if ty.kind == TypeKind.DISTINCT {
+        if ty.elem == null {
+            return false
+        }
+        return type_has_zero(ty.elem!!)
+    }
+    if ty.kind == TypeKind.STRUCT {
+        if !ty.has_layout || is_universe_void(ty) {
+            return false
+        }
+        var i: usize = 0
+        for i < ty.field_types.len {
+            if !type_has_zero(ty.field_types.get(i)) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    if ty.kind == TypeKind.ENUM {
+        return enum_has_zero(ty)
+    }
+    return false
+}
+
+/**
+ * Whether T? is a pointer/extern-fn niche (null bit pattern).
+ * Matches jog_type_option_is_niche.
+ * @param ty option type
+ * @return true when the none value is a null pointer
+ */
+fn type_option_is_niche(ty: *Type): bool {
+    if ty.kind != TypeKind.OPTION || ty.elem == null {
+        return false
+    }
+    var elem = ty.elem!!
+    for elem.kind == TypeKind.DISTINCT && elem.elem != null {
+        elem = elem.elem!!
+    }
+    if elem.kind == TypeKind.PTR {
+        return true
+    }
+    if elem.kind == TypeKind.FN && elem.fn_extern {
+        return true
+    }
+    return false
+}

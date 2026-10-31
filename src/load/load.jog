@@ -1,12 +1,856 @@
-// Loader and resolver. Checked against compiler/src/loader.c,
-// compiler/src/resolve_package.c, and compiler/src/resolve_universe.c.
-// Study note: JogDocs bootstrap/study/NameResolution.
+// Package src.load. jogc check starts here. The steps are JogDocs
+// bootstrap/LoaderGuide.md. Step 1 walks parents of the start path
+// looking for a jog.mod file, the same way find_manifest does in
+// compiler/src/loader.c.
+//
+// Files in this package:
+//   load.jog      — run and the jog.mod walk (step 1, done)
+//   diag.jog      — path-only and positioned error printers
+//   manifest.jog  — Manifest and parse_manifest (step 2)
+//   module.jog    — Module, Roots, and --module mappings (steps 3–5)
+//   package.jog         — Package, SourceFile, ImportRef, cycle colors
+//   package_files.jog   — list/lex/parse and the import walk (steps 6–7)
+//   resolve_package.jog — package and file scopes (step 8)
+//   prelude.jog         — universe + core/scalar.jog (step 9)
+//   scope.jog           — Symbol, PackageScope, BlockScope, file_lookup
+//
+// Study note: JogDocs bootstrap/study/NameResolution. Manifest contract:
+// JogDocs design/Packages.md. Steps 1–9 done. Step 10 resolves bodies.
 
+import std.fs
 import std.io
+import std.list
+import std.mem
+import std.os
+import std.strbuilder
+import std.text
 
-fn run(command: str): i32 {
-    io.eprint("jogc: ")
-    io.eprint(command)
-    io.eprintln(" is not implemented")
-    return 1
+private fn is_sep(b: u8): bool {
+    return b == '/' as u8 || b == '\\' as u8
+}
+
+private fn is_letter(c: u8): bool {
+    if c >= 'a' as u8 && c <= 'z' as u8 {
+        return true
+    }
+    return c >= 'A' as u8 && c <= 'Z' as u8
+}
+
+private fn is_absolute(path: str): bool {
+    if path.len >= 1 && is_sep(path.ptr[0]) {
+        return true
+    }
+    if path.len >= 2 && path.ptr[1] == ':' as u8 && is_letter(path.ptr[0]) {
+        return true
+    }
+    return false
+}
+
+private fn is_root_path(path: str): bool {
+    if path.len == 0 {
+        return true
+    }
+    if path.len == 1 && is_sep(path.ptr[0]) {
+        return true
+    }
+    if path.len == 2 && path.ptr[1] == ':' as u8 {
+        return true
+    }
+    if path.len == 3 && path.ptr[1] == ':' as u8 && is_sep(path.ptr[2]) {
+        return true
+    }
+    return false
+}
+
+private fn is_dir(path: str): bool with (a: mem.Allocator) {
+    var (names, ok) = fs.list(path)
+    if ok {
+        fs.free_names(&names)
+        return true
+    }
+    return false
+}
+
+private fn copy_range(path: str, n: usize): str with (a: mem.Allocator) {
+    return fs.copy_str(text.slice(path, 0, n))
+}
+
+private fn parent_dir(path: str): (str, bool) with (a: mem.Allocator) {
+    if path.len == 0 {
+        return "", false
+    }
+    var len = path.len
+    for len > 1 && is_sep(path.ptr[len - 1]) {
+        if len == 3 && path.ptr[1] == ':' as u8 {
+            break
+        }
+        len = len - 1
+    }
+    if (len == 1 && is_sep(path.ptr[0])) || (len == 2 && path.ptr[1] == ':' as u8) ||
+        (len == 3 && path.ptr[1] == ':' as u8 && is_sep(path.ptr[2])) {
+        return copy_range(path, len), true
+    }
+    var slash = len
+    for slash > 0 && !is_sep(path.ptr[slash - 1]) {
+        slash = slash - 1
+    }
+    if slash == 0 {
+        return fs.copy_str("."), true
+    }
+    if slash == 1 {
+        return copy_range(path, 1), true
+    }
+    if slash == 3 && path.ptr[1] == ':' as u8 {
+        return copy_range(path, 3), true
+    }
+    return copy_range(path, slash - 1), true
+}
+
+private fn make_abs(path: str): (str, bool) with (a: mem.Allocator) {
+    if is_absolute(path) {
+        return fs.copy_str(path), true
+    }
+    var (dir, ok) = fs.cwd()
+    if !ok {
+        return "", false
+    }
+    if path == "." {
+        return dir, true
+    }
+    val joined = fs.join(dir, path)
+    fs.free_str(dir)
+    return joined, true
+}
+
+/**
+ * Absolute paths from make_abs may mix '/' from fs.join with host
+ * separators. The C loader's absolute_path is all '\' on Windows, then
+ * joins jog.mod with '/'. Match that shape for diagnostics.
+ * @param path an absolute folder
+ * @context a allocator for the copy
+ * @return path with '/' replaced by '\' on Windows; a copy otherwise
+ */
+private fn native_abs_dir(path: str): str with (a: mem.Allocator) {
+    if host_os() != "windows" {
+        return fs.copy_str(path)
+    }
+    if path.len == 0 {
+        return ""
+    }
+    val (raw, err) = a.alloc(path.len, align(u8))
+    if err != null {
+        panic("out of memory")
+    }
+    var i: usize = 0
+    for i < path.len {
+        var b = path.ptr[i]
+        if b == '/' as u8 {
+            b = '\\' as u8
+        }
+        raw.ptr[i] = b
+        i = i + 1
+    }
+    return raw as str
+}
+
+private fn print_cannot_find(start: str) {
+    io.eprint(start)
+    io.eprint(": error: cannot find '")
+    io.eprint(start)
+    io.eprintln("'")
+}
+
+private fn print_cannot_find_mod(start: str) {
+    io.eprint(start)
+    io.eprint(": error: cannot find jog.mod above '")
+    io.eprint(start)
+    io.eprintln("'")
+}
+
+private fn print_cannot_resolve(start: str) {
+    io.eprint(start)
+    io.eprint(": error: cannot resolve '")
+    io.eprint(start)
+    io.eprintln("'")
+}
+
+private fn is_manifest_file(path: str): bool with (a: mem.Allocator) {
+    var (data, err) = fs.read_all(path)
+    if err != null {
+        return false
+    }
+    a.free(data)
+    return true
+}
+
+/**
+ * Walk parents of dir looking for a jog.mod file. Takes ownership of dir.
+ * @param dir absolute folder to start from
+ * @context a allocator for parent paths
+ * @return the folder that holds jog.mod, or empty when none exists
+ */
+private fn walk_manifest(dir: str): (str, bool) with (a: mem.Allocator) {
+    var current = dir
+    var guard: i64 = 0
+    for guard < 256 {
+        val man = fs.join(current, "jog.mod")
+        val found = is_manifest_file(man)
+        fs.free_str(man)
+        if found {
+            return current, true
+        }
+        if is_root_path(current) {
+            fs.free_str(current)
+            return "", false
+        }
+        var (parent, pok) = parent_dir(current)
+        if !pok {
+            fs.free_str(current)
+            return "", false
+        }
+        if parent == current {
+            fs.free_str(parent)
+            fs.free_str(current)
+            return "", false
+        }
+        fs.free_str(current)
+        current = parent
+        guard = guard + 1
+    }
+    fs.free_str(current)
+    return "", false
+}
+
+/**
+ * Walk parents of start looking for a jog.mod file.
+ * @param start file or folder, already known to exist
+ * @context a allocator for the absolute path
+ * @return the folder that holds jog.mod, or empty when none exists
+ */
+fn find_manifest(start: str): (str, bool) with (a: mem.Allocator) {
+    var (abs, ok) = make_abs(start)
+    if !ok {
+        return "", false
+    }
+    var current = abs
+    if !is_dir(start) {
+        var (parent, pok) = parent_dir(current)
+        fs.free_str(current)
+        if !pok {
+            return "", false
+        }
+        current = parent
+    }
+    return walk_manifest(current)
+}
+
+/**
+ * Free strings owned by a Roots value.
+ * @param roots the roots from locate_roots
+ * @context a allocator that owns the path strings
+ */
+fn free_roots(roots: Roots) with (a: mem.Allocator) {
+    if roots.std_root.len > 0 {
+        fs.free_str(roots.std_root)
+    }
+    if roots.core_root.len > 0 {
+        fs.free_str(roots.core_root)
+    }
+    if roots.runtime_root.len > 0 {
+        fs.free_str(roots.runtime_root)
+    }
+}
+
+/**
+ * Find std, core, and runtime the way jog_locate_roots does. JOG_ROOT is
+ * exact. Without it, try the parent of the executable's folder for std
+ * and core, then one directory higher for the stage0 layout. A missing
+ * library leaves that root empty; that is not an error here.
+ * @context a allocator for path strings
+ * @return the roots, and false when JOG_ROOT is set but unusable
+ */
+fn locate_roots(): (Roots, bool) with (a: mem.Allocator) {
+    var roots: Roots
+    roots.std_root = ""
+    roots.core_root = ""
+    roots.runtime_root = ""
+
+    var base = ""
+    var from_env = false
+    val (env_view, has_env) = os.env("JOG_ROOT")
+    if has_env && env_view.len > 0 {
+        from_env = true
+        val env = fs.copy_str(env_view)
+        if !is_dir(env) {
+            var b = strbuilder.empty()
+            b.append("JOG_ROOT '")
+            b.append(env)
+            b.append("' is not a directory")
+            print_path_error(env, b.str())
+            b.free()
+            fs.free_str(env)
+            return roots, false
+        }
+        var (abs, ok) = make_abs(env)
+        fs.free_str(env)
+        if !ok {
+            val (again, _) = os.env("JOG_ROOT")
+            var b = strbuilder.empty()
+            b.append("cannot resolve JOG_ROOT '")
+            b.append(again)
+            b.append("'")
+            print_path_error(again, b.str())
+            b.free()
+            return roots, false
+        }
+        base = native_abs_dir(abs)
+        fs.free_str(abs)
+    } else {
+        val exe = os.argv(0)
+        var (exe_abs, ok) = make_abs(exe)
+        if ok {
+            val exe_native = native_abs_dir(exe_abs)
+            fs.free_str(exe_abs)
+            var (exe_dir, dok) = parent_dir(exe_native)
+            fs.free_str(exe_native)
+            if dok {
+                var (parent, pok) = parent_dir(exe_dir)
+                fs.free_str(exe_dir)
+                if pok {
+                    base = parent
+                }
+            }
+        }
+    }
+
+    if base.len == 0 {
+        return roots, true
+    }
+
+    var std_dir = fs.join(base, "std")
+    var core_dir = fs.join(base, "core")
+    var runtime_dir = fs.join(base, "runtime")
+
+    if !from_env {
+        if !is_dir(std_dir) || !is_dir(core_dir) {
+            var (up, uok) = parent_dir(base)
+            if uok {
+                if !is_dir(std_dir) {
+                    val alt_std = fs.join(up, "std")
+                    if is_dir(alt_std) {
+                        fs.free_str(std_dir)
+                        std_dir = alt_std
+                        val alt_rt = fs.join(up, "runtime")
+                        if is_dir(alt_rt) {
+                            fs.free_str(runtime_dir)
+                            runtime_dir = alt_rt
+                        } else {
+                            fs.free_str(alt_rt)
+                        }
+                    } else {
+                        fs.free_str(alt_std)
+                    }
+                }
+                if !is_dir(core_dir) {
+                    val alt_core = fs.join(up, "core")
+                    if is_dir(alt_core) {
+                        fs.free_str(core_dir)
+                        core_dir = alt_core
+                    } else {
+                        fs.free_str(alt_core)
+                    }
+                }
+                fs.free_str(up)
+            }
+        }
+    }
+
+    if is_dir(std_dir) {
+        roots.std_root = std_dir
+    } else {
+        fs.free_str(std_dir)
+    }
+    if is_dir(core_dir) {
+        roots.core_root = core_dir
+    } else {
+        fs.free_str(core_dir)
+    }
+    if is_dir(runtime_dir) {
+        roots.runtime_root = runtime_dir
+    } else {
+        fs.free_str(runtime_dir)
+    }
+    fs.free_str(base)
+    return roots, true
+}
+
+/**
+ * True when both paths name one directory. Separators and, on Windows,
+ * letter case are ignored. A missing path is not a match, so a user
+ * folder called std still shadows a library that was not found.
+ * @param left first folder
+ * @param right second folder
+ * @context a allocator for absolute copies
+ * @return true when both resolve to the same directory
+ */
+private fn same_directory(left: str, right: str): bool with (a: mem.Allocator) {
+    if left.len == 0 || right.len == 0 {
+        return false
+    }
+    var (a_abs, aok) = make_abs(left)
+    if !aok {
+        return false
+    }
+    var (b_abs, bok) = make_abs(right)
+    if !bok {
+        fs.free_str(a_abs)
+        return false
+    }
+    val a_path = native_abs_dir(a_abs)
+    val b_path = native_abs_dir(b_abs)
+    fs.free_str(a_abs)
+    fs.free_str(b_abs)
+    var i: usize = 0
+    var match = true
+    for i < a_path.len && i < b_path.len {
+        var ca = a_path.ptr[i]
+        var cb = b_path.ptr[i]
+        if is_sep(ca) {
+            ca = '/' as u8
+        }
+        if is_sep(cb) {
+            cb = '/' as u8
+        }
+        if host_os() == "windows" {
+            if ca >= 'A' as u8 && ca <= 'Z' as u8 {
+                ca = ca - ('A' as u8) + ('a' as u8)
+            }
+            if cb >= 'A' as u8 && cb <= 'Z' as u8 {
+                cb = cb - ('A' as u8) + ('a' as u8)
+            }
+        }
+        if ca != cb {
+            match = false
+            break
+        }
+        i = i + 1
+    }
+    if match {
+        match = i == a_path.len && i == b_path.len
+    }
+    fs.free_str(a_path)
+    fs.free_str(b_path)
+    return match
+}
+
+/**
+ * Error when module_root/std or module_root/core is a different directory
+ * from the library already found. Position is the module name on jog.mod.
+ * @param man_path path of jog.mod for the diagnostic
+ * @param module_root absolute module folder
+ * @param roots std and core from locate_roots
+ * @param name_line line of the module name
+ * @param name_column column of the module name
+ * @context a allocator for joined paths
+ * @return true when neither folder shadows
+ */
+private fn check_shadows(man_path: str, module_root: str, roots: Roots, name_line: i64, name_column: i64): bool with (a: mem.Allocator) {
+    var ok = true
+    val local_std = fs.join(module_root, "std")
+    if is_dir(local_std) && !same_directory(local_std, roots.std_root) {
+        print_pos_error(man_path, name_line, name_column, "folder 'std' shadows the standard library")
+        ok = false
+    }
+    fs.free_str(local_std)
+    val local_core = fs.join(module_root, "core")
+    if is_dir(local_core) && !same_directory(local_core, roots.core_root) {
+        print_pos_error(man_path, name_line, name_column, "folder 'core' shadows the core prelude")
+        ok = false
+    }
+    fs.free_str(local_core)
+    return ok
+}
+
+private fn mark_required(mods: *list.List<Module>, name: str) {
+    var i: usize = 0
+    for i < mods.len {
+        val m = mods.at(i)
+        if m.name == name {
+            m.required = true
+            return
+        }
+        i = i + 1
+    }
+}
+
+/**
+ * Every require must not be shadowed by a same-named folder; mapped
+ * dependencies are marked required.
+ * @param man_path jog.mod path for diagnostics
+ * @param mod the module whose requires are checked
+ * @param mods --module modules
+ * @context a allocator for joined paths
+ * @return false when a shadow was reported
+ */
+private fn check_requires(man_path: str, mod: Module, mods: *list.List<Module>): bool with (a: mem.Allocator) {
+    var ok = true
+    for line in mod.manifest.requires.items() {
+        mark_required(mods, line.text)
+        val folder = fs.join(mod.root, line.text)
+        if is_dir(folder) {
+            var b = strbuilder.empty()
+            b.append("folder '")
+            b.append(line.text)
+            b.append("' shadows module '")
+            b.append(line.text)
+            b.append("'")
+            print_pos_error(man_path, line.line, line.column, b.str())
+            b.free()
+            ok = false
+        }
+        fs.free_str(folder)
+    }
+    return ok
+}
+
+/**
+ * open_mapped: each --module name=dir must name a library whose jog.mod
+ * says module name. Errors use the dir string as the path prefix when
+ * there is no jog.mod position yet.
+ * @param flags name=dir values in command-line order
+ * @param root_name the root module name
+ * @param mods filled with opened modules
+ * @context a allocator
+ * @return false when a mapping failed validation
+ */
+private fn open_mapped(flags: []str, root_name: str, mods: *list.List<Module>): bool with (a: mem.Allocator) {
+    var ok = true
+    var i: usize = 0
+    for i < flags.len {
+        val flag = flags[i]
+        val (name, dir, split_ok) = split_module_flag(flag)
+        if !split_ok {
+            i = i + 1
+            continue
+        }
+        if !is_ident_str(name) {
+            var b = strbuilder.empty()
+            b.append("--module name '")
+            b.append(name)
+            b.append("' is not an identifier")
+            print_path_error(dir, b.str())
+            b.free()
+            ok = false
+            i = i + 1
+            continue
+        }
+        if name == "std" {
+            print_path_error(dir, "--module cannot map std; the standard library is built in")
+            ok = false
+            i = i + 1
+            continue
+        }
+        if root_name.len > 0 && name == root_name {
+            var b = strbuilder.empty()
+            b.append("--module ")
+            b.append(name)
+            b.append(": '")
+            b.append(name)
+            b.append("' is the module being built")
+            print_path_error(dir, b.str())
+            b.free()
+            ok = false
+            i = i + 1
+            continue
+        }
+        var dup = false
+        var j: usize = 0
+        for j < i {
+            val (prev_name, _, prev_ok) = split_module_flag(flags[j])
+            if prev_ok && prev_name == name {
+                dup = true
+            }
+            j = j + 1
+        }
+        if dup {
+            var b = strbuilder.empty()
+            b.append("--module ")
+            b.append(name)
+            b.append(" is given twice")
+            print_path_error(dir, b.str())
+            b.free()
+            ok = false
+            i = i + 1
+            continue
+        }
+        if !is_dir(dir) {
+            var b = strbuilder.empty()
+            b.append("--module ")
+            b.append(name)
+            b.append(": cannot find folder '")
+            b.append(dir)
+            b.append("'")
+            print_path_error(dir, b.str())
+            b.free()
+            var bad = empty_module()
+            bad.name = fs.copy_str(name)
+            bad.arg_dir = fs.copy_str(dir)
+            bad.bad = true
+            mods.push(bad)
+            ok = false
+            i = i + 1
+            continue
+        }
+        var (abs, resolved) = make_abs(dir)
+        if !resolved {
+            var b = strbuilder.empty()
+            b.append("cannot resolve '")
+            b.append(dir)
+            b.append("'")
+            print_path_error(dir, b.str())
+            b.free()
+            var bad = empty_module()
+            bad.name = fs.copy_str(name)
+            bad.arg_dir = fs.copy_str(dir)
+            bad.bad = true
+            mods.push(bad)
+            ok = false
+            i = i + 1
+            continue
+        }
+        val abs_dir = native_abs_dir(abs)
+        fs.free_str(abs)
+        val man_path = fs.join(abs_dir, "jog.mod")
+        if !fs.exists(man_path) || is_dir(man_path) {
+            var b = strbuilder.empty()
+            b.append("--module ")
+            b.append(name)
+            b.append(": no jog.mod in '")
+            b.append(dir)
+            b.append("'")
+            print_path_error(dir, b.str())
+            b.free()
+            var bad = empty_module()
+            bad.name = fs.copy_str(name)
+            bad.root = abs_dir
+            bad.arg_dir = fs.copy_str(dir)
+            bad.bad = true
+            mods.push(bad)
+            fs.free_str(man_path)
+            ok = false
+            i = i + 1
+            continue
+        }
+        var (data, err) = fs.read_all(man_path)
+        if err != null {
+            print_path_error(man_path, "cannot read jog.mod")
+            var bad = empty_module()
+            bad.name = fs.copy_str(name)
+            bad.root = abs_dir
+            bad.arg_dir = fs.copy_str(dir)
+            bad.bad = true
+            mods.push(bad)
+            fs.free_str(man_path)
+            a.free(data)
+            ok = false
+            i = i + 1
+            continue
+        }
+        val (manifest, parsed) = parse_manifest(man_path, data as str)
+        a.free(data)
+        if !parsed {
+            var bad = empty_module()
+            bad.name = fs.copy_str(name)
+            bad.root = abs_dir
+            bad.arg_dir = fs.copy_str(dir)
+            bad.bad = true
+            bad.manifest = manifest
+            mods.push(bad)
+            fs.free_str(man_path)
+            ok = false
+            i = i + 1
+            continue
+        }
+        if manifest.name != name {
+            var b = strbuilder.empty()
+            b.append("jog.mod: module '")
+            b.append(manifest.name)
+            b.append("' was given as --module ")
+            b.append(name)
+            b.append("=")
+            b.append(dir)
+            print_pos_error(man_path, manifest.name_line, manifest.name_column, b.str())
+            b.free()
+            var bad = empty_module()
+            bad.name = fs.copy_str(name)
+            bad.root = abs_dir
+            bad.arg_dir = fs.copy_str(dir)
+            bad.bad = true
+            bad.manifest = manifest
+            mods.push(bad)
+            fs.free_str(man_path)
+            ok = false
+            i = i + 1
+            continue
+        }
+        if !manifest.is_library {
+            var b = strbuilder.empty()
+            b.append("jog.mod: module '")
+            b.append(name)
+            b.append("' is not a library; only a module with 'kind library' can be given with --module")
+            print_pos_error(man_path, manifest.name_line, manifest.name_column, b.str())
+            b.free()
+            var bad = empty_module()
+            bad.name = fs.copy_str(name)
+            bad.root = abs_dir
+            bad.arg_dir = fs.copy_str(dir)
+            bad.bad = true
+            bad.manifest = manifest
+            bad.is_library = false
+            mods.push(bad)
+            fs.free_str(man_path)
+            ok = false
+            i = i + 1
+            continue
+        }
+        var mod = empty_module()
+        mod.name = fs.copy_str(name)
+        mod.root = abs_dir
+        mod.arg_dir = fs.copy_str(dir)
+        mod.manifest = manifest
+        mod.is_library = true
+        mods.push(mod)
+        fs.free_str(man_path)
+        i = i + 1
+    }
+    return ok
+}
+
+/**
+ * check_modules: require folders must not shadow; every mapping must be
+ * required by some loaded jog.mod.
+ * @param root_man_path root jog.mod path
+ * @param root the root module
+ * @param mods --module modules
+ * @context a allocator
+ * @return false when a check failed
+ */
+private fn check_modules(root_man_path: str, root: Module, mods: *list.List<Module>): bool with (a: mem.Allocator) {
+    var ok = check_requires(root_man_path, root, mods)
+    var i: usize = 0
+    for i < mods.len {
+        val m = mods.get(i)
+        if !m.bad {
+            val man = fs.join(m.root, "jog.mod")
+            if !check_requires(man, m, mods) {
+                ok = false
+            }
+            fs.free_str(man)
+        }
+        i = i + 1
+    }
+    i = 0
+    for i < mods.len {
+        val m = mods.get(i)
+        if !m.bad && !m.required {
+            var b = strbuilder.empty()
+            b.append("--module ")
+            b.append(m.name)
+            b.append(": no loaded jog.mod requires module '")
+            b.append(m.name)
+            b.append("'")
+            val prefix = m.root
+            if prefix.len == 0 {
+                print_path_error(m.arg_dir, b.str())
+            } else {
+                print_path_error(prefix, b.str())
+            }
+            b.free()
+            ok = false
+        }
+        i = i + 1
+    }
+    return ok
+}
+
+/**
+ * Locate std/core, open the root module, apply --module mappings, and
+ * check requires. module_flags are `name=dir` strings from the command
+ * line. A loader error returns (empty, 1). A clean load returns the
+ * Program for the checker and 0.
+ * @param start file or folder, as given on the command line; `.` when omitted
+ * @param module_flags --module values without the flag name
+ * @context a allocator for the walk and the file bytes
+ * @return the program and 0, or an empty program and 1 on a loader error
+ */
+fn run(start: str, module_flags: []str): (Program, i32) with (a: mem.Allocator) {
+    val (roots, roots_ok) = locate_roots()
+    if !roots_ok {
+        free_roots(roots)
+        return empty_program(), 1
+    }
+
+    if !fs.exists(start) {
+        print_cannot_find(start)
+        free_roots(roots)
+        return empty_program(), 1
+    }
+    var (abs, resolved) = make_abs(start)
+    if !resolved {
+        print_cannot_resolve(start)
+        free_roots(roots)
+        return empty_program(), 1
+    }
+    fs.free_str(abs)
+    var (root, found) = find_manifest(start)
+    if !found {
+        print_cannot_find_mod(start)
+        free_roots(roots)
+        return empty_program(), 1
+    }
+    val abs_root = native_abs_dir(root)
+    fs.free_str(root)
+    val man_path = fs.join(abs_root, "jog.mod")
+    var (data, err) = fs.read_all(man_path)
+    if err != null {
+        print_path_error(man_path, "cannot read jog.mod")
+        fs.free_str(man_path)
+        fs.free_str(abs_root)
+        free_roots(roots)
+        return empty_program(), 1
+    }
+    val (manifest, ok) = parse_manifest(man_path, data as str)
+    a.free(data)
+    if !ok || manifest.name.len == 0 {
+        fs.free_str(man_path)
+        fs.free_str(abs_root)
+        free_roots(roots)
+        return empty_program(), 1
+    }
+    val shadows_ok = check_shadows(man_path, abs_root, roots, manifest.name_line, manifest.name_column)
+    var root_mod = empty_module()
+    root_mod.name = manifest.name
+    root_mod.root = abs_root
+    root_mod.is_root = true
+    root_mod.is_library = manifest.is_library
+    root_mod.manifest = manifest
+
+    var mods = list.empty<Module>()
+    val mapped_ok = open_mapped(module_flags, root_mod.name, &mods)
+    val modules_ok = check_modules(man_path, root_mod, &mods)
+    var prog = empty_program()
+    var files_ok = true
+    if shadows_ok && mapped_ok && modules_ok {
+        val (loaded, load_ok) = load_root_sources(root_mod, man_path, roots, mods)
+        prog = loaded
+        files_ok = load_ok
+    }
+
+    fs.free_str(man_path)
+    free_roots(roots)
+    mods.free()
+    if !shadows_ok || !mapped_ok || !modules_ok || !files_ok {
+        return empty_program(), 1
+    }
+    return prog, 0
 }

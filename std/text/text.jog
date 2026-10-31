@@ -3,37 +3,40 @@
 // is_digit and is_hex_digit classify one ASCII byte and allocate nothing.
 // A range that does not fit the string panics. An empty needle is a match
 // at the start. index_of returns the byte offset and false when the needle
-// is absent.
+// is absent. Core rejects ordinary methods on str (prelude only allows
+// intrinsic op methods), so the hybrid "always in scope" helpers live here
+// as extensions too. See JogDocs bootstrap/Friction.md.
 
 import std.c
 import std.list
 import std.mem
 
-/**
- * A Unicode code point. The same type as u32.
- */
-type rune = u32
-
-fn slice(s: str, from: usize, to: usize): str {
-    if from > to || to > s.len {
+fn str.slice(from: usize, to: usize): str {
+    if from > to || to > self.len {
         panic("slice out of range")
     }
     var view = bytes()
     if from == to {
         return view
     }
-    view.ptr = (s.ptr + from) as *u8
+    view.ptr = (self.ptr + from) as *u8
     view.len = to - from
     return view
 }
 
-fn starts_with(s: str, prefix: str): bool {
-    if prefix.len > s.len {
+// Free wrappers so a file that only needs slice/clone can call text.slice
+// / text.clone and keep the import used. Extension calls alone do not.
+fn slice(s: str, from: usize, to: usize): str {
+    return s.slice(from, to)
+}
+
+fn str.starts_with(prefix: str): bool {
+    if prefix.len > self.len {
         return false
     }
     var i: usize = 0
     for i < prefix.len {
-        if s.ptr[i] != prefix.ptr[i] {
+        if self.ptr[i] != prefix.ptr[i] {
             return false
         }
         i = i + 1
@@ -41,14 +44,14 @@ fn starts_with(s: str, prefix: str): bool {
     return true
 }
 
-fn ends_with(s: str, suffix: str): bool {
-    if suffix.len > s.len {
+fn str.ends_with(suffix: str): bool {
+    if suffix.len > self.len {
         return false
     }
-    val from = s.len - suffix.len
+    val from = self.len - suffix.len
     var i: usize = 0
     for i < suffix.len {
-        if s.ptr[from + i] != suffix.ptr[i] {
+        if self.ptr[from + i] != suffix.ptr[i] {
             return false
         }
         i = i + 1
@@ -57,17 +60,17 @@ fn ends_with(s: str, suffix: str): bool {
 }
 
 // Byte offset of the first match. false means the needle is absent.
-fn index_of(s: str, needle: str): (usize, bool) {
+fn str.index_of(needle: str): (usize, bool) {
     if needle.len == 0 {
         return 0, true
     }
-    if needle.len > s.len {
+    if needle.len > self.len {
         return 0, false
     }
     var i: usize = 0
-    val last = s.len - needle.len
+    val last = self.len - needle.len
     for i <= last {
-        if starts_with(slice(s, i, s.len), needle) {
+        if self.slice(i, self.len).starts_with(needle) {
             return i, true
         }
         if i == last {
@@ -78,9 +81,93 @@ fn index_of(s: str, needle: str): (usize, bool) {
     return 0, false
 }
 
+/**
+ * True when needle occurs in self. An empty needle is a match, the same
+ * rule as index_of.
+ * @self text to search
+ * @param needle sequence to find
+ * @return true when needle occurs
+ */
+fn str.contains(needle: str): bool {
+    val (_, ok) = self.index_of(needle)
+    return ok
+}
+
+// ASCII space, tab, CR, or LF.
+private fn is_ascii_space(c: u8): bool {
+    return c == ' ' as u8 || c == '\t' as u8 || c == '\n' as u8 || c == '\r' as u8
+}
+
+/**
+ * A view of self with ASCII space, tab, CR, and LF removed from the start.
+ * It allocates nothing.
+ * @self text to trim
+ * @return the trimmed view
+ */
+fn str.trim_start(): str {
+    var i: usize = 0
+    for i < self.len {
+        if !is_ascii_space(self.ptr[i]) {
+            break
+        }
+        i = i + 1
+    }
+    return self.slice(i, self.len)
+}
+
+/**
+ * A view of self with ASCII space, tab, CR, and LF removed from the end.
+ * It allocates nothing.
+ * @self text to trim
+ * @return the trimmed view
+ */
+fn str.trim_end(): str {
+    var i: usize = self.len
+    for i > 0 {
+        if !is_ascii_space(self.ptr[i - 1]) {
+            break
+        }
+        i = i - 1
+    }
+    return self.slice(0, i)
+}
+
+/**
+ * A view of self with ASCII space, tab, CR, and LF removed from both ends.
+ * It allocates nothing.
+ * @self text to trim
+ * @return the trimmed view
+ */
+fn str.trim(): str {
+    return self.trim_start().trim_end()
+}
+
 // True for an ASCII byte from '0' through '9'.
 fn is_digit(c: u8): bool {
     return c >= '0' as u8 && c <= '9' as u8
+}
+
+/**
+ * Parse an unsigned decimal integer from ASCII digits only. An empty
+ * string or any non-digit byte fails. Does not check overflow.
+ * @param text decimal digits
+ * @return the value and true, or 0 and false on failure
+ */
+fn parse_u64_dec(text: str): (u64, bool) {
+    if text.len == 0 {
+        return 0, false
+    }
+    var value: u64 = 0
+    var i: usize = 0
+    for i < text.len {
+        val c = text.ptr[i]
+        if !is_digit(c) {
+            return 0, false
+        }
+        value = value * 10 + (c - '0' as u8) as u64
+        i = i + 1
+    }
+    return value, true
 }
 
 // True for an ASCII byte from '0' through '9', 'a' through 'f', or
@@ -97,46 +184,38 @@ fn is_hex_digit(c: u8): bool {
 
 // An owned copy. An empty str allocates nothing. The caller frees it
 // with the same allocator, through fs.free_str or an equivalent block.
-fn clone(s: str): str with (a: mem.Allocator) {
-    if s.len == 0 {
-        return s
+fn str.clone(): str with (a: mem.Allocator) {
+    if self.len == 0 {
+        return self
     }
-    val (raw, err) = a.alloc(s.len, align(u8))
+    val (raw, err) = a.alloc(self.len, align(u8))
     if err != null {
         panic("out of memory")
     }
-    c.memcpy(raw.ptr as *void, s.ptr as *const void, s.len)
+    c.memcpy(raw.ptr as *void, self.ptr as *const void, self.len)
     return raw
 }
 
-/**
- * True when needle occurs in s. An empty needle is a match, the same
- * rule as index_of.
- * @param s text to search
- * @param needle sequence to find
- * @return true when needle occurs
- */
-fn contains(s: str, needle: str): bool {
-    val (_, ok) = index_of(s, needle)
-    return ok
+fn clone(s: str): str with (a: mem.Allocator) {
+    return s.clone()
 }
 
 /**
- * How many times needle occurs in s, without overlap. The next search
+ * How many times needle occurs in self, without overlap. The next search
  * starts after the previous match. An empty needle matches at every
- * byte boundary, including both ends, so the count is s.len + 1.
- * @param s text to search
+ * byte boundary, including both ends, so the count is self.len + 1.
+ * @self text to search
  * @param needle sequence to count
  * @return the number of matches
  */
-fn count(s: str, needle: str): usize {
+fn str.count(needle: str): usize {
     if needle.len == 0 {
-        return s.len + 1
+        return self.len + 1
     }
     var n: usize = 0
     var i: usize = 0
-    for i < s.len {
-        val (at, ok) = index_of(slice(s, i, s.len), needle)
+    for i < self.len {
+        val (at, ok) = self.slice(i, self.len).index_of(needle)
         if !ok {
             return n
         }
@@ -144,55 +223,6 @@ fn count(s: str, needle: str): usize {
         i = i + at + needle.len
     }
     return n
-}
-
-// ASCII space, tab, CR, or LF.
-private fn is_ascii_space(c: u8): bool {
-    return c == ' ' as u8 || c == '\t' as u8 || c == '\n' as u8 || c == '\r' as u8
-}
-
-/**
- * A view of s with ASCII space, tab, CR, and LF removed from the start.
- * It allocates nothing.
- * @param s text to trim
- * @return the trimmed view
- */
-fn trim_start(s: str): str {
-    var i: usize = 0
-    for i < s.len {
-        if !is_ascii_space(s.ptr[i]) {
-            break
-        }
-        i = i + 1
-    }
-    return slice(s, i, s.len)
-}
-
-/**
- * A view of s with ASCII space, tab, CR, and LF removed from the end.
- * It allocates nothing.
- * @param s text to trim
- * @return the trimmed view
- */
-fn trim_end(s: str): str {
-    var i: usize = s.len
-    for i > 0 {
-        if !is_ascii_space(s.ptr[i - 1]) {
-            break
-        }
-        i = i - 1
-    }
-    return slice(s, 0, i)
-}
-
-/**
- * A view of s with ASCII space, tab, CR, and LF removed from both ends.
- * It allocates nothing.
- * @param s text to trim
- * @return the trimmed view
- */
-fn trim(s: str): str {
-    return trim_end(trim_start(s))
 }
 
 // ASCII A and a differ by 32. Bytes outside the letters are copied as they are.
@@ -221,27 +251,27 @@ private fn ascii_case(s: str, upper: bool): str with (a: mem.Allocator) {
 }
 
 /**
- * An owned copy of s with ASCII letters mapped to lowercase. Bytes
+ * An owned copy of self with ASCII letters mapped to lowercase. Bytes
  * outside A-Z are copied unchanged. An empty str allocates nothing.
  * The caller frees the copy with the same allocator.
- * @param s text to map
+ * @self text to map
  * @context a allocator for the copy
  * @return the owned lowercase text
  */
-fn to_lower(s: str): str with (a: mem.Allocator) {
-    return ascii_case(s, false)
+fn str.to_lower(): str with (a: mem.Allocator) {
+    return ascii_case(self, false)
 }
 
 /**
- * An owned copy of s with ASCII letters mapped to uppercase. Bytes
+ * An owned copy of self with ASCII letters mapped to uppercase. Bytes
  * outside a-z are copied unchanged. An empty str allocates nothing.
  * The caller frees the copy with the same allocator.
- * @param s text to map
+ * @self text to map
  * @context a allocator for the copy
  * @return the owned uppercase text
  */
-fn to_upper(s: str): str with (a: mem.Allocator) {
-    return ascii_case(s, true)
+fn str.to_upper(): str with (a: mem.Allocator) {
+    return ascii_case(self, true)
 }
 
 // Copies src onto dest at at. An empty src writes nothing.
@@ -253,24 +283,24 @@ private fn write_at(dest: *u8, at: usize, src: str) {
 }
 
 /**
- * An owned copy of s with every non-overlapping old replaced by
+ * An owned copy of self with every non-overlapping old replaced by
  * replacement. An empty old inserts replacement at every byte boundary,
  * including the ends. An empty result allocates nothing. The caller
  * frees the copy with the same allocator.
- * @param s text to rewrite
+ * @self text to rewrite
  * @param old sequence to replace
  * @param replacement sequence written in its place
  * @context a allocator for the copy
  * @return the owned text
  */
-fn replace(s: str, old: str, replacement: str): str with (a: mem.Allocator) {
-    val n = count(s, old)
+fn str.replace(old: str, replacement: str): str with (a: mem.Allocator) {
+    val n = self.count(old)
     if n == 0 {
-        return clone(s)
+        return self.clone()
     }
     val removed = n * old.len
     val added = n * replacement.len
-    val total = (s.len - removed) + added
+    val total = (self.len - removed) + added
     if total == 0 {
         return bytes()
     }
@@ -281,11 +311,11 @@ fn replace(s: str, old: str, replacement: str): str with (a: mem.Allocator) {
     if old.len == 0 {
         var at: usize = 0
         var k: usize = 0
-        for k < s.len + 1 {
+        for k < self.len + 1 {
             write_at(raw.ptr, at, replacement)
             at = at + replacement.len
-            if k < s.len {
-                raw.ptr[at] = s.ptr[k]
+            if k < self.len {
+                raw.ptr[at] = self.ptr[k]
                 at = at + 1
             }
             k = k + 1
@@ -295,13 +325,13 @@ fn replace(s: str, old: str, replacement: str): str with (a: mem.Allocator) {
     var at: usize = 0
     var src: usize = 0
     for {
-        val rest = slice(s, src, s.len)
-        val (rel, ok) = index_of(rest, old)
+        val rest = self.slice(src, self.len)
+        val (rel, ok) = rest.index_of(old)
         if !ok {
             write_at(raw.ptr, at, rest)
             break
         }
-        write_at(raw.ptr, at, slice(rest, 0, rel))
+        write_at(raw.ptr, at, rest.slice(0, rel))
         at = at + rel
         write_at(raw.ptr, at, replacement)
         at = at + replacement.len
@@ -311,34 +341,34 @@ fn replace(s: str, old: str, replacement: str): str with (a: mem.Allocator) {
 }
 
 /**
- * Views of s split on sep, including the empty pieces. Each view points
- * into s and dies with that string. The list itself is allocated. An
+ * Views of self split on sep, including the empty pieces. Each view points
+ * into self and dies with that string. The list itself is allocated. An
  * empty sep yields one view per byte. An empty string and an empty sep
  * yield an empty list.
- * @param s text to split
+ * @self text to split
  * @param sep separator
  * @context a allocator for the list
  * @return the views
  */
-fn split(s: str, sep: str): list.List<str> with (a: mem.Allocator) {
+fn str.split(sep: str): list.List<str> with (a: mem.Allocator) {
     var parts = list.empty<str>()
     if sep.len == 0 {
         var i: usize = 0
-        for i < s.len {
-            parts.push(slice(s, i, i + 1))
+        for i < self.len {
+            parts.push(self.slice(i, i + 1))
             i = i + 1
         }
         return parts
     }
     var start: usize = 0
     for {
-        val (rel, ok) = index_of(slice(s, start, s.len), sep)
+        val (rel, ok) = self.slice(start, self.len).index_of(sep)
         if !ok {
-            parts.push(slice(s, start, s.len))
+            parts.push(self.slice(start, self.len))
             break
         }
         val at = start + rel
-        parts.push(slice(s, start, at))
+        parts.push(self.slice(start, at))
         start = at + sep.len
     }
     return parts
@@ -355,34 +385,34 @@ private fn is_cont(b: u8): bool {
 private fn decode_rune(s: str, i: usize): (rune, usize) {
     val b0 = s.ptr[i]
     if b0 < 0x80 {
-        return b0 as rune, 1
+        return b0 as u32 as rune, 1
     }
     val left = s.len - i
     if b0 >= 0xC2 && b0 <= 0xDF {
         if left < 2 {
-            return 0xFFFD as rune, 1
+            return 0xFFFD as u32 as rune, 1
         }
         val b1 = s.ptr[i + 1]
         if b1 < 0x80 || b1 > 0xBF {
-            return 0xFFFD as rune, 1
+            return 0xFFFD as u32 as rune, 1
         }
         val cp = (((b0 as u32) & 0x1F) << 6) | ((b1 as u32) & 0x3F)
         return cp as rune, 2
     }
     if b0 >= 0xE0 && b0 <= 0xEF {
         if left < 3 {
-            return 0xFFFD as rune, 1
+            return 0xFFFD as u32 as rune, 1
         }
         val b1 = s.ptr[i + 1]
         val b2 = s.ptr[i + 2]
         if !is_cont(b1) || !is_cont(b2) {
-            return 0xFFFD as rune, 1
+            return 0xFFFD as u32 as rune, 1
         }
         if b0 == 0xE0 && b1 < 0xA0 {
-            return 0xFFFD as rune, 1
+            return 0xFFFD as u32 as rune, 1
         }
         if b0 == 0xED && b1 > 0x9F {
-            return 0xFFFD as rune, 1
+            return 0xFFFD as u32 as rune, 1
         }
         val cp = (((b0 as u32) & 0x0F) << 12) |
             (((b1 as u32) & 0x3F) << 6) |
@@ -391,19 +421,19 @@ private fn decode_rune(s: str, i: usize): (rune, usize) {
     }
     if b0 >= 0xF0 && b0 <= 0xF4 {
         if left < 4 {
-            return 0xFFFD as rune, 1
+            return 0xFFFD as u32 as rune, 1
         }
         val b1 = s.ptr[i + 1]
         val b2 = s.ptr[i + 2]
         val b3 = s.ptr[i + 3]
         if !is_cont(b1) || !is_cont(b2) || !is_cont(b3) {
-            return 0xFFFD as rune, 1
+            return 0xFFFD as u32 as rune, 1
         }
         if b0 == 0xF0 && b1 < 0x90 {
-            return 0xFFFD as rune, 1
+            return 0xFFFD as u32 as rune, 1
         }
         if b0 == 0xF4 && b1 > 0x8F {
-            return 0xFFFD as rune, 1
+            return 0xFFFD as u32 as rune, 1
         }
         val cp = (((b0 as u32) & 0x07) << 18) |
             (((b1 as u32) & 0x3F) << 12) |
@@ -411,7 +441,7 @@ private fn decode_rune(s: str, i: usize): (rune, usize) {
             ((b3 as u32) & 0x3F)
         return cp as rune, 4
     }
-    return 0xFFFD as rune, 1
+    return 0xFFFD as u32 as rune, 1
 }
 
 /**
@@ -424,13 +454,13 @@ struct RuneIter {
 }
 
 /**
- * A cursor at the first code point of s. The caller owns it.
- * @param s text to walk
+ * A cursor at the first code point of self. The caller owns it.
+ * @self text to walk
  * @return the cursor
  */
-fn rune_iter(s: str): RuneIter {
+fn str.rune_iter(): RuneIter {
     var it = RuneIter()
-    it.src = s
+    it.src = self
     it.index = 0
     return it
 }
@@ -444,7 +474,7 @@ fn rune_iter(s: str): RuneIter {
  */
 fn *RuneIter.next(): (rune, bool) {
     if self.index >= self.src.len {
-        return 0, false
+        return 0 as u32 as rune, false
     }
     val (cp, n) = decode_rune(self.src, self.index)
     self.index = self.index + n
@@ -454,17 +484,17 @@ fn *RuneIter.next(): (rune, bool) {
 /**
  * One Unicode code point per element, in order. A byte that is not part
  * of a well-formed UTF-8 code point becomes U+FFFD and consumes that one
- * byte. The caller frees the list. The elements do not alias s.
- * @param s text to walk
+ * byte. The caller frees the list. The elements do not alias self.
+ * @self text to walk
  * @context a allocator for the list
  * @return the code points
  */
-fn runes(s: str): list.List<rune> with (a: mem.Allocator) {
+fn str.runes(): list.List<rune> with (a: mem.Allocator) {
     var xs = list.empty<rune>()
-    if s.len > 0 {
-        xs.reserve(s.len)
+    if self.len > 0 {
+        xs.reserve(self.len)
     }
-    var it = rune_iter(s)
+    var it = self.rune_iter()
     for {
         val (cp, ok) = it.next()
         if !ok {

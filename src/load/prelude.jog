@@ -1,0 +1,629 @@
+// Universe scope and the core prelude. Matches resolve_universe.c and
+// prelude.c. Scalar names come from core/scalar.jog, not a hand list in
+// the universe. Step 9 of LoaderGuide.md.
+
+import src.lex
+import src.parse
+import std.fs
+import std.list
+import std.mem
+import std.strbuilder
+import std.text as texts
+private val PRE_INT: i32 = 0
+private val PRE_FLOAT: i32 = 1
+private val PRE_BOOL: i32 = 2
+private val PRE_BYTES: i32 = 3
+private val PRE_STR: i32 = 4
+private val PRE_RUNE: i32 = 5
+
+private struct ScalarSpec {
+    name: str
+    form: i32
+    is_signed: bool
+    bits: u64
+    bits_ptr: bool
+}
+
+private struct Prelude {
+    scope: *PackageScope
+    path: str
+    failed: bool
+    ptr_size: u64
+}
+
+private fn scalar_count(): usize {
+    return 16
+}
+
+private fn scalar_at(i: usize): ScalarSpec {
+    // Matches k_scalar in prelude.c.
+    if i == 0 { return ScalarSpec(name: "i8", form: PRE_INT, is_signed: true, bits: 8, bits_ptr: false) }
+    if i == 1 { return ScalarSpec(name: "i16", form: PRE_INT, is_signed: true, bits: 16, bits_ptr: false) }
+    if i == 2 { return ScalarSpec(name: "i32", form: PRE_INT, is_signed: true, bits: 32, bits_ptr: false) }
+    if i == 3 { return ScalarSpec(name: "i64", form: PRE_INT, is_signed: true, bits: 64, bits_ptr: false) }
+    if i == 4 { return ScalarSpec(name: "u8", form: PRE_INT, is_signed: false, bits: 8, bits_ptr: false) }
+    if i == 5 { return ScalarSpec(name: "u16", form: PRE_INT, is_signed: false, bits: 16, bits_ptr: false) }
+    if i == 6 { return ScalarSpec(name: "u32", form: PRE_INT, is_signed: false, bits: 32, bits_ptr: false) }
+    if i == 7 { return ScalarSpec(name: "u64", form: PRE_INT, is_signed: false, bits: 64, bits_ptr: false) }
+    if i == 8 { return ScalarSpec(name: "isize", form: PRE_INT, is_signed: true, bits: 0, bits_ptr: true) }
+    if i == 9 { return ScalarSpec(name: "usize", form: PRE_INT, is_signed: false, bits: 0, bits_ptr: true) }
+    if i == 10 { return ScalarSpec(name: "f32", form: PRE_FLOAT, is_signed: false, bits: 32, bits_ptr: false) }
+    if i == 11 { return ScalarSpec(name: "f64", form: PRE_FLOAT, is_signed: false, bits: 64, bits_ptr: false) }
+    if i == 12 { return ScalarSpec(name: "bool", form: PRE_BOOL, is_signed: false, bits: 8, bits_ptr: false) }
+    if i == 13 { return ScalarSpec(name: "bytes", form: PRE_BYTES, is_signed: false, bits: 0, bits_ptr: false) }
+    if i == 14 { return ScalarSpec(name: "str", form: PRE_STR, is_signed: false, bits: 0, bits_ptr: false) }
+    return ScalarSpec(name: "rune", form: PRE_RUNE, is_signed: false, bits: 0, bits_ptr: false)
+}
+
+private fn scalar_index(name: str): i32 {
+    var i: usize = 0
+    for i < scalar_count() {
+        if scalar_at(i).name == name {
+            return i as i32
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+private fn pre_fail(p: *Prelude, line: i64, column: i64, message: str) with (a: mem.Allocator) {
+    if line == 0 {
+        print_bare_error(message)
+    } else {
+        print_pos_error(p.path, line, column, message)
+    }
+    p.failed = true
+}
+
+private fn pre_fail_name(p: *Prelude, line: i64, column: i64, prefix: str, name: str, suffix: str) with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    b.append(prefix)
+    b.append(name)
+    b.append(suffix)
+    pre_fail(p, line, column, b.str())
+    b.free()
+}
+
+private fn bind_universe_name(scope: *PackageScope, kind: SymbolKind, name: str) with (a: mem.Allocator) {
+    // sema is left null; the checker attaches builtin *Type values.
+    var s: Symbol
+    s.kind = kind
+    s.name = fs.copy_str(name)
+    s.referenced = false
+    s.assigned = false
+    s.file = ""
+    s.line = 0
+    s.column = 0
+    s.flag = ""
+    s.package = null
+    s.decl = null
+    s.sema = null
+    s.type_params = list.empty<*u8>()
+    s.nominal_insts = list.empty<*u8>()
+    package_scope_bind(scope, s)
+}
+
+/**
+ * Builtin universe before the prelude: true, false, null, and byte.
+ * Scalar names are not added here.
+ * @context a allocator for the scope
+ * @return a fresh universe scope
+ */
+fn universe_scope(): *PackageScope with (a: mem.Allocator) {
+    val (raw, err) = a.alloc(size(PackageScope), align(PackageScope))
+    if err != null {
+        panic("out of memory")
+    }
+    val scope = raw.ptr as *PackageScope
+    scope[0] = empty_package_scope()
+    bind_universe_name(scope, SymbolKind.CONSTANT, "true")
+    bind_universe_name(scope, SymbolKind.CONSTANT, "false")
+    bind_universe_name(scope, SymbolKind.CONSTANT, "null")
+    bind_universe_name(scope, SymbolKind.TYPE, "byte")
+    return scope
+}
+
+private fn base_matches(target: *parse.Node, pointer_sized: bool, bit_width: u64, ptr_size: u64): bool {
+    if bit_width == 0 || bit_width % 8 != 0 {
+        return false
+    }
+    val bytes = bit_width / 8
+    if pointer_sized {
+        val (ok, is_ptr, _) = byte_array(target)
+        return ok && is_ptr && bytes == ptr_size
+    }
+    if bytes == 1 {
+        return is_byte_name(target)
+    }
+    val (ok, is_ptr, len) = byte_array(target)
+    return ok && !is_ptr && len == bytes
+}
+
+private fn type_target(decl: *parse.Node): *parse.Node? {
+    if decl.head as usize >= decl.kids.len {
+        return null
+    }
+    return decl.kids.get(decl.head as usize) as *parse.Node?
+}
+
+private fn attr_at(decl: *parse.Node, i: usize): *parse.Node? {
+    var n: usize = 0
+    for kid in decl.kids.items() {
+        if parse.is_attribute(kid) {
+            if n == i {
+                return kid as *parse.Node?
+            }
+            n = n + 1
+        }
+    }
+    return null
+}
+
+private fn attr_count(decl: *parse.Node): usize {
+    var n: usize = 0
+    for kid in decl.kids.items() {
+        if parse.is_attribute(kid) {
+            n = n + 1
+        }
+    }
+    return n
+}
+
+private struct Intrinsic {
+    kind: i32
+    has_signed: bool
+    is_signed: bool
+    has_bits: bool
+    bits_ptr: bool
+    bits: u64
+    ok: bool
+}
+
+private fn read_intrinsic(attr: *parse.Node): Intrinsic {
+    var out: Intrinsic
+    out.kind = -1
+    out.has_signed = false
+    out.is_signed = false
+    out.has_bits = false
+    out.bits_ptr = false
+    out.bits = 0
+    out.ok = false
+    if attr.name != "intrinsic" {
+        return out
+    }
+    var positionals: i32 = 0
+    for arg in attr.kids.items() {
+        if !parse.is_arg(arg) || arg.kids.len == 0 {
+            return out
+        }
+        val value = arg.kids.get(0)
+        if arg.name.len == 0 {
+            positionals = positionals + 1
+            if positionals != 1 {
+                return out
+            }
+            if parse.is_ident(value) && value.name == "int" {
+                out.kind = PRE_INT
+            } else if parse.is_ident(value) && value.name == "float" {
+                out.kind = PRE_FLOAT
+            } else if parse.is_ident(value) && value.name == "bool" {
+                out.kind = PRE_BOOL
+            } else {
+                return out
+            }
+            continue
+        }
+        if arg.name == "signed" {
+            if out.has_signed || !parse.is_bool_lit(value) {
+                return out
+            }
+            out.has_signed = true
+            out.is_signed = value.text == "true"
+            continue
+        }
+        if arg.name == "bits" {
+            if out.has_bits {
+                return out
+            }
+            out.has_bits = true
+            if parse.is_ident(value) && value.name == "ptr" {
+                out.bits_ptr = true
+                continue
+            }
+            if parse.is_int_lit(value) {
+                val (n, ok) = texts.parse_u64_dec(value.text)
+                if !ok {
+                    return out
+                }
+                out.bits = n
+                continue
+            }
+            return out
+        }
+        return out
+    }
+    out.ok = out.kind >= 0
+    return out
+}
+
+private fn bind_type_name(p: *Prelude, name: str, decl: *parse.Node) with (a: mem.Allocator) {
+    if package_scope_lookup(p.scope, name) != null {
+        pre_fail_name(p, decl.line, decl.column, "duplicate prelude declaration '", name, "'")
+        return
+    }
+    bind_universe_name(p.scope, SymbolKind.TYPE, name)
+}
+
+private fn bind_intrinsic(p: *Prelude, decl: *parse.Node, name: str, index: i32) with (a: mem.Allocator) {
+    val spec = scalar_at(index as usize)
+    if attr_count(decl) != 1 {
+        pre_fail_name(p, decl.line, decl.column, "prelude declaration '", name, "' has a malformed @intrinsic")
+        return
+    }
+    val attr = attr_at(decl, 0)
+    if attr == null {
+        pre_fail_name(p, decl.line, decl.column, "prelude declaration '", name, "' has a malformed @intrinsic")
+        return
+    }
+    val read = read_intrinsic(attr!!)
+    if !read.ok {
+        pre_fail_name(p, decl.line, decl.column, "prelude declaration '", name, "' has a malformed @intrinsic")
+        return
+    }
+    if read.kind != spec.form {
+        pre_fail_name(p, decl.line, decl.column, "prelude declaration '", name, "' has the wrong kind")
+        return
+    }
+    val target = type_target(decl)
+    if target == null {
+        pre_fail_name(p, decl.line, decl.column, "prelude declaration '", name, "' has the wrong form")
+        return
+    }
+    if spec.form == PRE_BOOL {
+        if read.has_signed || read.has_bits {
+            pre_fail_name(p, decl.line, decl.column, "prelude declaration '", name, "' has a malformed @intrinsic")
+            return
+        }
+        if !is_byte_name(target!!) {
+            pre_fail_name(p, decl.line, decl.column, "prelude declaration '", name, "' has the wrong base")
+            return
+        }
+        bind_type_name(p, name, decl)
+        return
+    }
+    if spec.form == PRE_FLOAT {
+        if read.has_signed || !read.has_bits || read.bits_ptr {
+            pre_fail_name(p, decl.line, decl.column, "prelude declaration '", name, "' has a malformed @intrinsic")
+            return
+        }
+        if read.bits != spec.bits {
+            pre_fail_name(p, decl.line, decl.column, "prelude declaration '", name, "' has the wrong width")
+            return
+        }
+        if !base_matches(target!!, false, read.bits, p.ptr_size) {
+            pre_fail_name(p, decl.line, decl.column, "prelude declaration '", name, "' has the wrong base")
+            return
+        }
+        bind_type_name(p, name, decl)
+        return
+    }
+    if !read.has_signed || !read.has_bits {
+        pre_fail_name(p, decl.line, decl.column, "prelude declaration '", name, "' has a malformed @intrinsic")
+        return
+    }
+    if read.is_signed != spec.is_signed {
+        pre_fail_name(p, decl.line, decl.column, "prelude declaration '", name, "' has the wrong signedness")
+        return
+    }
+    var width = read.bits
+    var pointer_sized = false
+    if read.bits_ptr {
+        pointer_sized = true
+        width = p.ptr_size * 8
+    }
+    if spec.bits_ptr != pointer_sized || (!pointer_sized && width != spec.bits) {
+        pre_fail_name(p, decl.line, decl.column, "prelude declaration '", name, "' has the wrong width")
+        return
+    }
+    if !base_matches(target!!, pointer_sized, width, p.ptr_size) {
+        pre_fail_name(p, decl.line, decl.column, "prelude declaration '", name, "' has the wrong base")
+        return
+    }
+    bind_type_name(p, name, decl)
+}
+
+private fn slice_of_byte(node: *parse.Node, want_const: bool): bool {
+    if !parse.is_type_slice(node) || node.kids.len == 0 {
+        return false
+    }
+    val is_const = node.flag == "const"
+    if is_const != want_const {
+        return false
+    }
+    return is_byte_name(node.kids.get(0))
+}
+
+private fn bind_bytes(p: *Prelude, decl: *parse.Node, name: str) with (a: mem.Allocator) {
+    if attr_count(decl) != 0 || decl.op == lex.kind().COLON {
+        pre_fail_name(p, decl.line, decl.column, "prelude declaration '", name, "' has the wrong form")
+        return
+    }
+    val target = type_target(decl)
+    if target == null || !slice_of_byte(target!!, false) {
+        pre_fail_name(p, decl.line, decl.column, "prelude declaration '", name, "' has the wrong base")
+        return
+    }
+    bind_type_name(p, name, decl)
+}
+
+private fn bind_str(p: *Prelude, decl: *parse.Node, name: str) with (a: mem.Allocator) {
+    if attr_count(decl) != 0 || decl.op != lex.kind().COLON {
+        pre_fail_name(p, decl.line, decl.column, "prelude declaration '", name, "' has the wrong form")
+        return
+    }
+    val target = type_target(decl)
+    if target == null || !slice_of_byte(target!!, true) {
+        pre_fail_name(p, decl.line, decl.column, "prelude declaration '", name, "' has the wrong base")
+        return
+    }
+    bind_type_name(p, name, decl)
+}
+
+private fn bind_rune(p: *Prelude, decl: *parse.Node, name: str) with (a: mem.Allocator) {
+    if attr_count(decl) != 0 || decl.op != lex.kind().COLON {
+        pre_fail_name(p, decl.line, decl.column, "prelude declaration '", name, "' has the wrong form")
+        return
+    }
+    val target = type_target(decl)
+    if target == null || !parse.is_type_name(target!!) || target!!.name != "u32" {
+        pre_fail_name(p, decl.line, decl.column, "prelude declaration '", name, "' has the wrong base")
+        return
+    }
+    if package_scope_lookup(p.scope, "u32") == null {
+        pre_fail_name(p, decl.line, decl.column, "prelude declaration '", name, "' has the wrong base")
+        return
+    }
+    bind_type_name(p, name, decl)
+}
+
+private fn bind_void(p: *Prelude, node: *parse.Node) with (a: mem.Allocator) {
+    if node.kids.len != 0 || node.head != 0 {
+        pre_fail_name(p, node.line, node.column, "prelude declaration '", "void", "' has the wrong form")
+        return
+    }
+    bind_type_name(p, "void", node)
+}
+
+private fn bind_option(p: *Prelude, node: *parse.Node) with (a: mem.Allocator) {
+    // head is type-param count; then variants.
+    if node.head != 1 || node.kids.len != 3 {
+        pre_fail_name(p, node.line, node.column, "prelude declaration '", "Option", "' has the wrong form")
+        return
+    }
+    val param = node.kids.get(0)
+    val none = node.kids.get(1)
+    val some = node.kids.get(2)
+    if !parse.is_type_param(param) || param.name != "T" {
+        pre_fail_name(p, node.line, node.column, "prelude declaration '", "Option", "' has the wrong form")
+        return
+    }
+    if !parse.is_variant(none) || none.name != "None" || none.kids.len != 0 {
+        pre_fail_name(p, node.line, node.column, "prelude declaration '", "Option", "' has the wrong form")
+        return
+    }
+    if !parse.is_variant(some) || some.name != "Some" || some.kids.len != 1 || !parse.is_param(some.kids.get(0)) {
+        pre_fail_name(p, node.line, node.column, "prelude declaration '", "Option", "' has the wrong form")
+        return
+    }
+    val field = some.kids.get(0)
+    if field.name != "value" || field.kids.len == 0 || !parse.is_type_name(field.kids.get(0)) || field.kids.get(0).name != "T" {
+        pre_fail_name(p, node.line, node.column, "prelude declaration '", "Option", "' has the wrong form")
+        return
+    }
+    bind_type_name(p, "Option", node)
+}
+
+private fn bind_ordering(p: *Prelude, node: *parse.Node) with (a: mem.Allocator) {
+    // head type params (0), then tag type after colon, then 3 variants.
+    if node.head != 0 || node.op != lex.kind().COLON || node.kids.len != 4 {
+        pre_fail_name(p, node.line, node.column, "prelude declaration '", "Ordering", "' has the wrong form")
+        return
+    }
+    val tag = node.kids.get(0)
+    if !parse.is_type_name(tag) || tag.name != "i8" {
+        pre_fail_name(p, node.line, node.column, "prelude declaration '", "Ordering", "' has the wrong base")
+        return
+    }
+    if node.kids.get(1).name != "Less" || node.kids.get(2).name != "Equal" || node.kids.get(3).name != "Greater" {
+        pre_fail_name(p, node.line, node.column, "prelude declaration '", "Ordering", "' has the wrong form")
+        return
+    }
+    bind_type_name(p, "Ordering", node)
+}
+
+private fn bind_error(p: *Prelude, node: *parse.Node) with (a: mem.Allocator) {
+    if node.kids.len != 1 || !parse.is_fn(node.kids.get(0)) {
+        pre_fail_name(p, node.line, node.column, "prelude declaration '", "error", "' has the wrong form")
+        return
+    }
+    val method = node.kids.get(0)
+    if method.name != "message" || parse.fn_has_receiver(method) {
+        pre_fail_name(p, node.line, node.column, "prelude declaration '", "error", "' has the wrong form")
+        return
+    }
+    bind_type_name(p, "error", node)
+}
+
+private fn bind_core_nominal(p: *Prelude, node: *parse.Node) with (a: mem.Allocator) {
+    if parse.is_struct(node) && node.name == "void" {
+        bind_void(p, node)
+        return
+    }
+    if parse.is_enum(node) && node.name == "Option" {
+        bind_option(p, node)
+        return
+    }
+    if parse.is_enum(node) && node.name == "Ordering" {
+        bind_ordering(p, node)
+        return
+    }
+    if parse.is_interface(node) && node.name == "error" {
+        bind_error(p, node)
+        return
+    }
+    var name = node.name
+    if name.len == 0 {
+        name = "?"
+    }
+    pre_fail_name(p, node.line, node.column, "unexpected declaration '", name, "' in the core prelude")
+}
+
+private fn bind_decl(p: *Prelude, node: *parse.Node, seen: *list.List<bool>) with (a: mem.Allocator) {
+    if parse.is_fn(node) {
+        // Operator methods are recorded on builtins in C; they are not
+        // universe names. Accept them without binding.
+        return
+    }
+    if !parse.is_type_decl(node) {
+        bind_core_nominal(p, node)
+        return
+    }
+    val name = node.name
+    if name.len == 0 {
+        pre_fail(p, node.line, node.column, "prelude declaration has no name")
+        return
+    }
+    val index = scalar_index(name)
+    if index < 0 {
+        pre_fail_name(p, node.line, node.column, "unexpected declaration '", name, "' in the core prelude")
+        return
+    }
+    if seen.get(index as usize) {
+        pre_fail_name(p, node.line, node.column, "duplicate prelude declaration '", name, "'")
+        return
+    }
+    seen.set(index as usize, true)
+    val form = scalar_at(index as usize).form
+    if form == PRE_BYTES {
+        bind_bytes(p, node, name)
+        return
+    }
+    if node.op != lex.kind().COLON {
+        pre_fail_name(p, node.line, node.column, "prelude declaration '", name, "' has the wrong form")
+        return
+    }
+    if form == PRE_STR {
+        bind_str(p, node, name)
+        return
+    }
+    if form == PRE_RUNE {
+        bind_rune(p, node, name)
+        return
+    }
+    bind_intrinsic(p, node, name, index)
+}
+
+private fn report_missing(p: *Prelude, file: *parse.Node, seen: list.List<bool>) with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < scalar_count() {
+        if !seen.get(i) {
+            pre_fail_name(p, file.line, file.column, "missing prelude declaration '", scalar_at(i).name, "'")
+        }
+        i = i + 1
+    }
+}
+
+private fn bind_lang_items(scope: *PackageScope): bool with (a: mem.Allocator) {
+    if package_scope_lookup(scope, "void") == null {
+        return false
+    }
+    if package_scope_lookup(scope, "error") == null {
+        return false
+    }
+    bind_universe_name(scope, SymbolKind.TYPE, "Scope")
+    bind_universe_name(scope, SymbolKind.TYPE, "Chan")
+    bind_universe_name(scope, SymbolKind.TYPE, "Task")
+    bind_universe_name(scope, SymbolKind.CONSTANT, "ErrCancelled")
+    bind_universe_name(scope, SymbolKind.CONSTANT, "ErrClosed")
+    return true
+}
+
+/**
+ * Read core/scalar.jog into the universe scope, then bind language items.
+ * @param scope universe from universe_scope
+ * @param core_root path to the core folder, or empty when missing
+ * @context a allocator for the file bytes and symbols
+ * @return false when the prelude failed
+ */
+fn bind_prelude(scope: *PackageScope, core_root: str): bool with (a: mem.Allocator) {
+    if core_root.len == 0 || !dir_is(core_root) {
+        print_bare_error("core prelude was not found")
+        return false
+    }
+    val path = fs.join(core_root, "scalar.jog")
+    if !fs.exists(path) {
+        print_bare_error("core prelude was not found")
+        fs.free_str(path)
+        return false
+    }
+    var (data, err) = fs.read_all(path)
+    if err != null {
+        print_bare_error("core prelude was not found")
+        fs.free_str(path)
+        return false
+    }
+    var errors: list.List<lex.LexError>
+    var tokens = lex.lex(data, &errors)
+    if errors.len > 0 {
+        for e in errors.items() {
+            lex.print_error(path, e)
+        }
+        a.free(data)
+        fs.free_str(path)
+        return false
+    }
+    var parser: parse.Parser
+    parser.tokens = tokens
+    parser.path = path
+    parser.errors = list.empty<parse.ParseError>()
+    val file = parse.parse_file(&parser)
+    if parser.errors.len > 0 {
+        for e in parser.errors.items() {
+            parse.print_parse_error(path, e)
+        }
+        a.free(data)
+        fs.free_str(path)
+        return false
+    }
+    var pre = Prelude(scope: scope, path: path, failed: false, ptr_size: size(*u8) as u64)
+    var seen = list.empty<bool>()
+    var i: usize = 0
+    for i < scalar_count() {
+        seen.push(false)
+        i = i + 1
+    }
+    for kid in file.kids.items() {
+        if parse.is_import(kid) {
+            pre_fail(&pre, kid.line, kid.column, "unexpected import in the core prelude")
+            continue
+        }
+        bind_decl(&pre, kid, &seen)
+    }
+    report_missing(&pre, file, seen)
+    if !pre.failed && !bind_lang_items(scope) {
+        pre_fail(&pre, file.line, file.column, "out of memory")
+    }
+    seen.free()
+    a.free(data)
+    fs.free_str(path)
+    return !pre.failed
+}
+
+private fn dir_is(path: str): bool with (a: mem.Allocator) {
+    var (names, ok) = fs.list(path)
+    if ok {
+        fs.free_names(&names)
+        return true
+    }
+    return false
+}

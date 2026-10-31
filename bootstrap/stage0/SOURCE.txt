@@ -1,3 +1,3 @@
-011a7852b1c1fdbd401dd722b19d21ce9e7fe771
+e64191a502a31b414c060f7376f6945a98fbbbdf
 Rebuild from that commit: cmake -S . -B build -G Ninja && cmake --build build
-This copy is build/jog.exe from the dirty p3/jogc tree after check: OK (when-on-str, enum .name, error?, arena block), on top of the commit above. bootstrap/stage0 looks one directory higher for std.
+This copy is build/jog.exe from that commit. bootstrap/stage0 looks one directory higher for both std and core (the locate_roots rule already in compiler/src/loader.c).

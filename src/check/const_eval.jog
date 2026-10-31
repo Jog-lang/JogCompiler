@@ -1,0 +1,563 @@
+// Untyped int/float constant folding and fit checks.
+// Checked against compiler/src/const_eval.c.
+// CheckerGuide step 4.
+
+import src.parse
+import std.mem
+
+private fn is_arith_text(op: str): bool {
+    return op == "+" || op == "-" || op == "*" || op == "/" || op == "%" ||
+        op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>"
+}
+
+/**
+ * True when the node is an integer literal tree (literals and arithmetic).
+ * @param node expression
+ * @return whether const_eval can fold it as an int
+ */
+fn is_int_lit_tree(node: *parse.Node): bool {
+    if parse.is_int_lit(node) {
+        return true
+    }
+    if parse.is_unary(node) {
+        if node.kids.len == 0 {
+            return false
+        }
+        if node.text != "-" && node.text != "~" {
+            return false
+        }
+        return is_int_lit_tree(node.kids.get(0))
+    }
+    if parse.is_binary(node) {
+        if !is_arith_text(node.text) {
+            return false
+        }
+        if node.kids.len < 2 {
+            return false
+        }
+        return is_int_lit_tree(node.kids.get(0)) && is_int_lit_tree(node.kids.get(1))
+    }
+    return false
+}
+
+/**
+ * True when the node is a float literal tree (literals and + - * /).
+ */
+fn is_float_lit_tree(node: *parse.Node): bool {
+    if parse.is_float_lit(node) {
+        return true
+    }
+    if parse.is_unary(node) && node.text == "-" && node.kids.len > 0 {
+        return is_float_lit_tree(node.kids.get(0))
+    }
+    if parse.is_binary(node) && node.kids.len >= 2 {
+        val op = node.text
+        if op == "+" || op == "-" || op == "*" || op == "/" {
+            return is_float_lit_tree(node.kids.get(0)) && is_float_lit_tree(node.kids.get(1))
+        }
+    }
+    return false
+}
+
+private fn is_bool_lit_tree(node: *parse.Node): bool {
+    if parse.is_bool_lit(node) {
+        return true
+    }
+    if parse.is_unary(node) && node.text == "!" && node.kids.len > 0 {
+        return is_bool_lit_tree(node.kids.get(0))
+    }
+    if parse.is_binary(node) && node.kids.len >= 2 {
+        val op = node.text
+        if op == "&&" || op == "||" {
+            return is_bool_lit_tree(node.kids.get(0)) && is_bool_lit_tree(node.kids.get(1))
+        }
+        if op == "==" || op == "!=" {
+            if is_bool_lit_tree(node.kids.get(0)) && is_bool_lit_tree(node.kids.get(1)) {
+                return true
+            }
+            return is_int_lit_tree(node.kids.get(0)) && is_int_lit_tree(node.kids.get(1))
+        }
+        if op == "<" || op == "<=" || op == ">" || op == ">=" {
+            return is_int_lit_tree(node.kids.get(0)) && is_int_lit_tree(node.kids.get(1))
+        }
+    }
+    return false
+}
+
+private fn hex_digit(c: u8): i32 {
+    if c >= '0' as u8 && c <= '9' as u8 {
+        return (c - '0' as u8) as i32
+    }
+    if c >= 'a' as u8 && c <= 'f' as u8 {
+        return (c - 'a' as u8) as i32 + 10
+    }
+    if c >= 'A' as u8 && c <= 'F' as u8 {
+        return (c - 'A' as u8) as i32 + 10
+    }
+    return -1
+}
+
+private fn parse_int_text_u64(text: str): (u64, bool) {
+    if text.len == 0 {
+        return 0, false
+    }
+    var base: u64 = 10
+    var i: usize = 0
+    if text.len >= 2 && text.ptr[0] == '0' as u8 {
+        val mark = text.ptr[1]
+        if mark == 'x' as u8 || mark == 'X' as u8 {
+            base = 16
+            i = 2
+        } else if mark == 'b' as u8 || mark == 'B' as u8 {
+            base = 2
+            i = 2
+        } else if mark == 'o' as u8 || mark == 'O' as u8 {
+            base = 8
+            i = 2
+        }
+    }
+    var n: u64 = 0
+    var any = false
+    for i < text.len {
+        val c = text.ptr[i]
+        if c == '_' as u8 {
+            i = i + 1
+            continue
+        }
+        val d = hex_digit(c)
+        if d < 0 || (d as u64) >= base {
+            return 0, false
+        }
+        any = true
+        val du = d as u64
+        val max: u64 = 0xFFFFFFFFFFFFFFFF
+        if n > (max / base) {
+            return 0, false
+        }
+        if n == (max / base) && du > (max % base) {
+            return 0, false
+        }
+        n = n * base + du
+        i = i + 1
+    }
+    if !any {
+        return 0, false
+    }
+    return n, true
+}
+
+private fn parse_int_text(text: str): (i64, bool) {
+    val (n, ok) = parse_int_text_u64(text)
+    if !ok {
+        return 0, false
+    }
+    if n > 9223372036854775807 {
+        return 0, false
+    }
+    return n as i64, true
+}
+
+private fn int_fits_u64(value: u64, ty: *Type): bool {
+    if ty.kind != TypeKind.INT || ty.int_signed {
+        return false
+    }
+    var bits = ty.int_bits as i32
+    if bits <= 0 || bits > 64 {
+        return false
+    }
+    if bits == 8 {
+        return value <= 255
+    }
+    if bits == 16 {
+        return value <= 65535
+    }
+    if bits == 32 {
+        return value <= 4294967295
+    }
+    return true
+}
+
+private fn int_fits(value: i64, ty: *Type): bool {
+    if ty.kind != TypeKind.INT {
+        return false
+    }
+    var bits = ty.int_bits as i32
+    if bits <= 0 || bits > 64 {
+        return false
+    }
+    // Hardcoded limits: Jog i64 shifts of 31+ are not reliable for bound math.
+    if !ty.int_signed {
+        if value < 0 {
+            return false
+        }
+        if bits == 8 {
+            return value <= 255
+        }
+        if bits == 16 {
+            return value <= 65535
+        }
+        if bits == 32 {
+            return value <= 4294967295
+        }
+        return true
+    }
+    if bits == 8 {
+        return value >= -128 && value <= 127
+    }
+    if bits == 16 {
+        return value >= -32768 && value <= 32767
+    }
+    if bits == 32 {
+        return value >= -2147483648 && value <= 2147483647
+    }
+    return true
+}
+
+private fn fail_fit(ck: *Check, file: str, node: *parse.Node) with (a: mem.Allocator) {
+    check_fail(ck, file, node.line, node.column, "integer constant does not fit")
+}
+
+private fn fail_overflow(ck: *Check, file: str, node: *parse.Node) with (a: mem.Allocator) {
+    check_fail(ck, file, node.line, node.column, "integer overflow")
+}
+
+private fn add_ok(left: i64, right: i64): (i64, bool) {
+    if right > 0 && left > 9223372036854775807 - right {
+        return 0, false
+    }
+    if right < 0 && left < (0 - 9223372036854775807 - 1) - right {
+        return 0, false
+    }
+    return left + right, true
+}
+
+private fn sub_ok(left: i64, right: i64): (i64, bool) {
+    return add_ok(left, 0 - right)
+}
+
+private fn mul_ok(left: i64, right: i64): (i64, bool) {
+    if left == 0 || right == 0 {
+        return 0, true
+    }
+    if left == -1 && right == (0 - 9223372036854775807 - 1) {
+        return 0, false
+    }
+    if right == -1 && left == (0 - 9223372036854775807 - 1) {
+        return 0, false
+    }
+    val r = left * right
+    if r / left != right {
+        return 0, false
+    }
+    return r, true
+}
+
+private fn fold_int_value(
+    ck: *Check,
+    file: str,
+    node: *parse.Node,
+    out: *i64,
+): bool with (a: mem.Allocator) {
+    if parse.is_int_lit(node) {
+        val (n, ok) = parse_int_text(node.text)
+        if !ok {
+            fail_fit(ck, file, node)
+            return false
+        }
+        *out = n
+        return true
+    }
+    if parse.is_unary(node) && node.kids.len > 0 {
+        // -9223372036854775808 is i64::MIN; the positive magnitude does not fit i64.
+        if node.text == "-" && parse.is_int_lit(node.kids.get(0)) {
+            val (u, uok) = parse_int_text_u64(node.kids.get(0).text)
+            if uok && u == 9223372036854775808 {
+                *out = 0 - 9223372036854775807 - 1
+                return true
+            }
+        }
+        var v: i64 = 0
+        if !fold_int_value(ck, file, node.kids.get(0), &v) {
+            return false
+        }
+        if node.text == "-" {
+            if v == (0 - 9223372036854775807 - 1) {
+                fail_overflow(ck, file, node)
+                return false
+            }
+            *out = 0 - v
+            return true
+        }
+        if node.text == "~" {
+            *out = 0 - v - 1
+            return true
+        }
+    }
+    if parse.is_binary(node) && node.kids.len >= 2 {
+        var left: i64 = 0
+        var right: i64 = 0
+        if !fold_int_value(ck, file, node.kids.get(0), &left) {
+            return false
+        }
+        if !fold_int_value(ck, file, node.kids.get(1), &right) {
+            return false
+        }
+        val op = node.text
+        if op == "+" {
+            val (r, ok) = add_ok(left, right)
+            if !ok {
+                fail_overflow(ck, file, node)
+                return false
+            }
+            *out = r
+            return true
+        }
+        if op == "-" {
+            val (r, ok) = sub_ok(left, right)
+            if !ok {
+                fail_overflow(ck, file, node)
+                return false
+            }
+            *out = r
+            return true
+        }
+        if op == "*" {
+            val (r, ok) = mul_ok(left, right)
+            if !ok {
+                fail_overflow(ck, file, node)
+                return false
+            }
+            *out = r
+            return true
+        }
+        if op == "/" || op == "%" {
+            if right == 0 {
+                check_fail(ck, file, node.line, node.column, "division by zero")
+                return false
+            }
+            if op == "/" {
+                *out = left / right
+            } else {
+                *out = left % right
+            }
+            return true
+        }
+        if op == "&" {
+            *out = left & right
+            return true
+        }
+        if op == "|" {
+            *out = left | right
+            return true
+        }
+        if op == "^" {
+            *out = left ^ right
+            return true
+        }
+        if op == "<<" {
+            if right < 0 || right >= 64 {
+                fail_overflow(ck, file, node)
+                return false
+            }
+            *out = left << right
+            return true
+        }
+        if op == ">>" {
+            if right < 0 || right >= 64 {
+                fail_overflow(ck, file, node)
+                return false
+            }
+            *out = left >> right
+            return true
+        }
+    }
+    check_fail(ck, file, node.line, node.column, "not a constant expression")
+    return false
+}
+
+private fn apply_int_result(
+    ck: *Check,
+    file: str,
+    node: *parse.Node,
+    target: *Type?,
+    value: i64,
+    literal: bool,
+): *Type? with (a: mem.Allocator) {
+    var ty = target
+    if ty != null && type_is_host_int(ty!!) {
+        if !int_fits(value, ty!!) {
+            if literal {
+                fail_fit(ck, file, node)
+            } else {
+                fail_overflow(ck, file, node)
+            }
+            return err_ty(ck)
+        }
+        return ty
+    }
+    val i64t = type_builtin(&ck.types, Builtin.I64)
+    if !int_fits(value, i64t) {
+        if literal || parse.is_int_lit(node) {
+            fail_fit(ck, file, node)
+        } else {
+            fail_overflow(ck, file, node)
+        }
+        return err_ty(ck)
+    }
+    return i64t
+}
+
+private fn fold_bool_value(
+    ck: *Check,
+    file: str,
+    node: *parse.Node,
+    out: *bool,
+): bool with (a: mem.Allocator) {
+    if parse.is_bool_lit(node) {
+        *out = node.text == "true"
+        return true
+    }
+    if parse.is_unary(node) && node.text == "!" && node.kids.len > 0 {
+        var v = false
+        if !fold_bool_value(ck, file, node.kids.get(0), &v) {
+            return false
+        }
+        *out = !v
+        return true
+    }
+    if parse.is_binary(node) && node.kids.len >= 2 {
+        val op = node.text
+        if op == "&&" || op == "||" {
+            var left = false
+            var right = false
+            if !fold_bool_value(ck, file, node.kids.get(0), &left) {
+                return false
+            }
+            if !fold_bool_value(ck, file, node.kids.get(1), &right) {
+                return false
+            }
+            if op == "&&" {
+                *out = left && right
+            } else {
+                *out = left || right
+            }
+            return true
+        }
+        if op == "==" || op == "!=" {
+            if is_bool_lit_tree(node.kids.get(0)) {
+                var left = false
+                var right = false
+                if !fold_bool_value(ck, file, node.kids.get(0), &left) {
+                    return false
+                }
+                if !fold_bool_value(ck, file, node.kids.get(1), &right) {
+                    return false
+                }
+                if op == "==" {
+                    *out = left == right
+                } else {
+                    *out = left != right
+                }
+                return true
+            }
+        }
+        if is_int_lit_tree(node.kids.get(0)) && is_int_lit_tree(node.kids.get(1)) {
+            var left: i64 = 0
+            var right: i64 = 0
+            if !fold_int_value(ck, file, node.kids.get(0), &left) {
+                return false
+            }
+            if !fold_int_value(ck, file, node.kids.get(1), &right) {
+                return false
+            }
+            if op == "==" {
+                *out = left == right
+            } else if op == "!=" {
+                *out = left != right
+            } else if op == "<" {
+                *out = left < right
+            } else if op == "<=" {
+                *out = left <= right
+            } else if op == ">" {
+                *out = left > right
+            } else if op == ">=" {
+                *out = left >= right
+            } else {
+                check_fail(ck, file, node.line, node.column, "not a constant expression")
+                return false
+            }
+            return true
+        }
+    }
+    check_fail(ck, file, node.line, node.column, "not a constant expression")
+    return false
+}
+
+/**
+ * Fold a constant expression to a type. On failure sets ck.failed and returns
+ * the error type (or null when the checker stopped).
+ * @param ck checker
+ * @param file source path for diagnostics
+ * @param node constant expression
+ * @param target expected type, or null
+ * @context a allocator for diagnostics
+ * @return folded type, or null when stopped
+ */
+/**
+ * Fold an integer literal tree to a value. Used by enum tag evaluation.
+ * @param ck checker
+ * @param file source path for diagnostics
+ * @param node integer expression
+ * @param out folded value
+ * @return false when folding failed (diagnostic already reported)
+ */
+fn const_fold_int(ck: *Check, file: str, node: *parse.Node, out: *i64): bool with (a: mem.Allocator) {
+    return fold_int_value(ck, file, node, out)
+}
+
+/**
+ * Whether a folded integer fits in an INT type (tag fit checks).
+ */
+fn const_int_fits(value: i64, ty: *Type): bool {
+    return int_fits(value, ty)
+}
+
+fn const_eval(ck: *Check, file: str, node: *parse.Node, target: *Type?): *Type? with (a: mem.Allocator) {
+    if ck.stop {
+        return null
+    }
+    var natural = target
+    if natural != null && natural!!.kind == TypeKind.UNTYPED_INT {
+        natural = null
+    }
+    if is_bool_lit_tree(node) {
+        if natural != null && natural!!.kind != TypeKind.BOOL {
+            check_fail(ck, file, node.line, node.column, "constant does not fit")
+            return err_ty(ck)
+        }
+        var bit = false
+        if !fold_bool_value(ck, file, node, &bit) {
+            return err_ty(ck)
+        }
+        return type_builtin(&ck.types, Builtin.BOOL)
+    }
+    if natural != null && !type_is_host_int(natural!!) {
+        check_fail(ck, file, node.line, node.column, "constant does not fit")
+        return err_ty(ck)
+    }
+    // Unsigned targets accept decimal literals above i64::MAX (e.g. 2^63 as u64).
+    if natural != null && !natural!!.int_signed && parse.is_int_lit(node) {
+        val (u, ok) = parse_int_text_u64(node.text)
+        if !ok || !int_fits_u64(u, natural!!) {
+            fail_fit(ck, file, node)
+            return err_ty(ck)
+        }
+        return natural
+    }
+    var value: i64 = 0
+    if !fold_int_value(ck, file, node, &value) {
+        return err_ty(ck)
+    }
+    val literal = parse.is_int_lit(node)
+    return apply_int_result(ck, file, node, natural, value, literal)
+}

@@ -1,0 +1,58 @@
+// @comptime and @embed.
+// Checked against compiler/src/check_comptime.c.
+// Operator intrinsics (@add, ...) are gated in body.jog (check_op_intrinsic).
+
+import src.parse
+import std.mem
+import std.strbuilder
+
+private fn arg_value(arg: *parse.Node?): *parse.Node? {
+    if arg == null {
+        return null
+    }
+    if parse.is_arg(arg!!) {
+        if arg!!.name.len > 0 {
+            return null
+        }
+        if arg!!.kids.len == 0 {
+            return null
+        }
+        return arg!!.kids.get(0)
+    }
+    return arg
+}
+
+fn is_op_intrinsic_name(name: str): bool {
+    return name == "add" || name == "sub" || name == "mul" || name == "div" || name == "rem" ||
+        name == "neg" || name == "eq" || name == "ne" || name == "lt" || name == "le" || name == "gt" ||
+        name == "ge" || name == "and" || name == "or" || name == "xor" || name == "shl" || name == "shr" ||
+        name == "bitnot" || name == "not"
+}
+
+/**
+ * Type-check @comptime(expr). @embed is not implemented yet.
+ */
+fn check_comptime(env: *Env, node: *parse.Node, target: *Type?): *Type? with (a: mem.Allocator) {
+    if node.name == "embed" {
+        env_fail(env, node, "attribute 'embed' is not checked yet")
+        return err_ty(env.ck) as *Type?
+    }
+    if node.name != "comptime" {
+        var b = strbuilder.empty()
+        b.append("unknown compile-time builtin @")
+        b.append(node.name)
+        env_fail(env, node, b.str())
+        b.free()
+        return err_ty(env.ck) as *Type?
+    }
+    if node.kids.len != 1 {
+        check_fail(env.ck, env.job.file, node.line, node.column, "@comptime expects one argument")
+        return err_ty(env.ck) as *Type?
+    }
+    val expr = arg_value(node.kids.get(0) as *parse.Node?)
+    if expr == null {
+        check_fail(env.ck, env.job.file, node.line, node.column, "@comptime expects one argument")
+        return err_ty(env.ck) as *Type?
+    }
+    return check_expr(env, expr!!, target)
+}

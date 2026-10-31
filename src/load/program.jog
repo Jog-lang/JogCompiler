@@ -1,0 +1,27 @@
+// Loaded program handed from the loader to the checker. Matches the
+// packages list on JogProgram after jog_load / jog_resolve_packages.
+// CheckerGuide step 1.
+
+import std.list
+import std.mem
+
+/**
+ * A successfully loaded and name-resolved module graph. packages is in
+ * dependency order. The checker types these; it does not resolve again.
+ */
+struct Program {
+    packages: list.List<*Package>
+    root_module: str
+}
+
+/**
+ * An empty program. The loader fills packages on a clean load.
+ * @context a allocator for the package list
+ * @return a program with no packages
+ */
+fn empty_program(): Program with (a: mem.Allocator) {
+    var p: Program
+    p.packages = list.empty<*Package>()
+    p.root_module = ""
+    return p
+}

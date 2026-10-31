@@ -1,0 +1,564 @@
+// expect / actual platform checking.
+// Checked against compiler/src/check_platform.c.
+
+import src.load
+import src.parse
+import std.fs
+import std.list
+import std.mem
+import std.strbuilder
+
+private fn plat_fail(ck: *Check, file: str, line: i64, column: i64, message: str) with (a: mem.Allocator) {
+    load.print_pos_error(file, line, column, message)
+    ck.failed = true
+}
+
+private fn plat_fn_col(_node: *parse.Node): i64 {
+    return 1
+}
+
+private fn fn_name(fndecl: *parse.Node): str {
+    if fndecl.name.len > 0 {
+        return fndecl.name
+    }
+    return "?"
+}
+
+private fn path_is_os(path: str): bool {
+    return load.file_stem_os_tag(load.source_file_base(path)).len > 0
+}
+
+private fn core_file_path(path: str): bool {
+    return !path_is_os(path)
+}
+
+private fn same_text(a: str, b: str): bool {
+    return a == b
+}
+
+private fn same_expr(a: *parse.Node?, b: *parse.Node?): bool {
+    if (a as *u8) == (b as *u8) {
+        return true
+    }
+    if a == null || b == null {
+        return false
+    }
+    if a!!.kind != b!!.kind {
+        return false
+    }
+    if parse.is_string_lit(a!!) || parse.is_int_lit(a!!) || parse.is_float_lit(a!!) || parse.is_char_lit(a!!) {
+        return a!!.text == b!!.text
+    }
+    if parse.is_bool_lit(a!!) {
+        return a!!.text == b!!.text
+    }
+    if parse.is_null_lit(a!!) {
+        return true
+    }
+    if parse.is_ident(a!!) {
+        return a!!.name == b!!.name
+    }
+    if parse.is_unary(a!!) && a!!.kids.len > 0 && b!!.kids.len > 0 {
+        return a!!.text == b!!.text && same_expr(a!!.kids.get(0) as *parse.Node?, b!!.kids.get(0) as *parse.Node?)
+    }
+    if parse.is_binary(a!!) && a!!.kids.len > 1 && b!!.kids.len > 1 {
+        return a!!.text == b!!.text && same_expr(a!!.kids.get(0) as *parse.Node?, b!!.kids.get(0) as *parse.Node?) &&
+            same_expr(a!!.kids.get(1) as *parse.Node?, b!!.kids.get(1) as *parse.Node?)
+    }
+    return false
+}
+
+private fn same_type(a: *parse.Node?, b: *parse.Node?): bool {
+    if (a as *u8) == (b as *u8) {
+        return true
+    }
+    if a == null || b == null {
+        return false
+    }
+    if a!!.kind != b!!.kind {
+        return false
+    }
+    if parse.is_type_name(a!!) {
+        if a!!.flag != b!!.flag || a!!.name != b!!.name || a!!.kids.len != b!!.kids.len {
+            return false
+        }
+        var i: usize = 0
+        for i < a!!.kids.len {
+            if !same_type(a!!.kids.get(i) as *parse.Node?, b!!.kids.get(i) as *parse.Node?) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    if parse.is_type_ptr(a!!) || parse.is_type_slice(a!!) || parse.is_type_option(a!!) {
+        if a!!.flag != b!!.flag || a!!.kids.len != b!!.kids.len {
+            return false
+        }
+        if a!!.kids.len == 0 {
+            return true
+        }
+        return same_type(a!!.kids.get(0) as *parse.Node?, b!!.kids.get(0) as *parse.Node?)
+    }
+    if parse.is_type_array(a!!) {
+        if a!!.flag != b!!.flag || a!!.kids.len != b!!.kids.len || a!!.kids.len < 2 {
+            return false
+        }
+        return same_expr(a!!.kids.get(0) as *parse.Node?, b!!.kids.get(0) as *parse.Node?) &&
+            same_type(a!!.kids.get(1) as *parse.Node?, b!!.kids.get(1) as *parse.Node?)
+    }
+    if parse.is_type_tuple(a!!) {
+        if a!!.kids.len != b!!.kids.len {
+            return false
+        }
+        var i: usize = 0
+        for i < a!!.kids.len {
+            if !same_type(a!!.kids.get(i) as *parse.Node?, b!!.kids.get(i) as *parse.Node?) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    if parse.is_type_unit(a!!) {
+        return true
+    }
+    if parse.is_type_fn(a!!) {
+        return a!!.flag == b!!.flag
+    }
+    return false
+}
+
+private fn type_text(node: *parse.Node?, pack: bool): str with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    if pack {
+        b.append("...")
+    }
+    if node == null {
+        b.append("()")
+    } else if parse.is_type_name(node!!) {
+        if node!!.flag == "const" {
+            b.append("const ")
+        }
+        b.append(node!!.name)
+    } else if parse.is_type_ptr(node!!) {
+        b.append("*")
+        if node!!.flag == "const" {
+            b.append("const ")
+        }
+        if node!!.kids.len > 0 {
+            b.append(type_text(node!!.kids.get(0) as *parse.Node?, false))
+        }
+    } else if parse.is_type_slice(node!!) {
+        b.append("[]")
+        if node!!.flag == "const" {
+            b.append("const ")
+        }
+        if node!!.kids.len > 0 {
+            b.append(type_text(node!!.kids.get(0) as *parse.Node?, false))
+        }
+    } else if parse.is_type_option(node!!) {
+        if node!!.kids.len > 0 {
+            b.append(type_text(node!!.kids.get(0) as *parse.Node?, false))
+        }
+        b.append("?")
+    } else if parse.is_type_unit(node!!) {
+        b.append("()")
+    } else {
+        b.append("?")
+    }
+    val out = fs.copy_str(b.str())
+    b.free()
+    return out
+}
+
+private fn fn_shape_parts(node: *parse.Node): (i64, i64, bool, bool, bool, bool, i64, i64) {
+    val shape = node.head
+    val nparams = shape % 256
+    val nctx = (shape / 256) % 256
+    val has_recv = (shape / 65536) % 2 == 1
+    val has_ret = (shape / 131072) % 2 == 1
+    val has_body = (shape / 262144) % 2 == 1
+    val expr_body = (shape / 524288) % 2 == 1
+    val ntype = (shape / 1048576) % 256
+    val nattrs = (shape / 268435456) % 256
+    return nparams, nctx, has_recv, has_ret, has_body, expr_body, ntype, nattrs
+}
+
+private fn fn_param_name(param: *parse.Node): str {
+    return param.name
+}
+
+private fn fn_param_type(param: *parse.Node): *parse.Node? {
+    if param.kids.len == 0 {
+        return null
+    }
+    return param.kids.get(0) as *parse.Node?
+}
+
+private fn fn_param_pack(param: *parse.Node): bool {
+    return param.text == "pack"
+}
+
+private fn fn_layout(fndecl: *parse.Node): (i64, i64, i64, i64, *parse.Node?, *parse.Node?) {
+    val (nparams, nctx, has_recv, has_ret, _, _, ntype, nattrs) = fn_shape_parts(fndecl)
+    var i: i64 = nattrs
+    var recv: *parse.Node? = null
+    if has_recv {
+        recv = fndecl.kids.get(i as usize) as *parse.Node?
+        i = i + 1
+    }
+    i = i + ntype
+    val params_start = i
+    i = i + nparams + nctx
+    var ret: *parse.Node? = null
+    if has_ret {
+        ret = fndecl.kids.get(i as usize) as *parse.Node?
+    }
+    return params_start, nparams, nctx, ntype, recv, ret
+}
+
+private fn param_at(fndecl: *parse.Node, params_start: i64, index: i64): *parse.Node {
+    return fndecl.kids.get((params_start + index) as usize)
+}
+
+private fn signatures_differ(ck: *Check, file: str, expect: *parse.Node, actual: *parse.Node): bool with (a: mem.Allocator) {
+    val (eps, enp, enctx, ent, erecv, eret) = fn_layout(expect)
+    val (aps, anp, anctx, ant, arecv, aret) = fn_layout(actual)
+    if ent != ant {
+        var b = strbuilder.empty()
+        b.append("actual fn '")
+        b.append(fn_name(actual))
+        b.append("' does not match its expect: type parameter count differs")
+        plat_fail(ck, file, actual.line, plat_fn_col(actual), b.str())
+        b.free()
+        return true
+    }
+    if (erecv != null) != (arecv != null) || !same_type(erecv, arecv) {
+        var b = strbuilder.empty()
+        b.append("actual fn '")
+        b.append(fn_name(actual))
+        b.append("' does not match its expect: receiver differs")
+        plat_fail(ck, file, actual.line, plat_fn_col(actual), b.str())
+        b.free()
+        return true
+    }
+    if enp != anp {
+        var b = strbuilder.empty()
+        b.append("actual fn '")
+        b.append(fn_name(actual))
+        b.append("' does not match its expect: parameter count differs")
+        plat_fail(ck, file, actual.line, plat_fn_col(actual), b.str())
+        b.free()
+        return true
+    }
+    var pi: i64 = 0
+    for pi < enp {
+        val ep = param_at(expect, eps, pi)
+        val ap = param_at(actual, aps, pi)
+        if !same_text(fn_param_name(ep), fn_param_name(ap)) {
+            var b = strbuilder.empty()
+            b.append("actual fn '")
+            b.append(fn_name(actual))
+            b.append("' does not match its expect: parameter ")
+            b.append_int(pi + 1 as i64, 10)
+            b.append(" is named '")
+            b.append(fn_param_name(ap))
+            b.append("', expected '")
+            b.append(fn_param_name(ep))
+            b.append("'")
+            plat_fail(ck, file, actual.line, plat_fn_col(actual), b.str())
+            b.free()
+            return true
+        }
+        if fn_param_pack(ep) != fn_param_pack(ap) || !same_type(fn_param_type(ep), fn_param_type(ap)) {
+            val got = type_text(fn_param_type(ap), fn_param_pack(ap))
+            val want = type_text(fn_param_type(ep), fn_param_pack(ep))
+            var b = strbuilder.empty()
+            b.append("actual fn '")
+            b.append(fn_name(actual))
+            b.append("' does not match its expect: parameter ")
+            b.append_int(pi + 1 as i64, 10)
+            b.append(" is '")
+            b.append(got)
+            b.append("', expected '")
+            b.append(want)
+            b.append("'")
+            plat_fail(ck, file, actual.line, plat_fn_col(actual), b.str())
+            b.free()
+            fs.free_str(got)
+            fs.free_str(want)
+            return true
+        }
+        pi = pi + 1
+    }
+    val evar = parse.flag_has_word(expect.flag, "variadic")
+    val avar = parse.flag_has_word(actual.flag, "variadic")
+    if evar != avar {
+        var b = strbuilder.empty()
+        b.append("actual fn '")
+        b.append(fn_name(actual))
+        b.append("' does not match its expect: variadic mismatch")
+        plat_fail(ck, file, actual.line, plat_fn_col(actual), b.str())
+        b.free()
+        return true
+    }
+    if !same_type(aret, eret) {
+        val got = type_text(aret, false)
+        val want = type_text(eret, false)
+        var b = strbuilder.empty()
+        b.append("actual fn '")
+        b.append(fn_name(actual))
+        b.append("' does not match its expect: return type is '")
+        b.append(got)
+        b.append("', expected '")
+        b.append(want)
+        b.append("'")
+        plat_fail(ck, file, actual.line, plat_fn_col(actual), b.str())
+        b.free()
+        fs.free_str(got)
+        fs.free_str(want)
+        return true
+    }
+    if enctx != anctx {
+        var b = strbuilder.empty()
+        b.append("actual fn '")
+        b.append(fn_name(actual))
+        b.append("' does not match its expect: context count differs")
+        plat_fail(ck, file, actual.line, plat_fn_col(actual), b.str())
+        b.free()
+        return true
+    }
+    return false
+}
+
+private fn collect_fns(
+    source: load.SourceFile,
+    want_expect: bool,
+    nodes: *list.List<*parse.Node>,
+    files: *list.List<str>,
+) {
+    if source.ast == null {
+        return
+    }
+    for decl in source.ast!!.kids.items() {
+        if !parse.is_fn(decl) || parse.fn_has_receiver(decl) {
+            continue
+        }
+        if want_expect && parse.flag_has_word(decl.flag, "expect") {
+            nodes.push(decl)
+            files.push(source.path)
+        } else if !want_expect && parse.flag_has_word(decl.flag, "actual") {
+            nodes.push(decl)
+            files.push(source.path)
+        }
+    }
+}
+
+private fn place_file(ck: *Check, source: load.SourceFile) with (a: mem.Allocator) {
+    if source.ast == null {
+        return
+    }
+    val is_os = path_is_os(source.path)
+    for decl in source.ast!!.kids.items() {
+        if !parse.is_fn(decl) {
+            continue
+        }
+        if parse.flag_has_word(decl.flag, "expect") && is_os {
+            var b = strbuilder.empty()
+            b.append("expect fn '")
+            b.append(fn_name(decl))
+            b.append("' is only allowed in a file with no OS suffix")
+            plat_fail(ck, source.path, decl.line, plat_fn_col(decl), b.str())
+            b.free()
+        }
+        if parse.flag_has_word(decl.flag, "actual") && !is_os {
+            var b = strbuilder.empty()
+            b.append("actual fn '")
+            b.append(fn_name(decl))
+            b.append("' is only allowed in an OS-suffixed file")
+            plat_fail(ck, source.path, decl.line, plat_fn_col(decl), b.str())
+            b.free()
+        }
+    }
+}
+
+private fn expect_named(nodes: list.List<*parse.Node>, name: str): bool {
+    for n in nodes.items() {
+        if n.name == name {
+            return true
+        }
+    }
+    return false
+}
+
+private fn report_twice(
+    ck: *Check,
+    expect: *parse.Node,
+    expect_file: str,
+    os: str,
+    match_files: list.List<str>,
+) with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    b.append("expect fn '")
+    b.append(fn_name(expect))
+    b.append("' has ")
+    b.append_int(match_files.len as i64, 10)
+    b.append(" actuals for target '")
+    b.append(os)
+    b.append("' (")
+    var i: usize = 0
+    for mf in match_files.items() {
+        if i > 0 {
+            b.append(", ")
+        }
+        b.append(load.source_file_base(mf))
+        i = i + 1
+    }
+    b.append(")")
+    plat_fail(ck, expect_file, expect.line, plat_fn_col(expect), b.str())
+    b.free()
+}
+
+private fn check_target(
+    ck: *Check,
+    os: str,
+    sources: list.List<load.SourceFile>,
+    expect_nodes: list.List<*parse.Node>,
+    expect_files: list.List<str>,
+    compared: *list.List<*parse.Node>,
+) with (a: mem.Allocator) {
+    var actual_nodes = list.empty<*parse.Node>()
+    var actual_files = list.empty<str>()
+    for src in sources.items() {
+        collect_fns(src, false, &actual_nodes, &actual_files)
+    }
+    var ei: usize = 0
+    for ei < expect_nodes.len {
+        val expect = expect_nodes.get(ei)
+        val expect_file = expect_files.get(ei)
+        var match_files = list.empty<str>()
+        var ai: usize = 0
+        for ai < actual_nodes.len {
+            if actual_nodes.get(ai).name == expect.name {
+                match_files.push(actual_files.get(ai))
+            }
+            ai = ai + 1
+        }
+        if match_files.len == 0 {
+            var b = strbuilder.empty()
+            b.append("expect fn '")
+            b.append(fn_name(expect))
+            b.append("' has no actual for target '")
+            b.append(os)
+            b.append("'")
+            plat_fail(ck, expect_file, expect.line, plat_fn_col(expect), b.str())
+            b.free()
+        } else if match_files.len > 1 {
+            report_twice(ck, expect, expect_file, os, match_files)
+        } else {
+            var found: *parse.Node? = null
+            var found_file = ""
+            ai = 0
+            for ai < actual_nodes.len {
+                if actual_files.get(ai) == match_files.get(0) && actual_nodes.get(ai).name == expect.name {
+                    found = actual_nodes.get(ai) as *parse.Node?
+                    found_file = actual_files.get(ai)
+                    break
+                }
+                ai = ai + 1
+            }
+            if found != null {
+                var seen = false
+                for c in compared.items() {
+                    if (c as *u8) == (found!! as *u8) {
+                        seen = true
+                        break
+                    }
+                }
+                if !seen {
+                    compared.push(found!!)
+                    signatures_differ(ck, found_file, expect, found!!)
+                }
+            }
+        }
+        match_files.free()
+        ei = ei + 1
+    }
+    var ai2: usize = 0
+    for ai2 < actual_nodes.len {
+        val act = actual_nodes.get(ai2)
+        val act_file = actual_files.get(ai2)
+        if !expect_named(expect_nodes, act.name) {
+            var b = strbuilder.empty()
+            b.append("actual fn '")
+            b.append(fn_name(act))
+            b.append("' has no expect fn")
+            plat_fail(ck, act_file, act.line, plat_fn_col(act), b.str())
+            b.free()
+        }
+        ai2 = ai2 + 1
+    }
+    actual_nodes.free()
+    actual_files.free()
+}
+
+private fn sources_for_target(pkg: *load.Package, os: str): list.List<load.SourceFile> with (a: mem.Allocator) {
+    for group in pkg.target_groups.items() {
+        if group.os == os {
+            return group.files
+        }
+    }
+    var out = list.empty<load.SourceFile>()
+    for src in pkg.files.items() {
+        val tag = load.file_stem_os_tag(load.source_file_base(src.path))
+        if tag.len > 0 {
+            val (kept, _) = load.file_os_kept(load.source_file_base(src.path), os)
+            if kept {
+                out.push(src)
+            }
+        }
+    }
+    return out
+}
+
+private fn check_package_platform(ck: *Check, pkg: *load.Package) with (a: mem.Allocator) {
+    for src in pkg.files.items() {
+        place_file(ck, src)
+    }
+    for src in pkg.platform_files.items() {
+        place_file(ck, src)
+    }
+    var expect_nodes = list.empty<*parse.Node>()
+    var expect_files = list.empty<str>()
+    for src in pkg.files.items() {
+        if !core_file_path(src.path) {
+            continue
+        }
+        collect_fns(src, true, &expect_nodes, &expect_files)
+    }
+    var compared = list.empty<*parse.Node>()
+    if pkg.targets.len == 0 {
+        val os = load.host_os()
+        val files = sources_for_target(pkg, os)
+        check_target(ck, os, files, expect_nodes, expect_files, &compared)
+    } else {
+        for os in pkg.targets.items() {
+            val files = sources_for_target(pkg, os)
+            check_target(ck, os, files, expect_nodes, expect_files, &compared)
+        }
+    }
+    expect_nodes.free()
+    expect_files.free()
+    compared.free()
+}
+
+fn check_platform(ck: *Check): bool with (a: mem.Allocator) {
+    if ck.failed || ck.stop {
+        return false
+    }
+    for pkg in ck.prog.packages.items() {
+        check_package_platform(ck, pkg)
+    }
+    return !ck.failed
+}

@@ -1,0 +1,661 @@
+// Check jobs, go, park/wait, and declaration-cycle reports.
+// Checked against compiler/src/check.c (collect_jobs, run_jobs, wait_for_symbol).
+// CheckerGuide step 2. Scheduler is Jog coroutines (Roadmap).
+
+import src.load
+import src.parse
+import std.list
+import std.mem
+import std.strbuilder
+import std.text as texts
+
+/**
+ * One top-level declaration to type-check. Matches CheckJob in check_body.h.
+ */
+struct CheckJob {
+    decl: *parse.Node
+    pkg: *load.Package
+    file_index: usize
+    file: str
+    name: str
+    waiting_for: *CheckJob?
+    // Who on-demand-started this job on the same worker stack (null when a
+    // pool worker claimed it). Used to tell real cycles from "other worker
+    // is mid-check".
+    on_demand_caller: *CheckJob?
+    parked: bool
+    started: bool
+    done: bool
+    // Private-function context inference (check_context.c).
+    infer_contexts: bool
+    infer_collecting: bool
+    infer_solved: bool
+    infer_parked: bool
+    sig_ready: bool
+    infer_type_wait: bool
+    infer_state: *InferState?
+    ctx_stack: *CtxLevel?
+    inferred_contexts: list.List<*Type>
+    infer_chains: list.List<str>
+    // go body returns (check_coro.c): bare return is the Task result, not the
+    // enclosing function's return type.
+    in_go: bool
+    go_ret_set: bool
+    go_ret: *Type?
+}
+
+/**
+ * Checker state for the coroutine scheduler. Matches Check in check_body.h.
+ */
+struct CoroInst {
+    kind: i32
+    elem: *Type
+    typ: *Type
+}
+
+struct Check {
+    prog: load.Program
+    types: TypeTable
+    jobs: list.List<*CheckJob>
+    failed: bool
+    stop: bool
+    current: *CheckJob?
+    // When true, resolve_type may return a type-set interface (constraints).
+    allow_typeset: bool
+    // Cached Chan<T> / Task<T> instances (check_coro.c).
+    coro_insts: list.List<CoroInst>
+    // Self-alias on-demand cycles deferred so other decls' first errors match stage0.
+    deferred_cycles: list.List<usize>
+}
+
+private fn is_scheduled(node: *parse.Node): bool {
+    return parse.is_fn(node) || parse.is_var(node) || parse.is_val(node) || parse.is_context(node) ||
+        parse.is_type_decl(node) || parse.is_struct(node) || parse.is_interface(node) || parse.is_enum(node)
+}
+
+private fn job_name(job: *CheckJob): str {
+    if job.name.len > 0 {
+        return job.name
+    }
+    return "?"
+}
+
+private fn first_binding_name(node: *parse.Node): str {
+    if node.name.len > 0 {
+        return node.name
+    }
+    if node.text.len == 0 {
+        return ""
+    }
+    var i: usize = 0
+    for i < node.text.len {
+        if node.text.ptr[i] == ' ' as u8 {
+            return texts.slice(node.text, 0, i)
+        }
+        i = i + 1
+    }
+    return node.text
+}
+
+private fn alloc_job(
+    decl: *parse.Node,
+    pkg: *load.Package,
+    file_index: usize,
+    file: str,
+    name: str,
+): *CheckJob with (a: mem.Allocator) {
+    val (raw, err) = a.alloc(size(CheckJob), align(CheckJob))
+    if err != null {
+        panic("out of memory")
+    }
+    val job = raw.ptr as *CheckJob
+    job.decl = decl
+    job.pkg = pkg
+    job.file_index = file_index
+    job.file = file
+    job.name = name
+    job.waiting_for = null
+    job.on_demand_caller = null
+    job.parked = false
+    job.started = false
+    job.done = false
+    job.infer_contexts = false
+    job.infer_collecting = false
+    job.infer_solved = false
+    job.infer_parked = false
+    job.sig_ready = false
+    job.infer_type_wait = false
+    job.infer_state = null
+    job.ctx_stack = null
+    job.inferred_contexts = list.empty<*Type>()
+    job.infer_chains = list.empty<str>()
+    job.in_go = false
+    job.go_ret_set = false
+    job.go_ret = null
+    return job
+}
+
+private fn push_job(ck: *Check, pkg: *load.Package, file_index: usize, file: str, node: *parse.Node) with (a: mem.Allocator) {
+    var name = node.name
+    if parse.is_val(node) || parse.is_var(node) || parse.is_context(node) {
+        name = first_binding_name(node)
+    }
+    if name.len == 0 && !parse.is_fn(node) {
+        return
+    }
+    ck.jobs.push(alloc_job(node, pkg, file_index, file, name))
+}
+
+private fn schedule_node(ck: *Check, pkg: *load.Package, file_index: usize, file: str, node: *parse.Node) with (a: mem.Allocator) {
+    if parse.is_extern_block(node) {
+        for kid in node.kids.items() {
+            schedule_node(ck, pkg, file_index, file, kid)
+        }
+        return
+    }
+    if !is_scheduled(node) {
+        return
+    }
+    // Methods and free functions both get a job; expect without a body still does.
+    push_job(ck, pkg, file_index, file, node)
+}
+
+/**
+ * Build one job per top-level declaration that needs checking.
+ * @param ck checker
+ * @context a allocator for jobs
+ * @return false when collection failed
+ */
+fn collect_jobs(ck: *Check): bool with (a: mem.Allocator) {
+    var n: usize = 0
+    for pkg in ck.prog.packages.items() {
+        var fi: usize = 0
+        for fi < pkg.files.len {
+            val source = pkg.files.get(fi)
+            if source.ast == null {
+                fi = fi + 1
+                continue
+            }
+            val file_node = source.ast!!
+            for kid in file_node.kids.items() {
+                schedule_node(ck, pkg, fi, source.path, kid)
+                n = n + 1
+                if n % 64 == 0 {
+                    yield()
+                }
+            }
+            fi = fi + 1
+        }
+    }
+    return !ck.failed
+}
+
+private fn job_index(ck: *Check, job: *CheckJob): usize {
+    var i: usize = 0
+    for i < ck.jobs.len {
+        if ck.jobs.get(i) == job {
+            return i
+        }
+        i = i + 1
+    }
+    return ck.jobs.len
+}
+
+/**
+ * Find the job that publishes a symbol, or null when the name has no job
+ * (builtin, or not a top-level declaration).
+ * @param ck checker
+ * @param symbol resolved symbol
+ * @return the job, or null
+ */
+fn job_for_symbol(ck: *Check, symbol: *load.Symbol): *CheckJob? {
+    if symbol.decl == null {
+        return null
+    }
+    val decl = symbol.decl!!
+    for job in ck.jobs.items() {
+        if job.decl == decl {
+            return job as *CheckJob?
+        }
+    }
+    return null
+}
+
+/**
+ * Mark a job finished without publishing a type. Prefer finish_job_typed
+ * once the declaration has a *Type.
+ * @param job the job
+ */
+fn finish_job(job: *CheckJob) {
+    finish_job_typed(job, null)
+}
+
+/**
+ * Park the current job until other's job is done. until_done is the layout
+ * wait; when false, a struct/enum/interface may use another nominal's
+ * identity early (step 3 fills that). Returns false when the checker stopped.
+ * @param ck checker
+ * @param self current job
+ * @param symbol symbol to wait on
+ * @param until_done true to wait until the other job has finished
+ * @return false when stopped or the other job did not finish
+ */
+fn wait_for_symbol(ck: *Check, self: *CheckJob, symbol: *load.Symbol, until_done: bool): bool with (a: mem.Allocator) {
+    if ck.stop {
+        return false
+    }
+    val other = job_for_symbol(ck, symbol)
+    if other == null {
+        return !ck.stop
+    }
+    val o = other!!
+    // The job already running cannot wait for itself (context inference walks
+    // the body before finish_job_typed publishes done). A type alias that
+    // names itself before publishing is a real cycle — defer and fail the wait
+    // so resolve returns quietly and the cycle is reported last.
+    if o == self {
+        if get_sema(symbol) == null && parse.is_type_decl(self.decl) {
+            val idx = job_index(ck, o)
+            var seen = false
+            for d in ck.deferred_cycles.items() {
+                if d == idx {
+                    seen = true
+                    break
+                }
+            }
+            if !seen {
+                ck.deferred_cycles.push(idx)
+            }
+            return false
+        }
+        return !ck.stop
+    }
+    if o.done {
+        return !ck.stop
+    }
+    // A struct/enum/interface may use another nominal's identity before
+    // fields finish. until_done is the layout wait.
+    if !until_done {
+        val ty = symbol.sema
+        if ty != null && symbol.decl != null && o.decl == symbol.decl!! {
+            val t = ty!! as *Type
+            if t.kind == TypeKind.STRUCT && parse.is_struct(self.decl) {
+                return !ck.stop
+            }
+            if t.kind == TypeKind.ENUM && parse.is_enum(self.decl) {
+                return !ck.stop
+            }
+            if t.kind == TypeKind.INTERFACE && parse.is_interface(self.decl) {
+                return !ck.stop
+            }
+        }
+    }
+    // Worker pool: run an unstarted callee on this stack (on-demand). If it
+    // is already running, park — unless it is an on-demand ancestor on this
+    // same stack (real cycle). "Started but not parked" alone is not a
+    // cycle: another pool worker may be mid-check.
+    //
+    // Mark self parked while on-demand runs so a third job waiting on self
+    // can form a visible wait chain (otherwise self is stuck in a sync call
+    // and blocked() never fires → "declaration check did not finish").
+    if !o.started {
+        self.waiting_for = other
+        self.parked = true
+        o.on_demand_caller = self as *CheckJob?
+        run_job(ck, o, a)
+        o.on_demand_caller = null
+        self.parked = false
+        self.waiting_for = null
+        if o.done || ck.stop {
+            return !ck.stop && o.done
+        }
+        // Another worker claimed it between our check and run_job — wait.
+    } else {
+        var frame: *CheckJob? = self as *CheckJob?
+        for frame != null {
+            if frame!! == o {
+                // Defer: stage0 reports the cycle last; emitting now skews
+                // first-error position for err_generic_alias.
+                val idx = job_index(ck, o)
+                var seen = false
+                for d in ck.deferred_cycles.items() {
+                    if d == idx {
+                        seen = true
+                        break
+                    }
+                }
+                if !seen {
+                    ck.deferred_cycles.push(idx)
+                }
+                // Do not set stop: other decls still need their errors.
+                return false
+            }
+            frame = frame!!.on_demand_caller
+        }
+    }
+    self.waiting_for = other
+    self.parked = true
+    for !o.done && !ck.stop {
+        yield()
+        ck.current = self as *CheckJob?
+    }
+    self.parked = false
+    self.waiting_for = null
+    return !ck.stop && o.done
+}
+
+/**
+ * Wait until the symbol's job has finished (no identity early-out).
+ * @param ck checker
+ * @param self current job
+ * @param symbol symbol to wait on
+ * @return false when stopped
+ */
+fn wait_for_symbol_finished(ck: *Check, self: *CheckJob, symbol: *load.Symbol): bool with (a: mem.Allocator) {
+    return wait_for_symbol(ck, self, symbol, true)
+}
+
+private fn report_cycle(ck: *Check, idxs: list.List<usize>) with (a: mem.Allocator) {
+    if idxs.len == 0 {
+        return
+    }
+    // Deduplicate while preserving order (self-wait is [i, i] → "Name -> Name").
+    var uniq = list.empty<usize>()
+    var i: usize = 0
+    for i < idxs.len {
+        val at = idxs.get(i)
+        var seen = false
+        var u: usize = 0
+        for u < uniq.len {
+            if uniq.get(u) == at {
+                seen = true
+                break
+            }
+            u = u + 1
+        }
+        if !seen {
+            uniq.push(at)
+        }
+        i = i + 1
+    }
+    var best: usize = 0
+    i = 1
+    for i < uniq.len {
+        if uniq.get(i) < uniq.get(best) {
+            best = i
+        }
+        i = i + 1
+    }
+    var b = strbuilder.empty()
+    b.append("declaration cycle: ")
+    i = 0
+    for i < uniq.len {
+        if i > 0 {
+            b.append(" -> ")
+        }
+        val at = uniq.get((best + i) % uniq.len)
+        b.append(job_name(ck.jobs.get(at)))
+        i = i + 1
+    }
+    b.append(" -> ")
+    val first = ck.jobs.get(uniq.get(best))
+    b.append(job_name(first))
+    load.print_pos_error(first.file, first.decl.line, first.decl.column, b.str())
+    b.free()
+    ck.failed = true
+}
+
+private fn color_at(color: list.List<u8>, i: usize): u8 {
+    if i >= color.len {
+        return 0
+    }
+    return color.get(i)
+}
+
+private fn color_set_black(color: list.List<u8>, path: list.List<usize>, n: usize): list.List<u8> with (a: mem.Allocator) {
+    var marked = list.empty<u8>()
+    var ci: usize = 0
+    for ci < n {
+        var bit: u8 = color_at(color, ci)
+        var pk: usize = 0
+        for pk < path.len {
+            if path.get(pk) == ci {
+                bit = 2
+                break
+            }
+            pk = pk + 1
+        }
+        marked.push(bit)
+        ci = ci + 1
+    }
+    return marked
+}
+
+private fn report_wait_cycles(ck: *Check) with (a: mem.Allocator) {
+    val n = ck.jobs.len
+    if n == 0 {
+        return
+    }
+    var color = list.empty<u8>()
+    var i: usize = 0
+    for i < n {
+        color.push(0)
+        i = i + 1
+    }
+    i = 0
+    for i < n {
+        if color_at(color, i) != 0 {
+            i = i + 1
+            continue
+        }
+        val job = ck.jobs.get(i)
+        if job.done || !job.parked || job.waiting_for == null {
+            i = i + 1
+            continue
+        }
+        var path = list.empty<usize>()
+        var at = i
+        var guard: usize = 0
+        for guard <= n {
+            guard = guard + 1
+            if at >= n || color_at(color, at) == 2 {
+                break
+            }
+            var found = n
+            var k: usize = 0
+            for k < path.len {
+                if path.get(k) == at {
+                    found = k
+                    break
+                }
+                k = k + 1
+            }
+            if found < n {
+                var cycle = list.empty<usize>()
+                k = found
+                for k < path.len {
+                    cycle.push(path.get(k))
+                    k = k + 1
+                }
+                report_cycle(ck, cycle)
+                break
+            }
+            if path.len >= n {
+                break
+            }
+            path.push(at)
+            val next = ck.jobs.get(at).waiting_for
+            if next == null || next!!.done {
+                break
+            }
+            at = job_index(ck, next!!)
+        }
+        color = color_set_black(color, path, n)
+        i = i + 1
+    }
+}
+
+private fn blocked(ck: *Check): bool {
+    var any = false
+    for job in ck.jobs.items() {
+        if job.done {
+            continue
+        }
+        any = true
+        if !job.parked || job.waiting_for == null || job.waiting_for!!.done {
+            return false
+        }
+    }
+    return any
+}
+
+private fn all_done(ck: *Check): bool {
+    for job in ck.jobs.items() {
+        if !job.done {
+            return false
+        }
+    }
+    return true
+}
+
+/**
+ * Type one declaration. Step 3 handles type decls and top-level bindings;
+ * other kinds finish without a type until later steps.
+ * @param ck checker
+ * @param job the job
+ * @context a allocator for types
+ */
+private fn check_decl(ck: *Check, job: *CheckJob, stack: mem.Allocator) {
+    check_decl_types(ck, job) with (stack)
+}
+
+private fn run_job(ck: *Check, job: *CheckJob, stack: mem.Allocator) {
+    if job.started || job.done {
+        return
+    }
+    job.started = true
+    ck.current = job as *CheckJob?
+    if !ck.stop {
+        check_decl(ck, job, stack)
+    }
+    if !job.done {
+        finish_job_typed(job, type_error(&ck.types))
+    }
+}
+
+/**
+ * Launch one coroutine per job inside a scope, with a watchdog that
+ * reports declaration cycles when every live job is parked.
+ * @param ck checker
+ * @context a allocator for coroutine stacks and diagnostics
+ * @return false when a cycle or other failure was reported
+ */
+fn run_jobs(ck: *Check): bool with (a: mem.Allocator) {
+    // C launches one coroutine per job. Jog's default stacks are 256 KiB, so
+    // one go per decl OOMs on a full module, and nested on-demand waits on a
+    // 256 KiB worker overflow (ACCESS_VIOLATION) when checking JogCompiler.
+    // Fixed worker pool with 1 MiB stacks; wait_for_symbol still parks with
+    // yield (needed for context inference). Capture the allocator in a local:
+    // `go with (a)` on a context parameter fails with "global values are not
+    // lowered yet".
+    val stack = a
+    var next_i: usize = 0
+    var workers_left: usize = 8
+    if ck.jobs.len < workers_left {
+        workers_left = ck.jobs.len
+    }
+    if workers_left == 0 {
+        return !ck.failed
+    }
+    val nworkers = workers_left
+    val worker_stack: usize = 1 << 20
+    scope {
+        go(stack: worker_stack) with (stack) {
+            var idle: usize = 0
+            var last_done: usize = 0
+            for {
+                yield()
+                if ck.stop {
+                    return
+                }
+                if all_done(ck) {
+                    return
+                }
+                if blocked(ck) {
+                    report_wait_cycles(ck) with (stack)
+                    ck.stop = true
+                    return
+                }
+                var done: usize = 0
+                for job in ck.jobs.items() {
+                    if job.done {
+                        done = done + 1
+                    }
+                }
+                if done == last_done {
+                    idle = idle + 1
+                } else {
+                    idle = 0
+                    last_done = done
+                }
+                if idle > ck.jobs.len + 32 {
+                    load.print_bare_error("declaration check did not finish")
+                    ck.failed = true
+                    ck.stop = true
+                    return
+                }
+            }
+        }
+        var w: usize = 0
+        for w < nworkers {
+            go(stack: worker_stack) with (stack) {
+                for {
+                    if ck.stop {
+                        return
+                    }
+                    if next_i >= ck.jobs.len {
+                        return
+                    }
+                    val i = next_i
+                    next_i = next_i + 1
+                    run_job(ck, ck.jobs.get(i), stack)
+                    yield()
+                }
+            }
+            w = w + 1
+        }
+    }
+    // Flush deferred self-alias cycles after other jobs have reported.
+    if ck.deferred_cycles.len > 0 {
+        for idx in ck.deferred_cycles.items() {
+            var cycle = list.empty<usize>()
+            cycle.push(idx)
+            cycle.push(idx)
+            report_cycle(ck, cycle) with (a)
+        }
+        ck.deferred_cycles = list.empty<usize>()
+    }
+    return !ck.failed
+}
+
+/**
+ * Create checker state for a loaded program.
+ * @param prog loaded packages
+ * @param ptr_size 8 on x64, 4 on wasm32
+ * @context a allocator for the type table
+ * @return a checker ready for collect_jobs
+ */
+fn check_new(prog: load.Program, ptr_size: u32): Check with (a: mem.Allocator) {
+    var ck: Check
+    ck.prog = prog
+    ck.types = type_table_create(ptr_size)
+    ck.jobs = list.empty<*CheckJob>()
+    ck.failed = false
+    ck.stop = false
+    ck.current = null
+    ck.allow_typeset = false
+    ck.coro_insts = list.empty<CoroInst>()
+    ck.deferred_cycles = list.empty<usize>()
+    attach_universe_types(&ck)
+    return ck
+}

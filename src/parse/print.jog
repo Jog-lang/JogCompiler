@@ -27,25 +27,21 @@ fn print_quoted(s: str) {
     var i: usize = 0
     for i < s.len {
         val c = s.ptr[i]
-        if c == '\n' as u8 {
-            io.print("\\n")
-        } else if c == '\t' as u8 {
-            io.print("\\t")
-        } else if c == '\r' as u8 {
-            io.print("\\r")
-        } else if c == '\\' as u8 {
-            io.print("\\\\")
-        } else if c == '"' as u8 {
-            io.print("\\\"")
-        } else if c < 32 || c == 127 {
-            val n = c as i64
-            val hi = (n / 16) as usize
-            val lo = (n % 16) as usize
-            io.print("\\x")
-            io.print(text.slice(digits, hi, hi + 1))
-            io.print(text.slice(digits, lo, lo + 1))
-        } else {
-            io.print(text.slice(s, i, i + 1))
+        when {
+            c == '\n' as u8 -> io.print("\\n")
+            c == '\t' as u8 -> io.print("\\t")
+            c == '\r' as u8 -> io.print("\\r")
+            c == '\\' as u8 -> io.print("\\\\")
+            c == '"' as u8 -> io.print("\\\"")
+            c < 32 || c == 127 -> {
+                val n = c as i64
+                val hi = (n / 16) as usize
+                val lo = (n % 16) as usize
+                io.print("\\x")
+                io.print(text.slice(digits, hi, hi + 1))
+                io.print(text.slice(digits, lo, lo + 1))
+            }
+            else -> io.print(text.slice(s, i, i + 1))
         }
         i = i + 1
     }
@@ -754,9 +750,7 @@ fn print_node(node: *Node, ind: i64) {
         io.print(")")
         return
         }
-        else -> {}
-    }
-    if node.kind == NodeKind.TYPE_FN {
+        TYPE_FN -> {
         if node.flag.len > 0 {
             io.print(" ")
             io.print(node.flag)
@@ -790,10 +784,30 @@ fn print_node(node: *Node, ind: i64) {
         print_indent(ind)
         io.print(")")
         return
-    }
-    if node.kind == NodeKind.TYPE_ARRAY && node.name.len > 0 {
-        io.print(" ")
-        io.print(node.name)
+        }
+        TYPE_ARRAY -> {
+        if node.name.len > 0 {
+            io.print(" ")
+            io.print(node.name)
+        }
+        if node.flag.len > 0 {
+            io.print(" ")
+            io.print(node.flag)
+        }
+        if node.kids.len == 0 {
+            io.print(")")
+            return
+        }
+        for kid in node.kids.items() {
+            io.print("\n")
+            print_node(kid, ind + 1)
+        }
+        io.print("\n")
+        print_indent(ind)
+        io.print(")")
+        return
+        }
+        else -> {}
     }
     if node.flag.len > 0 {
         io.print(" ")
@@ -803,11 +817,9 @@ fn print_node(node: *Node, ind: i64) {
         io.print(")")
         return
     }
-    var i: usize = 0
-    for i < node.kids.len {
+    for kid in node.kids.items() {
         io.print("\n")
-        print_node(node.kids.get(i), ind + 1)
-        i = i + 1
+        print_node(kid, ind + 1)
     }
     io.print("\n")
     print_indent(ind)
