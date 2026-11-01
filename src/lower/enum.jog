@@ -1,0 +1,2231 @@
+// Enum / when / option sugar. Checked against compiler/src/lower_enum.c.
+// LowerGuide step 9.
+
+import src.check
+import src.ir
+import src.load
+import src.parse
+import std.list
+import std.mem
+import std.text as texts
+
+private fn peel(ty: *check.Type?): *check.Type? {
+    if ty == null {
+        return null
+    }
+    return check.type_peel_distinct(ty!!) as *check.Type?
+}
+
+private fn is_unit_ty(ty: *check.Type?): bool {
+    if ty == null {
+        return true
+    }
+    return ty!!.kind == check.type_kinds().UNIT
+}
+
+private fn bool_ty(L: *Lower): *check.Type? {
+    return check.type_bool(L.types) as *check.Type?
+}
+
+private fn emit_cmp(L: *Lower, op: ir.BinOp, lhs: ir.Operand, rhs: ir.Operand, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    return emit_binop(L, op, false, lhs, rhs, bool_ty(L), pos)
+}
+
+private fn enum_tag_of(L: *Lower, value: ir.Operand, en: *check.Type, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    var tag = en.elem
+    if tag == null {
+        fail(L, null, "enum is missing a tag type")
+        return none_value()
+    }
+    val src = as_local(L, value, pos)
+    val dst = new_local(L, "", tag)
+    val inst = emit_inst(L, ir.op_kinds().ENUM_TAG, dst as i32, pos)
+    if inst != null {
+        inst!!.a = src
+    }
+    return local_operand(L, dst)
+}
+
+private fn enum_fields_eq(
+    L: *Lower,
+    lhs: ir.Operand,
+    rhs: ir.Operand,
+    en: *check.Type,
+    variant_index: usize,
+    pos: ir.Pos,
+): ir.Operand with (a: mem.Allocator) {
+    val boolean = bool_ty(L)
+    val v = check.type_variant_at(en, variant_index)
+    val acc = new_local(L, "", boolean)
+    emit_copy(L, acc, ir.int_op(boolean, 1), pos)
+    var lhs_l = lhs
+    var rhs_l = rhs
+    var f: usize = 0
+    for f < v.field_count {
+        val fld = check.type_variant_field_at(en, v, f)
+        val field = fld.field_type
+        if is_unit_ty(field) {
+            f = f + 1
+            continue
+        }
+        if field == null {
+            fail(L, null, "enum payload is not comparable")
+            return none_value()
+        }
+        lhs_l = as_local(L, lhs_l, pos)
+        rhs_l = as_local(L, rhs_l, pos)
+        val aux2 = (variant_index + 1) as u32
+        val left = emit_extract_aux(L, lhs_l, f as u32, aux2, field, pos)
+        val right = emit_extract_aux(L, rhs_l, f as u32, aux2, field, pos)
+        val under = check.type_peel_distinct(field!!)
+        var eq = none_value()
+        if under.kind == check.type_kinds().ENUM {
+            eq = lower_enum_eq(L, left, right, false, pos)
+        } else if check.type_bytes_view(field!!) != null {
+            eq = lower_bytes_cmp(L, left, right, false, pos)
+        } else if under.kind == check.type_kinds().INT || under.kind == check.type_kinds().BOOL ||
+            under.kind == check.type_kinds().FLOAT {
+            eq = emit_cmp(L, ir.bin_ops().EQ, left, right, pos)
+        } else {
+            fail(L, null, "enum payload is not comparable")
+            return none_value()
+        }
+        if L.failed {
+            return none_value()
+        }
+        val both = emit_binop(L, ir.bin_ops().AND, false, local_operand(L, acc), eq, boolean, pos)
+        emit_copy(L, acc, both, pos)
+        f = f + 1
+    }
+    return local_operand(L, acc)
+}
+
+fn lower_enum_eq(L: *Lower, lhs_in: ir.Operand, rhs_in: ir.Operand, negate: bool, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    if L.failed {
+        return none_value()
+    }
+    if lhs_in.ty == null {
+        fail(L, null, "enum comparison is missing a type")
+        return none_value()
+    }
+    val en = check.type_peel_distinct(lhs_in.ty!!)
+    val boolean = bool_ty(L)
+    if en.kind != check.type_kinds().ENUM || en.elem == null || boolean == null {
+        fail(L, null, "enum comparison is missing a type")
+        return none_value()
+    }
+    val tag_ty = en.elem
+    val lhs = as_local(L, lhs_in, pos)
+    val rhs = as_local(L, rhs_in, pos)
+    val ltag = enum_tag_of(L, lhs, en, pos)
+    val rtag = enum_tag_of(L, rhs, en, pos)
+    val tags_eq = emit_cmp(L, ir.bin_ops().EQ, ltag, rtag, pos)
+    var any_payload = false
+    var i: usize = 0
+    val n = check.type_variant_count(en)
+    for i < n {
+        if !payload_free_variant(en, i) {
+            any_payload = true
+        }
+        i = i + 1
+    }
+    if !any_payload {
+        if !negate {
+            return tags_eq
+        }
+        return emit_unop(L, ir.un_ops().NOT, false, tags_eq, boolean, pos)
+    }
+    val result = new_local(L, "", boolean)
+    emit_copy(L, result, ir.int_op(boolean, 0), pos)
+    val payload = new_block(L, "enum.eq.pay")
+    val mismatch = new_block(L, "enum.eq.miss")
+    val join = new_block(L, "enum.eq.join")
+    emit_cond(L, tags_eq, payload, mismatch, pos)
+    use_block(L, mismatch)
+    emit_br(L, join, pos)
+    use_block(L, payload)
+    i = 0
+    for i < n {
+        val last = i + 1 == n
+        if !last {
+            val match_b = new_block(L, "enum.eq.var")
+            val next = new_block(L, "enum.eq.next")
+            val want = check.type_variant_at(en, i).tag
+            val is_var = emit_cmp(L, ir.bin_ops().EQ, ltag, ir.int_op(tag_ty, want as i64), pos)
+            emit_cond(L, is_var, match_b, next, pos)
+            use_block(L, match_b)
+            val fields = enum_fields_eq(L, lhs, rhs, en, i, pos)
+            if L.failed {
+                return none_value()
+            }
+            emit_copy(L, result, fields, pos)
+            emit_br(L, join, pos)
+            use_block(L, next)
+        } else {
+            val fields = enum_fields_eq(L, lhs, rhs, en, i, pos)
+            if L.failed {
+                return none_value()
+            }
+            emit_copy(L, result, fields, pos)
+            emit_br(L, join, pos)
+        }
+        i = i + 1
+    }
+    if !L.terminated {
+        emit_br(L, join, pos)
+    }
+    use_block(L, join)
+    if negate {
+        return emit_unop(L, ir.un_ops().NOT, false, local_operand(L, result), boolean, pos)
+    }
+    return local_operand(L, result)
+}
+
+private fn make_enum(L: *Lower, ty: *check.Type?, index: u32, args: list.List<ir.Operand>, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    return emit_aggregate_aux(L, ty, index, args, pos)
+}
+
+private fn payload_free_variant(en: *check.Type, index: usize): bool {
+    val v = check.type_variant_at(en, index)
+    var fi: usize = 0
+    for fi < v.field_count {
+        val fld = check.type_variant_field_at(en, v, fi)
+        if !is_unit_ty(fld.field_type) {
+            return false
+        }
+        fi = fi + 1
+    }
+    return true
+}
+
+private fn variant_index_by_sym(en: *check.Type?, sym: *load.Symbol?): i64 {
+    if en == null || sym == null || en!!.kind != check.type_kinds().ENUM {
+        return -1
+    }
+    var i: usize = 0
+    val n = check.type_variant_count(en!!)
+    for i < n {
+        val v = check.type_variant_at(en!!, i)
+        if v.name == sym!!.name {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+private fn variant_index_by_name(en: *check.Type?, name: str): i64 {
+    if en == null || name.len == 0 || en!!.kind != check.type_kinds().ENUM {
+        return -1
+    }
+    var i: usize = 0
+    val n = check.type_variant_count(en!!)
+    for i < n {
+        if check.type_variant_at(en!!, i).name == name {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+/** T → T? (C wrap_option_some). */
+fn wrap_option_some(L: *Lower, value: ir.Operand, opt: *check.Type, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    if check.type_option_is_niche(opt) {
+        return emit_bitcast(L, value, opt as *check.Type?, pos)
+    }
+    var args = list.empty<ir.Operand>()
+    args.push(ir.int_op(bool_ty(L), 1))
+    args.push(value)
+    return emit_aggregate(L, opt as *check.Type?, args, pos)
+}
+
+/** Option None (niche null or (false, zero)). */
+fn option_none_value(L: *Lower, opt: *check.Type?, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    if opt == null {
+        return none_value()
+    }
+    val peeled = peel(opt)
+    if peeled == null || peeled!!.kind != check.type_kinds().OPTION {
+        return none_value()
+    }
+    if check.type_option_is_niche(peeled!!) {
+        return ir.null_op(opt)
+    }
+    val elem = peeled!!.elem
+    // C: allocate option dst, then zero payload local, then aggregate (dst before zero).
+    val dst = new_local(L, "", opt)
+    val zero_l = new_local(L, "", elem)
+    val zinst = emit_inst(L, ir.op_kinds().ZERO, zero_l as i32, pos)
+    var args = list.empty<ir.Operand>()
+    args.push(ir.int_op(bool_ty(L), 0))
+    args.push(local_operand(L, zero_l))
+    val inst = emit_inst(L, ir.op_kinds().AGGREGATE, dst as i32, pos)
+    if inst != null {
+        ir.set_args(inst!!, args)
+    }
+    return local_operand(L, dst)
+}
+
+/** `.Some` / `.None` / `Option.Some` / `Option.None` name. */
+private fn option_ctor_name(node: *parse.Node): (str, bool) {
+    if parse.is_dot_variant(node) {
+        var nm = node.name
+        if nm.len == 0 {
+            nm = node.text
+        }
+        if nm.len > 0 {
+            return nm, true
+        }
+    }
+    if parse.is_member(node) && node.kids.len > 0 {
+        val base = node.kids.get(0)
+        var bname = base.name
+        if bname.len == 0 {
+            bname = base.text
+        }
+        if parse.is_ident(base) && bname == "Option" {
+            return node.name, true
+        }
+    }
+    return "", false
+}
+
+/** Bare `.None` / `Option.None` (C lower_option_ctor). */
+fn lower_option_ctor(L: *Lower, node: *parse.Node): (ir.Operand, bool) with (a: mem.Allocator) {
+    val (name, ok) = option_ctor_name(node)
+    if !ok {
+        return none_value(), false
+    }
+    var ty = check.get_node_ty(node)
+    ty = lower_type_subst(L, ty)
+    val peeled = peel(ty)
+    if peeled == null || peeled!!.kind != check.type_kinds().OPTION {
+        return none_value(), false
+    }
+    if name == "None" {
+        return option_none_value(L, ty, node_pos(L, node)), true
+    }
+    if name == "Some" {
+        fail(L, node, "variant 'Some' needs arguments")
+        return none_value(), true
+    }
+    return none_value(), false
+}
+
+/** `.Some(v)` / `Option.Some(v:)` / `.None()` (C lower_option_ctor_call). */
+fn lower_option_ctor_call(L: *Lower, node: *parse.Node): (ir.Operand, bool) with (a: mem.Allocator) {
+    if node.kids.len == 0 {
+        return none_value(), false
+    }
+    val callee = node.kids.get(0)
+    val (name, ok) = option_ctor_name(callee)
+    if !ok {
+        return none_value(), false
+    }
+    var ty = check.get_node_ty(node)
+    ty = lower_type_subst(L, ty)
+    val peeled = peel(ty)
+    if peeled == null || peeled!!.kind != check.type_kinds().OPTION {
+        return none_value(), false
+    }
+    if name == "None" {
+        return option_none_value(L, ty, node_pos(L, node)), true
+    }
+    if name != "Some" {
+        return none_value(), false
+    }
+    val arg_end = parse.call_arg_end(node)
+    if arg_end != 2 {
+        fail(L, node, "variant 'Some' takes one argument")
+        return none_value(), true
+    }
+    val arg = node.kids.get(1)
+    var value_node = arg
+    if parse.is_arg(arg) && arg.kids.len > 0 {
+        value_node = arg.kids.get(0)
+    }
+    val inner = lower_expr(L, value_node)
+    if L.failed {
+        return none_value(), true
+    }
+    return wrap_option_some(L, inner, ty!!, node_pos(L, node)), true
+}
+
+private fn option_is_some(L: *Lower, opt: ir.Operand, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    val opt_ty = peel(opt.ty)
+    if opt_ty != null && opt_ty!!.kind == check.type_kinds().OPTION && check.type_option_is_niche(opt_ty!!) {
+        return emit_cmp(L, ir.bin_ops().NE, opt, ir.null_op(opt.ty), pos)
+    }
+    return emit_extract(L, opt, 0, bool_ty(L), pos)
+}
+
+private fn option_value(L: *Lower, opt: ir.Operand, inner: *check.Type?, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    if inner == null {
+        fail(L, null, "lowering is missing a type")
+        return none_value()
+    }
+    val opt_ty = peel(opt.ty)
+    if opt_ty != null && opt_ty!!.kind == check.type_kinds().OPTION && check.type_option_is_niche(opt_ty!!) {
+        val dst = new_local(L, "", inner)
+        emit_copy(L, dst, opt, pos)
+        return local_operand(L, dst)
+    }
+    return emit_extract(L, opt, 1, inner, pos)
+}
+
+fn lower_enum_force(L: *Lower, node: *parse.Node): ir.Operand with (a: mem.Allocator) {
+    if node.kids.len == 0 {
+        return none_value()
+    }
+    val pos = node_pos(L, node)
+    val opt = as_local(L, lower_expr(L, node.kids.get(0)), pos)
+    if L.failed || L.terminated {
+        return none_value()
+    }
+    val ty = peel(opt.ty)
+    var inner: *check.Type? = null
+    if ty != null && ty!!.kind == check.type_kinds().OPTION {
+        inner = ty!!.elem
+    }
+    val inst = emit_inst(L, ir.op_kinds().NULL_CHECK, -1, pos)
+    if inst != null {
+        inst!!.a = opt
+    }
+    return option_value(L, opt, inner, pos)
+}
+
+fn lower_enum_elvis(L: *Lower, node: *parse.Node): ir.Operand with (a: mem.Allocator) {
+    if node.kids.len < 2 {
+        return none_value()
+    }
+    val pos = node_pos(L, node)
+    val result_ty = check.get_node_ty(node)
+    val result = new_local(L, "", result_ty)
+    val opt = as_local(L, lower_expr(L, node.kids.get(0)), pos)
+    if L.failed || L.terminated {
+        return none_value()
+    }
+    val some = option_is_some(L, opt, pos)
+    val yes = new_block(L, "elvis.some")
+    val no = new_block(L, "elvis.none")
+    val join = new_block(L, "elvis.join")
+    emit_cond(L, some, yes, no, pos)
+    use_block(L, no)
+    val rhs = lower_expr(L, node.kids.get(1))
+    if !L.terminated {
+        emit_copy(L, result, rhs, pos)
+        emit_br(L, join, pos)
+    }
+    use_block(L, yes)
+    val ty = peel(opt.ty)
+    var inner: *check.Type? = null
+    if ty != null && ty!!.kind == check.type_kinds().OPTION {
+        inner = ty!!.elem
+    }
+    val got = option_value(L, opt, inner, pos)
+    if !L.terminated {
+        emit_copy(L, result, got, pos)
+        emit_br(L, join, pos)
+    }
+    use_block(L, join)
+    return local_operand(L, result)
+}
+
+fn lower_enum_is(L: *Lower, node: *parse.Node): ir.Operand with (a: mem.Allocator) {
+    if node.kids.len == 0 {
+        return none_value()
+    }
+    val pos = node_pos(L, node)
+    val subject = as_local(L, lower_expr(L, node.kids.get(0)), pos)
+    val sty = peel(check.get_node_ty(node.kids.get(0)))
+    if sty == null || sty!!.kind != check.type_kinds().ENUM {
+        fail(L, node, "'is' needs an enum")
+        return none_value()
+    }
+    val sym = check.get_node_sym(node)
+    var index = variant_index_by_sym(sty, sym)
+    if index < 0 && node.name.len > 0 {
+        index = variant_index_by_name(sty, node.name)
+    }
+    if index < 0 && node.kids.len > 1 {
+        val rhs = node.kids.get(1)
+        if parse.is_ident(rhs) || parse.is_type_name(rhs) || parse.is_dot_variant(rhs) ||
+            parse.is_member(rhs) {
+            var nm = rhs.name
+            if nm.len == 0 {
+                nm = rhs.text
+            }
+            // `Color.Red` is TYPE_NAME with dotted name — use the last segment.
+            var last = nm
+            var i: usize = 0
+            for i < nm.len {
+                if nm.ptr[i] == '.' as u8 {
+                    last = texts.slice(nm, i + 1, nm.len)
+                }
+                i = i + 1
+            }
+            index = variant_index_by_name(sty, last)
+        }
+    }
+    if index < 0 {
+        fail(L, node, "unknown variant")
+        return none_value()
+    }
+    val tag = enum_tag_of(L, subject, sty!!, pos)
+    val want = check.type_variant_at(sty!!, index as usize).tag
+    val tag_ty = sty!!.elem
+    return emit_cmp(L, ir.bin_ops().EQ, tag, ir.int_op(tag_ty, want as i64), pos)
+}
+
+fn lower_enum_dot(L: *Lower, node: *parse.Node): ir.Operand with (a: mem.Allocator) {
+    var ty = peel(check.get_node_ty(node))
+    val sym = check.get_node_sym(node)
+    var index = variant_index_by_sym(ty, sym)
+    if index < 0 {
+        var nm = node.name
+        if nm.len == 0 {
+            nm = node.text
+        }
+        index = variant_index_by_name(ty, nm)
+    }
+    if index < 0 || ty == null || ty!!.kind != check.type_kinds().ENUM {
+        fail(L, node, "enum variant needs a known type")
+        return none_value()
+    }
+    if !payload_free_variant(ty!!, index as usize) {
+        fail(L, node, "variant needs arguments")
+        return none_value()
+    }
+    var out_ty = check.get_node_ty(node)
+    if out_ty == null {
+        out_ty = ty
+    }
+    return make_enum(L, out_ty, index as u32, list.empty<ir.Operand>(), node_pos(L, node))
+}
+
+fn lower_enum_member(L: *Lower, node: *parse.Node): (ir.Operand, bool) with (a: mem.Allocator) {
+    val sym = check.get_node_sym(node)
+    var ty = peel(check.get_node_ty(node))
+    // Resolve enum type from the member result, else from `Color` in `Color.Green`.
+    if (ty == null || ty!!.kind != check.type_kinds().ENUM) && node.kids.len > 0 {
+        val base = node.kids.get(0)
+        ty = peel(check.get_node_ty(base))
+        if (ty == null || ty!!.kind != check.type_kinds().ENUM) {
+            val bsym = check.get_node_sym(base)
+            if bsym != null {
+                ty = peel(check.get_sema(bsym!!))
+            }
+        }
+    }
+    if ty == null || ty!!.kind != check.type_kinds().ENUM {
+        return none_value(), false
+    }
+    var index = variant_index_by_sym(ty, sym)
+    if index < 0 {
+        index = variant_index_by_name(ty, node.name)
+    }
+    if index < 0 {
+        return none_value(), false
+    }
+    if !payload_free_variant(ty!!, index as usize) {
+        fail(L, node, "variant needs arguments")
+        return none_value(), true
+    }
+    var out_ty = check.get_node_ty(node)
+    if out_ty == null {
+        out_ty = ty
+    }
+    return make_enum(L, out_ty, index as u32, list.empty<ir.Operand>(), node_pos(L, node)), true
+}
+
+/** Place a call arg onto a variant field slot (C place_arg). */
+private fn place_variant_arg(
+    ty: *check.Type,
+    v: check.EnumVariant,
+    name: str,
+    positional: *usize,
+    filled: *list.List<bool>,
+): i64 {
+    if name.len > 0 {
+        var i: usize = 0
+        for i < v.field_count {
+            if check.type_variant_field_at(ty, v, i).name == name {
+                if filled.get(i) {
+                    return -2
+                }
+                filled.set(i, true)
+                return i as i64
+            }
+            i = i + 1
+        }
+        return -3
+    }
+    for *positional < v.field_count && filled.get(*positional) {
+        *positional = *positional + 1
+    }
+    if *positional >= v.field_count {
+        return -4
+    }
+    val slot = *positional
+    filled.set(slot, true)
+    *positional = *positional + 1
+    return slot as i64
+}
+
+fn lower_enum_call(L: *Lower, node: *parse.Node): (ir.Operand, bool) with (a: mem.Allocator) {
+    if node.kids.len == 0 {
+        return none_value(), false
+    }
+    var sym = check.get_node_sym(node)
+    val callee = node.kids.get(0)
+    if (sym == null || !load.is_symbol_variant(sym!!)) && check.get_node_sym(callee) != null {
+        sym = check.get_node_sym(callee)
+    }
+    var ty = peel(check.get_node_ty(node))
+    if ty == null || ty!!.kind != check.type_kinds().ENUM {
+        ty = peel(check.get_node_ty(callee))
+    }
+    // `Shape.Circle`: callee is MEMBER; enum type is on Shape (base / type symbol).
+    if (ty == null || ty!!.kind != check.type_kinds().ENUM) && parse.is_member(callee) && callee.kids.len > 0 {
+        val base = callee.kids.get(0)
+        ty = peel(check.get_node_ty(base))
+        if ty == null || ty!!.kind != check.type_kinds().ENUM {
+            val bsym = check.get_node_sym(base)
+            if bsym != null {
+                ty = peel(check.get_sema(bsym!!))
+            }
+        }
+    }
+    var index = variant_index_by_sym(ty, sym)
+    if index < 0 && parse.is_member(callee) {
+        index = variant_index_by_name(ty, callee.name)
+    }
+    if index < 0 || ty == null || ty!!.kind != check.type_kinds().ENUM {
+        return none_value(), false
+    }
+    // C lower_variant_call: map named/positional args, then fill defaults.
+    val v = check.type_variant_at(ty!!, index as usize)
+    var filled = list.empty<bool>()
+    var values = list.empty<ir.Operand>()
+    var fi: usize = 0
+    for fi < v.field_count {
+        filled.push(false)
+        values.push(none_value())
+        fi = fi + 1
+    }
+    var positional: usize = 0
+    val arg_end = parse.call_arg_end(node)
+    var i: usize = 1
+    for i < arg_end && !L.failed {
+        val arg = node.kids.get(i)
+        if !parse.is_arg(arg) {
+            fail(L, node, "expected an argument")
+            return none_value(), true
+        }
+        var value_node = arg
+        if arg.kids.len > 0 {
+            value_node = arg.kids.get(0)
+        }
+        val slot = place_variant_arg(ty!!, v, arg.name, &positional, &filled)
+        if slot < 0 {
+            fail(L, arg, "variant argument does not match a field")
+            return none_value(), true
+        }
+        values.set(slot as usize, lower_expr(L, value_node))
+        if L.failed || L.terminated {
+            return none_value(), true
+        }
+        i = i + 1
+    }
+    var args = list.empty<ir.Operand>()
+    fi = 0
+    for fi < v.field_count && !L.failed {
+        val fld = check.type_variant_field_at(ty!!, v, fi)
+        if is_unit_ty(fld.field_type) {
+            fi = fi + 1
+            continue
+        }
+        if !filled.get(fi) {
+            val decl = fld.decl
+            if decl != null && parse.is_param(decl!!) {
+                val def = param_default(decl!!)
+                if def != null {
+                    values.set(fi, lower_expr(L, def!!))
+                    if L.failed || L.terminated {
+                        return none_value(), true
+                    }
+                } else {
+                    fail(L, node, "missing variant field")
+                    return none_value(), true
+                }
+            } else {
+                fail(L, node, "missing variant field")
+                return none_value(), true
+            }
+        }
+        args.push(values.get(fi))
+        fi = fi + 1
+    }
+    return make_enum(L, check.get_node_ty(node), index as u32, args, node_pos(L, node)), true
+}
+
+fn lower_enum_cast(L: *Lower, node: *parse.Node): (ir.Operand, bool) with (a: mem.Allocator) {
+    if node.kids.len < 2 {
+        return none_value(), false
+    }
+    val src_node = node.kids.get(0)
+    val dest_ty = peel(check.get_node_ty(node))
+    val src_ty = peel(check.get_node_ty(src_node))
+    val pos = node_pos(L, node)
+    if dest_ty != null && dest_ty!!.kind == check.type_kinds().ENUM && src_ty != null &&
+        (src_ty!!.kind == check.type_kinds().INT || src_ty!!.kind == check.type_kinds().UNTYPED_INT) {
+        // Tag → payload-free enum: switch on tag, aggregate each variant.
+        if !payload_free_all(dest_ty!!) {
+            return none_value(), false
+        }
+        val result = new_local(L, "", check.get_node_ty(node))
+        val raw = lower_expr(L, src_node)
+        val tag = convert_checked(L, raw, dest_ty!!.elem, pos)
+        val join = new_block(L, "cast.join")
+        val miss = new_block(L, "tag.miss")
+        var cases = list.empty<ir.Case>()
+        var arms = list.empty<u32>()
+        val n = check.type_variant_count(dest_ty!!)
+        var i: usize = 0
+        for i < n {
+            val arm = new_block(L, "tag.arm")
+            arms.push(arm)
+            var c: ir.Case
+            c.value = check.type_variant_at(dest_ty!!, i).tag
+            c.target = arm
+            cases.push(c)
+            i = i + 1
+        }
+        emit_switch(L, tag, miss, cases, pos)
+        i = 0
+        for i < n {
+            use_block(L, arms.get(i))
+            val made = make_enum(L, check.get_node_ty(node), i as u32, list.empty<ir.Operand>(), pos)
+            emit_copy(L, result, made, pos)
+            emit_br(L, join, pos)
+            i = i + 1
+        }
+        use_block(L, miss)
+        panic_range(L, pos)
+        use_block(L, join)
+        return local_operand(L, result), true
+    }
+    if src_ty != null && src_ty!!.kind == check.type_kinds().ENUM && dest_ty != null &&
+        (dest_ty!!.kind == check.type_kinds().INT || dest_ty!!.kind == check.type_kinds().UNTYPED_INT) {
+        val src = lower_expr(L, src_node)
+        return enum_tag_of(L, src, src_ty!!, pos), true
+    }
+    return none_value(), false
+}
+
+private fn convert_checked(
+    L: *Lower,
+    src: ir.Operand,
+    dest: *check.Type?,
+    pos: ir.Pos,
+): ir.Operand with (a: mem.Allocator) {
+    if dest == null {
+        fail(L, null, "enum is missing a tag type")
+        return none_value()
+    }
+    if src.ty != null && src.ty!! == dest!! {
+        return src
+    }
+    // Int literals folded against the enum base should stay constants (C
+    // retypes the lit during check_tag_cast / const_eval).
+    if src.kind == ir.operand_kinds().INT &&
+        (dest!!.kind == check.type_kinds().INT || dest!!.kind == check.type_kinds().UNTYPED_INT) {
+        return ir.int_op(dest, src.local as i64)
+    }
+    val dst = new_local(L, "", dest)
+    val inst = emit_inst(L, ir.op_kinds().CONVERT, dst as i32, pos)
+    if inst != null {
+        inst!!.checked = true
+        inst!!.a = src
+    }
+    return local_operand(L, dst)
+}
+
+private fn panic_range(L: *Lower, pos: ir.Pos) with (a: mem.Allocator) {
+    val str_ty = check.type_const_bytes(L.types) as *check.Type?
+    val inst = emit_inst(L, ir.op_kinds().PANIC, -1, pos)
+    if inst != null {
+        inst!!.a = ir.string_op(str_ty, "value out of range")
+    }
+    emit_unreachable(L, pos)
+}
+
+private fn payload_free_all(en: *check.Type): bool {
+    var i: usize = 0
+    val n = check.type_variant_count(en)
+    for i < n {
+        if !payload_free_variant(en, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return n > 0
+}
+
+fn lower_enum_name(L: *Lower, node: *parse.Node): (ir.Operand, bool) with (a: mem.Allocator) {
+    if node.name != "name" || node.kids.len == 0 {
+        return none_value(), false
+    }
+    val base = node.kids.get(0)
+    val sty = peel(check.get_node_ty(base))
+    if sty == null || sty!!.kind != check.type_kinds().ENUM {
+        return none_value(), false
+    }
+    // Tag-indexed string table via switch — match C lower_enum_name.
+    val pos = node_pos(L, node)
+    val result_ty = check.get_node_ty(node)
+    val result = new_local(L, "", result_ty)
+    val subject = as_local(L, lower_expr(L, base), pos)
+    if L.failed || L.terminated {
+        return none_value(), true
+    }
+    val tag = enum_tag_of(L, subject, sty!!, pos)
+    val join = new_block(L, "name.join")
+    val miss = new_block(L, "tag.miss")
+    var cases = list.empty<ir.Case>()
+    var arms = list.empty<u32>()
+    val n = check.type_variant_count(sty!!)
+    var i: usize = 0
+    for i < n {
+        val arm = new_block(L, "tag.arm")
+        arms.push(arm)
+        var c: ir.Case
+        c.value = check.type_variant_at(sty!!, i).tag
+        c.target = arm
+        cases.push(c)
+        i = i + 1
+    }
+    emit_switch(L, tag, miss, cases, pos)
+    i = 0
+    for i < n {
+        use_block(L, arms.get(i))
+        val name = check.type_variant_at(sty!!, i).name
+        emit_copy(L, result, ir.string_op(result_ty, name), pos)
+        emit_br(L, join, pos)
+        i = i + 1
+    }
+    use_block(L, miss)
+    emit_unreachable(L, pos)
+    use_block(L, join)
+    return local_operand(L, result), true
+}
+
+private fn when_subject_and_arms(node: *parse.Node): (*parse.Node?, list.List<*parse.Node>) with (a: mem.Allocator) {
+    var subject: *parse.Node? = null
+    var arms = list.empty<*parse.Node>()
+    var i: usize = 0
+    for i < node.kids.len {
+        val kid = node.kids.get(i)
+        if parse.is_when_arm(kid) {
+            arms.push(kid)
+        } else if subject == null && i == 0 {
+            subject = kid as *parse.Node?
+        }
+        i = i + 1
+    }
+    return subject, arms
+}
+
+private fn arm_body(arm: *parse.Node): *parse.Node? {
+    val n = arm.head as usize
+    if n < arm.kids.len {
+        return arm.kids.get(n) as *parse.Node?
+    }
+    return null
+}
+
+private fn arm_conds(arm: *parse.Node): list.List<*parse.Node> with (a: mem.Allocator) {
+    var out = list.empty<*parse.Node>()
+    val n = arm.head as usize
+    var i: usize = 0
+    for i < n && i < arm.kids.len {
+        out.push(arm.kids.get(i))
+        i = i + 1
+    }
+    return out
+}
+
+private fn arm_is_else(arm: *parse.Node): bool {
+    return arm.head == 0
+}
+
+private fn pat_selects_variant(pat: *parse.Node, en: *check.Type): (i64, bool) {
+    if parse.is_pat_variant(pat) {
+        var index = variant_index_by_sym(en as *check.Type?, check.get_node_sym(pat))
+        if index < 0 {
+            index = variant_index_by_name(en as *check.Type?, pat.name)
+        }
+        return index, index >= 0
+    }
+    if parse.is_pat_is(pat) {
+        var index = variant_index_by_sym(en as *check.Type?, check.get_node_sym(pat))
+        if index < 0 {
+            index = variant_index_by_name(en as *check.Type?, pat.name)
+        }
+        return index, index >= 0
+    }
+    if parse.is_dot_variant(pat) || parse.is_ident(pat) || parse.is_pat_bind(pat) {
+        var nm = pat.name
+        if nm.len == 0 {
+            nm = pat.text
+        }
+        val index = variant_index_by_name(en as *check.Type?, nm)
+        return index, index >= 0
+    }
+    return -1, false
+}
+
+private fn bind_option_some(L: *Lower, subject: ir.Operand, opt: *check.Type, pat: *parse.Node) with (a: mem.Allocator) {
+    // `Some(v)` / PAT_VARIANT with one bind — extract option payload.
+    if !(parse.is_pat_variant(pat) || (parse.is_ident(pat) && pat.name == "Some")) {
+        return
+    }
+    var bind_name = ""
+    var bind_sym: *load.Symbol? = null
+    if parse.is_pat_variant(pat) && pat.kids.len > 0 {
+        val kid = pat.kids.get(0)
+        if parse.is_pat_bind(kid) || parse.is_ident(kid) {
+            bind_name = kid.name
+            bind_sym = check.get_node_sym(kid)
+        }
+    }
+    if bind_name.len == 0 || bind_name == "_" {
+        return
+    }
+    val inner = opt.elem
+    val got = option_value(L, subject, inner, node_pos(L, pat))
+    val local = new_local(L, bind_name, inner)
+    emit_copy(L, local, got, node_pos(L, pat))
+    bind_local(L, bind_sym, local)
+}
+
+/** Inner pattern of a PAT_FIELD, or the node itself. */
+private fn mapped_inner(node: *parse.Node): *parse.Node {
+    if parse.is_pat_field(node) && node.kids.len > 0 {
+        return node.kids.get(0)
+    }
+    return node
+}
+
+private fn bind_name_pat(
+    L: *Lower,
+    sym: *load.Symbol?,
+    name: str,
+    value: ir.Operand,
+    pos: ir.Pos,
+) with (a: mem.Allocator) {
+    if name.len == 0 || name == "_" {
+        return
+    }
+    val local = new_local(L, name, value.ty)
+    emit_copy(L, local, value, pos)
+    bind_local(L, sym, local)
+}
+
+/** Nested struct pattern `Point(x, y)` (C bind_struct_fields). */
+private fn bind_struct_fields(L: *Lower, subject: ir.Operand, st: *check.Type, pat: *parse.Node) with (
+    a: mem.Allocator,
+) {
+    if st.kind != check.type_kinds().STRUCT || !parse.is_pat_variant(pat) {
+        return
+    }
+    val n = check.type_field_count(st)
+    var fi: usize = 0
+    var pi: usize = 0
+    for pi < pat.kids.len && fi < n {
+        val kid = pat.kids.get(pi)
+        val inner = mapped_inner(kid)
+        // Skip unit fields.
+        for fi < n {
+            val fld = check.type_field_at(st, fi)
+            val field_index = fi as u32
+            fi = fi + 1
+            if is_unit_ty(fld.field_type) {
+                continue
+            }
+            val epos = node_pos(L, pat)
+            val got = emit_extract_aux(L, subject, field_index, 0, fld.field_type, epos)
+            bind_pat(L, got, inner)
+            if parse.is_pat_field(kid) {
+                val fsym = check.get_node_sym(kid)
+                if fsym != null {
+                    bind_name_pat(L, fsym, kid.name, got, node_pos(L, kid))
+                }
+            }
+            break
+        }
+        pi = pi + 1
+    }
+}
+
+/** Recursive pattern bind (C bind_pat). */
+private fn bind_pat(L: *Lower, subject: ir.Operand, pat: *parse.Node) with (a: mem.Allocator) {
+    if L.failed || L.terminated {
+        return
+    }
+    val type0 = peel(subject.ty)
+    if parse.is_pat_bind(pat) {
+        if type0 != null && type0!!.kind == check.type_kinds().OPTION && pat.name == "None" {
+            return
+        }
+        // Checker marks enum-variant binds with flag "variant" — do not bind a local.
+        if pat.flag == "variant" {
+            return
+        }
+        val sym = check.get_node_sym(pat)
+        if sym != null && load.is_symbol_variant(sym!!) {
+            return
+        }
+        bind_name_pat(L, sym, pat.name, subject, node_pos(L, pat))
+        return
+    }
+    if parse.is_pat_variant(pat) && type0 != null && type0!!.kind == check.type_kinds().OPTION &&
+        (pat.name == "Some" || pat.text == "Some") {
+        val elem = type0!!.elem
+        if elem == null || is_unit_ty(elem) {
+            return
+        }
+        val value = option_value(L, subject, elem, node_pos(L, pat))
+        if pat.kids.len > 0 {
+            val field = pat.kids.get(0)
+            val inner = mapped_inner(field)
+            bind_pat(L, value, inner)
+            if parse.is_pat_field(field) {
+                val fsym = check.get_node_sym(field)
+                if fsym != null {
+                    bind_name_pat(L, fsym, field.name, value, node_pos(L, field))
+                }
+            }
+        }
+        return
+    }
+    if parse.is_pat_variant(pat) && type0 != null && type0!!.kind == check.type_kinds().STRUCT &&
+        type0!!.name.len > 0 && pat.name == type0!!.name {
+        bind_struct_fields(L, subject, type0!!, pat)
+        return
+    }
+    if parse.is_pat_variant(pat) && type0 != null && type0!!.kind == check.type_kinds().ENUM {
+        val (index, ok) = pat_selects_variant(pat, type0!!)
+        if ok {
+            bind_variant_fields(L, subject, type0!!, index, pat)
+        }
+    }
+}
+
+private fn bind_variant_fields(L: *Lower, subject: ir.Operand, en: *check.Type, index: i64, pat: *parse.Node) with (a: mem.Allocator) {
+    if !parse.is_pat_variant(pat) {
+        return
+    }
+    val v = check.type_variant_at(en, index as usize)
+    val aux2 = (index + 1) as u32
+    var fi: usize = 0
+    var pi: usize = 0
+    for pi < pat.kids.len {
+        val kid = pat.kids.get(pi)
+        val inner = mapped_inner(kid)
+        for fi < v.field_count {
+            val fld = check.type_variant_field_at(en, v, fi)
+            val field_index = fi as u32
+            fi = fi + 1
+            if is_unit_ty(fld.field_type) {
+                continue
+            }
+            val epos = node_pos(L, pat)
+            val got = emit_extract_aux(L, subject, field_index, aux2, fld.field_type, epos)
+            bind_pat(L, got, inner)
+            if parse.is_pat_field(kid) {
+                val fsym = check.get_node_sym(kid)
+                if fsym != null {
+                    bind_name_pat(L, fsym, kid.name, got, node_pos(L, kid))
+                }
+            }
+            break
+        }
+        pi = pi + 1
+    }
+}
+
+private fn lower_arm_body(
+    L: *Lower,
+    arm: *parse.Node,
+    subject: ir.Operand,
+    has_subject: bool,
+    as_value: bool,
+    result: u32,
+    have_result: bool,
+    join: u32,
+    en: *check.Type?,
+) with (a: mem.Allocator) {
+    val saved = L.locals.len
+    if has_subject && en != null {
+        val conds = arm_conds(arm)
+        if conds.len == 1 {
+            val pat = conds.get(0)
+            if en!!.kind == check.type_kinds().ENUM {
+                val (index, ok) = pat_selects_variant(pat, en!!)
+                if ok {
+                    bind_variant_fields(L, subject, en!!, index, pat)
+                }
+            } else if en!!.kind == check.type_kinds().OPTION {
+                // Some(v): extract payload and bind.
+                if parse.is_pat_variant(pat) && (pat.name == "Some" || pat.text == "Some") {
+                    val inner = en!!.elem
+                    val got = option_value(L, subject, inner, node_pos(L, pat))
+                    if pat.kids.len > 0 {
+                        var bind = pat.kids.get(0)
+                        if parse.is_pat_field(bind) && bind.kids.len > 0 {
+                            bind = bind.kids.get(0)
+                        }
+                        if parse.is_pat_bind(bind) {
+                            var name = bind.name
+                            if name.len == 0 {
+                                name = bind.text
+                            }
+                            if name.len > 0 && name != "_" {
+                                val local = new_local(L, name, inner)
+                                emit_copy(L, local, got, node_pos(L, bind))
+                                bind_local(L, check.get_node_sym(bind), local)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    val body = arm_body(arm)
+    val pos = node_pos(L, arm)
+    if as_value {
+        var value = none_value()
+        if body != null {
+            if parse.is_block(body!!) {
+                value = lower_block_value(L, body!!)
+            } else {
+                value = lower_expr(L, body!!)
+            }
+        }
+        if !L.failed && !L.terminated {
+            if have_result && value.kind != ir.operand_kinds().NONE {
+                emit_copy(L, result, value, pos)
+            }
+            emit_br(L, join, pos)
+        }
+    } else {
+        if body != null {
+            if parse.is_block(body!!) {
+                lower_stmt(L, body!!)
+            } else {
+                lower_expr(L, body!!)
+            }
+        }
+        if !L.terminated && !L.failed {
+            emit_br(L, join, pos)
+        }
+    }
+    // Pop pattern locals.
+    for L.locals.len > saved {
+        L.locals.pop()
+    }
+}
+
+fn lower_enum_when(L: *Lower, node: *parse.Node, as_value: bool): ir.Operand with (a: mem.Allocator) {
+    val (subject_node, arms) = when_subject_and_arms(node)
+    if arms.len == 0 {
+        fail(L, node, "when needs an arm")
+        return none_value()
+    }
+    val pos = node_pos(L, node)
+    var subject = none_value()
+    var has_subject = subject_node != null
+    var sty: *check.Type? = null
+    if has_subject {
+        subject = as_local(L, lower_expr(L, subject_node!!), pos)
+        if L.failed || L.terminated {
+            return none_value()
+        }
+        sty = peel(check.get_node_ty(subject_node!!))
+    }
+    var have_result = false
+    var result: u32 = 0
+    val result_ty = check.get_node_ty(node)
+    if as_value && result_ty != null && !is_unit_ty(result_ty) {
+        result = new_local(L, "", result_ty)
+        have_result = true
+    }
+    val join = new_block(L, "when.join")
+    var arm_blocks = list.empty<u32>()
+    var i: usize = 0
+    for i < arms.len {
+        arm_blocks.push(new_block(L, "when.arm"))
+        i = i + 1
+    }
+    // Find first else / total arm.
+    var total: i64 = -1
+    i = 0
+    for i < arms.len {
+        if arm_is_else(arms.get(i)) {
+            total = i as i64
+            break
+        }
+        i = i + 1
+    }
+    val limit = if total >= 0 {
+        total as usize
+    } else {
+        arms.len
+    }
+    var def = join
+    var have_sink = false
+    var sink: u32 = 0
+    if total >= 0 {
+        def = arm_blocks.get(total as usize)
+    } else if has_subject && sty != null &&
+        (sty!!.kind == check.type_kinds().ENUM || sty!!.kind == check.type_kinds().OPTION) {
+        sink = new_block(L, "when.miss")
+        have_sink = true
+        def = sink
+    }
+    if has_subject && sty != null && sty!!.kind == check.type_kinds().ENUM {
+        emit_enum_switch(L, subject, sty!!, arms, arm_blocks, limit, def, have_sink, sink, pos)
+    } else if has_subject && sty != null && sty!!.kind == check.type_kinds().INT &&
+        int_switch_ok(arms, limit) {
+        emit_int_switch(L, subject, arms, arm_blocks, limit, def, have_sink, sink, pos)
+    } else {
+        emit_when_chain(L, subject, has_subject, arms, arm_blocks, limit, def, have_sink, sink, sty, pos)
+    }
+    i = 0
+    for i < arms.len && !L.failed {
+        use_block(L, arm_blocks.get(i))
+        lower_arm_body(L, arms.get(i), subject, has_subject, as_value, result, have_result, join, sty)
+        i = i + 1
+    }
+    if L.failed {
+        return none_value()
+    }
+    use_block(L, join)
+    if have_result {
+        return local_operand(L, result)
+    }
+    return none_value()
+}
+
+private fn emit_enum_switch(
+    L: *Lower,
+    subject: ir.Operand,
+    en: *check.Type,
+    arms: list.List<*parse.Node>,
+    arm_blocks: list.List<u32>,
+    limit: usize,
+    def: u32,
+    have_sink: bool,
+    sink: u32,
+    pos: ir.Pos,
+) with (a: mem.Allocator) {
+    val tag = enum_tag_of(L, subject, en, pos)
+    val vc = check.type_variant_count(en)
+    var cases = list.empty<ir.Case>()
+    var tag_blocks = list.empty<u32>()
+    var tag_variants = list.empty<usize>()
+    var v: usize = 0
+    for v < vc && !L.failed {
+        var any = false
+        var a: usize = 0
+        for a < limit {
+            val conds = arm_conds(arms.get(a))
+            var c: usize = 0
+            for c < conds.len {
+                val (ix, hit) = pat_selects_variant(conds.get(c), en)
+                if hit && ix == v as i64 {
+                    any = true
+                    break
+                }
+                c = c + 1
+            }
+            if any {
+                break
+            }
+            a = a + 1
+        }
+        if any {
+            val blk = new_block(L, "when.tag")
+            tag_blocks.push(blk)
+            tag_variants.push(v)
+            var cse: ir.Case
+            cse.value = check.type_variant_at(en, v).tag
+            cse.target = blk
+            cases.push(cse)
+        }
+        v = v + 1
+    }
+    emit_switch(L, tag, def, cases, pos)
+    var ti: usize = 0
+    for ti < tag_blocks.len && !L.failed {
+        val variant = tag_variants.get(ti)
+        use_block(L, tag_blocks.get(ti))
+        var stopped = false
+        var a: usize = 0
+        for a < limit && !stopped && !L.failed {
+            val arm = arms.get(a)
+            val (mentions, irref) = arm_mentions_variant(arm, en, variant)
+            if !mentions {
+                a = a + 1
+                continue
+            }
+            if irref {
+                emit_br(L, arm_blocks.get(a), node_pos(L, arm))
+                stopped = true
+                break
+            }
+            val failb = new_block(L, "when.fail")
+            test_selected(L, subject, arm, en, variant, arm_blocks.get(a), failb)
+            use_block(L, failb)
+            a = a + 1
+        }
+        if !stopped && !L.terminated && !L.failed {
+            emit_br(L, def, pos)
+        }
+        ti = ti + 1
+    }
+    if have_sink {
+        use_block(L, sink)
+        emit_unreachable(L, pos)
+    }
+}
+
+/** Whether an arm mentions variant `index`, and whether any mention is irrefutable (C arm_mentions). */
+private fn arm_mentions_variant(arm: *parse.Node, en: *check.Type, index: usize): (bool, bool) with (a: mem.Allocator) {
+    var any = false
+    var irref = false
+    val conds = arm_conds(arm)
+    for pat in conds.items() {
+        val (ix, hit) = pat_selects_variant(pat, en)
+        if !hit || ix != index as i64 {
+            continue
+        }
+        any = true
+        var one = false
+        if parse.is_pat_variant(pat) {
+            one = fields_irrefutable(pat, en, index)
+        } else {
+            // Bind / is / bare variant name: irrefutable when payload is free or PAT_IS.
+            one = true
+            if parse.is_pat_bind(pat) {
+                one = payload_free_variant(en, index)
+            }
+        }
+        if one {
+            irref = true
+        }
+    }
+    return any, irref
+}
+
+/** Test arm patterns that select this variant (C test_selected). */
+private fn test_selected(
+    L: *Lower,
+    subject: ir.Operand,
+    arm: *parse.Node,
+    en: *check.Type,
+    index: usize,
+    yes: u32,
+    no: u32,
+) with (a: mem.Allocator) {
+    if L.failed {
+        return
+    }
+    val conds = arm_conds(arm)
+    var n: usize = 0
+    for pat in conds.items() {
+        val (ix, hit) = pat_selects_variant(pat, en)
+        if hit && ix == index as i64 {
+            n = n + 1
+        }
+    }
+    if n == 0 {
+        emit_br(L, no, node_pos(L, arm))
+        return
+    }
+    var seen: usize = 0
+    var i: usize = 0
+    for i < conds.len && !L.failed {
+        val pat = conds.get(i)
+        val (ix, hit) = pat_selects_variant(pat, en)
+        if !hit || ix != index as i64 {
+            i = i + 1
+            continue
+        }
+        seen = seen + 1
+        if seen == n {
+            test_pat(L, subject, true, pat, yes, no, en as *check.Type?)
+            return
+        }
+        val next = new_block(L, "when.or")
+        test_pat(L, subject, true, pat, yes, next, en as *check.Type?)
+        use_block(L, next)
+        i = i + 1
+    }
+}
+
+private fn first_cond(arm: *parse.Node): *parse.Node {
+    if arm.head > 0 && arm.kids.len > 0 {
+        return arm.kids.get(0)
+    }
+    return arm
+}
+
+private fn int_switch_ok(arms: list.List<*parse.Node>, limit: usize): bool {
+    var a: usize = 0
+    for a < limit {
+        val arm = arms.get(a)
+        if arm_is_else(arm) {
+            a = a + 1
+            continue
+        }
+        val conds = arm_conds(arm)
+        if conds.len == 0 {
+            return false
+        }
+        var c: usize = 0
+        for c < conds.len {
+            val pat = conds.get(c)
+            if !parse.is_pat_expr(pat) || pat.kids.len == 0 {
+                return false
+            }
+            if !is_int_lit_pat(pat.kids.get(0)) {
+                return false
+            }
+            c = c + 1
+        }
+        a = a + 1
+    }
+    return true
+}
+
+private fn is_int_lit_pat(node: *parse.Node): bool {
+    if parse.is_int_lit(node) || parse.is_char_lit(node) {
+        return true
+    }
+    if parse.is_unary(node) && node.kids.len > 0 && (node.text == "-" || node.text == "~") {
+        return is_int_lit_pat(node.kids.get(0))
+    }
+    return false
+}
+
+private fn emit_int_switch(
+    L: *Lower,
+    subject: ir.Operand,
+    arms: list.List<*parse.Node>,
+    arm_blocks: list.List<u32>,
+    limit: usize,
+    def: u32,
+    have_sink: bool,
+    sink: u32,
+    pos: ir.Pos,
+) with (a: mem.Allocator) {
+    var cases = list.empty<ir.Case>()
+    var a: usize = 0
+    for a < limit && !L.failed {
+        val conds = arm_conds(arms.get(a))
+        var c: usize = 0
+        for c < conds.len {
+            val pat = conds.get(c)
+            if parse.is_pat_expr(pat) && pat.kids.len > 0 {
+                val bits = fold_int_bits(pat.kids.get(0))
+                var cse: ir.Case
+                cse.value = bits
+                cse.target = arm_blocks.get(a)
+                cases.push(cse)
+            }
+            c = c + 1
+        }
+        a = a + 1
+    }
+    emit_switch(L, subject, def, cases, pos)
+    if have_sink {
+        use_block(L, sink)
+        emit_unreachable(L, pos)
+    }
+}
+
+private fn fold_int_bits(node: *parse.Node): i64 {
+    if parse.is_int_lit(node) {
+        var text = node.text
+        if text.len == 0 {
+            text = node.name
+        }
+        return parse_int_lit_simple(text)
+    }
+    if parse.is_unary(node) && node.text == "-" && node.kids.len > 0 {
+        return -fold_int_bits(node.kids.get(0))
+    }
+    return 0
+}
+
+private fn parse_int_lit_simple(text: str): i64 {
+    var i: usize = 0
+    var v: i64 = 0
+    var neg = false
+    if text.len > 0 && text.ptr[0] == '-' as u8 {
+        neg = true
+        i = 1
+    }
+    for i < text.len {
+        val c = text.ptr[i]
+        if c >= '0' as u8 && c <= '9' as u8 {
+            v = v * 10 + ((c - '0' as u8) as i64)
+        }
+        i = i + 1
+    }
+    if neg {
+        return -v
+    }
+    return v
+}
+
+private fn emit_when_chain(
+    L: *Lower,
+    subject: ir.Operand,
+    has_subject: bool,
+    arms: list.List<*parse.Node>,
+    arm_blocks: list.List<u32>,
+    limit: usize,
+    def: u32,
+    have_sink: bool,
+    sink: u32,
+    sty: *check.Type?,
+    pos: ir.Pos,
+) with (a: mem.Allocator) {
+    if limit == 0 {
+        emit_br(L, def, pos)
+        if have_sink {
+            use_block(L, sink)
+            emit_unreachable(L, pos)
+        }
+        return
+    }
+    var i: usize = 0
+    for i < limit && !L.failed {
+        val arm = arms.get(i)
+        var no = def
+        if i + 1 < limit {
+            no = new_block(L, "when.next")
+        }
+        test_arm(L, subject, has_subject, arm, arm_blocks.get(i), no, sty)
+        if i + 1 < limit {
+            use_block(L, no)
+        }
+        i = i + 1
+    }
+    if have_sink {
+        use_block(L, sink)
+        emit_unreachable(L, pos)
+    }
+}
+
+private fn value_eq(
+    L: *Lower,
+    subject: ir.Operand,
+    rhs: ir.Operand,
+    pos: ir.Pos,
+): ir.Operand with (a: mem.Allocator) {
+    if subject.ty != null && check.type_bytes_view(subject.ty!!) != null {
+        return lower_bytes_cmp(L, subject, rhs, false, pos)
+    }
+    if subject.ty != null {
+        val under = check.type_peel_distinct(subject.ty!!)
+        if under.kind == check.type_kinds().ENUM {
+            return lower_enum_eq(L, subject, rhs, false, pos)
+        }
+    }
+    return emit_cmp(L, ir.bin_ops().EQ, subject, rhs, pos)
+}
+
+/** Map PAT_VARIANT kids onto enum-variant field slots (C map_fields). */
+private fn map_variant_fields(
+    pat: *parse.Node,
+    en: *check.Type,
+    v: check.EnumVariant,
+): (list.List<*parse.Node?>, bool) with (a: mem.Allocator) {
+    var slots = list.empty<*parse.Node?>()
+    var filled = list.empty<bool>()
+    var i: usize = 0
+    for i < v.field_count {
+        slots.push(null)
+        filled.push(false)
+        i = i + 1
+    }
+    if v.field_count == 0 {
+        return slots, parse.is_pat_variant(pat) && pat.kids.len == 0
+    }
+    if !parse.is_pat_variant(pat) {
+        return slots, false
+    }
+    var positional: usize = 0
+    for kid in pat.kids.items() {
+        if !parse.is_pat_field(kid) {
+            return slots, false
+        }
+        var slot: i64 = -1
+        if kid.name.len > 0 {
+            var f: usize = 0
+            for f < v.field_count {
+                if check.type_variant_field_at(en, v, f).name == kid.name {
+                    slot = f as i64
+                    break
+                }
+                f = f + 1
+            }
+        } else {
+            for positional < v.field_count && filled.get(positional) {
+                positional = positional + 1
+            }
+            if positional < v.field_count {
+                slot = positional as i64
+                positional = positional + 1
+            }
+        }
+        if slot < 0 || filled.get(slot as usize) {
+            return slots, false
+        }
+        filled.set(slot as usize, true)
+        slots.set(slot as usize, kid as *parse.Node?)
+    }
+    return slots, true
+}
+
+/** Map PAT_VARIANT kids onto struct field slots. */
+private fn map_struct_fields(
+    pat: *parse.Node,
+    st: *check.Type,
+): (list.List<*parse.Node?>, bool) with (a: mem.Allocator) {
+    val n = check.type_field_count(st)
+    var slots = list.empty<*parse.Node?>()
+    var filled = list.empty<bool>()
+    var i: usize = 0
+    for i < n {
+        slots.push(null)
+        filled.push(false)
+        i = i + 1
+    }
+    if n == 0 {
+        return slots, parse.is_pat_variant(pat) && pat.kids.len == 0
+    }
+    if !parse.is_pat_variant(pat) {
+        return slots, false
+    }
+    var positional: usize = 0
+    for kid in pat.kids.items() {
+        if !parse.is_pat_field(kid) {
+            return slots, false
+        }
+        var slot: i64 = -1
+        if kid.name.len > 0 {
+            var f: usize = 0
+            for f < n {
+                if check.type_field_at(st, f).name == kid.name {
+                    slot = f as i64
+                    break
+                }
+                f = f + 1
+            }
+        } else {
+            for positional < n && filled.get(positional) {
+                positional = positional + 1
+            }
+            if positional < n {
+                slot = positional as i64
+                positional = positional + 1
+            }
+        }
+        if slot < 0 || filled.get(slot as usize) {
+            return slots, false
+        }
+        filled.set(slot as usize, true)
+        slots.set(slot as usize, kid as *parse.Node?)
+    }
+    return slots, true
+}
+
+private fn pat_irrefutable(pat: *parse.Node?, ty_in: *check.Type?): bool with (a: mem.Allocator) {
+    if pat == null {
+        return false
+    }
+    var type0 = peel(ty_in)
+    if parse.is_pat_bind(pat!!) && (pat!!.name == "_" || pat!!.text == "_") {
+        return true
+    }
+    if parse.is_pat_bind(pat!!) {
+        // Checker marks enum-variant binds with flag "variant" (C JOG_SYM_VARIANT).
+        if pat!!.flag == "variant" {
+            return false
+        }
+        val sym = check.get_node_sym(pat!!)
+        if sym != null && load.is_symbol_variant(sym!!) {
+            return false
+        }
+        if type0 != null && type0!!.kind == check.type_kinds().OPTION && pat!!.name == "None" {
+            return false
+        }
+        return true
+    }
+    if type0 != null && type0!!.kind == check.type_kinds().ENUM &&
+        check.type_variant_count(type0!!) == 1 && parse.is_pat_variant(pat!!) {
+        val (index, hit) = pat_selects_variant(pat!!, type0!!)
+        if !hit || index != 0 {
+            return false
+        }
+        return fields_irrefutable(pat!!, type0!!, index as usize)
+    }
+    if type0 != null && type0!!.kind == check.type_kinds().STRUCT && parse.is_pat_variant(pat!!) &&
+        type0!!.name.len > 0 && pat!!.name == type0!!.name {
+        return struct_pat_irrefutable(pat!!, type0!!)
+    }
+    return false
+}
+
+private fn fields_irrefutable(pat: *parse.Node, en: *check.Type, index: usize): bool with (a: mem.Allocator) {
+    val v = check.type_variant_at(en, index)
+    if v.field_count == 0 {
+        return parse.is_pat_variant(pat) && pat.kids.len == 0
+    }
+    val (slots, ok) = map_variant_fields(pat, en, v)
+    if !ok {
+        return false
+    }
+    var i: usize = 0
+    for i < v.field_count {
+        val slot = slots.get(i)
+        if slot == null {
+            return false
+        }
+        val inner = mapped_inner(slot!!)
+        val fld = check.type_variant_field_at(en, v, i)
+        if !pat_irrefutable(inner as *parse.Node?, fld.field_type) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+private fn struct_pat_irrefutable(pat: *parse.Node, st: *check.Type): bool with (a: mem.Allocator) {
+    val n = check.type_field_count(st)
+    if n == 0 {
+        return parse.is_pat_variant(pat) && pat.kids.len == 0
+    }
+    val (slots, ok) = map_struct_fields(pat, st)
+    if !ok {
+        return false
+    }
+    var i: usize = 0
+    for i < n {
+        val slot = slots.get(i)
+        if slot == null {
+            return false
+        }
+        val inner = mapped_inner(slot!!)
+        val fld = check.type_field_at(st, i)
+        if !pat_irrefutable(inner as *parse.Node?, fld.field_type) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+private fn test_fields(
+    L: *Lower,
+    subject: ir.Operand,
+    en: *check.Type,
+    index: i64,
+    pat: *parse.Node,
+    yes: u32,
+    no: u32,
+) with (a: mem.Allocator) {
+    if L.failed || L.terminated {
+        return
+    }
+    if index < 0 || (index as usize) >= check.type_variant_count(en) {
+        emit_br(L, no, node_pos(L, pat))
+        return
+    }
+    val v = check.type_variant_at(en, index as usize)
+    if v.field_count == 0 {
+        emit_br(L, yes, node_pos(L, pat))
+        return
+    }
+    val (slots, ok) = map_variant_fields(pat, en, v)
+    if !ok {
+        fail(L, pat, "variant pattern is missing a field")
+        return
+    }
+    val aux2 = (index + 1) as u32
+    var i: usize = 0
+    for i < v.field_count {
+        val slot = slots.get(i)
+        if slot == null {
+            i = i + 1
+            continue
+        }
+        val inner = mapped_inner(slot!!)
+        val fld = check.type_variant_field_at(en, v, i)
+        if is_unit_ty(fld.field_type) || pat_irrefutable(inner as *parse.Node?, fld.field_type) {
+            i = i + 1
+            continue
+        }
+        val field = emit_extract_aux(L, subject, i as u32, aux2, fld.field_type, node_pos(L, pat))
+        var later = false
+        var j = i + 1
+        for j < v.field_count {
+            val s2 = slots.get(j)
+            if s2 == null {
+                j = j + 1
+                continue
+            }
+            val f2 = check.type_variant_field_at(en, v, j)
+            if !is_unit_ty(f2.field_type) &&
+                !pat_irrefutable(mapped_inner(s2!!) as *parse.Node?, f2.field_type) {
+                later = true
+                break
+            }
+            j = j + 1
+        }
+        if !later {
+            test_pat(L, field, true, inner, yes, no, fld.field_type)
+            return
+        }
+        val mid = new_block(L, "when.field")
+        test_pat(L, field, true, inner, mid, no, fld.field_type)
+        use_block(L, mid)
+        i = i + 1
+    }
+    if !L.terminated && !L.failed {
+        emit_br(L, yes, node_pos(L, pat))
+    }
+}
+
+private fn test_struct_fields(
+    L: *Lower,
+    subject: ir.Operand,
+    st: *check.Type,
+    pat: *parse.Node,
+    yes: u32,
+    no: u32,
+) with (a: mem.Allocator) {
+    if L.failed || L.terminated {
+        return
+    }
+    if st.kind != check.type_kinds().STRUCT {
+        emit_br(L, no, node_pos(L, pat))
+        return
+    }
+    val n = check.type_field_count(st)
+    if n == 0 {
+        emit_br(L, yes, node_pos(L, pat))
+        return
+    }
+    val (slots, ok) = map_struct_fields(pat, st)
+    if !ok {
+        fail(L, pat, "struct pattern is missing a field")
+        return
+    }
+    var i: usize = 0
+    for i < n {
+        val slot = slots.get(i)
+        if slot == null {
+            i = i + 1
+            continue
+        }
+        val inner = mapped_inner(slot!!)
+        val fld = check.type_field_at(st, i)
+        if is_unit_ty(fld.field_type) || pat_irrefutable(inner as *parse.Node?, fld.field_type) {
+            i = i + 1
+            continue
+        }
+        val field = emit_extract_aux(L, subject, i as u32, 0, fld.field_type, node_pos(L, pat))
+        var later = false
+        var j = i + 1
+        for j < n {
+            val s2 = slots.get(j)
+            if s2 == null {
+                j = j + 1
+                continue
+            }
+            val f2 = check.type_field_at(st, j)
+            if !is_unit_ty(f2.field_type) &&
+                !pat_irrefutable(mapped_inner(s2!!) as *parse.Node?, f2.field_type) {
+                later = true
+                break
+            }
+            j = j + 1
+        }
+        if !later {
+            test_pat(L, field, true, inner, yes, no, fld.field_type)
+            return
+        }
+        val mid = new_block(L, "when.field")
+        test_pat(L, field, true, inner, mid, no, fld.field_type)
+        use_block(L, mid)
+        i = i + 1
+    }
+    if !L.terminated && !L.failed {
+        emit_br(L, yes, node_pos(L, pat))
+    }
+}
+
+private fn test_pat(
+    L: *Lower,
+    subject: ir.Operand,
+    has_subject: bool,
+    pat: *parse.Node,
+    yes: u32,
+    no: u32,
+    sty: *check.Type?,
+) with (a: mem.Allocator) {
+    if L.failed || L.terminated {
+        return
+    }
+    val pos = node_pos(L, pat)
+    var type0: *check.Type? = null
+    if has_subject {
+        type0 = peel(subject.ty)
+    }
+    var subj_ty = sty
+    if subj_ty == null {
+        subj_ty = type0
+    }
+    if parse.is_pat_bind(pat) && (pat.name == "_" || pat.text == "_") {
+        emit_br(L, yes, pos)
+        return
+    }
+    if has_subject && pat_irrefutable(pat as *parse.Node?, subj_ty) {
+        emit_br(L, yes, pos)
+        return
+    }
+    if !has_subject {
+        var cond = none_value()
+        if parse.is_pat_expr(pat) && pat.kids.len > 0 {
+            cond = lower_expr(L, pat.kids.get(0))
+        } else {
+            cond = lower_expr(L, pat)
+        }
+        if L.failed || L.terminated {
+            return
+        }
+        emit_cond(L, cond, yes, no, pos)
+        return
+    }
+    // Range `in lo..hi` (half-open).
+    if parse.is_pat_in(pat) && pat.kids.len >= 1 {
+        val range = pat.kids.get(0)
+        if parse.is_binary(range) && range.text == ".." && range.kids.len >= 2 {
+            val lo = lower_expr(L, range.kids.get(0))
+            val hi = lower_expr(L, range.kids.get(1))
+            val ge = emit_cmp(L, ir.bin_ops().GE, subject, lo, pos)
+            val in_range = new_block(L, "when.range")
+            emit_cond(L, ge, in_range, no, pos)
+            use_block(L, in_range)
+            val lt = emit_cmp(L, ir.bin_ops().LT, subject, hi, pos)
+            emit_cond(L, lt, yes, no, pos)
+            return
+        }
+        fail(L, pat, "in pattern needs a range")
+        return
+    }
+    if subj_ty != null && subj_ty!!.kind == check.type_kinds().OPTION {
+        if parse.is_pat_variant(pat) && (pat.name == "None" || pat.text == "None") {
+            val some = option_is_some(L, subject, pos)
+            emit_cond(L, some, no, yes, pos)
+            return
+        }
+        if parse.is_null_lit(pat) ||
+            (parse.is_pat_expr(pat) && pat.kids.len > 0 && parse.is_null_lit(pat.kids.get(0))) {
+            val some = option_is_some(L, subject, pos)
+            emit_cond(L, some, no, yes, pos)
+            return
+        }
+        if parse.is_pat_variant(pat) && (pat.name == "Some" || pat.text == "Some") {
+            var inner: *parse.Node? = null
+            if pat.kids.len > 0 {
+                inner = mapped_inner(pat.kids.get(0)) as *parse.Node?
+            }
+            val elem = subj_ty!!.elem
+            if pat_irrefutable(inner, elem) {
+                val some = option_is_some(L, subject, pos)
+                emit_cond(L, some, yes, no, pos)
+                return
+            }
+            val some = option_is_some(L, subject, pos)
+            val mid = new_block(L, "when.some")
+            emit_cond(L, some, mid, no, pos)
+            use_block(L, mid)
+            if elem == null || is_unit_ty(elem) || inner == null {
+                if !L.terminated && !L.failed {
+                    emit_br(L, yes, pos)
+                }
+                return
+            }
+            val value = option_value(L, subject, elem, pos)
+            test_pat(L, value, true, inner!!, yes, no, elem)
+            return
+        }
+        if parse.is_ident(pat) && (pat.name == "Some" || pat.text == "Some") {
+            val some = option_is_some(L, subject, pos)
+            emit_cond(L, some, yes, no, pos)
+            return
+        }
+    }
+    if subj_ty != null && subj_ty!!.kind == check.type_kinds().ENUM {
+        val (index, hit) = pat_selects_variant(pat, subj_ty!!)
+        if hit {
+            val tag = enum_tag_of(L, subject, subj_ty!!, pos)
+            val v = check.type_variant_at(subj_ty!!, index as usize)
+            val cmp = emit_cmp(L, ir.bin_ops().EQ, tag, ir.int_op(subj_ty!!.elem, v.tag), pos)
+            // Bare variant bind / is / name: tag only. Nested PAT_VARIANT may need payload tests.
+            if !parse.is_pat_variant(pat) || fields_irrefutable(pat, subj_ty!!, index as usize) {
+                emit_cond(L, cmp, yes, no, pos)
+                return
+            }
+            val mid = new_block(L, "when.payload")
+            emit_cond(L, cmp, mid, no, pos)
+            use_block(L, mid)
+            test_fields(L, subject, subj_ty!!, index, pat, yes, no)
+            return
+        }
+    }
+    if subj_ty != null && subj_ty!!.kind == check.type_kinds().STRUCT && parse.is_pat_variant(pat) &&
+        subj_ty!!.name.len > 0 && pat.name == subj_ty!!.name {
+        test_struct_fields(L, subject, subj_ty!!, pat, yes, no)
+        return
+    }
+    // PAT_EXPR / literal / member: lower rhs and compare (str/bytes/int/…).
+    var expr: *parse.Node? = null
+    if parse.is_pat_expr(pat) && pat.kids.len > 0 {
+        expr = pat.kids.get(0) as *parse.Node?
+    } else if parse.is_string_lit(pat) || parse.is_cstring_lit(pat) || parse.is_int_lit(pat) ||
+        parse.is_char_lit(pat) || parse.is_bool_lit(pat) || parse.is_null_lit(pat) ||
+        parse.is_member(pat) || parse.is_ident(pat) || parse.is_unary(pat) || parse.is_binary(pat) {
+        expr = pat as *parse.Node?
+    }
+    if expr != null {
+        if parse.is_null_lit(expr!!) && subj_ty != null && subj_ty!!.kind == check.type_kinds().OPTION {
+            val some = option_is_some(L, subject, pos)
+            emit_cond(L, some, no, yes, pos)
+            return
+        }
+        if subj_ty != null && subj_ty!!.kind == check.type_kinds().ENUM {
+            val esym = check.get_node_sym(expr!!)
+            if esym != null && load.is_symbol_variant(esym!!) {
+                val index = variant_index_by_sym(subj_ty, esym)
+                if index >= 0 {
+                    val tag = enum_tag_of(L, subject, subj_ty!!, pos)
+                    val v = check.type_variant_at(subj_ty!!, index as usize)
+                    val cmp = emit_cmp(L, ir.bin_ops().EQ, tag, ir.int_op(subj_ty!!.elem, v.tag), pos)
+                    emit_cond(L, cmp, yes, no, pos)
+                    return
+                }
+            }
+        }
+        val rhs = lower_expr(L, expr!!)
+        if L.failed || L.terminated {
+            return
+        }
+        val cmp = value_eq(L, subject, rhs, pos)
+        if L.failed || L.terminated {
+            return
+        }
+        emit_cond(L, cmp, yes, no, pos)
+        return
+    }
+    fail(L, pat, "pattern is not lowered yet")
+}
+
+private fn test_arm(
+    L: *Lower,
+    subject: ir.Operand,
+    has_subject: bool,
+    arm: *parse.Node,
+    yes: u32,
+    no: u32,
+    sty: *check.Type?,
+) with (a: mem.Allocator) {
+    if arm_is_else(arm) {
+        emit_br(L, yes, node_pos(L, arm))
+        return
+    }
+    val conds = arm_conds(arm)
+    if conds.len == 0 {
+        emit_br(L, yes, node_pos(L, arm))
+        return
+    }
+    var i: usize = 0
+    for i < conds.len && !L.failed {
+        var next = no
+        if i + 1 < conds.len {
+            next = new_block(L, "when.or")
+        }
+        test_pat(L, subject, has_subject, conds.get(i), yes, next, sty)
+        if i + 1 < conds.len {
+            use_block(L, next)
+        }
+        i = i + 1
+    }
+}
+
+/**
+ * `x?.len` / `x?.ptr` when x is T? and T is str/bytes/slice (C lower_option_view).
+ * Returns (op, true) when handled; (none, false) when not this form.
+ */
+fn lower_option_view(L: *Lower, node: *parse.Node): (ir.Operand, bool) with (a: mem.Allocator) {
+    if node.flag != "?." {
+        return none_value(), false
+    }
+    if node.name != "ptr" && node.name != "len" {
+        return none_value(), false
+    }
+    if node.kids.len == 0 {
+        return none_value(), false
+    }
+    val base_node = node.kids.get(0)
+    val opt = peel(check.get_node_ty(base_node))
+    var inner: *check.Type? = null
+    if opt != null && opt!!.kind == check.type_kinds().OPTION {
+        inner = peel(opt!!.elem)
+    }
+    if inner == null {
+        return none_value(), false
+    }
+    val tk = check.type_kinds()
+    val view = check.type_bytes_view(inner!!)
+    var bytes_or_slice = inner!!
+    if view != null {
+        bytes_or_slice = view!!
+    }
+    if bytes_or_slice.kind != tk.BYTES && bytes_or_slice.kind != tk.SLICE {
+        return none_value(), false
+    }
+    val result_ty = check.get_node_ty(node)
+    if result_ty == null {
+        return none_value(), false
+    }
+    val aux: u32 = if node.name == "ptr" {
+        0
+    } else {
+        1
+    }
+    var field_ty: *check.Type? = null
+    if aux == 1 {
+        field_ty = check.type_usize(L.types) as *check.Type?
+    } else {
+        var elem: *check.Type? = null
+        if bytes_or_slice.kind == tk.BYTES {
+            elem = check.type_u8(L.types) as *check.Type?
+        } else {
+            elem = bytes_or_slice.elem
+        }
+        if elem != null {
+            field_ty = check.type_ptr(L.types, elem!!, bytes_or_slice.is_const) as *check.Type?
+        }
+    }
+    if field_ty == null {
+        fail(L, node, "out of memory")
+        return none_value(), true
+    }
+    val pos = node_pos(L, node)
+    val result = new_local(L, "", result_ty)
+    val base = as_local(L, lower_expr(L, base_node), pos)
+    if L.failed || L.terminated {
+        return none_value(), true
+    }
+    val some = option_is_some(L, base, pos)
+    val yes = new_block(L, "view.some")
+    val no = new_block(L, "view.none")
+    val join = new_block(L, "view.join")
+    emit_cond(L, some, yes, no, pos)
+    use_block(L, no)
+    val peeled_res = peel(result_ty)
+    if peeled_res != null && check.type_option_is_niche(peeled_res!!) {
+        emit_copy(L, result, ir.null_op(result_ty), pos)
+    } else {
+        emit_inst(L, ir.op_kinds().ZERO, result as i32, pos)
+    }
+    if !L.terminated {
+        emit_br(L, join, pos)
+    }
+    use_block(L, yes)
+    val inner_val = option_value(L, base, inner, pos)
+    val field_val = emit_extract(L, inner_val, aux, field_ty, pos)
+    var args = list.empty<ir.Operand>()
+    args.push(ir.int_op(bool_ty(L), 1))
+    args.push(field_val)
+    fill_aggregate(L, result, 0, args, pos)
+    if !L.terminated {
+        emit_br(L, join, pos)
+    }
+    use_block(L, join)
+    return local_operand(L, result), true
+}
+
+fn lower_enum_safe(L: *Lower, node: *parse.Node): (ir.Operand, bool) with (a: mem.Allocator) {
+    if node.flag != "?." {
+        return none_value(), false
+    }
+    if node.kids.len == 0 {
+        return none_value(), true
+    }
+    val pos = node_pos(L, node)
+    val result_ty = check.get_node_ty(node)
+    val result = new_local(L, "", result_ty)
+    val base = as_local(L, lower_expr(L, node.kids.get(0)), pos)
+    val some = option_is_some(L, base, pos)
+    val yes = new_block(L, "safe.some")
+    val no = new_block(L, "safe.none")
+    val join = new_block(L, "safe.join")
+    emit_cond(L, some, yes, no, pos)
+    use_block(L, no)
+    emit_inst(L, ir.op_kinds().ZERO, result as i32, pos)
+    emit_br(L, join, pos)
+    use_block(L, yes)
+    val opt = peel(base.ty)
+    var inner: *check.Type? = null
+    if opt != null && opt!!.kind == check.type_kinds().OPTION {
+        inner = peel(opt!!.elem)
+    }
+    val inner_val = option_value(L, base, inner, pos)
+    val sym = check.get_node_sym(node)
+    var index: u32 = 0
+    var field_ty: *check.Type? = null
+    if inner != null && inner!!.kind == check.type_kinds().STRUCT {
+        val n = check.type_field_count(inner!!)
+        var fi: usize = 0
+        for fi < n {
+            val fld = check.type_field_at(inner!!, fi)
+            if fld.name == node.name || (sym != null && fld.name == sym!!.name) {
+                index = fi as u32
+                field_ty = fld.field_type
+                break
+            }
+            fi = fi + 1
+        }
+    }
+    val field_val = emit_extract(L, inner_val, index, field_ty, pos)
+    var args = list.empty<ir.Operand>()
+    args.push(ir.int_op(bool_ty(L), 1))
+    if field_ty == null || !is_unit_ty(field_ty) {
+        args.push(field_val)
+    }
+    fill_aggregate(L, result, 0, args, pos)
+    emit_br(L, join, pos)
+    use_block(L, join)
+    return local_operand(L, result), true
+}

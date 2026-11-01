@@ -1,0 +1,1583 @@
+// Coroutines / channels / scope / go. Checked against lower_coro.c + lower_chan_for.c.
+
+import src.check
+import src.ir
+import src.load
+import src.parse
+import std.list
+import std.mem
+import std.strbuilder
+
+struct CoroRt {
+    void_ptr: *check.Type?
+    void_const: *check.Type?
+    scope_ty: *check.Type?
+    err: *check.Type?
+    err_opt: *check.Type?
+    unit: *check.Type?
+    i32: *check.Type?
+    i64: *check.Type?
+    u32: *check.Type?
+    usize: *check.Type?
+    boolean: *check.Type?
+    scope_root: i32
+    scope_enter: i32
+    scope_leave: i32
+    scope_cancel: i32
+    scope_join: i32
+    scope_fail: i32
+    go_fn: i32
+    yield_fn: i32
+    task_set: i32
+    task_join: i32
+    chan_init: i32
+    chan_free: i32
+    chan_close: i32
+    chan_send: i32
+    chan_recv: i32
+    err_cancelled: i32
+    err_closed: i32
+    cap_new: i32
+    cap_set: i32
+    cap_get: i32
+    sel_begin: i32
+    sel_recv: i32
+    sel_send: i32
+    sel_default: i32
+    sel_timeout: i32
+    sel_wait: i32
+    sel_status: i32
+    sleep_fn: i32
+}
+
+private fn universe_named(L: *Lower, name: str): *check.Type? {
+    if L.root_pkg == null {
+        return null
+    }
+    val uni = L.root_pkg!!.scope.universe
+    if uni == null {
+        return null
+    }
+    val sym = load.package_scope_lookup(uni!!, name)
+    if sym == null {
+        return null
+    }
+    return check.get_sema(sym!!)
+}
+
+private fn is_chan_ty(ty: *check.Type?): bool {
+    if ty == null {
+        return false
+    }
+    val t = ty!!
+    return t.kind == check.type_kinds().DISTINCT && t.package.len == 0 && t.name == "Chan" && t.elems.len == 1
+}
+
+private fn is_task_ty(ty: *check.Type?): bool {
+    if ty == null {
+        return false
+    }
+    val t = ty!!
+    return t.kind == check.type_kinds().DISTINCT && t.package.len == 0 && t.name == "Task" && t.elems.len == 1
+}
+
+private fn is_scope_ty(ty: *check.Type?): bool {
+    if ty == null {
+        return false
+    }
+    val t = ty!!
+    return t.kind == check.type_kinds().DISTINCT && t.package.len == 0 && t.name == "Scope" && t.decl == null
+}
+
+private fn chan_elem(ty: *check.Type?): *check.Type? {
+    if ty == null || ty!!.elems.len != 1 {
+        return null
+    }
+    return ty!!.elems.get(0)
+}
+
+private fn is_root_main(L: *Lower): bool {
+    if L.func == null || L.module.main_func < 0 {
+        return false
+    }
+    val want = L.module.main_func as u32
+    if (want as usize) >= L.module.funcs.len {
+        return false
+    }
+    return L.module.funcs.get(want as usize) == L.func!!
+}
+
+/**
+ * Universe ErrCancelled / ErrClosed (C jog_lower_coro_error). Ensures the full
+ * coro RT extern set so fN numbering matches stage0.
+ */
+fn lower_coro_universe_err(L: *Lower, node: *parse.Node, sym: *load.Symbol): (ir.Operand, bool) with (a: mem.Allocator) {
+    if !load.is_symbol_constant(sym) || sym.decl != null {
+        return none_value(), false
+    }
+    var which: i32 = 0
+    if sym.name == "ErrCancelled" {
+        which = 1
+    } else if sym.name == "ErrClosed" {
+        which = 2
+    } else {
+        return none_value(), false
+    }
+    val pos = node_pos(L, node)
+    val (rt, ok) = load_coro_rt(L, pos)
+    if !ok {
+        return none_value(), true
+    }
+    var fn_i = rt.err_cancelled
+    if which == 2 {
+        fn_i = rt.err_closed
+    }
+    val ptr = call_rt0(L, fn_i, rt.void_ptr, pos)
+    return iface_of(L, rt, ptr, pos), true
+}
+
+private fn load_coro_rt(L: *Lower, pos: ir.Pos): (CoroRt, bool) with (a: mem.Allocator) {
+    var rt: CoroRt
+    rt.unit = check.type_unit(L.types) as *check.Type?
+    rt.i32 = check.type_i32(L.types) as *check.Type?
+    rt.i64 = check.type_i64(L.types) as *check.Type?
+    rt.u32 = check.type_u32(L.types) as *check.Type?
+    rt.usize = check.type_usize(L.types) as *check.Type?
+    rt.boolean = check.type_bool(L.types) as *check.Type?
+    rt.err = universe_named(L, "error")
+    rt.scope_ty = universe_named(L, "Scope")
+    rt.void_ptr = void_ptr(L)
+    val void_ty = void_ty(L)
+    if void_ty != null {
+        rt.void_const = check.type_ptr(L.types, void_ty!!, true) as *check.Type?
+    } else {
+        rt.void_const = null
+    }
+    if rt.err != null {
+        rt.err_opt = check.type_option(L.types, rt.err!!) as *check.Type?
+    } else {
+        rt.err_opt = null
+    }
+    if rt.unit == null || rt.i32 == null || rt.void_ptr == null || rt.scope_ty == null || rt.err == null ||
+        rt.err_opt == null || rt.usize == null || rt.boolean == null || rt.u32 == null || rt.void_const == null {
+        fail_pos(L, pos, "coroutine runtime types are missing")
+        return rt, false
+    }
+    val empty = list.empty<*check.Type>()
+    var one = list.empty<*check.Type>()
+    one.push(rt.void_ptr!!)
+    var two = list.empty<*check.Type>()
+    two.push(rt.void_ptr!!)
+    two.push(rt.usize!!)
+    var send3 = list.empty<*check.Type>()
+    send3.push(rt.void_ptr!!)
+    send3.push(rt.void_ptr!!)
+    send3.push(rt.usize!!)
+    var go_params = list.empty<*check.Type>()
+    val env_fn = check.type_fn(L.types, one, rt.unit!!, empty, false, false, true)
+    go_params.push(env_fn)
+    go_params.push(rt.void_ptr!!)
+    go_params.push(rt.usize!!)
+    go_params.push(rt.void_ptr!!)
+    go_params.push(rt.void_const!!)
+    go_params.push(rt.u32!!)
+    var cap_set_p = list.empty<*check.Type>()
+    cap_set_p.push(rt.void_ptr!!)
+    cap_set_p.push(rt.usize!!)
+    cap_set_p.push(rt.void_ptr!!)
+    var init_p = list.empty<*check.Type>()
+    init_p.push(rt.usize!!)
+    init_p.push(rt.usize!!)
+
+    rt.scope_root = ensure_extern(L, "jogrt_scope_root", empty, rt.void_ptr!!)
+    rt.scope_enter = ensure_extern(L, "jogrt_scope_enter", one, rt.void_ptr!!)
+    rt.scope_leave = ensure_extern(L, "jogrt_scope_leave", one, rt.void_ptr!!)
+    rt.scope_cancel = ensure_extern(L, "jogrt_scope_cancel", one, rt.unit!!)
+    rt.scope_join = ensure_extern(L, "jogrt_scope_join", one, rt.unit!!)
+    rt.scope_fail = ensure_extern(L, "jogrt_scope_fail", one, rt.unit!!)
+    rt.go_fn = ensure_extern(L, "jogrt_go", go_params, rt.void_ptr!!)
+    rt.yield_fn = ensure_extern(L, "jogrt_yield", empty, rt.unit!!)
+    rt.task_set = ensure_extern(L, "jogrt_task_set", two, rt.unit!!)
+    rt.task_join = ensure_extern(L, "jogrt_task_join", send3, rt.unit!!)
+    rt.chan_init = ensure_extern(L, "jogrt_chan_init", init_p, rt.void_ptr!!)
+    rt.chan_free = ensure_extern(L, "jogrt_chan_free", one, rt.unit!!)
+    rt.chan_close = ensure_extern(L, "jogrt_chan_close", one, rt.unit!!)
+    rt.chan_send = ensure_extern(L, "jogrt_chan_send", send3, rt.i32!!)
+    rt.chan_recv = ensure_extern(L, "jogrt_chan_recv", send3, rt.i32!!)
+    // Match C load_rt ensure order (select before err/cap) so fN indices align.
+    rt.sel_begin = ensure_extern(L, "jogrt_select_begin", empty, rt.unit!!)
+    rt.sel_recv = ensure_extern(L, "jogrt_select_add_recv", send3, rt.i32!!)
+    rt.sel_send = ensure_extern(L, "jogrt_select_add_send", send3, rt.i32!!)
+    rt.sel_default = ensure_extern(L, "jogrt_select_add_default", empty, rt.i32!!)
+    rt.sel_timeout = ensure_extern(L, "jogrt_select_add_timeout", list_of_one(rt.i64!!), rt.i32!!)
+    rt.sel_wait = ensure_extern(L, "jogrt_select_wait", empty, rt.i32!!)
+    rt.sel_status = ensure_extern(L, "jogrt_select_status", empty, rt.i32!!)
+    rt.sleep_fn = ensure_extern(L, "jogrt_sleep", list_of_one(rt.i64!!), rt.i32!!)
+    rt.err_cancelled = ensure_extern(L, "jogrt_err_cancelled", empty, rt.void_ptr!!)
+    rt.err_closed = ensure_extern(L, "jogrt_err_closed", empty, rt.void_ptr!!)
+    rt.cap_new = ensure_extern(L, "jogrt_cap_new", list_of_one(rt.usize!!), rt.void_ptr!!)
+    rt.cap_set = ensure_extern(L, "jogrt_cap_set", cap_set_p, rt.unit!!)
+    rt.cap_get = ensure_extern(L, "jogrt_cap_get", two, rt.void_ptr!!)
+    return rt, true
+}
+
+private fn list_of_one(t: *check.Type): list.List<*check.Type> with (a: mem.Allocator) {
+    var xs = list.empty<*check.Type>()
+    xs.push(t)
+    return xs
+}
+
+private fn fail_pos(L: *Lower, pos: ir.Pos, message: str) with (a: mem.Allocator) {
+    L.failed = true
+    load.print_pos_error(pos.file, pos.line, pos.column, message)
+}
+
+private fn call_rt(
+    L: *Lower,
+    fn_i: i32,
+    args: list.List<ir.Operand>,
+    as_ty: *check.Type?,
+    pos: ir.Pos,
+): ir.Operand with (a: mem.Allocator) {
+    if fn_i < 0 || L.failed || L.terminated {
+        if fn_i < 0 && !L.failed {
+            fail_pos(L, pos, "missing coroutine runtime")
+        }
+        return none_value()
+    }
+    val f = ir.func_at(&L.module, fn_i as u32)
+    var ret: *check.Type? = null
+    if f != null && f!!.ty != null {
+        ret = f!!.ty!!.elem
+    }
+    var local_ty = as_ty
+    if local_ty == null {
+        local_ty = ret
+    }
+    var dst: i32 = -1
+    if local_ty != null && !check.type_is_unit(local_ty!!) {
+        dst = new_local(L, "", local_ty) as i32
+    }
+    val inst = emit_inst(L, ir.op_kinds().CALL, dst, pos)
+    if inst != null {
+        inst!!.a = ir.func_ref(&L.module, fn_i as u32)
+        ir.set_args(inst!!, args)
+    }
+    if dst >= 0 {
+        return local_operand(L, dst as u32)
+    }
+    return none_value()
+}
+
+private fn call_rt0(L: *Lower, fn_i: i32, as_ty: *check.Type?, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    return call_rt(L, fn_i, list.empty<ir.Operand>(), as_ty, pos)
+}
+
+private fn call_rt1(
+    L: *Lower,
+    fn_i: i32,
+    a0: ir.Operand,
+    as_ty: *check.Type?,
+    pos: ir.Pos,
+): ir.Operand with (a: mem.Allocator) {
+    var args = list.empty<ir.Operand>()
+    args.push(a0)
+    return call_rt(L, fn_i, args, as_ty, pos)
+}
+
+/** C addr_of: ADDR dest is already *void (no *T then bitcast). */
+private fn addr_void(L: *Lower, local: u32, vp: *check.Type?, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    val dst = new_local(L, "", vp)
+    val inst = emit_inst(L, ir.op_kinds().ADDR, dst as i32, pos)
+    if inst != null && L.func != null {
+        inst!!.a = ir.local_op(L.func!!, local)
+    }
+    return local_operand(L, dst)
+}
+
+private fn iface_of(L: *Lower, rt: CoroRt, ptr: ir.Operand, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    var p = ptr
+    if p.kind != ir.operand_kinds().LOCAL {
+        p = as_local(L, p, pos)
+    }
+    var args = list.empty<ir.Operand>()
+    args.push(p)
+    args.push(p)
+    return emit_aggregate(L, rt.err, args, pos)
+}
+
+private fn error_from_ptr(L: *Lower, rt: CoroRt, ptr: ir.Operand, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    var p = ptr
+    if p.kind != ir.operand_kinds().LOCAL && p.kind != ir.operand_kinds().NULL {
+        p = as_local(L, p, pos)
+    }
+    val has = emit_binop(L, ir.bin_ops().NE, false, p, ir.null_op(rt.void_ptr), rt.boolean, pos)
+    val iface = iface_of(L, rt, p, pos)
+    var args = list.empty<ir.Operand>()
+    args.push(has)
+    args.push(iface)
+    return emit_aggregate(L, rt.err_opt, args, pos)
+}
+
+private fn error_from_status(L: *Lower, rt: CoroRt, status_in: ir.Operand, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    var status = status_in
+    if status.kind != ir.operand_kinds().LOCAL {
+        status = as_local(L, status, pos)
+    }
+    val ptr_l = new_local(L, "", rt.void_ptr)
+    val cancelled = call_rt0(L, rt.err_cancelled, rt.void_ptr, pos)
+    emit_copy(L, ptr_l, cancelled, pos)
+    val yes = new_block(L, "")
+    val join = new_block(L, "")
+    val is_closed = emit_binop(L, ir.bin_ops().EQ, false, status, ir.int_op(rt.i32, 2), rt.boolean, pos)
+    emit_cond(L, is_closed, yes, join, pos)
+    use_block(L, yes)
+    val closed = call_rt0(L, rt.err_closed, rt.void_ptr, pos)
+    emit_copy(L, ptr_l, closed, pos)
+    emit_br(L, join, pos)
+    use_block(L, join)
+    val has = emit_binop(L, ir.bin_ops().NE, false, status, ir.int_op(rt.i32, 0), rt.boolean, pos)
+    val iface = iface_of(L, rt, local_operand(L, ptr_l), pos)
+    var args = list.empty<ir.Operand>()
+    args.push(has)
+    args.push(iface)
+    return emit_aggregate(L, rt.err_opt, args, pos)
+}
+
+private fn push_scope(L: *Lower, local: u32) {
+    L.coro_scopes.push(local)
+}
+
+private fn leave_top(L: *Lower, rt: CoroRt, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    if L.coro_scopes.len == 0 || L.failed || L.terminated {
+        return ir.null_op(rt.void_ptr)
+    }
+    val local = L.coro_scopes.get(L.coro_scopes.len - 1)
+    L.coro_scopes.len = L.coro_scopes.len - 1
+    return call_rt1(L, rt.scope_leave, local_operand(L, local), rt.void_ptr, pos)
+}
+
+private fn is_error_opt_ty(ty: *check.Type?): bool {
+    if ty == null || ty!!.kind != check.type_kinds().OPTION || ty!!.elem == null {
+        return false
+    }
+    val e = ty!!.elem!!
+    return e.kind == check.type_kinds().INTERFACE && e.name == "error" && e.package.len == 0
+}
+
+private fn maybe_fail(L: *Lower, rt: CoroRt, value_in: ir.Operand, ty: *check.Type?, pos: ir.Pos) with (a: mem.Allocator) {
+    if !is_error_opt_ty(ty) || L.failed || L.terminated {
+        return
+    }
+    var value = value_in
+    if value.kind != ir.operand_kinds().LOCAL {
+        value = as_local(L, value, pos)
+    }
+    val has = emit_extract(L, value, 0, rt.boolean, pos)
+    val iface = emit_extract(L, value, 1, rt.err, pos)
+    val ptr = emit_extract(L, iface, 0, rt.void_ptr, pos)
+    val yes = new_block(L, "")
+    val join = new_block(L, "")
+    emit_cond(L, has, yes, join, pos)
+    use_block(L, yes)
+    call_rt1(L, rt.scope_fail, ptr, null, pos)
+    emit_br(L, join, pos)
+    use_block(L, join)
+}
+
+private fn task_set(L: *Lower, rt: CoroRt, value: ir.Operand, pos: ir.Pos) with (a: mem.Allocator) {
+    val ty = value.ty
+    if L.failed || L.terminated || ty == null || check.type_is_unit(ty!!) || ty!!.size == 0 {
+        return
+    }
+    var args = list.empty<ir.Operand>()
+    args.push(elem_ptr(L, value, rt.void_ptr, pos))
+    args.push(ir.int_op(rt.usize, ty!!.size as i64))
+    call_rt(L, rt.task_set, args, null, pos)
+}
+
+private fn lower_result_body(L: *Lower, rt: CoroRt, body: *parse.Node, publish: bool) with (a: mem.Allocator) {
+    if L.failed {
+        return
+    }
+    if !parse.is_block(body) {
+        val value = lower_expr(L, body)
+        if L.failed || L.terminated {
+            return
+        }
+        maybe_fail(L, rt, value, check.get_node_ty(body), node_pos(L, body))
+        if publish {
+            task_set(L, rt, value, node_pos(L, body))
+        }
+        return
+    }
+    val n = body.kids.len
+    val base = L.cleanups.len
+    var last: *parse.Node? = null
+    if n > 0 {
+        last = body.kids.get(n - 1) as *parse.Node?
+    }
+    var tail = false
+    if last != null && parse.is_expr_stmt(last!!) && last!!.kids.len > 0 {
+        val expr = last!!.kids.get(0)
+        if !parse.is_if(expr) && !parse.is_when(expr) {
+            tail = true
+        }
+    }
+    val limit = if tail {
+        n - 1
+    } else {
+        n
+    }
+    var i: usize = 0
+    for i < limit && !L.failed && !L.terminated {
+        lower_stmt(L, body.kids.get(i))
+        i = i + 1
+    }
+    if tail && !L.failed && !L.terminated {
+        val expr = last!!.kids.get(0)
+        val value = lower_expr(L, expr)
+        if !L.failed && !L.terminated {
+            maybe_fail(L, rt, value, check.get_node_ty(expr), node_pos(L, last!!))
+            if publish {
+                task_set(L, rt, value, node_pos(L, last!!))
+            }
+        }
+    }
+    lower_error_block_end(L, base, node_pos(L, body))
+}
+
+private fn finish_status(
+    L: *Lower,
+    rt: CoroRt,
+    chosen: ir.Operand,
+    status: ir.Operand,
+    pos: ir.Pos,
+): ir.Operand with (a: mem.Allocator) {
+    val bad = new_local(L, "", rt.i32)
+    emit_copy(L, bad, status, pos)
+    val neg = new_block(L, "")
+    val keep = new_block(L, "")
+    val join = new_block(L, "")
+    val lt = emit_binop(L, ir.bin_ops().LT, false, chosen, ir.int_op(rt.i32, 0), rt.boolean, pos)
+    emit_cond(L, lt, neg, keep, pos)
+    use_block(L, neg)
+    val closed_b = new_block(L, "")
+    val one_b = new_block(L, "")
+    val after = new_block(L, "")
+    val eq = emit_binop(L, ir.bin_ops().EQ, false, chosen, ir.int_op(rt.i32, -2), rt.boolean, pos)
+    emit_cond(L, eq, closed_b, one_b, pos)
+    use_block(L, closed_b)
+    emit_copy(L, bad, ir.int_op(rt.i32, 2), pos)
+    emit_br(L, after, pos)
+    use_block(L, one_b)
+    emit_copy(L, bad, ir.int_op(rt.i32, 1), pos)
+    emit_br(L, after, pos)
+    use_block(L, after)
+    emit_br(L, join, pos)
+    use_block(L, keep)
+    emit_br(L, join, pos)
+    use_block(L, join)
+    return error_from_status(L, rt, local_operand(L, bad), pos)
+}
+
+private fn case_name(expr: *parse.Node): str {
+    if !parse.is_call(expr) || expr.kids.len == 0 {
+        return ""
+    }
+    val callee = expr.kids.get(0)
+    if !parse.is_ident(callee) {
+        return ""
+    }
+    var name = callee.name
+    if name.len == 0 {
+        name = callee.text
+    }
+    return name
+}
+
+private fn arg_value(node: *parse.Node?): *parse.Node? {
+    if node == null {
+        return null
+    }
+    var n = node!!
+    if parse.is_arg(n) && n.kids.len > 0 {
+        n = n.kids.get(0)
+    }
+    return n as *parse.Node?
+}
+
+private fn lower_case_body(L: *Lower, lambda: *parse.Node?, has_slot: bool, slot: u32) with (a: mem.Allocator) {
+    if lambda == null || !parse.is_lambda(lambda!!) {
+        return
+    }
+    val base = L.locals.len
+    if has_slot {
+        var sym = check.get_node_sym(lambda!!)
+        if sym == null && lambda!!.kids.len > 0 {
+            val p0 = lambda!!.kids.get(0)
+            if parse.is_param(p0) {
+                sym = check.get_node_sym(p0)
+            }
+        }
+        if sym != null {
+            bind_local(L, sym, slot)
+        }
+    }
+    var body: *parse.Node? = null
+    if lambda!!.kids.len > 0 {
+        body = lambda!!.kids.get(lambda!!.kids.len - 1) as *parse.Node?
+    }
+    if body != null {
+        if parse.is_block(body!!) {
+            lower_stmt(L, body!!)
+        } else {
+            lower_expr(L, body!!)
+        }
+    }
+    L.locals.len = base
+}
+
+private fn lower_select(L: *Lower, rt: CoroRt, call: *parse.Node): ir.Operand with (a: mem.Allocator) {
+    if !parse.call_has_trailing(call) || call.kids.len < 2 {
+        fail(L, call, "select needs a block")
+        return none_value()
+    }
+    val lam = call.kids.get(call.kids.len - 1 - parse.call_nctx(call))
+    if !parse.is_lambda(lam) || lam.kids.len == 0 {
+        fail(L, call, "select needs a block")
+        return none_value()
+    }
+    val block = lam.kids.get(lam.kids.len - 1)
+    if !parse.is_block(block) {
+        fail(L, call, "select needs a block")
+        return none_value()
+    }
+    val n = block.kids.len
+    if n == 0 || n > 32 {
+        fail(L, call, if n == 0 {
+            "select needs a case"
+        } else {
+            "too many select cases"
+        })
+        return none_value()
+    }
+    call_rt0(L, rt.sel_begin, null, node_pos(L, call))
+    var case_ids = list.empty<ir.Operand>()
+    var case_lams = list.empty<*parse.Node?>()
+    var case_slots = list.empty<u32>()
+    var case_has = list.empty<bool>()
+    var i: usize = 0
+    for i < n && !L.failed && !L.terminated {
+        val stmt = block.kids.get(i)
+        var expr = stmt
+        if parse.is_expr_stmt(stmt) && stmt.kids.len > 0 {
+            expr = stmt.kids.get(0)
+        }
+        val name = case_name(expr)
+        if name.len == 0 {
+            fail(L, stmt, "select case must be recv, send, timeout, or default")
+            return none_value()
+        }
+        var trail: *parse.Node? = null
+        if parse.call_has_trailing(expr) {
+            val cend = parse.call_arg_end(expr)
+            if cend < expr.kids.len {
+                // trailing is after args; call_arg_end already excludes trailing
+                trail = expr.kids.get(expr.kids.len - 1 - parse.call_nctx(expr)) as *parse.Node?
+            }
+        }
+        case_lams.push(trail)
+        case_slots.push(0)
+        case_has.push(false)
+        if name == "default" {
+            case_ids.push(call_rt0(L, rt.sel_default, null, node_pos(L, expr)))
+            i = i + 1
+            continue
+        }
+        if name == "timeout" {
+            var ms: *parse.Node? = null
+            if parse.call_arg_end(expr) > 1 {
+                ms = arg_value(expr.kids.get(1) as *parse.Node?)
+            }
+            val ms_op = if ms != null {
+                lower_expr(L, ms!!)
+            } else {
+                ir.int_op(rt.i64, 0)
+            }
+            case_ids.push(call_rt1(L, rt.sel_timeout, ms_op, null, node_pos(L, expr)))
+            i = i + 1
+            continue
+        }
+        var chan_node: *parse.Node? = null
+        if parse.call_arg_end(expr) > 1 {
+            chan_node = arg_value(expr.kids.get(1) as *parse.Node?)
+        }
+        val chan = if chan_node != null {
+            lower_expr(L, chan_node!!)
+        } else {
+            none_value()
+        }
+        var chan_ty: *check.Type? = null
+        if chan_node != null {
+            chan_ty = check.get_node_ty(chan_node!!)
+        }
+        val elem = chan_elem(chan_ty)
+        if elem == null {
+            fail(L, expr, "select case needs a Chan")
+            return none_value()
+        }
+        check.type_layout(L.types, elem!!)
+        var args = list.empty<ir.Operand>()
+        args.push(chan)
+        args.push(none_value())
+        args.push(ir.int_op(rt.usize, elem!!.size as i64))
+        if name == "recv" {
+            val slot = new_local(L, "", elem)
+            zero_local(L, slot, node_pos(L, expr))
+            args.set(1, addr_void(L, slot, rt.void_ptr, node_pos(L, expr)))
+            case_ids.push(call_rt(L, rt.sel_recv, args, null, node_pos(L, expr)))
+            case_slots.set(i, slot)
+            case_has.set(i, true)
+            i = i + 1
+            continue
+        }
+        var value_node: *parse.Node? = null
+        if parse.call_arg_end(expr) > 2 {
+            value_node = arg_value(expr.kids.get(2) as *parse.Node?)
+        }
+        val value = if value_node != null {
+            lower_expr(L, value_node!!)
+        } else {
+            none_value()
+        }
+        args.set(1, elem_ptr(L, value, rt.void_ptr, node_pos(L, expr)))
+        case_ids.push(call_rt(L, rt.sel_send, args, null, node_pos(L, expr)))
+        i = i + 1
+    }
+    if L.failed || L.terminated {
+        return none_value()
+    }
+    val chosen = call_rt0(L, rt.sel_wait, null, node_pos(L, call))
+    val status = call_rt0(L, rt.sel_status, null, node_pos(L, call))
+    val status_ok = emit_binop(L, ir.bin_ops().EQ, false, status, ir.int_op(rt.i32, 0), rt.boolean, node_pos(L, call))
+    val done = new_block(L, "")
+    var ci: usize = 0
+    for ci < n && !L.failed {
+        val gate = new_block(L, "")
+        val yes = new_block(L, "")
+        val no = new_block(L, "")
+        val eq = emit_binop(L, ir.bin_ops().EQ, false, chosen, case_ids.get(ci), rt.boolean, node_pos(L, call))
+        emit_cond(L, eq, gate, no, node_pos(L, call))
+        use_block(L, gate)
+        emit_cond(L, status_ok, yes, no, node_pos(L, call))
+        use_block(L, yes)
+        lower_case_body(L, case_lams.get(ci), case_has.get(ci), case_slots.get(ci))
+        if !L.terminated {
+            emit_br(L, done, node_pos(L, call))
+        }
+        use_block(L, no)
+        ci = ci + 1
+    }
+    if !L.terminated {
+        emit_br(L, done, node_pos(L, call))
+    }
+    use_block(L, done)
+    return finish_status(L, rt, chosen, status, node_pos(L, call))
+}
+
+private fn lower_sleep(L: *Lower, rt: CoroRt, call: *parse.Node): ir.Operand with (a: mem.Allocator) {
+    var ms: *parse.Node? = null
+    if parse.call_arg_end(call) > 1 {
+        ms = arg_value(call.kids.get(1) as *parse.Node?)
+    }
+    val ms_op = if ms != null {
+        lower_expr(L, ms!!)
+    } else {
+        ir.int_op(rt.i64, 0)
+    }
+    val status = call_rt1(L, rt.sleep_fn, ms_op, null, node_pos(L, call))
+    return error_from_status(L, rt, status, node_pos(L, call))
+}
+
+/** Capture store inside `go`. */
+fn lower_coro_store(L: *Lower, node: *parse.Node): bool with (a: mem.Allocator) {
+    if !L.in_coro || node.kids.len < 2 {
+        return false
+    }
+    val target = node.kids.get(0)
+    if !parse.is_ident(target) {
+        return false
+    }
+    val sym = check.get_node_sym(target)
+    if sym == null {
+        return false
+    }
+    val idx = cap_of(L, sym!!)
+    if idx < 0 {
+        return false
+    }
+    if node.text != "=" && node.text.len > 0 {
+        val (bin, checked, ok_op) = assign_base_binop(node.text)
+        if !ok_op {
+            fail(L, node, "assignment not lowered yet")
+            return true
+        }
+    }
+    val (rt, ok) = load_coro_rt(L, node_pos(L, node))
+    if !ok {
+        return true
+    }
+    var ty = check.get_sema(sym!!)
+    if ty == null {
+        ty = check.get_node_ty(target)
+    }
+    var gargs = list.empty<ir.Operand>()
+    gargs.push(local_operand(L, 0))
+    gargs.push(ir.int_op(rt.usize, idx as i64))
+    val raw = call_rt(L, rt.cap_get, gargs, rt.void_ptr, node_pos(L, node))
+    val ptr_ty = check.type_ptr(L.types, ty!!, false) as *check.Type?
+    val ptr = emit_bitcast(L, raw, ptr_ty, node_pos(L, node))
+    if L.failed || L.terminated {
+        return true
+    }
+    val rhs_node = node.kids.get(1)
+    if node.text != "=" && node.text.len > 0 {
+        val tk = check.type_kinds()
+        if (node.text == "+=" || node.text == "-=") && ty != null &&
+            check.type_peel_distinct(ty!!).kind == tk.PTR {
+            ptr_update(L, ptr, node.text, rhs_node, node_pos(L, node))
+            return true
+        }
+        val (bin, checked, ok_op) = assign_base_binop(node.text)
+        if !ok_op {
+            fail(L, node, "assignment not lowered yet")
+            return true
+        }
+        val lhs = emit_load(L, ptr, node_pos(L, node))
+        if L.failed || L.terminated {
+            return true
+        }
+        val rhs = lower_expr(L, rhs_node)
+        if L.failed || L.terminated {
+            return true
+        }
+        val value = emit_binop(L, bin, checked, lhs, rhs, ty, node_pos(L, node))
+        if L.failed || L.terminated {
+            return true
+        }
+        emit_store(L, ptr, value, node_pos(L, node))
+        return true
+    }
+    val value = lower_expr(L, rhs_node)
+    if L.failed || L.terminated {
+        return true
+    }
+    emit_store(L, ptr, value, node_pos(L, node))
+    return true
+}
+
+private fn fail_last_error(L: *Lower, rt: CoroRt, value: ir.Operand, pos: ir.Pos) with (a: mem.Allocator) {
+    val ty = value.ty
+    if ty == null || ty!!.kind != check.type_kinds().TUPLE || ty!!.elems.len == 0 {
+        return
+    }
+    val last = ty!!.elems.get(ty!!.elems.len - 1)
+    // C: only extract when the trailing element is error? (skip for (i32, i32)).
+    if !is_error_opt_ty(last) {
+        return
+    }
+    maybe_fail(L, rt, emit_extract(L, value, (ty!!.elems.len - 1) as u32, last, pos), last, pos)
+}
+
+private fn lower_go_tuple(L: *Lower, node: *parse.Node, count: usize): ir.Operand with (a: mem.Allocator) {
+    var args = list.empty<ir.Operand>()
+    var elems = list.empty<*check.Type>()
+    var i: usize = 0
+    for i < count {
+        val value_node = node.kids.get(i)
+        val op = lower_expr(L, value_node)
+        if L.failed || L.terminated {
+            return none_value()
+        }
+        args.push(op)
+        if op.ty == null {
+            fail(L, value_node, "return value has no type")
+            return none_value()
+        }
+        elems.push(op.ty!!)
+        i = i + 1
+    }
+    val tuple = check.type_tuple(L.types, elems)
+    return emit_aggregate(L, tuple as *check.Type?, args, node_pos(L, node))
+}
+
+/** `return` inside a `go` child: publish via task_set then exit. */
+fn lower_coro_return(L: *Lower, node: *parse.Node): bool with (a: mem.Allocator) {
+    if !L.in_coro {
+        return false
+    }
+    val (rt, ok) = load_coro_rt(L, node_pos(L, node))
+    if !ok {
+        return true
+    }
+    val count = node.kids.len
+    if count > 1 {
+        val value = lower_go_tuple(L, node, count)
+        if !L.failed && !L.terminated {
+            fail_last_error(L, rt, value, node_pos(L, node))
+            task_set(L, rt, value, node_pos(L, node))
+        }
+    }
+    if count == 1 {
+        val value = lower_expr(L, node.kids.get(0))
+        if !L.failed && !L.terminated {
+            maybe_fail(L, rt, value, check.get_node_ty(node.kids.get(0)), node_pos(L, node))
+            task_set(L, rt, value, node_pos(L, node))
+        }
+    }
+    if !L.failed && !L.terminated {
+        lower_coro_on_exit(L, node_pos(L, node))
+    }
+    // Unit return from the coro child (values already published).
+    if !L.failed && !L.terminated {
+        emit_ret(L, none_value(), node_pos(L, node))
+    }
+    return true
+}
+
+/** Leave open scopes (and join root) on exit paths. */
+fn lower_coro_on_exit(L: *Lower, pos: ir.Pos) with (a: mem.Allocator) {
+    if L.failed || L.terminated {
+        return
+    }
+    if L.coro_scopes.len == 0 && (L.in_coro || L.coro_seq == 0 || !is_root_main(L)) {
+        return
+    }
+    val (rt, ok) = load_coro_rt(L, pos)
+    if !ok {
+        return
+    }
+    var i = L.coro_scopes.len
+    for i > 0 {
+        i = i - 1
+        val scope = local_operand(L, L.coro_scopes.get(i))
+        call_rt1(L, rt.scope_leave, scope, null, pos)
+        if L.failed || L.terminated {
+            return
+        }
+    }
+    if !L.in_coro && is_root_main(L) {
+        val root = call_rt0(L, rt.scope_root, rt.void_ptr, pos)
+        call_rt1(L, rt.scope_join, root, null, pos)
+    }
+}
+
+private fn lower_scope_call(L: *Lower, rt: CoroRt, call: *parse.Node): ir.Operand with (a: mem.Allocator) {
+    if !parse.call_has_trailing(call) || call.kids.len < 2 {
+        fail(L, call, "scope needs a block")
+        return none_value()
+    }
+    val lam = call.kids.get(call.kids.len - 1)
+    var body: *parse.Node? = null
+    if parse.is_lambda(lam) && lam.kids.len > 0 {
+        body = lam.kids.get(lam.kids.len - 1) as *parse.Node?
+    }
+    if body == null {
+        fail(L, call, "scope needs a block")
+        return none_value()
+    }
+    val parent = ir.null_op(rt.void_ptr)
+    val entered = call_rt1(L, rt.scope_enter, parent, rt.scope_ty, node_pos(L, call))
+    if L.failed || entered.kind != ir.operand_kinds().LOCAL {
+        return none_value()
+    }
+    val sym = check.get_node_sym(call)
+    if sym != null {
+        bind_local(L, sym, entered.local)
+    }
+    push_scope(L, entered.local)
+    lower_result_body(L, rt, body!!, false)
+    if L.failed || L.terminated {
+        return none_value()
+    }
+    val left = leave_top(L, rt, node_pos(L, call))
+    return error_from_ptr(L, rt, left, node_pos(L, call))
+}
+
+private fn lower_chan_init(L: *Lower, rt: CoroRt, call: *parse.Node): ir.Operand with (a: mem.Allocator) {
+    val callee = call.kids.get(0)
+    val base = callee.kids.get(0)
+    var elem = chan_elem(check.get_node_ty(base))
+    if elem == null {
+        elem = chan_elem(check.get_node_ty(call))
+    }
+    if elem == null {
+        // `Chan<T>.init` — T may live as a type kid on the Chan ident.
+        var ki: usize = 0
+        for ki < base.kids.len {
+            val kid = base.kids.get(ki)
+            val kt = check.get_node_ty(kid)
+            if kt != null {
+                elem = kt
+                break
+            }
+            ki = ki + 1
+        }
+    }
+    if elem == null {
+        fail(L, call, "channel element has no type")
+        return none_value()
+    }
+    check.type_layout(L.types, elem!!)
+    // Lower with-clause contexts (Allocator). Contexts sit after ordinary args.
+    val nctx = parse.call_nctx(call)
+    val arg_end = parse.call_arg_end(call)
+    var ci: usize = 0
+    for ci < nctx {
+        val ix = arg_end + ci
+        if ix < call.kids.len {
+            val ctx = call.kids.get(ix)
+            // Package calls like `mem.heap()` are typed on the CALL node.
+            if check.get_node_ty(ctx) != null || parse.is_call(ctx) {
+                lower_expr(L, ctx)
+            }
+        }
+        ci = ci + 1
+        if L.failed {
+            return none_value()
+        }
+    }
+    var cap_node: *parse.Node? = null
+    if arg_end > 1 {
+        var a0 = call.kids.get(1)
+        if parse.is_arg(a0) && a0.kids.len > 0 {
+            a0 = a0.kids.get(0)
+        }
+        cap_node = a0 as *parse.Node?
+    }
+    var args = list.empty<ir.Operand>()
+    args.push(ir.int_op(rt.usize, elem!!.size as i64))
+    if cap_node != null {
+        args.push(lower_expr(L, cap_node!!))
+    } else {
+        args.push(ir.int_op(rt.usize, 0))
+    }
+    var out_ty = check.get_node_ty(call)
+    if out_ty == null {
+        out_ty = check.get_node_ty(base)
+    }
+    return call_rt(L, rt.chan_init, args, out_ty, node_pos(L, call))
+}
+
+private fn elem_ptr(L: *Lower, value: ir.Operand, vp: *check.Type?, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    val loc = as_local(L, value, pos)
+    return addr_void(L, loc.local, vp, pos)
+}
+
+private fn lower_chan_send(L: *Lower, rt: CoroRt, call: *parse.Node, base: *parse.Node): ir.Operand with (a: mem.Allocator) {
+    val elem = chan_elem(check.get_node_ty(base))
+    if elem == null {
+        fail(L, call, "channel element has no type")
+        return none_value()
+    }
+    check.type_layout(L.types, elem!!)
+    val chan = lower_expr(L, base)
+    var value_node: *parse.Node? = null
+    if parse.call_arg_end(call) > 1 {
+        var a = call.kids.get(1)
+        if parse.is_arg(a) && a.kids.len > 0 {
+            a = a.kids.get(0)
+        }
+        value_node = a as *parse.Node?
+    }
+    val value = if value_node != null {
+        lower_expr(L, value_node!!)
+    } else {
+        none_value()
+    }
+    var args = list.empty<ir.Operand>()
+    args.push(chan)
+    args.push(elem_ptr(L, value, rt.void_ptr, node_pos(L, call)))
+    args.push(ir.int_op(rt.usize, elem!!.size as i64))
+    val status = call_rt(L, rt.chan_send, args, null, node_pos(L, call))
+    return error_from_status(L, rt, status, node_pos(L, call))
+}
+
+private fn lower_chan_recv(L: *Lower, rt: CoroRt, call: *parse.Node, base: *parse.Node): ir.Operand with (a: mem.Allocator) {
+    val elem = chan_elem(check.get_node_ty(base))
+    val call_ty = check.get_node_ty(call)
+    if elem == null || call_ty == null {
+        fail(L, call, "channel element has no type")
+        return none_value()
+    }
+    check.type_layout(L.types, elem!!)
+    val slot = new_local(L, "", elem)
+    zero_local(L, slot, node_pos(L, call))
+    val chan = lower_expr(L, base)
+    var args = list.empty<ir.Operand>()
+    args.push(chan)
+    args.push(addr_void(L, slot, rt.void_ptr, node_pos(L, call)))
+    args.push(ir.int_op(rt.usize, elem!!.size as i64))
+    val status = call_rt(L, rt.chan_recv, args, null, node_pos(L, call))
+    val err = error_from_status(L, rt, status, node_pos(L, call))
+    var parts = list.empty<ir.Operand>()
+    parts.push(local_operand(L, slot))
+    parts.push(err)
+    return emit_aggregate(L, call_ty, parts, node_pos(L, call))
+}
+
+/**
+ * `scope` / `Chan.init` / send/recv/close / cancel. Returns (op, true) when handled.
+ */
+fn lower_coro_call(L: *Lower, node: *parse.Node): (ir.Operand, bool) with (a: mem.Allocator) {
+    if node.kids.len == 0 {
+        return none_value(), false
+    }
+    val callee = node.kids.get(0)
+    if parse.is_ident(callee) {
+        val sym = check.get_node_sym(callee)
+        if sym != null {
+            return none_value(), false
+        }
+        var name = callee.name
+        if name.len == 0 {
+            name = callee.text
+        }
+        if name != "scope" && name != "select" && name != "yield" && name != "sleep" {
+            return none_value(), false
+        }
+        val (rt, ok) = load_coro_rt(L, node_pos(L, node))
+        if !ok {
+            return none_value(), true
+        }
+        if name == "scope" {
+            return lower_scope_call(L, rt, node), true
+        }
+        if name == "yield" {
+            call_rt0(L, rt.yield_fn, null, node_pos(L, node))
+            return none_value(), true
+        }
+        if name == "select" {
+            return lower_select(L, rt, node), true
+        }
+        if name == "sleep" {
+            return lower_sleep(L, rt, node), true
+        }
+        fail(L, node, "select/sleep not lowered yet")
+        return none_value(), true
+    }
+    if !parse.is_member(callee) || callee.kids.len == 0 || callee.name.len == 0 {
+        return none_value(), false
+    }
+    val base = callee.kids.get(0)
+    var base_ty = check.get_node_ty(base)
+    if base_ty == null {
+        val bsym = check.get_node_sym(base)
+        if bsym != null {
+            base_ty = check.get_sema(bsym!!)
+        }
+    }
+    val name = callee.name
+    // `Chan<T>.init` — base may be a type name / instantiated Chan.
+    var base_name = base.name
+    if base_name.len == 0 {
+        base_name = base.text
+    }
+    if name == "init" && (is_chan_ty(base_ty) || base_name == "Chan") {
+        val (rt, ok) = load_coro_rt(L, node_pos(L, node))
+        if !ok {
+            return none_value(), true
+        }
+        return lower_chan_init(L, rt, node), true
+    }
+    if base_ty == null || (!is_chan_ty(base_ty) && !is_task_ty(base_ty) && !is_scope_ty(base_ty)) {
+        return none_value(), false
+    }
+    val (rt, ok) = load_coro_rt(L, node_pos(L, node))
+    if !ok {
+        return none_value(), true
+    }
+    if is_scope_ty(base_ty) {
+        val scope = lower_expr(L, base)
+        call_rt1(L, rt.scope_cancel, scope, null, node_pos(L, node))
+        return none_value(), true
+    }
+    if is_task_ty(base_ty) {
+        // join — simplified unit/value
+        val elem = check.get_node_ty(node)
+        val task = lower_expr(L, base)
+        if elem == null || check.type_is_unit(elem!!) || elem!!.size == 0 {
+            var args = list.empty<ir.Operand>()
+            args.push(task)
+            args.push(ir.null_op(rt.void_ptr))
+            args.push(ir.int_op(rt.usize, 0))
+            call_rt(L, rt.task_join, args, null, node_pos(L, node))
+            return none_value(), true
+        }
+        check.type_layout(L.types, elem!!)
+        val slot = new_local(L, "", elem)
+        var args = list.empty<ir.Operand>()
+        args.push(task)
+        args.push(addr_void(L, slot, rt.void_ptr, node_pos(L, node)))
+        args.push(ir.int_op(rt.usize, elem!!.size as i64))
+        call_rt(L, rt.task_join, args, null, node_pos(L, node))
+        return local_operand(L, slot), true
+    }
+    if name == "send" {
+        return lower_chan_send(L, rt, node, base), true
+    }
+    if name == "recv" {
+        return lower_chan_recv(L, rt, node, base), true
+    }
+    if name == "close" || name == "free" {
+        val chan = lower_expr(L, base)
+        val fn_i = if name == "close" {
+            rt.chan_close
+        } else {
+            rt.chan_free
+        }
+        call_rt1(L, fn_i, chan, null, node_pos(L, node))
+        return none_value(), true
+    }
+    fail(L, node, "undefined method")
+    return none_value(), true
+}
+
+private fn cap_of(L: *Lower, symbol: *load.Symbol): i32 {
+    var i: usize = 0
+    for i < L.coro_caps.len {
+        val c = L.coro_caps.at(i)
+        if c.symbol != null && c.symbol!! == symbol {
+            return i as i32
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+private fn scan_add_cap(L: *Lower, caps: *list.List<CoroCap>, symbol: *load.Symbol?) {
+    if symbol == null {
+        return
+    }
+    // Already listed?
+    var i: usize = 0
+    for i < caps.len {
+        if caps.at(i).symbol != null && caps.at(i).symbol!! == symbol!! {
+            return
+        }
+        i = i + 1
+    }
+    val parent_i = cap_of(L, symbol!!)
+    val (local, ok) = find_local(L, symbol!!)
+    if parent_i < 0 && !ok {
+        return
+    }
+    var c: CoroCap
+    c.symbol = symbol
+    c.indirect = parent_i >= 0
+    if parent_i >= 0 {
+        c.indirect_slot = parent_i as u32
+        c.parent_local = 0
+    } else {
+        c.parent_local = local
+        c.indirect_slot = 0
+    }
+    caps.push(c)
+}
+
+/** True when the go body may resolve ambient contexts (calls / methods). */
+private fn body_may_need_context(node: *parse.Node?): bool {
+    if node == null {
+        return false
+    }
+    val n = node!!
+    if parse.is_call(n) || parse.is_go(n) {
+        return true
+    }
+    for kid in n.kids.items() {
+        if body_may_need_context(kid as *parse.Node?) {
+            return true
+        }
+    }
+    return false
+}
+
+/**
+ * Capture live context-parameter locals even when the body never names them
+ * (calls resolve Allocator via ctx_frames). Skip empty `go { }` so IR stays
+ * stage0-identical when nothing needs a context.
+ */
+private fn scan_context_locals(L: *Lower, caps: *list.List<CoroCap>, body: *parse.Node?) {
+    if !body_may_need_context(body) {
+        return
+    }
+    var i: usize = 0
+    for i < L.locals.len {
+        val b = L.locals.at(i)
+        if b.symbol != null && b.symbol!!.kind == load.kind_context() {
+            scan_add_cap(L, caps, b.symbol)
+        }
+        i = i + 1
+    }
+}
+
+/**
+ * Inside a `go` child: materialize captured context params as locals and
+ * ctx_frames so lower_context_args can resolve Allocator / Scope / ….
+ */
+private fn rebind_context_caps(L: *Lower, rt: CoroRt, caps: list.List<CoroCap>, pos: ir.Pos) with (
+    a: mem.Allocator,
+) {
+    var i: usize = 0
+    for i < caps.len && !L.failed {
+        val cap = caps.at(i)
+        if cap.symbol == null || cap.symbol!!.kind != load.kind_context() {
+            i = i + 1
+            continue
+        }
+        val sty = check.get_sema(cap.symbol!!)
+        var gargs = list.empty<ir.Operand>()
+        gargs.push(local_operand(L, 0))
+        gargs.push(ir.int_op(rt.usize, i as i64))
+        val raw = call_rt(L, rt.cap_get, gargs, rt.void_ptr, pos)
+        val ptr_ty = check.type_ptr(L.types, sty!!, false)
+        val ptr = emit_bitcast(L, raw, ptr_ty as *check.Type?, pos)
+        val value = emit_load(L, ptr, pos)
+        val local = new_local(L, cap.symbol!!.name, sty)
+        emit_copy(L, local, value, pos)
+        bind_local(L, cap.symbol, local)
+        context_push_local(L, sty, local)
+        i = i + 1
+    }
+}
+
+private fn scan_node(L: *Lower, caps: *list.List<CoroCap>, node: *parse.Node?) {
+    if node == null || L.failed {
+        return
+    }
+    val n = node!!
+    if parse.is_ident(n) {
+        scan_add_cap(L, caps, check.get_node_sym(n))
+        return
+    }
+    for kid in n.kids.items() {
+        scan_node(L, caps, kid as *parse.Node?)
+    }
+}
+
+private fn fill_caps(L: *Lower, rt: CoroRt, caps: list.List<CoroCap>, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    if caps.len == 0 {
+        return ir.null_op(rt.void_ptr)
+    }
+    val count = ir.int_op(rt.usize, caps.len as i64)
+    var nargs = list.empty<ir.Operand>()
+    nargs.push(count)
+    val env = call_rt(L, rt.cap_new, nargs, rt.void_ptr, pos)
+    var i: usize = 0
+    for i < caps.len && !L.failed && !L.terminated {
+        val cap = caps.at(i)
+        var ptr = none_value()
+        if cap.indirect {
+            var gargs = list.empty<ir.Operand>()
+            gargs.push(local_operand(L, 0))
+            gargs.push(ir.int_op(rt.usize, cap.indirect_slot as i64))
+            ptr = call_rt(L, rt.cap_get, gargs, rt.void_ptr, pos)
+        } else {
+            ptr = addr_void(L, cap.parent_local, rt.void_ptr, pos)
+        }
+        var sargs = list.empty<ir.Operand>()
+        sargs.push(env)
+        sargs.push(ir.int_op(rt.usize, i as i64))
+        sargs.push(ptr)
+        call_rt(L, rt.cap_set, sargs, null, pos)
+        i = i + 1
+    }
+    return env
+}
+
+/** Load a captured name inside a `go` child. */
+fn lower_coro_name(L: *Lower, node: *parse.Node, sym: *load.Symbol): (ir.Operand, bool) with (a: mem.Allocator) {
+    if !L.in_coro {
+        return none_value(), false
+    }
+    val idx = cap_of(L, sym)
+    if idx < 0 {
+        return none_value(), false
+    }
+    val (rt, ok) = load_coro_rt(L, node_pos(L, node))
+    if !ok {
+        return none_value(), true
+    }
+    var gargs = list.empty<ir.Operand>()
+    gargs.push(local_operand(L, 0))
+    gargs.push(ir.int_op(rt.usize, idx as i64))
+    val raw = call_rt(L, rt.cap_get, gargs, rt.void_ptr, node_pos(L, node))
+    val sty = check.get_sema(sym)
+    val ptr_ty = check.type_ptr(L.types, sty!!, false)
+    val ptr = emit_bitcast(L, raw, ptr_ty as *check.Type?, node_pos(L, node))
+    return emit_load(L, ptr, node_pos(L, node)), true
+}
+
+private fn go_body(node: *parse.Node): *parse.Node? {
+    val shape = node.head
+    val has_body = (shape / 65536) % 2 == 1
+    if !has_body || node.kids.len == 0 {
+        return null
+    }
+    return node.kids.get(node.kids.len - 1) as *parse.Node?
+}
+
+private fn go_lower_contexts(L: *Lower, node: *parse.Node) with (a: mem.Allocator) {
+    val shape = node.head
+    val nargs = (shape % 256) as usize
+    val nctx = ((shape / 256) % 256) as usize
+    var c: usize = 0
+    for c < nctx {
+        val ix = nargs + c
+        if ix < node.kids.len {
+            lower_expr(L, node.kids.get(ix))
+        }
+        c = c + 1
+    }
+}
+
+private fn go_scope_op(L: *Lower, rt: CoroRt, node: *parse.Node): ir.Operand with (a: mem.Allocator) {
+    if L.coro_scopes.len > 0 {
+        return local_operand(L, L.coro_scopes.get(L.coro_scopes.len - 1))
+    }
+    // Function context `Scope` param / with-frame (C go->context_args[0]).
+    var i = L.ctx_frames.len
+    for i != 0 {
+        i = i - 1
+        val fr = L.ctx_frames.at(i)
+        if fr.ty != null && is_scope_ty(fr.ty!!) {
+            return local_operand(L, fr.local)
+        }
+    }
+    for bind in L.locals.items() {
+        if bind.symbol == null {
+            continue
+        }
+        val sty = check.get_sema(bind.symbol!!)
+        if sty != null && is_scope_ty(sty!!) {
+            return local_operand(L, bind.local)
+        }
+    }
+    if is_root_main(L) {
+        return call_rt0(L, rt.scope_root, rt.void_ptr, node_pos(L, node))
+    }
+    fail(L, node, "missing context Scope")
+    return none_value()
+}
+
+private fn coro_name_str(L: *Lower): str with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    b.append("jog_coro_")
+    // decimal of coro_seq
+    var n = L.coro_seq
+    if n == 0 {
+        b.append("0")
+        return b.str()
+    }
+    var digs = list.empty<u8>()
+    for n > 0 {
+        digs.push(('0' as u8) + ((n % 10) as u8))
+        n = n / 10
+    }
+    var i = digs.len
+    for i > 0 {
+        i = i - 1
+        b.append_byte(digs.get(i))
+    }
+    return b.str()
+}
+
+/** `go …` launch. */
+fn lower_go(L: *Lower, node: *parse.Node): ir.Operand with (a: mem.Allocator) {
+    val (rt, ok) = load_coro_rt(L, node_pos(L, node))
+    if !ok {
+        return none_value()
+    }
+    val body = go_body(node)
+    if body == null {
+        fail(L, node, "go needs a body")
+        return none_value()
+    }
+    var caps = list.empty<CoroCap>()
+    scan_node(L, &caps, body)
+    // Ambient context params (Allocator, …) may never appear as idents in the
+    // body AST — calls resolve them via ctx_frames. Capture those locals too.
+    scan_context_locals(L, &caps, body)
+    go_lower_contexts(L, node)
+    val scope_op = go_scope_op(L, rt, node)
+    val env = fill_caps(L, rt, caps, node_pos(L, node))
+    if L.failed || L.terminated {
+        return none_value()
+    }
+    val name = coro_name_str(L)
+    L.coro_seq = L.coro_seq + 1
+    val empty_ctx = list.empty<*check.Type>()
+    var params = list.empty<*check.Type>()
+    params.push(rt.void_ptr!!)
+    val fn_ty = check.type_fn(L.types, params, rt.unit!!, empty_ctx, false, false, true)
+    var pnames = list.empty<str>()
+    pnames.push("env")
+    val index = ir.func_add(&L.module, name, name, ir.linkages().INTERNAL, fn_ty, pnames)
+    if index < 0 {
+        fail(L, node, "out of memory")
+        return none_value()
+    }
+    val child = ir.func_at(&L.module, index as u32)
+    // Swap into child.
+    val saved_func = L.func
+    val saved_ast = L.ast_fn
+    val saved_block = L.block
+    val saved_term = L.terminated
+    val saved_locals = L.locals
+    val saved_loops = L.loops
+    val saved_cleanups = L.cleanups
+    val saved_caps = L.coro_caps
+    val saved_in = L.in_coro
+    val saved_scope_n = L.coro_scopes.len
+    val saved_ctx = L.ctx_frames
+    L.locals = list.empty<LocalBind>()
+    L.loops = list.empty<LoopFrame>()
+    L.cleanups = list.empty<Cleanup>()
+    L.ctx_frames = list.empty<CtxFrame>()
+    L.func = child
+    L.ast_fn = null
+    L.terminated = false
+    L.coro_caps = caps
+    L.in_coro = true
+    L.coro_scopes.len = 0
+    val entry = ir.block_add(child!!, "entry")
+    L.block = entry
+    // Bind env param as local 0 (already a param).
+    rebind_context_caps(L, rt, caps, node_pos(L, node))
+    lower_result_body(L, rt, body!!, true)
+    if !L.failed && !L.terminated {
+        lower_coro_on_exit(L, node_pos(L, node))
+        if !L.terminated {
+            emit_ret(L, none_value(), node_pos(L, node))
+        }
+    }
+    // Restore.
+    L.func = saved_func
+    L.ast_fn = saved_ast
+    L.block = saved_block
+    L.terminated = saved_term
+    L.locals = saved_locals
+    L.loops = saved_loops
+    L.cleanups = saved_cleanups
+    L.coro_caps = saved_caps
+    L.in_coro = saved_in
+    L.coro_scopes.len = saved_scope_n
+    L.ctx_frames = saved_ctx
+    if L.failed {
+        return none_value()
+    }
+    val stack = lower_go_stack(L, rt, node)
+    var file_op = ir.null_op(rt.void_const)
+    if L.file.len > 0 {
+        file_op = ir.cstring_op(rt.void_const, L.file)
+    }
+    var gargs = list.empty<ir.Operand>()
+    gargs.push(ir.func_ref(&L.module, index as u32))
+    gargs.push(env)
+    gargs.push(stack)
+    gargs.push(scope_op)
+    gargs.push(file_op)
+    gargs.push(ir.int_op(rt.u32, node.line as i64))
+    return call_rt(L, rt.go_fn, gargs, check.get_node_ty(node), node_pos(L, node))
+}
+
+// `go(stack: n)` passes n. No argument is the runtime default (0).
+private fn lower_go_stack(L: *Lower, rt: CoroRt, node: *parse.Node): ir.Operand with (a: mem.Allocator) {
+    val nargs = node.head % 256
+    if nargs == 0 || node.kids.len == 0 {
+        return ir.int_op(rt.usize, 0)
+    }
+    var value = node.kids.get(0)
+    if parse.is_arg(value) && value.kids.len > 0 {
+        value = value.kids.get(value.kids.len - 1)
+    }
+    return lower_expr(L, value)
+}
+
+/** `for v in ch` over a channel. */
+fn lower_chan_for(L: *Lower, node: *parse.Node): bool with (a: mem.Allocator) {
+    if node.text != "in" || node.kids.len == 0 {
+        return false
+    }
+    val expr = node.kids.get(0)
+    // Range `a..b` is binary, not a channel.
+    if parse.is_binary(expr) && expr.text == ".." {
+        return false
+    }
+    val base = lower_type_subst(L, check.get_node_ty(expr))
+    if !is_chan_ty(base) {
+        return false
+    }
+    if L.failed || L.terminated {
+        return true
+    }
+    val pos = node_pos(L, node)
+    val elem = chan_elem(base)
+    val (rt, ok) = load_coro_rt(L, pos)
+    if !ok || elem == null {
+        fail(L, node, "channel element has no type")
+        return true
+    }
+    check.type_layout(L.types, elem!!)
+    // C jog_lower_chan_for: unnamed slot local (name lives on the binding only).
+    val slot = new_local(L, "", elem)
+    val sym = check.get_node_sym(node)
+    bind_local(L, sym, slot)
+    zero_local(L, slot, pos)
+    var chan = lower_expr(L, expr)
+    if chan.ty != rt.void_ptr {
+        chan = emit_bitcast(L, chan, rt.void_ptr, pos)
+    }
+    val head = new_block(L, "chan.head")
+    val open_b = new_block(L, "chan.open")
+    val body = new_block(L, "chan.body")
+    val cancel = new_block(L, "chan.cancel")
+    val exit_b = new_block(L, "chan.exit")
+    emit_br(L, head, pos)
+    use_block(L, head)
+    var args = list.empty<ir.Operand>()
+    args.push(chan)
+    if elem!!.size == 0 {
+        args.push(ir.null_op(rt.void_ptr))
+    } else {
+        args.push(addr_void(L, slot, rt.void_ptr, pos))
+    }
+    args.push(ir.int_op(rt.usize, elem!!.size as i64))
+    val status = call_rt(L, rt.chan_recv, args, null, pos)
+    val closed = emit_binop(L, ir.bin_ops().EQ, false, status, ir.int_op(rt.i32, 2), rt.boolean, pos)
+    emit_cond(L, closed, exit_b, open_b, pos)
+    use_block(L, open_b)
+    val ok_st = emit_binop(L, ir.bin_ops().EQ, false, status, ir.int_op(rt.i32, 0), rt.boolean, pos)
+    emit_cond(L, ok_st, body, cancel, pos)
+    use_block(L, body)
+    push_loop(L, head, exit_b)
+    val body_node = for_body(node)
+    if body_node != null {
+        lower_stmt(L, body_node!!)
+    }
+    if L.loops.len > 0 {
+        L.loops.len = L.loops.len - 1
+    }
+    if !L.failed && !L.terminated {
+        emit_br(L, head, pos)
+    }
+    use_block(L, cancel)
+    val cancelled = call_rt0(L, rt.err_cancelled, rt.void_ptr, pos)
+    call_rt1(L, rt.scope_fail, cancelled, null, pos)
+    if !L.failed && !L.terminated {
+        emit_br(L, exit_b, pos)
+    }
+    use_block(L, exit_b)
+    return true
+}

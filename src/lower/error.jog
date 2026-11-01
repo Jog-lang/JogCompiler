@@ -1,0 +1,696 @@
+// Defer / errdefer / error returns / null. Checked against compiler/src/lower_error.c.
+
+import src.check
+import src.ir
+import src.load
+import src.parse
+import std.list
+import std.mem
+
+struct Cleanup {
+    node: *parse.Node?
+    err: bool
+}
+
+fn lower_error_null(L: *Lower, node: *parse.Node): ir.Operand with (a: mem.Allocator) {
+    var ty = check.get_node_ty(node)
+    ty = lower_type_subst(L, ty)
+    val peeled = peel_ty(ty)
+    if peeled != null && peeled!!.kind == check.type_kinds().OPTION &&
+        !check.type_option_is_niche(peeled!!) {
+        return emit_zero(L, ty, node_pos(L, node))
+    }
+    return ir.null_op(ty)
+}
+
+private fn is_sentinel_operand_ty(ty: *check.Type?): bool {
+    return is_error_interface(ty) || (ty != null && ty!!.kind == check.type_kinds().PTR)
+}
+
+private fn sentinel_pair_ty(left: *check.Type?, right: *check.Type?): bool {
+    if is_error_option(left) && !is_error_option(right) && is_sentinel_operand_ty(right) {
+        return true
+    }
+    if is_error_option(right) && !is_error_option(left) && is_sentinel_operand_ty(left) {
+        return true
+    }
+    return false
+}
+
+/** Extract the data pointer from error? / error / *T (C operand_data). */
+private fn error_operand_data(L: *Lower, value: ir.Operand, ty: *check.Type?, pos: ir.Pos): (ir.Operand, bool) with (a: mem.Allocator) {
+    var cur = value
+    var cur_ty = ty
+    if cur_ty == null {
+        cur_ty = value.ty
+    }
+    if is_error_option(cur_ty) {
+        val elem = cur_ty!!.elem
+        cur = emit_extract(L, cur, 1, elem, pos)
+        cur_ty = elem
+    }
+    if is_error_interface(cur_ty) {
+        val vp = void_ptr(L)
+        return emit_extract(L, cur, 0, vp, pos), true
+    }
+    if cur_ty != null && cur_ty!!.kind == check.type_kinds().PTR {
+        val vp = void_ptr(L)
+        return emit_bitcast(L, cur, vp, pos), true
+    }
+    return none_value(), false
+}
+
+fn lower_error_compare(
+    L: *Lower,
+    node: *parse.Node,
+    lhs: ir.Operand,
+    rhs: ir.Operand,
+): (ir.Operand, bool) with (a: mem.Allocator) {
+    if node.text != "==" && node.text != "!=" {
+        return none_value(), false
+    }
+    if node.kids.len < 2 {
+        return none_value(), false
+    }
+    val left = node.kids.get(0)
+    val right = node.kids.get(1)
+    val lt = peel_ty(check.get_node_ty(left))
+    val rt = peel_ty(check.get_node_ty(right))
+    val left_null = lt != null && lt!!.kind == check.type_kinds().NULL
+    val right_null = rt != null && rt!!.kind == check.type_kinds().NULL
+    var opt: *check.Type? = null
+    var value = none_value()
+    if left_null && rt != null && rt!!.kind == check.type_kinds().OPTION {
+        opt = rt
+        value = rhs
+    } else if right_null && lt != null && lt!!.kind == check.type_kinds().OPTION {
+        opt = lt
+        value = lhs
+    } else if lt != null && rt != null && lt!!.kind == check.type_kinds().OPTION && lt!! == rt!! &&
+        check.type_option_is_niche(lt!!) {
+        val op = if node.text == "==" { ir.bin_ops().EQ } else { ir.bin_ops().NE }
+        return emit_binop(L, op, false, lhs, rhs, check.type_bool(L.types) as *check.Type?, node_pos(L, node)), true
+    } else if sentinel_pair_ty(lt, rt) {
+        val pos = node_pos(L, node)
+        val (lp, lok) = error_operand_data(L, lhs, lt, pos)
+        val (rp, rok) = error_operand_data(L, rhs, rt, pos)
+        if !lok || !rok {
+            return none_value(), true
+        }
+        val op = if node.text == "==" { ir.bin_ops().EQ } else { ir.bin_ops().NE }
+        return emit_binop(L, op, false, lp, rp, check.type_bool(L.types) as *check.Type?, pos), true
+    } else {
+        return none_value(), false
+    }
+    val pos = node_pos(L, node)
+    if check.type_option_is_niche(opt!!) {
+        val op = if node.text == "==" { ir.bin_ops().EQ } else { ir.bin_ops().NE }
+        return emit_binop(L, op, false, value, ir.null_op(opt), check.type_bool(L.types) as *check.Type?, pos), true
+    }
+    val has = emit_extract(L, value, 0, check.type_bool(L.types) as *check.Type?, pos)
+    if node.text == "!=" {
+        return has, true
+    }
+    return emit_unop(L, ir.un_ops().NOT, false, has, check.type_bool(L.types) as *check.Type?, pos), true
+}
+
+fn lower_error_note(L: *Lower, node: *parse.Node) with (a: mem.Allocator) {
+    if L.failed {
+        return
+    }
+    var item: Cleanup
+    item.node = node as *parse.Node?
+    item.err = parse.is_errdefer(node)
+    L.cleanups.push(item)
+}
+
+fn lower_error_block_end(L: *Lower, base: usize, pos: ir.Pos) with (a: mem.Allocator) {
+    if L.failed {
+        return
+    }
+    if L.terminated {
+        if L.cleanups.len > base {
+            L.cleanups.len = base
+        }
+        return
+    }
+    val (items, n) = snapshot(L, base)
+    if L.failed {
+        return
+    }
+    if n == 0 {
+        return
+    }
+    var bodies = list.empty<*parse.Node?>()
+    val kept = collect_bodies(items, n, false, &bodies)
+    L.cleanups.len = base
+    if kept == 0 {
+        return
+    }
+    val cont = new_block(L, "cleanup.next")
+    chain(L, bodies, kept, cont, true, pos)
+}
+
+fn lower_error_exit(L: *Lower, base: usize, target: u32, pos: ir.Pos) with (a: mem.Allocator) {
+    if L.failed || L.terminated {
+        return
+    }
+    if L.in_cleanup {
+        emit_br(L, target, pos)
+        return
+    }
+    val (items, n) = snapshot(L, base)
+    if L.failed {
+        return
+    }
+    if n == 0 {
+        emit_br(L, target, pos)
+        return
+    }
+    var bodies = list.empty<*parse.Node?>()
+    val kept = collect_bodies(items, n, false, &bodies)
+    if kept == 0 {
+        emit_br(L, target, pos)
+        return
+    }
+    chain(L, bodies, kept, target, false, pos)
+}
+
+fn lower_error_return(L: *Lower, node: *parse.Node) with (a: mem.Allocator) {
+    if L.failed || L.terminated {
+        return
+    }
+    if lower_coro_return(L, node) {
+        return
+    }
+    var ret: *check.Type? = null
+    if L.func != null && L.func!!.ty != null && check.type_is_fn(L.func!!.ty!!) {
+        ret = L.func!!.ty!!.elem
+    }
+    val value = build_return_value(L, node, ret)
+    if L.failed || L.terminated {
+        return
+    }
+    if L.in_cleanup {
+        emit_ret(L, value, node_pos(L, node))
+        return
+    }
+    val (items, n) = snapshot(L, 0)
+    if L.failed {
+        return
+    }
+    var held = value
+    if n > 0 && value.kind != ir.operand_kinds().NONE {
+        held = hold_value(L, value, value.ty, node_pos(L, node))
+    }
+    var any_err = false
+    var i: usize = 0
+    for i < n {
+        if items.get(i).err {
+            any_err = true
+            break
+        }
+        i = i + 1
+    }
+    if any_err && is_error_option(last_result(ret)) {
+        return_err(L, held, ret, items, n, node_pos(L, node))
+        return
+    }
+    return_plain(L, held, items, n, node_pos(L, node))
+}
+
+fn lower_error_panic(L: *Lower, node: *parse.Node): bool with (a: mem.Allocator) {
+    if !parse.is_call(node) || node.kids.len == 0 {
+        return false
+    }
+    val callee = node.kids.get(0)
+    if !parse.is_ident(callee) || callee.name != "panic" {
+        return false
+    }
+    if check.get_node_sym(callee) != null {
+        return false
+    }
+    if L.failed {
+        return true
+    }
+    var message = none_value()
+    if node.kids.len > 1 {
+        var value_node = node.kids.get(1)
+        if parse.is_arg(value_node) && value_node.kids.len > 0 {
+            value_node = value_node.kids.get(0)
+        }
+        message = lower_expr(L, value_node)
+    }
+    if L.failed || L.terminated {
+        return true
+    }
+    val inst = emit_inst(L, ir.op_kinds().PANIC, -1, node_pos(L, node))
+    if inst != null {
+        inst!!.a = message
+    }
+    emit_unreachable(L, node_pos(L, node))
+    return true
+}
+
+fn lower_error_binding(L: *Lower, node: *parse.Node) with (a: mem.Allocator) {
+    val count = check.binding_name_count(node)
+    val (_, init, _) = check.local_binding_parts(node)
+    var tuple = check.get_node_ty(node)
+    var value = none_value()
+    val have = init != null
+    if have {
+        val raw = lower_expr(L, init!!)
+        if L.failed || L.terminated {
+            return
+        }
+        if tuple == null {
+            tuple = raw.ty
+        }
+        if tuple == null {
+            tuple = check.get_node_ty(init!!)
+        }
+        value = hold_value(L, raw, tuple, node_pos(L, node))
+    }
+    if tuple == null {
+        if !have {
+            fail(L, node, "destructuring missing init")
+        } else {
+            fail(L, node, "destructuring init has no type")
+        }
+        return
+    }
+    if tuple!!.kind != check.type_kinds().TUPLE {
+        // Prefer the init expression's type when the binding node was overwritten.
+        if have {
+            val from_init = check.get_node_ty(init!!)
+            if from_init != null && from_init!!.kind == check.type_kinds().TUPLE {
+                tuple = from_init
+            } else if value.ty != null && value.ty!!.kind == check.type_kinds().TUPLE {
+                tuple = value.ty
+            }
+        }
+    }
+    if tuple == null || tuple!!.kind != check.type_kinds().TUPLE {
+        fail(L, node, "destructuring is missing a tuple type")
+        return
+    }
+    var i: usize = 0
+    for i < count && !L.failed && !L.terminated {
+        val name = check.binding_name_at(node, i)
+        var elem: *check.Type? = null
+        if i < tuple!!.elems.len {
+            elem = tuple!!.elems.get(i)
+        }
+        if name.len == 0 || name == "_" {
+            i = i + 1
+            continue
+        }
+        val local = new_local(L, name, elem)
+        if have {
+            val field = emit_extract(L, value, i as u32, elem, node_pos(L, node))
+            emit_copy(L, local, field, node_pos(L, node))
+        } else {
+            emit_inst(L, ir.op_kinds().ZERO, local as i32, node_pos(L, node))
+        }
+        // No per-name symbol list on the binding node (C uses bound_symbols).
+        // Name-keyed LocalBind so later `(n, err) = …` finds locals by symbol.name.
+        var fake: LocalBind
+        fake.symbol = null
+        fake.local = local
+        L.locals.push(fake)
+        i = i + 1
+    }
+}
+
+private fn binding_init_node(node: *parse.Node): *parse.Node? {
+    var i: usize = 0
+    for i < node.kids.len {
+        if !parse.is_attribute(node.kids.get(i)) {
+            break
+        }
+        i = i + 1
+    }
+    // Optional type annotation then init.
+    if node.kids.len > i + 1 {
+        return node.kids.get(node.kids.len - 1) as *parse.Node?
+    }
+    if i < node.kids.len {
+        val only = node.kids.get(i)
+        if parse.is_type_name(only) || parse.is_type_ptr(only) || parse.is_type_slice(only) ||
+            parse.is_type_array(only) || parse.is_type_option(only) || parse.is_type_tuple(only) ||
+            parse.is_type_fn(only) || parse.is_type_unit(only) {
+            return null
+        }
+        return only as *parse.Node?
+    }
+    return null
+}
+
+private fn peel_ty(ty: *check.Type?): *check.Type? {
+    if ty == null {
+        return null
+    }
+    return check.type_peel_distinct(ty!!) as *check.Type?
+}
+
+private fn is_error_interface(ty: *check.Type?): bool {
+    val u = peel_ty(ty)
+    if u == null || u!!.kind != check.type_kinds().INTERFACE {
+        return false
+    }
+    return u!!.name == "error"
+}
+
+private fn is_error_option(ty: *check.Type?): bool {
+    if ty == null || ty!!.kind != check.type_kinds().OPTION {
+        return false
+    }
+    return is_error_interface(ty!!.elem)
+}
+
+private fn last_result(ret: *check.Type?): *check.Type? {
+    if ret == null {
+        return null
+    }
+    if ret!!.kind == check.type_kinds().TUPLE && ret!!.elems.len > 0 {
+        return ret!!.elems.get(ret!!.elems.len - 1)
+    }
+    return ret
+}
+
+private fn hold_value(L: *Lower, src: ir.Operand, ty: *check.Type?, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    var use_ty = ty
+    if use_ty == null {
+        use_ty = src.ty
+    }
+    val dst = new_local(L, "", use_ty)
+    emit_copy(L, dst, src, pos)
+    return local_operand(L, dst)
+}
+
+private fn defer_body(node: *parse.Node): *parse.Node? {
+    if node.kids.len == 0 {
+        return null
+    }
+    return node.kids.get(0) as *parse.Node?
+}
+
+private fn snapshot(L: *Lower, base: usize): (list.List<Cleanup>, usize) with (a: mem.Allocator) {
+    var copy = list.empty<Cleanup>()
+    if L.cleanups.len < base {
+        return copy, 0
+    }
+    val n = L.cleanups.len - base
+    var i: usize = 0
+    for i < n {
+        copy.push(L.cleanups.get(base + i))
+        i = i + 1
+    }
+    return copy, n
+}
+
+private fn collect_bodies(
+    items: list.List<Cleanup>,
+    n: usize,
+    include_err: bool,
+    out: *list.List<*parse.Node?>,
+): usize with (a: mem.Allocator) {
+    var filled: usize = 0
+    var i = n
+    for i > 0 {
+        i = i - 1
+        val item = items.get(i)
+        if item.node == null {
+            continue
+        }
+        if item.err && !include_err {
+            continue
+        }
+        out.push(defer_body(item.node!!))
+        filled = filled + 1
+    }
+    return filled
+}
+
+private fn chain(
+    L: *Lower,
+    bodies: list.List<*parse.Node?>,
+    n: usize,
+    done: u32,
+    resume: bool,
+    pos: ir.Pos,
+) with (a: mem.Allocator) {
+    if L.failed {
+        return
+    }
+    if n == 0 {
+        if !L.terminated {
+            emit_br(L, done, pos)
+        }
+        if resume {
+            use_block(L, done)
+        }
+        return
+    }
+    var blocks = list.empty<u32>()
+    var i: usize = 0
+    for i < n {
+        blocks.push(new_block(L, "cleanup"))
+        i = i + 1
+    }
+    if !L.terminated {
+        emit_br(L, blocks.get(0), pos)
+    }
+    i = 0
+    for i < n && !L.failed {
+        use_block(L, blocks.get(i))
+        val saved = L.in_cleanup
+        L.in_cleanup = true
+        val body = bodies.get(i)
+        if body != null {
+            lower_stmt(L, body!!)
+        }
+        L.in_cleanup = saved
+        if !L.terminated && !L.failed {
+            var next = done
+            if i + 1 < n {
+                next = blocks.get(i + 1)
+            }
+            emit_br(L, next, pos)
+        }
+        i = i + 1
+    }
+    if resume && !L.failed {
+        use_block(L, done)
+    }
+}
+
+/** *T / error → error / error? (C jog_lower_error_box). */
+fn error_box(L: *Lower, src: ir.Operand, slot: *check.Type?, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    if L.failed || src.kind == ir.operand_kinds().NONE || slot == null || src.ty == null {
+        return src
+    }
+    var want = lower_type_subst(L, slot)
+    if L.failed || want == null {
+        return none_value()
+    }
+    if src.ty!! == want!! || (is_error_option(src.ty) && is_error_option(want)) ||
+        (is_error_interface(src.ty) && is_error_interface(want)) {
+        return src
+    }
+    if !is_error_option(want) && !is_error_interface(want) {
+        return src
+    }
+    var iface = want
+    if is_error_option(want) {
+        iface = peel_ty(want!!.elem)
+    }
+    if !is_error_interface(iface) {
+        return src
+    }
+    var boxed = src
+    if is_error_interface(src.ty) {
+        boxed = src
+    } else if src.ty!!.kind == check.type_kinds().PTR {
+        val vp = void_ptr(L)
+        val data = emit_bitcast(L, src, vp, pos)
+        if L.failed {
+            return none_value()
+        }
+        var words = list.empty<ir.Operand>()
+        words.push(data)
+        words.push(data)
+        boxed = emit_aggregate(L, iface, words, pos)
+        if L.failed {
+            return none_value()
+        }
+    } else {
+        return src
+    }
+    if !is_error_option(want) || L.failed {
+        return boxed
+    }
+    val boolean = check.type_bool(L.types) as *check.Type?
+    var args = list.empty<ir.Operand>()
+    args.push(ir.int_op(boolean, 1))
+    args.push(boxed)
+    return emit_aggregate(L, want, args, pos)
+}
+
+private fn build_return_value(L: *Lower, node: *parse.Node, ret: *check.Type?): ir.Operand with (a: mem.Allocator) {
+    if node.kids.len == 0 {
+        return none_value()
+    }
+    if node.kids.len == 1 {
+        var one = lower_expr(L, node.kids.get(0))
+        if L.failed || L.terminated {
+            return none_value()
+        }
+        if ret == null || check.type_is_unit(ret!!) {
+            return none_value()
+        }
+        return error_box(L, one, ret, node_pos(L, node))
+    }
+    var args = list.empty<ir.Operand>()
+    var i: usize = 0
+    for kid in node.kids.items() {
+        var v = lower_expr(L, kid)
+        if L.failed || L.terminated {
+            return none_value()
+        }
+        var slot: *check.Type? = null
+        if ret != null && ret!!.kind == check.type_kinds().TUPLE && i < ret!!.elems.len {
+            slot = ret!!.elems.get(i)
+        }
+        v = error_box(L, v, slot, node_pos(L, node))
+        if L.failed {
+            return none_value()
+        }
+        args.push(v)
+        i = i + 1
+    }
+    return emit_aggregate(L, ret, args, node_pos(L, node))
+}
+
+private fn return_plain(
+    L: *Lower,
+    value: ir.Operand,
+    items: list.List<Cleanup>,
+    n: usize,
+    pos: ir.Pos,
+) with (a: mem.Allocator) {
+    if n == 0 {
+        if !L.failed && !L.terminated {
+            lower_coro_on_exit(L, pos)
+            emit_ret(L, value, pos)
+        }
+        return
+    }
+    var bodies = list.empty<*parse.Node?>()
+    val kept = collect_bodies(items, n, false, &bodies)
+    if kept == 0 {
+        if !L.failed && !L.terminated {
+            lower_coro_on_exit(L, pos)
+            emit_ret(L, value, pos)
+        }
+        return
+    }
+    val ret_b = new_block(L, "ret")
+    chain(L, bodies, kept, ret_b, false, pos)
+    use_block(L, ret_b)
+    if !L.failed && !L.terminated {
+        lower_coro_on_exit(L, pos)
+        emit_ret(L, value, pos)
+    }
+}
+
+private fn error_present(
+    L: *Lower,
+    value: ir.Operand,
+    ret: *check.Type?,
+    pos: ir.Pos,
+): (ir.Operand, bool) with (a: mem.Allocator) {
+    val last = last_result(ret)
+    if last == null || !is_error_option(last) {
+        return none_value(), false
+    }
+    var opt = value
+    if ret != null && ret!!.kind == check.type_kinds().TUPLE {
+        opt = emit_extract(L, value, (ret!!.elems.len - 1) as u32, last, pos)
+    }
+    if check.type_option_is_niche(last!!) {
+        return emit_binop(L, ir.bin_ops().NE, false, opt, ir.null_op(last), check.type_bool(L.types) as *check.Type?, pos), true
+    }
+    return emit_extract(L, opt, 0, check.type_bool(L.types) as *check.Type?, pos), true
+}
+
+private fn return_err(
+    L: *Lower,
+    value: ir.Operand,
+    ret: *check.Type?,
+    items: list.List<Cleanup>,
+    n: usize,
+    pos: ir.Pos,
+) with (a: mem.Allocator) {
+    val (present, ok) = error_present(L, value, ret, pos)
+    if !ok || L.failed || L.terminated {
+        if !L.failed && !L.terminated {
+            return_plain(L, value, items, n, pos)
+        }
+        return
+    }
+    var all_bodies = list.empty<*parse.Node?>()
+    var ok_bodies = list.empty<*parse.Node?>()
+    val all_n = collect_bodies(items, n, true, &all_bodies)
+    val ok_n = collect_bodies(items, n, false, &ok_bodies)
+    val err_b = new_block(L, "cleanup.err")
+    val ok_b = new_block(L, "cleanup.ok")
+    val ret_b = new_block(L, "ret")
+    emit_cond(L, present, err_b, ok_b, pos)
+    use_block(L, err_b)
+    chain(L, all_bodies, all_n, ret_b, false, pos)
+    use_block(L, ok_b)
+    chain(L, ok_bodies, ok_n, ret_b, false, pos)
+    use_block(L, ret_b)
+    if !L.failed && !L.terminated {
+        emit_ret(L, value, pos)
+    }
+}
+
+private fn find_fn_by_name(L: *Lower, name: str): i32 {
+    var i: usize = 0
+    for i < L.module.funcs.len {
+        val f = L.module.funcs.get(i)
+        if f.name == name {
+            return i as i32
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+/** Add or reuse a C extern with the given signature (C lower_coro ensure). */
+fn ensure_extern(
+    L: *Lower,
+    name: str,
+    params: list.List<*check.Type>,
+    ret: *check.Type,
+): i32 with (a: mem.Allocator) {
+    val found = find_fn_by_name(L, name)
+    if found >= 0 {
+        return found
+    }
+    val empty_ctx = list.empty<*check.Type>()
+    val fn_ty = check.type_fn(L.types, params, ret, empty_ctx, false, false, true)
+    val empty_names = list.empty<str>()
+    return ir.func_add(&L.module, name, name, ir.linkages().EXTERN, fn_ty, empty_names)
+}
+
+/**
+ * Universe `ErrCancelled` / `ErrClosed` → full coro RT ensure (C load_rt) then
+ * call jogrt_err_* and pack as error iface. Declaring only err_cancelled would
+ * omit scope/chan/select/cap externs and shift later fN indices (error_value).
+ */
+fn lower_universe_err_const(L: *Lower, node: *parse.Node, sym: *load.Symbol): (ir.Operand, bool) with (a: mem.Allocator) {
+    return lower_coro_universe_err(L, node, sym)
+}

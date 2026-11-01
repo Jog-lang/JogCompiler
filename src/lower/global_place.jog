@@ -1,0 +1,749 @@
+// Const global image placement (C lower_global.c place_at / place_group).
+
+import src.check
+import src.ir
+import src.load
+import src.parse
+import std.fs
+import std.list
+import std.mem
+
+private fn place_bytes_as_str(b: bytes): str with (a: mem.Allocator) {
+    if b.len == 0 {
+        return ""
+    }
+    val (raw, err) = a.alloc(b.len, 1)
+    if err != null {
+        panic("out of memory")
+    }
+    var i: usize = 0
+    for i < b.len {
+        raw.ptr[i] = b.ptr[i]
+        i = i + 1
+    }
+    return raw
+}
+
+struct PlaceImg {
+    bytes: list.List<u8>
+    relocs: list.List<ir.Reloc>
+    size: usize
+}
+
+fn peel_global_type(ty: *check.Type?): *check.Type? {
+    var t = ty
+    for t != null && t!!.kind == check.type_kinds().DISTINCT && t!!.elem != null {
+        t = t!!.elem
+    }
+    return t
+}
+
+fn place_img_new(size: usize): PlaceImg with (a: mem.Allocator) {
+    var img: PlaceImg
+    img.bytes = list.empty<u8>()
+    img.relocs = list.empty<ir.Reloc>()
+    img.size = size
+    var i: usize = 0
+    for i < size {
+        img.bytes.push(0)
+        i = i + 1
+    }
+    return img
+}
+
+fn place_img_write_le(img: *PlaceImg, offset: usize, bits: u64, n: usize): bool {
+    if n == 0 || offset > img.size || n > img.size - offset {
+        return false
+    }
+    var v = bits
+    var i: usize = 0
+    for i < n {
+        img.bytes.set(offset + i, (v & 0xff) as u8)
+        v = v / 256
+        i = i + 1
+    }
+    return true
+}
+
+fn place_img_add_reloc(
+    img: *PlaceImg,
+    offset: u32,
+    kind: ir.RelocKind,
+    index: u32,
+    addend: u32,
+    ptr: str,
+): bool with (a: mem.Allocator) {
+    for r in img.relocs.items() {
+        if r.offset == offset {
+            return false
+        }
+    }
+    var rel: ir.Reloc
+    rel.offset = offset
+    rel.index = index
+    rel.addend = addend
+    rel.kind = kind
+    rel.ptr = ptr
+    img.relocs.push(rel)
+    return true
+}
+
+fn tuple_elem_offset(ty: *check.Type, index: usize): (u64, bool) {
+    var offset: u64 = 0
+    var i: usize = 0
+    for i < ty.elems.len {
+        val e = ty.elems.get(i)
+        var al = e.align as u64
+        if al < 1 {
+            al = 1
+        }
+        offset = (offset + al - 1) / al * al
+        if i == index {
+            return offset, true
+        }
+        offset = offset + e.size
+        i = i + 1
+    }
+    return 0, false
+}
+
+private fn variant_index_of(en: *check.Type, sym: *load.Symbol?): i64 {
+    if sym == null {
+        return -1
+    }
+    var i: usize = 0
+    val n = check.type_variant_count(en)
+    for i < n {
+        val v = check.type_variant_at(en, i)
+        if v.name == sym!!.name {
+            return i as i64
+        }
+        if v.decl != null && sym!!.decl != null && v.decl!! == sym!!.decl!! {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+private fn variant_index_named(en: *check.Type, name: str): i64 {
+    if name.len == 0 {
+        return -1
+    }
+    var i: usize = 0
+    val n = check.type_variant_count(en)
+    for i < n {
+        if check.type_variant_at(en, i).name == name {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+private fn global_is_runtime(L: *Lower, gindex: i32): bool {
+    var bi: usize = 0
+    for bi < L.globals.len {
+        if L.globals.at(bi).index == gindex {
+            return L.globals.at(bi).runtime
+        }
+        bi = bi + 1
+    }
+    return true
+}
+
+fn place_const_int_bits(node: *parse.Node): (u64, bool) {
+    if parse.is_int_lit(node) {
+        return place_parse_u64(node.text), true
+    }
+    if parse.is_unary(node) && node.kids.len > 0 {
+        val (inner, ok) = place_const_int_bits(node.kids.get(0))
+        if !ok {
+            return 0, false
+        }
+        if node.text == "-" {
+            return (0 as u64) - inner, true
+        }
+        if node.text == "~" {
+            return ~inner, true
+        }
+    }
+    if parse.is_binary(node) && node.kids.len >= 2 {
+        val (l, lok) = place_const_int_bits(node.kids.get(0))
+        val (r, rok) = place_const_int_bits(node.kids.get(1))
+        if !lok || !rok {
+            return 0, false
+        }
+        if node.text == "+" {
+            return l + r, true
+        }
+        if node.text == "-" {
+            return l - r, true
+        }
+        if node.text == "*" {
+            return l * r, true
+        }
+        if node.text == "&" {
+            return l & r, true
+        }
+        if node.text == "|" {
+            return l | r, true
+        }
+        if node.text == "^" {
+            return l ^ r, true
+        }
+    }
+    return 0, false
+}
+
+private fn place_parse_u64(text: str): u64 {
+    var v: u64 = 0
+    var i: usize = 0
+    if text.len >= 2 && text.ptr[0] == '0' as u8 && (text.ptr[1] == 'x' as u8 || text.ptr[1] == 'X' as u8) {
+        i = 2
+        for i < text.len {
+            val c = text.ptr[i]
+            var d: u64 = 0
+            if c >= '0' as u8 && c <= '9' as u8 {
+                d = (c - ('0' as u8)) as u64
+            } else if c >= 'a' as u8 && c <= 'f' as u8 {
+                d = (10 as u64) + (c - ('a' as u8)) as u64
+            } else if c >= 'A' as u8 && c <= 'F' as u8 {
+                d = (10 as u64) + (c - ('A' as u8)) as u64
+            } else {
+                break
+            }
+            v = v * 16 + d
+            i = i + 1
+        }
+        return v
+    }
+    for i < text.len {
+        val c = text.ptr[i]
+        if c < '0' as u8 || c > '9' as u8 {
+            break
+        }
+        v = v * 10 + (c - ('0' as u8)) as u64
+        i = i + 1
+    }
+    return v
+}
+
+fn place_at(
+    L: *Lower,
+    img: *PlaceImg,
+    offset: usize,
+    type_in: *check.Type?,
+    node: *parse.Node?,
+    depth: i32,
+): bool with (a: mem.Allocator) {
+    if depth > 64 || type_in == null {
+        return false
+    }
+    val ty = type_in!!
+    if !check.type_layout(L.types, ty) || !ty.has_layout {
+        return false
+    }
+    if ty.size == 0 {
+        return true
+    }
+    if offset > img.size || (ty.size as usize) > img.size - offset {
+        return false
+    }
+    if node == null {
+        return true
+    }
+    val n = node!!
+    val base = peel_global_type(ty)
+    if base == null {
+        return false
+    }
+    val tk = check.type_kinds()
+    val rk = ir.reloc_kinds()
+
+    if base!!.kind == tk.INT || base!!.kind == tk.BOOL {
+        if ty.size == 0 || ty.size > 8 {
+            return false
+        }
+        val (bits, ok) = place_const_int_bits(n)
+        if ok {
+            return place_img_write_le(img, offset, bits, ty.size as usize)
+        }
+        if parse.is_bool_lit(n) {
+            var b: u64 = 0
+            if n.text == "true" {
+                b = 1
+            }
+            return place_img_write_le(img, offset, b, ty.size as usize)
+        }
+        return false
+    }
+
+    if parse.is_string_lit(n) {
+        val view = check.type_bytes_view(ty)
+        if view == null {
+            return false
+        }
+        val psz = L.types.ptr_size as usize
+        if ty.size as usize != psz * 2 {
+            return false
+        }
+        if !place_img_write_le(img, offset + psz, n.text.len as u64, psz) {
+            return false
+        }
+        return place_img_add_reloc(img, offset as u32, rk.STRING, 0, 0, n.text)
+    }
+    if parse.is_builtin(n) && n.name == "embed" {
+        val view = check.type_bytes_view(ty)
+        if view == null {
+            return false
+        }
+        if n.kids.len != 1 {
+            return false
+        }
+        var arg = n.kids.get(0)
+        if parse.is_arg(arg) {
+            if arg.name.len > 0 || arg.kids.len == 0 {
+                return false
+            }
+            arg = arg.kids.get(0)
+        }
+        if !parse.is_string_lit(arg) {
+            return false
+        }
+        var mod_root = ""
+        if L.root_pkg != null {
+            mod_root = L.root_pkg!!.module_root
+        }
+        val full = check.embed_resolve(L.file, arg.text, mod_root)
+        if full.len == 0 || !fs.exists(full) {
+            return false
+        }
+        val (data, err) = fs.read_all(full)
+        if err != null {
+            return false
+        }
+        val text = place_bytes_as_str(data)
+        val psz = L.types.ptr_size as usize
+        if ty.size as usize != psz * 2 {
+            return false
+        }
+        if !place_img_write_le(img, offset + psz, text.len as u64, psz) {
+            return false
+        }
+        return place_img_add_reloc(img, offset as u32, rk.STRING, 0, 0, text)
+    }
+    if parse.is_null_lit(n) {
+        return true
+    }
+    if parse.is_ident(n) {
+        val sym = check.get_node_sym(n)
+        if sym != null && load.is_symbol_function(sym!!) && base!!.kind == tk.FN {
+            if sym!!.decl == null {
+                return false
+            }
+            val fi = find_fn(L, sym!!.decl!!)
+            if fi < 0 {
+                return false
+            }
+            val psz = L.types.ptr_size as usize
+            if (ty.size as usize) < psz {
+                return false
+            }
+            return place_img_add_reloc(img, offset as u32, rk.FUNC, fi as u32, 0, "")
+        }
+        if sym != null {
+            val gi = find_global(L, sym!!)
+            if gi < 0 || global_is_runtime(L, gi) {
+                return false
+            }
+            val src = ir.global_at(&L.module, gi as u32)
+            if src == null || src!!.data.len != ty.size as usize {
+                return false
+            }
+            val sg = src!!
+            var i: usize = 0
+            for i < sg.data.len {
+                img.bytes.set(offset + i, sg.data.get(i))
+                i = i + 1
+            }
+            for rel in sg.relocs.items() {
+                if !place_img_add_reloc(img, (offset as u32) + rel.offset, rel.kind, rel.index, rel.addend, rel.ptr) {
+                    return false
+                }
+            }
+            return true
+        }
+        return false
+    }
+    if parse.is_unary(n) && n.text == "&" && n.kids.len > 0 {
+        val op = n.kids.get(0)
+        if parse.is_ident(op) && base!!.kind == tk.PTR {
+            val sym = check.get_node_sym(op)
+            if sym == null {
+                return false
+            }
+            val gi = find_global(L, sym!!)
+            if gi < 0 {
+                return false
+            }
+            val psz = L.types.ptr_size as usize
+            if ty.size as usize != psz {
+                return false
+            }
+            return place_img_add_reloc(img, offset as u32, rk.GLOBAL, gi as u32, 0, "")
+        }
+        return false
+    }
+    if parse.is_tuple(n) && base!!.kind == tk.TUPLE {
+        if n.kids.len != base!!.elems.len {
+            return false
+        }
+        var i: usize = 0
+        for i < base!!.elems.len {
+            val (off, ok) = tuple_elem_offset(base!!, i)
+            if !ok {
+                return false
+            }
+            if !place_at(L, img, offset + (off as usize), base!!.elems.get(i), n.kids.get(i), depth + 1) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    if (parse.is_array_lit(n) || parse.is_call(n)) && base!!.kind == tk.ARRAY && base!!.elem != null {
+        val elem = base!!.elem!!
+        val stride = elem.size as usize
+        if stride == 0 {
+            return false
+        }
+        var i: usize = 1
+        var count: usize = 0
+        for i < n.kids.len {
+            val arg = n.kids.get(i)
+            var value = arg
+            if parse.is_arg(arg) && arg.kids.len > 0 {
+                value = arg.kids.get(0)
+            }
+            if !place_at(L, img, offset + count * stride, elem, value, depth + 1) {
+                return false
+            }
+            count = count + 1
+            i = i + 1
+        }
+        return count == base!!.len as usize
+    }
+    if parse.is_call(n) {
+        var sym = check.get_node_sym(n)
+        val callee = n.kids.get(0)
+        if (sym == null || !load.is_symbol_variant(sym!!)) && check.get_node_sym(callee) != null {
+            sym = check.get_node_sym(callee)
+        }
+        // Struct / variant ctors: prefer the destination type when symbols are thin.
+        if base!!.kind == tk.STRUCT {
+            return place_fields_image(L, img, offset, base!!, n, depth)
+        }
+        if base!!.kind == tk.ENUM {
+            if sym != null && load.is_symbol_variant(sym!!) {
+                return place_enum_image(L, img, offset, base!!, sym!!, n, depth)
+            }
+            // Shape.Circle(...): variant name on MEMBER callee.
+            if parse.is_member(callee) || parse.is_dot_variant(callee) {
+                var index = variant_index_named(base!!, callee.name)
+                if index < 0 {
+                    index = variant_index_of(base!!, check.get_node_sym(callee))
+                }
+                if index >= 0 {
+                    return place_enum_at_index(L, img, offset, base!!, index as usize, n, depth)
+                }
+            }
+            return false
+        }
+        return false
+    }
+    if parse.is_member(n) || parse.is_dot_variant(n) {
+        var sym = check.get_node_sym(n)
+        if sym != null && load.is_symbol_variant(sym!!) && base!!.kind == tk.ENUM {
+            var index = variant_index_of(base!!, sym)
+            if index < 0 {
+                index = variant_index_named(base!!, n.name)
+            }
+            if index < 0 {
+                return false
+            }
+            val v = check.type_variant_at(base!!, index as usize)
+            if v.field_count > 0 {
+                return false
+            }
+            return place_enum_at_index(L, img, offset, base!!, index as usize, null, depth)
+        }
+        // Tag.On style: member may put variant on the node without is_symbol_variant check path above.
+        if base!!.kind == tk.ENUM {
+            var index = variant_index_of(base!!, sym)
+            if index < 0 {
+                index = variant_index_named(base!!, n.name)
+            }
+            if index >= 0 {
+                val v = check.type_variant_at(base!!, index as usize)
+                if v.field_count == 0 {
+                    return place_enum_at_index(L, img, offset, base!!, index as usize, null, depth)
+                }
+            }
+        }
+        return false
+    }
+    return false
+}
+
+private fn struct_field_offset(sty: *check.Type, index: usize): u64 with (a: mem.Allocator) {
+    if index < sty.field_offsets.len {
+        return sty.field_offsets.get(index)
+    }
+    // Recompute when offsets were not recorded (has_layout early-out).
+    var offset: u64 = 0
+    var i: usize = 0
+    for i <= index && i < sty.field_types.len {
+        val ft = sty.field_types.get(i)
+        var al = ft.align as u64
+        if al < 1 {
+            al = 1
+        }
+        offset = (offset + al - 1) / al * al
+        if i == index {
+            return offset
+        }
+        offset = offset + ft.size
+        i = i + 1
+    }
+    return 0
+}
+
+private fn place_fields_image(
+    L: *Lower,
+    img: *PlaceImg,
+    base_off: usize,
+    sty: *check.Type,
+    call: *parse.Node,
+    depth: i32,
+): bool with (a: mem.Allocator) {
+    if !check.type_layout(L.types, sty) {
+        return false
+    }
+    val count = sty.field_types.len
+    if count == 0 {
+        return true
+    }
+    var filled = list.empty<bool>()
+    var i: usize = 0
+    for i < count {
+        filled.push(false)
+        i = i + 1
+    }
+    var positional: usize = 0
+    i = 1
+    for i < call.kids.len {
+        val arg = call.kids.get(i)
+        if !parse.is_arg(arg) {
+            return false
+        }
+        var slot: i64 = -1
+        if arg.name.len > 0 {
+            var s: usize = 0
+            for s < count {
+                if s < sty.field_names.len && sty.field_names.get(s) == arg.name {
+                    slot = s as i64
+                    break
+                }
+                s = s + 1
+            }
+        } else {
+            slot = positional as i64
+            positional = positional + 1
+        }
+        if slot < 0 || (slot as usize) >= count || filled.get(slot as usize) {
+            return false
+        }
+        filled.set(slot as usize, true)
+        val fty = sty.field_types.get(slot as usize)
+        val foff = struct_field_offset(sty, slot as usize)
+        var value: *parse.Node? = null
+        if arg.kids.len > 0 {
+            value = arg.kids.get(0) as *parse.Node?
+        }
+        if !place_at(L, img, base_off + (foff as usize), fty, value, depth + 1) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+private fn place_enum_at_index(
+    L: *Lower,
+    img: *PlaceImg,
+    offset: usize,
+    en: *check.Type,
+    index: usize,
+    call: *parse.Node?,
+    depth: i32,
+): bool with (a: mem.Allocator) {
+    if index >= check.type_variant_count(en) {
+        return false
+    }
+    val tag = en.elem
+    if tag == null || !tag!!.has_layout || tag!!.size == 0 || tag!!.size > 8 {
+        return false
+    }
+    val v = check.type_variant_at(en, index)
+    if !place_img_write_le(img, offset, v.tag as u64, tag!!.size as usize) {
+        return false
+    }
+    if v.field_count == 0 {
+        return true
+    }
+    val payload = en.payload_offset as usize
+    var positional: usize = 0
+    var filled = list.empty<bool>()
+    var fi: usize = 0
+    for fi < v.field_count {
+        filled.push(false)
+        fi = fi + 1
+    }
+    if call != null {
+        var i: usize = 1
+        for i < call!!.kids.len {
+            val arg = call!!.kids.get(i)
+            if !parse.is_arg(arg) {
+                return false
+            }
+            var slot: i64 = -1
+            if arg.name.len > 0 {
+                var s: usize = 0
+                for s < v.field_count {
+                    if check.type_variant_field_at(en, v, s).name == arg.name {
+                        slot = s as i64
+                        break
+                    }
+                    s = s + 1
+                }
+            } else {
+                slot = positional as i64
+                positional = positional + 1
+            }
+            if slot < 0 || (slot as usize) >= v.field_count || filled.get(slot as usize) {
+                return false
+            }
+            filled.set(slot as usize, true)
+            var off: u64 = 0
+            var j: usize = 0
+            for j <= (slot as usize) {
+                val fldj = check.type_variant_field_at(en, v, j)
+                if fldj.field_type != null {
+                    var al = fldj.field_type!!.align as u64
+                    if al < 1 {
+                        al = 1
+                    }
+                    off = (off + al - 1) / al * al
+                    if j == (slot as usize) {
+                        break
+                    }
+                    off = off + fldj.field_type!!.size
+                }
+                j = j + 1
+            }
+            val fld = check.type_variant_field_at(en, v, slot as usize)
+            var value: *parse.Node? = null
+            if arg.kids.len > 0 {
+                value = arg.kids.get(0) as *parse.Node?
+            }
+            if !place_at(L, img, offset + payload + (off as usize), fld.field_type, value, depth + 1) {
+                return false
+            }
+            i = i + 1
+        }
+    }
+    return true
+}
+
+private fn place_enum_image(
+    L: *Lower,
+    img: *PlaceImg,
+    offset: usize,
+    en: *check.Type,
+    sym: *load.Symbol,
+    call: *parse.Node,
+    depth: i32,
+): bool with (a: mem.Allocator) {
+    var index = variant_index_of(en, sym)
+    if index < 0 && call.kids.len > 0 {
+        index = variant_index_named(en, call.kids.get(0).name)
+    }
+    if index < 0 {
+        return false
+    }
+    return place_enum_at_index(L, img, offset, en, index as usize, call, depth)
+}
+
+/** Commit a placed image onto a global. Returns true when placed. */
+fn commit_place_image(L: *Lower, g: *ir.Global, init: *parse.Node): bool with (a: mem.Allocator) {
+    if g.ty == null {
+        return false
+    }
+    val ty = g.ty!!
+    if !check.type_layout(L.types, ty) || !ty.has_layout {
+        return false
+    }
+    if ty.size == 0 {
+        g.data = list.empty<u8>()
+        g.relocs = list.empty<ir.Reloc>()
+        g.has_data = true
+        g.data_len = 0
+        return true
+    }
+    if ty.size > (32 as u64) * 1024 * 1024 {
+        return false
+    }
+    var img = place_img_new(ty.size as usize)
+    if !place_at(L, &img, 0, ty, init, 0) {
+        return false
+    }
+    g.data = img.bytes
+    g.relocs = img.relocs
+    g.has_data = true
+    g.data_len = img.size
+    return true
+}
+
+fn clear_place_image(g: *ir.Global) with (a: mem.Allocator) {
+    g.data = list.empty<u8>()
+    g.relocs = list.empty<ir.Reloc>()
+    g.has_data = false
+    g.data_len = 0
+}
+
+fn copy_tuple_piece_image(dst: *ir.Global, src: *ir.Global, off: usize, n: usize): bool with (a: mem.Allocator) {
+    if n == 0 {
+        return true
+    }
+    if src.data.len < off + n {
+        return false
+    }
+    dst.data = list.empty<u8>()
+    var i: usize = 0
+    for i < n {
+        dst.data.push(src.data.get(off + i))
+        i = i + 1
+    }
+    dst.relocs = list.empty<ir.Reloc>()
+    for rel in src.relocs.items() {
+        if (rel.offset as usize) >= off && (rel.offset as usize) - off < n {
+            var r = rel
+            r.offset = ((rel.offset as usize) - off) as u32
+            dst.relocs.push(r)
+        }
+    }
+    dst.has_data = true
+    dst.data_len = n
+    return true
+}

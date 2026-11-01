@@ -4,6 +4,7 @@
 
 import src.load
 import src.parse
+import std.fs
 import std.list
 import std.mem
 import std.strbuilder
@@ -385,11 +386,117 @@ fn context_reject_decl(ck: *Check, job: *CheckJob): bool with (a: mem.Allocator)
     return bad
 }
 
+private fn bare_root_main(ck: *Check, job: *CheckJob): bool {
+    if job.infer_collecting || ck.stop {
+        return false
+    }
+    if ck.prog.root_module.len > 0 && job.pkg.module_name != ck.prog.root_module {
+        return false
+    }
+    val decl = job.decl
+    if !parse.is_fn(decl) || parse.fn_has_receiver(decl) || parse.flag_has_word(decl.flag, "extern") {
+        return false
+    }
+    if decl.name != "main" {
+        return false
+    }
+    if fn_nctx(decl) != 0 || fn_has_attr(decl, "test") {
+        return false
+    }
+    val (_, _, _, _, has_body, _, _, _) = fn_shape_parts(decl)
+    return has_body
+}
+
+private fn pkg_nominal(ck: *Check, job: *CheckJob, path: str, name: str, kind: TypeKind): *Type? with (a: mem.Allocator) {
+    if ck.stop {
+        return null
+    }
+    for pkg in ck.prog.packages.items() {
+        if pkg.path != path {
+            continue
+        }
+        val sym = load.package_scope_lookup(&pkg.scope, name)
+        if sym == null {
+            return null
+        }
+        if get_sema(sym!!) == null {
+            if !wait_for_symbol(ck, job, sym!!, false) {
+                return null
+            }
+        }
+        val ty = get_sema(sym!!)
+        if ty == null || ty!!.kind != kind || type_is_error(ty!!) {
+            return null
+        }
+        return ty
+    }
+    return null
+}
+
+private fn universe_scope_type(ck: *Check, job: *CheckJob): *Type? {
+    val uni = job.pkg.scope.universe
+    if uni == null {
+        return null
+    }
+    val sym = load.package_scope_lookup(uni!!, "Scope")
+    if sym == null {
+        return null
+    }
+    val ty = get_sema(sym!!)
+    // Universe Scope is distinct *void with no decl (C universe_scope_type).
+    if ty == null || ty!!.kind != TypeKind.DISTINCT || ty!!.decl != null {
+        return null
+    }
+    if ty!!.name != "Scope" {
+        return null
+    }
+    _ = ck
+    return ty
+}
+
 /**
- * Drop the context stack at the start of a function body.
+ * Bare root `fn main()` receives Allocator, ErrorAllocator, Scope, and Logger
+ * (C install_main_defaults).
  */
-fn context_begin(job: *CheckJob) {
+private fn install_main_defaults(ck: *Check, job: *CheckJob) with (a: mem.Allocator) {
+    if !bare_root_main(ck, job) {
+        return
+    }
+    val alloc = pkg_nominal(ck, job, "std.mem", "Allocator", TypeKind.INTERFACE)
+    var err_alloc = pkg_nominal(ck, job, "std.mem", "ErrorAllocator", TypeKind.DISTINCT)
+    if err_alloc != null && (alloc == null || err_alloc!!.elem != alloc) {
+        err_alloc = null
+    }
+    val scope = universe_scope_type(ck, job)
+    val logger = pkg_nominal(ck, job, "std.io", "Logger", TypeKind.INTERFACE)
+    if ck.stop {
+        return
+    }
+    var srcs = list.empty<CtxSrc>()
+    if alloc != null {
+        srcs.push(CtxSrc(ty: alloc!!, expr: null))
+    }
+    if err_alloc != null {
+        srcs.push(CtxSrc(ty: err_alloc!!, expr: null))
+    }
+    if scope != null {
+        srcs.push(CtxSrc(ty: scope!!, expr: null))
+    }
+    if logger != null {
+        srcs.push(CtxSrc(ty: logger!!, expr: null))
+    }
+    if srcs.len == 0 {
+        return
+    }
+    push_level(job, srcs)
+}
+
+/**
+ * Drop the context stack at the start of a function body; install main defaults.
+ */
+fn context_begin(ck: *Check, job: *CheckJob) with (a: mem.Allocator) {
     job.ctx_stack = null
+    install_main_defaults(ck, job)
 }
 
 /**
@@ -438,7 +545,7 @@ fn context_push_params(job: *CheckJob, types: list.List<*Type>) with (a: mem.All
  * Bind FN context params into the body scope and push them on the stack.
  */
 fn context_bind_params(env: *Env, fn_node: *parse.Node, fn_ty: *Type) with (a: mem.Allocator) {
-    context_begin(env.job)
+    context_begin(env.ck, env.job)
     val n = fn_ty.contexts.len
     if n == 0 || env.ck.stop {
         return
@@ -811,14 +918,17 @@ private fn fresh_ctx_name(fn_node: *parse.Node, index: i64): str with (a: mem.Al
     var b = strbuilder.empty()
     b.append("ctx")
     b.append_int(index, 10)
-    var name = b.str()
+    // b.str() is a view of the builder. free would reuse those bytes, so a
+    // later parameter name can land in this context parameter.
+    var name = fs.copy_str(b.str())
     b.free()
     if name_taken(fn_node, name) {
+        fs.free_str(name)
         var b2 = strbuilder.empty()
         b2.append("ctx")
         b2.append_int(index, 10)
         b2.append("_")
-        name = b2.str()
+        name = fs.copy_str(b2.str())
         b2.free()
     }
     return name

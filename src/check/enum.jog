@@ -1185,6 +1185,22 @@ fn check_enum_is(env: *Env, node: *parse.Node): *Type? with (a: mem.Allocator) {
         b.free()
         return err_ty(env.ck) as *Type?
     }
+    // C attaches the variant symbol on the IS node (and the type kid) for lowering.
+    val v = type_variant_at(en!!, index as usize)
+    var vsym: *load.Symbol? = null
+    if v.decl != null {
+        vsym = get_node_sym(v.decl!!)
+    }
+    if vsym == null && en!!.name.len > 0 {
+        // Fall back: look up variant name in the enum's declaring package scope.
+        vsym = null
+    }
+    if v.decl != null && v.decl!!.name.len > 0 {
+        // Prefer symbol stored on the variant decl during check_enum.
+        vsym = get_node_sym(v.decl!!)
+    }
+    set_node_sym(node, vsym)
+    set_node_sym(type_node, vsym)
     return type_builtin(&env.ck.types, Builtin.BOOL) as *Type?
 }
 
@@ -1397,14 +1413,18 @@ private fn check_tag_cast(env: *Env, node: *parse.Node, got: *Type?, dest: *Type
         return null, 0
     }
     if node.kids.len > 0 && is_int_lit_tree(node.kids.get(0)) {
-        var value: i64 = 0
+        // C jog_const_eval(..., en->base) retypes the lit to the tag type.
+        val lit = node.kids.get(0)
         val host = en!!.elem
-        if !const_fold_int(env.ck, env.job.file, node.kids.get(0), &value) {
+        val folded = const_eval(env.ck, env.job.file, lit, host)
+        if folded == null || is_err(folded) {
             env.ck.failed = true
             return err_ty(env.ck) as *Type?, 1
         }
-        if host != null && host!!.kind == TypeKind.INT && !const_int_fits(value, host!!) {
-            enum_env_fail(env, node, "constant does not fit")
+        set_node_ty(lit, folded)
+        var value: i64 = 0
+        if !const_fold_int(env.ck, env.job.file, lit, &value) {
+            env.ck.failed = true
             return err_ty(env.ck) as *Type?, 1
         }
         if variant_by_tag(en!!, value) < 0 {

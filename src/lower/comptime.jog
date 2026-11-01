@@ -1,0 +1,876 @@
+// Compile-time global folding + @comptime. Port of compiler/src/lower_comptime.c.
+
+import src.check
+import src.ir
+import src.load
+import src.parse
+import std.list
+import std.mem
+import std.strbuilder
+
+private fn seq_name(L: *Lower, prefix: str): str with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    b.append(prefix)
+    b.append_int(L.ct_seq as i64, 10)
+    L.ct_seq = L.ct_seq + 1
+    val out = b.str()
+    if out.len == 0 {
+        b.free()
+        return ""
+    }
+    val (raw, err) = a.alloc(out.len, 1)
+    if err != null {
+        b.free()
+        return ""
+    }
+    var i: usize = 0
+    for i < out.len {
+        raw.ptr[i] = out.ptr[i]
+        i = i + 1
+    }
+    b.free()
+    return raw
+}
+
+fn type_has_ptr(ty0: *check.Type?, depth: i32): bool {
+    if ty0 == null || depth > 64 {
+        return false
+    }
+    val ty = check.type_peel_distinct(ty0!!)
+    val tk = check.type_kinds()
+    if ty.kind == tk.PTR || ty.kind == tk.SLICE || ty.kind == tk.BYTES || ty.kind == tk.FN ||
+        ty.kind == tk.INTERFACE {
+        return true
+    }
+    if ty.kind == tk.ARRAY {
+        return type_has_ptr(ty.elem, depth + 1)
+    }
+    if ty.kind == tk.OPTION {
+        if check.type_option_is_niche(ty) {
+            return true
+        }
+        return type_has_ptr(ty.elem, depth + 1)
+    }
+    if ty.kind == tk.TUPLE {
+        for e in ty.elems.items() {
+            if type_has_ptr(e as *check.Type?, depth + 1) {
+                return true
+            }
+        }
+        return false
+    }
+    if ty.kind == tk.STRUCT {
+        var i: usize = 0
+        for i < ty.field_types.len {
+            if type_has_ptr(ty.field_types.get(i) as *check.Type?, depth + 1) {
+                return true
+            }
+            i = i + 1
+        }
+        return false
+    }
+    if ty.kind == tk.ENUM {
+        var vi: usize = 0
+        for vi < check.type_variant_count(ty) {
+            val v = check.type_variant_at(ty, vi)
+            var f: usize = 0
+            for f < v.field_count {
+                val fld = check.type_variant_field_at(ty, v, f)
+                if type_has_ptr(fld.field_type, depth + 1) {
+                    return true
+                }
+                f = f + 1
+            }
+            vi = vi + 1
+        }
+        return false
+    }
+    return false
+}
+
+private fn fail_pos(L: *Lower, pos: ir.Pos, message: str) with (a: mem.Allocator) {
+    L.failed = true
+    if pos.file.len > 0 && pos.line > 0 {
+        load.print_pos_error(pos.file, pos.line, pos.column, message)
+    } else {
+        load.print_bare_error(message)
+    }
+}
+
+private struct Walk {
+    L: *Lower?
+    self_i: i32
+    n: i32
+    deps: list.List<u8>
+    map: list.List<i32>
+    nglobal: usize
+}
+
+private fn note_dep(w: *Walk, node: *parse.Node?, symbol: *load.Symbol?) with (a: mem.Allocator) {
+    if w.L == null || symbol == null || w.L!!.failed {
+        return
+    }
+    val L = w.L!!
+    val gi = find_global(L, symbol!!)
+    if gi < 0 {
+        return
+    }
+    var bind: *GlobalBind? = null
+    var bi: usize = 0
+    for bi < L.globals.len {
+        if L.globals.at(bi).index == gi {
+            bind = L.globals.at(bi)
+            break
+        }
+        bi = bi + 1
+    }
+    if bind == null || !bind!!.runtime || gi < 0 {
+        return
+    }
+    if (gi as usize) >= w.nglobal || (gi as usize) >= w.map.len {
+        return
+    }
+    val ci = w.map.get(gi as usize)
+    if ci < 0 {
+        var name = symbol!!.name
+        if name.len == 0 {
+            name = "?"
+        }
+        var b = strbuilder.empty()
+        b.append("compile-time initializer reads '")
+        b.append(name)
+        b.append("', which is not a compile-time constant")
+        if node != null {
+            fail(L, node, b.str())
+        } else {
+            fail(L, null, b.str())
+        }
+        b.free()
+        return
+    }
+    if w.self_i >= 0 && w.self_i < w.n && ci < w.n {
+        val idx = (w.self_i as usize) * (w.n as usize) + (ci as usize)
+        if idx < w.deps.len {
+            w.deps.set(idx, 1)
+        }
+    }
+}
+
+private fn walk_expr(w: *Walk, node: *parse.Node?) with (a: mem.Allocator) {
+    if node == null || w.L == null || w.L!!.failed {
+        return
+    }
+    val n = node!!
+    if parse.is_fn(n) {
+        return
+    }
+    if (parse.is_ident(n) || parse.is_member(n)) && check.get_node_sym(n) != null {
+        note_dep(w, n, check.get_node_sym(n))
+    }
+    if parse.is_ident(n) {
+        for kid in n.kids.items() {
+            walk_expr(w, kid as *parse.Node?)
+        }
+        return
+    }
+    if parse.is_unary(n) || parse.is_force(n) {
+        if n.kids.len > 0 {
+            walk_expr(w, n.kids.get(0) as *parse.Node?)
+        }
+        return
+    }
+    if parse.is_binary(n) {
+        if n.kids.len > 0 {
+            walk_expr(w, n.kids.get(0) as *parse.Node?)
+        }
+        if n.kids.len > 1 {
+            walk_expr(w, n.kids.get(1) as *parse.Node?)
+        }
+        return
+    }
+    if parse.is_call(n) || parse.is_builtin(n) || parse.is_tuple(n) || parse.is_block(n) ||
+        parse.is_array_lit(n) || parse.is_return(n) {
+        for kid in n.kids.items() {
+            walk_expr(w, kid as *parse.Node?)
+        }
+        return
+    }
+    if parse.is_arg(n) {
+        if n.kids.len > 0 {
+            walk_expr(w, n.kids.get(0) as *parse.Node?)
+        }
+        return
+    }
+    if parse.is_index(n) || parse.is_slice_expr(n) {
+        for kid in n.kids.items() {
+            walk_expr(w, kid as *parse.Node?)
+        }
+        return
+    }
+    if parse.is_member(n) {
+        if n.kids.len > 0 {
+            walk_expr(w, n.kids.get(0) as *parse.Node?)
+        }
+        return
+    }
+    if parse.is_cast(n) {
+        for kid in n.kids.items() {
+            walk_expr(w, kid as *parse.Node?)
+        }
+        return
+    }
+    if parse.is_if(n) {
+        for kid in n.kids.items() {
+            walk_expr(w, kid as *parse.Node?)
+        }
+        return
+    }
+    if parse.is_expr_stmt(n) || parse.is_assign_stmt(n) {
+        for kid in n.kids.items() {
+            walk_expr(w, kid as *parse.Node?)
+        }
+        return
+    }
+    if parse.is_for(n) {
+        for kid in n.kids.items() {
+            walk_expr(w, kid as *parse.Node?)
+        }
+        return
+    }
+}
+
+private fn ensure_index(L: *Lower, index: i32): bool with (a: mem.Allocator) {
+    if L.failed || index < 0 {
+        return false
+    }
+    val func = ir.func_at(&L.module, index as u32)
+    if func == null {
+        fail(L, null, "missing lowered function")
+        return false
+    }
+    if func!!.linkage == ir.linkages().EXTERN {
+        return true
+    }
+    if L.ensuring == index {
+        fail_pos(L, func!!.pos, "compile-time cycle")
+        return false
+    }
+    if func!!.blocks.len > 0 {
+        return true
+    }
+    // Bodies are lowered before comptime vals; only on-demand for early @comptime.
+    var bind: *FnBind? = null
+    var i: usize = 0
+    for i < L.fns.len {
+        if L.fns.at(i).index == index {
+            bind = L.fns.at(i)
+            break
+        }
+        i = i + 1
+    }
+    if bind != null && bind!!.body_done {
+        return true
+    }
+    if bind != null && bind!!.decl != null {
+        val sym = check.get_node_sym(bind!!.decl!!)
+        if sym != null && check.sym_type_param_count(sym!!) > 0 {
+            bind!!.body_done = true
+            return true
+        }
+        val saved_func = L.func
+        val saved_ast = L.ast_fn
+        val saved_block = L.block
+        val saved_term = L.terminated
+        val saved_locals = L.locals
+        val saved_loops = L.loops
+        val saved_cleanups = L.cleanups
+        val saved_overlays = L.overlays
+        val saved_unchecked = L.unchecked
+        val saved_in_cleanup = L.in_cleanup
+        val saved_in_coro = L.in_coro
+        val saved_in_ct = L.in_comptime
+        val saved_ensuring = L.ensuring
+        L.ensuring = index
+        L.func = func
+        L.in_comptime = false
+        L.in_coro = false
+        L.unchecked = false
+        L.in_cleanup = false
+        L.overlays = list.empty<Overlay>()
+        L.locals = list.empty<LocalBind>()
+        L.loops = list.empty<LoopFrame>()
+        L.cleanups = list.empty<Cleanup>()
+        bind!!.body_done = true
+        lower_body(L, bind!!.decl!!)
+        val failed = L.failed
+        L.func = saved_func
+        L.ast_fn = saved_ast
+        L.block = saved_block
+        L.terminated = saved_term
+        L.locals = saved_locals
+        L.loops = saved_loops
+        L.cleanups = saved_cleanups
+        L.overlays = saved_overlays
+        L.unchecked = saved_unchecked
+        L.in_cleanup = saved_in_cleanup
+        L.in_coro = saved_in_coro
+        L.in_comptime = saved_in_ct
+        L.ensuring = saved_ensuring
+        if failed {
+            L.failed = true
+        }
+        return !L.failed
+    }
+    // Generic pending bodies
+    i = 0
+    for i < L.generic_pending.len {
+        val inst = L.generic_pending.at(i)
+        if inst.jir_index == index {
+            if inst.body_done || inst.fn_decl == null {
+                if func!!.blocks.len > 0 {
+                    return true
+                }
+                fail_pos(L, func!!.pos, "compile-time function has no body")
+                return false
+            }
+            val saved_func = L.func
+            val saved_ast = L.ast_fn
+            val saved_block = L.block
+            val saved_term = L.terminated
+            val saved_locals = L.locals
+            val saved_loops = L.loops
+            val saved_cleanups = L.cleanups
+            val saved_overlays = L.overlays
+            val saved_unchecked = L.unchecked
+            val saved_in_cleanup = L.in_cleanup
+            val saved_in_coro = L.in_coro
+            val saved_in_ct = L.in_comptime
+            val saved_ensuring = L.ensuring
+            val saved_sub_p = L.subst_params
+            val saved_sub_a = L.subst_args
+            L.ensuring = index
+            L.func = func
+            L.in_comptime = false
+            L.in_coro = false
+            L.unchecked = false
+            L.in_cleanup = false
+            L.overlays = list.empty<Overlay>()
+            L.locals = list.empty<LocalBind>()
+            L.loops = list.empty<LoopFrame>()
+            L.cleanups = list.empty<Cleanup>()
+            inst.body_done = true
+            lower_body(L, inst.fn_decl!!)
+            val failed = L.failed
+            L.func = saved_func
+            L.ast_fn = saved_ast
+            L.block = saved_block
+            L.terminated = saved_term
+            L.locals = saved_locals
+            L.loops = saved_loops
+            L.cleanups = saved_cleanups
+            L.overlays = saved_overlays
+            L.unchecked = saved_unchecked
+            L.in_cleanup = saved_in_cleanup
+            L.in_coro = saved_in_coro
+            L.in_comptime = saved_in_ct
+            L.ensuring = saved_ensuring
+            L.subst_params = saved_sub_p
+            L.subst_args = saved_sub_a
+            if failed {
+                L.failed = true
+            }
+            return !L.failed
+        }
+        i = i + 1
+    }
+    fail_pos(L, func!!.pos, "compile-time function has no body")
+    return false
+}
+
+private fn prepare(L: *Lower, root: i32): bool with (a: mem.Allocator) {
+    var seen = list.empty<u8>()
+    var stack = list.empty<i32>()
+    stack.push(root)
+    for stack.len > 0 && !L.failed {
+        val id = stack.pop()
+        if id < 0 {
+            continue
+        }
+        for seen.len <= id as usize {
+            seen.push(0)
+        }
+        if seen.get(id as usize) != 0 {
+            continue
+        }
+        seen.set(id as usize, 1)
+        if !ensure_index(L, id) {
+            return false
+        }
+        val f = ir.func_at(&L.module, id as u32)
+        if f == null {
+            continue
+        }
+        var b: usize = 0
+        for b < f!!.blocks.len {
+            val block = f!!.blocks.at(b)
+            var k: usize = 0
+            for k < block.insts.len {
+                val inst = block.insts.get(k)
+                if inst.op == ir.op_kinds().CALL && inst.a.kind == ir.operand_kinds().FUNC {
+                    stack.push(inst.a.func as i32)
+                }
+                k = k + 1
+            }
+            b = b + 1
+        }
+    }
+    return !L.failed
+}
+
+fn isolate_expr(
+    L: *Lower,
+    expr: *parse.Node,
+    ty: *check.Type,
+    name: str,
+    jog_name: str,
+): i32 with (a: mem.Allocator) {
+    if L.failed {
+        return -1
+    }
+    val empty_params = list.empty<*check.Type>()
+    val empty_ctx = list.empty<*check.Type>()
+    val fn_type = check.type_fn(L.types, empty_params, ty, empty_ctx, false, false, false)
+    val empty_names = list.empty<str>()
+    val index = ir.func_add(&L.module, name, jog_name, ir.linkages().INTERNAL, fn_type, empty_names)
+    var func: *ir.Func? = null
+    if index >= 0 {
+        func = ir.func_at(&L.module, index as u32)
+    }
+    if func == null {
+        fail(L, expr, "out of memory")
+        return -1
+    }
+    func!!.pos = node_pos(L, expr)
+    val saved_func = L.func
+    val saved_ast = L.ast_fn
+    val saved_block = L.block
+    val saved_term = L.terminated
+    val saved_locals = L.locals
+    val saved_loops = L.loops
+    val saved_cleanups = L.cleanups
+    val saved_overlays = L.overlays
+    val saved_unchecked = L.unchecked
+    val saved_in_cleanup = L.in_cleanup
+    val saved_in_coro = L.in_coro
+    val saved_in_ct = L.in_comptime
+    L.func = func
+    L.ast_fn = null
+    L.locals = list.empty<LocalBind>()
+    L.loops = list.empty<LoopFrame>()
+    L.cleanups = list.empty<Cleanup>()
+    L.overlays = list.empty<Overlay>()
+    L.terminated = false
+    L.unchecked = false
+    L.in_cleanup = false
+    L.in_coro = false
+    L.in_comptime = true
+    var failed = false
+    val entry = new_block(L, "entry")
+    use_block(L, entry)
+    val value = lower_expr(L, expr)
+    if !L.failed && !L.terminated {
+        if check.type_is_unit(ty) {
+            emit_ret(L, none_value(), node_pos(L, expr))
+        } else if value.kind == ir.operand_kinds().NONE {
+            fail(L, expr, "compile-time expression does not produce a value")
+        } else {
+            emit_ret(L, value, node_pos(L, expr))
+        }
+    }
+    failed = L.failed
+    L.func = saved_func
+    L.ast_fn = saved_ast
+    L.block = saved_block
+    L.terminated = saved_term
+    L.locals = saved_locals
+    L.loops = saved_loops
+    L.cleanups = saved_cleanups
+    L.overlays = saved_overlays
+    L.unchecked = saved_unchecked
+    L.in_cleanup = saved_in_cleanup
+    L.in_coro = saved_in_coro
+    L.in_comptime = saved_in_ct
+    if failed {
+        L.failed = true
+        return -1
+    }
+    return index
+}
+
+fn materialize(L: *Lower, ty: *check.Type?, bytes: list.List<u8>, n: usize, pos: ir.Pos): ir.Operand with (
+    a: mem.Allocator,
+) {
+    if ty == null {
+        fail_pos(L, pos, "compile-time value has no type")
+        return none_value()
+    }
+    if type_has_ptr(ty, 0) {
+        fail_pos(L, pos, "compile-time value contains a pointer")
+        return none_value()
+    }
+    if !ty!!.has_layout || n != ty!!.size as usize {
+        fail_pos(L, pos, "compile-time value has the wrong size")
+        return none_value()
+    }
+    if n > 0 && bytes.len < n {
+        fail_pos(L, pos, "compile-time value is missing")
+        return none_value()
+    }
+    val base = check.type_peel_distinct(ty!!)
+    val tk = check.type_kinds()
+    if (base.kind == tk.INT || base.kind == tk.BOOL) && n <= 8 {
+        var bits: u64 = 0
+        var i: usize = 0
+        for i < n {
+            bits = bits | ((bytes.get(i) as u64) << ((i as u64) * 8))
+            i = i + 1
+        }
+        return ir.int_op(ty, u64_as_i64_bits(bits))
+    }
+    if n == 0 {
+        return none_value()
+    }
+    val gname = seq_name(L, "jog__ctdat_")
+    if gname.len == 0 {
+        fail_pos(L, pos, "out of memory")
+        return none_value()
+    }
+    val gindex = ir.global_add(&L.module, gname, ty, true)
+    var global: *ir.Global? = null
+    if gindex >= 0 {
+        global = ir.global_at(&L.module, gindex as u32)
+    }
+    if global == null {
+        fail_pos(L, pos, "out of memory")
+        return none_value()
+    }
+    val g = global!!
+    g.data = list.empty<u8>()
+    var i: usize = 0
+    for i < n {
+        g.data.push(bytes.get(i))
+        i = i + 1
+    }
+    g.has_data = true
+    g.data_len = n
+    g.pos = pos
+    val dst = new_local(L, "", ty)
+    val inst = emit_inst(L, ir.op_kinds().LOAD, dst as i32, pos)
+    if inst != null {
+        inst!!.a = ir.global_ref(&L.module, gindex as u32)
+    }
+    return local_operand(L, dst)
+}
+
+private fn u64_as_i64_bits(bits: u64): i64 {
+    var w = bits
+    val p: *u8 = &w as *u8
+    var out: i64 = 0
+    val op: *u8 = &out as *u8
+    var i: usize = 0
+    for i < 8 {
+        op[i] = p[i]
+        i = i + 1
+    }
+    return out
+}
+
+private fn dot_comptime_name(L: *Lower): str with (a: mem.Allocator) {
+    var base = "comptime"
+    if L.func != null && L.func!!.jog_name.len > 0 {
+        base = L.func!!.jog_name
+    }
+    var b = strbuilder.empty()
+    b.append(base)
+    b.append(".comptime")
+    val out = b.str()
+    if out.len == 0 {
+        b.free()
+        return ""
+    }
+    val (raw, err) = a.alloc(out.len, 1)
+    if err != null {
+        b.free()
+        return ""
+    }
+    var i: usize = 0
+    for i < out.len {
+        raw.ptr[i] = out.ptr[i]
+        i = i + 1
+    }
+    b.free()
+    return raw
+}
+
+private fn eval_expr(L: *Lower, expr: *parse.Node, ty: *check.Type, jog_name: str): (list.List<u8>, bool) with (
+    a: mem.Allocator,
+) {
+    var empty = list.empty<u8>()
+    val cname = seq_name(L, "jog__ctfn_")
+    if cname.len == 0 || jog_name.len == 0 {
+        fail(L, expr, "out of memory")
+        return empty, false
+    }
+    val idx = isolate_expr(L, expr, ty, cname, jog_name)
+    if idx < 0 {
+        return empty, false
+    }
+    if !prepare(L, idx) {
+        return empty, false
+    }
+    val (bytes, ok) = ir.interp_call(&L.module, idx as u32, L.ct_steps)
+    if !ok {
+        L.failed = true
+        return empty, false
+    }
+    return bytes, true
+}
+
+private fn deps_ready(deps: list.List<u8>, done: list.List<u8>, n: i32, i: i32): bool {
+    var j: i32 = 0
+    for j < n {
+        val idx = (i as usize) * (n as usize) + (j as usize)
+        if deps.get(idx) != 0 && done.get(j as usize) == 0 {
+            return false
+        }
+        j = j + 1
+    }
+    return true
+}
+
+private fn binding_init(node: *parse.Node): *parse.Node? {
+    if node.kids.len == 0 {
+        return null
+    }
+    if node.kids.len == 1 {
+        val only = node.kids.get(0)
+        if parse.is_type_name(only) || parse.is_type_ptr(only) || parse.is_type_slice(only) ||
+            parse.is_type_array(only) || parse.is_type_option(only) || parse.is_type_tuple(only) ||
+            parse.is_type_fn(only) || parse.is_type_unit(only) {
+            return null
+        }
+        return only as *parse.Node?
+    }
+    return node.kids.get(node.kids.len - 1) as *parse.Node?
+}
+
+/**
+ * Fold runtime VAL globals without pointers into constant data via the interp.
+ */
+fn lower_comptime_vals(L: *Lower): bool with (a: mem.Allocator) {
+    if L.failed {
+        return false
+    }
+    val ng = L.module.globals.len
+    var n: usize = 0
+    var i: usize = 0
+    for i < L.globals.len {
+        val bind = L.globals.at(i)
+        if !bind.runtime || bind.part >= 0 || bind.decl == null || !parse.is_val(bind.decl!!) || bind.index < 0 {
+            i = i + 1
+            continue
+        }
+        val global = ir.global_at(&L.module, bind.index as u32)
+        var ty: *check.Type? = null
+        if global != null {
+            ty = global!!.ty
+        }
+        if ty == null || !check.type_layout(L.types, ty!!) || !ty!!.has_layout || ty!!.size == 0 {
+            i = i + 1
+            continue
+        }
+        if type_has_ptr(ty, 0) {
+            i = i + 1
+            continue
+        }
+        n = n + 1
+        i = i + 1
+    }
+    if n == 0 {
+        return true
+    }
+    if n > 4096 {
+        fail(L, null, "compile-time initializer is too large")
+        return false
+    }
+    var map = list.empty<i32>()
+    var cands = list.empty<*GlobalBind?>()
+    var order = list.empty<i32>()
+    var deps = list.empty<u8>()
+    var done = list.empty<u8>()
+    var mi: usize = 0
+    for mi < (if ng > 0 { ng } else { 1 }) {
+        map.push(-1)
+        mi = mi + 1
+    }
+    var di: usize = 0
+    for di < n * n {
+        deps.push(0)
+        di = di + 1
+    }
+    var oi: usize = 0
+    for oi < n {
+        done.push(0)
+        order.push(0)
+        cands.push(null)
+        oi = oi + 1
+    }
+    var c: usize = 0
+    i = 0
+    for i < L.globals.len {
+        val bind = L.globals.at(i)
+        if !bind.runtime || bind.part >= 0 || bind.decl == null || !parse.is_val(bind.decl!!) || bind.index < 0 {
+            i = i + 1
+            continue
+        }
+        val global = ir.global_at(&L.module, bind.index as u32)
+        var ty: *check.Type? = null
+        if global != null {
+            ty = global!!.ty
+        }
+        if ty == null || !ty!!.has_layout || ty!!.size == 0 || type_has_ptr(ty, 0) {
+            i = i + 1
+            continue
+        }
+        if (bind.index as usize) < ng {
+            map.set(bind.index as usize, c as i32)
+        }
+        cands.set(c, L.globals.at(i))
+        c = c + 1
+        i = i + 1
+    }
+    i = 0
+    for i < n && !L.failed {
+        var w: Walk
+        w.L = L as *Lower?
+        w.self_i = i as i32
+        w.n = n as i32
+        w.deps = deps
+        w.map = map
+        w.nglobal = ng
+        val init = binding_init(cands.get(i)!!.decl!!)
+        walk_expr(&w, init)
+        // deps may have been mutated through w.deps alias — copy back
+        deps = w.deps
+        i = i + 1
+    }
+    if L.failed {
+        return false
+    }
+    var placed: usize = 0
+    var ok = true
+    for ok && placed < n {
+        var progress = false
+        i = 0
+        for i < n {
+            if done.get(i) != 0 || !deps_ready(deps, done, n as i32, i as i32) {
+                i = i + 1
+                continue
+            }
+            order.set(placed, i as i32)
+            placed = placed + 1
+            done.set(i, 1)
+            progress = true
+            break
+        }
+        if !progress {
+            var pos = ir.pos_none()
+            if cands.get(0) != null && cands.get(0)!!.decl != null {
+                pos = node_pos(L, cands.get(0)!!.decl!!)
+            }
+            i = 0
+            for i < n {
+                if done.get(i) == 0 && cands.get(i) != null && cands.get(i)!!.decl != null {
+                    pos = node_pos(L, cands.get(i)!!.decl!!)
+                    break
+                }
+                i = i + 1
+            }
+            fail_pos(L, pos, "global initializer cycle")
+            ok = false
+        }
+    }
+    i = 0
+    for ok && i < placed && !L.failed {
+        val bind = cands.get(order.get(i) as usize)!!
+        val global = ir.global_at(&L.module, bind.index as u32)
+        val init = binding_init(bind.decl!!)
+        var ty: *check.Type? = null
+        if global != null {
+            ty = global!!.ty
+        }
+        var jname = "val"
+        if bind.symbol != null && bind.symbol!!.name.len > 0 {
+            jname = bind.symbol!!.name
+        }
+        if init == null || ty == null || global == null {
+            fail(L, bind.decl, "compile-time initializer is missing")
+            ok = false
+            break
+        }
+        val (bytes, eok) = eval_expr(L, init!!, ty!!, jname)
+        if !eok {
+            ok = false
+            break
+        }
+        if ty!!.size > 0 && bytes.len == 0 {
+            fail(L, init, "compile-time value is missing")
+            ok = false
+            break
+        }
+        val g = global!!
+        g.data = list.empty<u8>()
+        var bi: usize = 0
+        val want = ty!!.size as usize
+        for bi < want {
+            if bi < bytes.len {
+                g.data.push(bytes.get(bi))
+            } else {
+                g.data.push(0)
+            }
+            bi = bi + 1
+        }
+        g.has_data = true
+        g.data_len = want
+        // Clear runtime via index into L.globals
+        var gi: usize = 0
+        for gi < L.globals.len {
+            if L.globals.at(gi).index == bind.index && L.globals.at(gi).part == bind.part {
+                L.globals.at(gi).runtime = false
+                break
+            }
+            gi = gi + 1
+        }
+        i = i + 1
+    }
+    return ok && !L.failed
+}
+
+/**
+ * Evaluate @comptime(expr) via isolate + interp + materialize.
+ * Called from lower_comptime_builtin in body.jog.
+ */
+fn eval_comptime_expr(L: *Lower, node: *parse.Node, expr: *parse.Node): ir.Operand with (a: mem.Allocator) {
+    val ty = check.get_node_ty(node)
+    if ty == null {
+        fail(L, node, "compile-time expression has no type")
+        return none_value()
+    }
+    val jname = dot_comptime_name(L)
+    val (bytes, ok) = eval_expr(L, expr, ty!!, jname)
+    if !ok {
+        return none_value()
+    }
+    val n = if ty!!.has_layout { ty!!.size as usize } else { 0 }
+    return materialize(L, ty, bytes, n, node_pos(L, node))
+}

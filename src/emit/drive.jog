@@ -1,0 +1,691 @@
+// build, run, and test. Checked against compiler/src/cmd_build.c
+// (link_program, compile_pipeline, jog_drive_test) and cmd_test.c.
+
+import src.check
+import src.load
+import src.lower
+import src.parse
+import std.fs
+import std.io
+import std.list
+import std.mem
+import std.os
+import std.proc
+import std.strbuilder
+import std.text as texts
+
+struct Drive {
+    start: str
+    saw_start: bool
+    output: str
+    saw_output: bool
+    mode: i32
+    saw_mode: bool
+    keep_c: bool
+    saw_keep: bool
+    wasm: bool
+    saw_target: bool
+    steps: u64
+    saw_steps: bool
+    modules: list.List<str>
+    run_args: list.List<str>
+    include_tests: bool
+}
+
+fn parse_steps(text: str): (u64, bool) {
+    if text.len == 0 {
+        return 0, false
+    }
+    val limit: u64 = 1844674407370955161
+    var n: u64 = 0
+    var i: usize = 0
+    for i < text.len {
+        val c = text.ptr[i]
+        if c < '0' as u8 || c > '9' as u8 {
+            return 0, false
+        }
+        val d = (c - '0' as u8) as u64
+        if n > limit || (n == limit && d > 5) {
+            return 0, false
+        }
+        n = n * 10 + d
+        i = i + 1
+    }
+    if n == 0 {
+        return 0, false
+    }
+    return n, true
+}
+
+private fn usage_of(command: str): i32 {
+    if command == "build" {
+        io.eprintln("usage: jog build [package] [-o file] [--release | --release-fast] [--keep-c] [--target wasm32] [--comptime-steps N] [--module name=dir ...]")
+    } else if command == "run" {
+        io.eprintln("usage: jog run [package] [--target wasm32] [--comptime-steps N] [--module name=dir ...] [-- args...]")
+    } else {
+        io.eprintln("usage: jog test [package | --all] [--module name=dir ...]")
+    }
+    return 2
+}
+
+private fn take_module(arg: str, i: *i64): (str, i32) {
+    var value = ""
+    if arg == "--module" {
+        if i[0] + 1 >= os.argc() {
+            io.eprintln("jog: --module expects <name>=<dir>")
+            return "", 2
+        }
+        i[0] = i[0] + 1
+        value = os.argv(i[0])
+    } else if arg.len >= 9 && texts.slice(arg, 0, 9) == "--module=" {
+        value = texts.slice(arg, 9, arg.len)
+    } else {
+        return "", 1
+    }
+    val (_, _, ok) = load.split_module_flag(value)
+    if !ok {
+        var buf = strbuilder.empty()
+        buf.append("jog: --module expects <name>=<dir>, got '")
+        buf.append(value)
+        buf.append("'")
+        io.eprintln(buf.str())
+        return "", 2
+    }
+    return value, 0
+}
+
+private fn take_steps(arg: str, i: *i64, saw: bool): (u64, i32) with (a: mem.Allocator) {
+    if saw {
+        return 0, 3
+    }
+    var value = ""
+    if arg == "--comptime-steps" {
+        if i[0] + 1 >= os.argc() {
+            io.eprintln("jog: --comptime-steps expects a positive integer")
+            return 0, 2
+        }
+        i[0] = i[0] + 1
+        value = os.argv(i[0])
+    } else {
+        value = texts.slice(arg, 17, arg.len)
+    }
+    val (n, ok) = parse_steps(value)
+    if !ok {
+        io.eprintln("jog: --comptime-steps expects a positive integer")
+        return 0, 2
+    }
+    return n, 0
+}
+
+private fn empty_drive(): Drive with (a: mem.Allocator) {
+    var d: Drive
+    d.start = ""
+    d.saw_start = false
+    d.output = ""
+    d.saw_output = false
+    d.mode = 0
+    d.saw_mode = false
+    d.keep_c = false
+    d.saw_keep = false
+    d.wasm = false
+    d.saw_target = false
+    d.steps = 0
+    d.saw_steps = false
+    d.modules = list.empty<str>()
+    d.run_args = list.empty<str>()
+    d.include_tests = false
+    return d
+}
+
+private fn parse_test(): (Drive, i32) with (a: mem.Allocator) {
+    var d = empty_drive()
+    d.include_tests = true
+    var all = false
+    var i: i64 = 2
+    for i < os.argc() {
+        val arg = os.argv(i)
+        val (mod, flag) = take_module(arg, &i)
+        if flag == 2 {
+            return d, 2
+        }
+        if flag == 0 {
+            d.modules.push(mod)
+            i = i + 1
+            continue
+        }
+        if arg == "--all" {
+            if all || d.saw_start {
+                return d, usage_of("test")
+            }
+            all = true
+            i = i + 1
+            continue
+        }
+        if arg.len > 0 && arg.ptr[0] == '-' as u8 || d.saw_start || all {
+            return d, usage_of("test")
+        }
+        d.start = arg
+        d.saw_start = true
+        i = i + 1
+    }
+    return d, 0
+}
+
+private fn parse_build(command: str): (Drive, i32) with (a: mem.Allocator) {
+    var d = empty_drive()
+    var i: i64 = 2
+    for i < os.argc() {
+        val arg = os.argv(i)
+        val (mod, flag) = take_module(arg, &i)
+        if flag == 2 {
+            return d, 2
+        }
+        if flag == 0 {
+            d.modules.push(mod)
+            i = i + 1
+            continue
+        }
+        if arg == "--" {
+            if command == "run" {
+                var j = i + 1
+                for j < os.argc() {
+                    d.run_args.push(os.argv(j))
+                    j = j + 1
+                }
+                return d, 0
+            }
+            if i + 1 != os.argc() {
+                return d, usage_of(command)
+            }
+            return d, 0
+        }
+        if arg.len == 0 || arg.ptr[0] != '-' as u8 {
+            if d.saw_start {
+                return d, usage_of(command)
+            }
+            d.start = arg
+            d.saw_start = true
+            i = i + 1
+            continue
+        }
+        if arg == "--target" || (arg.len >= 9 && texts.slice(arg, 0, 9) == "--target=") {
+            if command != "build" && command != "run" {
+                return d, usage_of(command)
+            }
+            if d.saw_target {
+                return d, usage_of(command)
+            }
+            var value = ""
+            if arg == "--target" {
+                if i + 1 >= os.argc() {
+                    return d, usage_of(command)
+                }
+                i = i + 1
+                value = os.argv(i)
+            } else {
+                value = texts.slice(arg, 9, arg.len)
+            }
+            if value != "wasm32" {
+                var buf = strbuilder.empty()
+                buf.append("jog: unknown target '")
+                buf.append(value)
+                buf.append("'")
+                io.eprintln(buf.str())
+                return d, 2
+            }
+            d.saw_target = true
+            d.wasm = true
+            i = i + 1
+            continue
+        }
+        if arg == "--comptime-steps" || (arg.len >= 17 && texts.slice(arg, 0, 17) == "--comptime-steps=") {
+            val (n, sc) = take_steps(arg, &i, d.saw_steps)
+            if sc == 3 {
+                return d, usage_of(command)
+            }
+            if sc != 0 {
+                return d, sc
+            }
+            d.steps = n
+            d.saw_steps = true
+            i = i + 1
+            continue
+        }
+        if command != "build" {
+            return d, usage_of(command)
+        }
+        if arg == "--release" {
+            if d.saw_mode {
+                return d, usage_of(command)
+            }
+            d.saw_mode = true
+            d.mode = 1
+            i = i + 1
+            continue
+        }
+        if arg == "--release-fast" {
+            if d.saw_mode {
+                return d, usage_of(command)
+            }
+            d.saw_mode = true
+            d.mode = 2
+            i = i + 1
+            continue
+        }
+        if arg == "--keep-c" {
+            if d.saw_keep {
+                return d, usage_of(command)
+            }
+            d.saw_keep = true
+            d.keep_c = true
+            i = i + 1
+            continue
+        }
+        if arg == "-o" {
+            if d.saw_output || i + 1 >= os.argc() {
+                return d, usage_of(command)
+            }
+            i = i + 1
+            d.saw_output = true
+            d.output = os.argv(i)
+            i = i + 1
+            continue
+        }
+        return d, usage_of(command)
+    }
+    return d, 0
+}
+
+private fn root_pkg(prog: load.Program): *load.Package? {
+    if prog.packages.len == 0 {
+        return null
+    }
+    return prog.packages.get(prog.packages.len - 1) as *load.Package?
+}
+
+private fn decl_is_test(node: *parse.Node): bool {
+    if !parse.is_fn(node) {
+        return false
+    }
+    val nattrs = (node.head / 268435456) % 256
+    var i: i64 = 0
+    for i < nattrs {
+        if (i as usize) >= node.kids.len {
+            break
+        }
+        val attr = node.kids.get(i as usize)
+        if parse.is_attribute(attr) && attr.name == "test" {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+private fn program_has_test(prog: load.Program): bool {
+    var pi: usize = 0
+    for pi < prog.packages.len {
+        val pkg: *load.Package = prog.packages.get(pi)
+        var fi: usize = 0
+        for fi < pkg.files.len {
+            val source = pkg.files.get(fi)
+            if source.ast != null {
+                val root = source.ast!!
+                for decl in root.kids.items() {
+                    if decl_is_test(decl) {
+                        return true
+                    }
+                }
+            }
+            fi = fi + 1
+        }
+        pi = pi + 1
+    }
+    return false
+}
+
+private fn line_is_expect(line: str): (str, bool) {
+    var i: usize = 0
+    for i < line.len && (line.ptr[i] == ' ' as u8 || line.ptr[i] == '\t' as u8) {
+        i = i + 1
+    }
+    val prefix = "// expect:"
+    if line.len - i < prefix.len {
+        return "", false
+    }
+    var j: usize = 0
+    for j < prefix.len {
+        if line.ptr[i + j] != prefix.ptr[j] {
+            return "", false
+        }
+        j = j + 1
+    }
+    i = i + prefix.len
+    if i < line.len && line.ptr[i] == ' ' as u8 {
+        i = i + 1
+    }
+    return texts.slice(line, i, line.len), true
+}
+
+private fn collect_expects(prog: load.Program): (list.List<str>, bool) with (a: mem.Allocator) {
+    var out = list.empty<str>()
+    var pi: usize = 0
+    for pi < prog.packages.len {
+        val pkg: *load.Package = prog.packages.get(pi)
+        var fi: usize = 0
+        for fi < pkg.files.len {
+            val source = pkg.files.get(fi)
+            if !source.is_test || source.path.len == 0 {
+                fi = fi + 1
+                continue
+            }
+            val (raw, err) = fs.read_all(source.path)
+            if err != null {
+                return out, false
+            }
+            val data = raw as str
+            var i: usize = 0
+            for i < data.len {
+                val start = i
+                for i < data.len && data.ptr[i] != '\n' as u8 && data.ptr[i] != '\r' as u8 {
+                    i = i + 1
+                }
+                val line = texts.slice(data, start, i)
+                val (text, ok) = line_is_expect(line)
+                if ok {
+                    out.push(fs.copy_str(text))
+                }
+                if i < data.len && data.ptr[i] == '\r' as u8 {
+                    i = i + 1
+                }
+                if i < data.len && data.ptr[i] == '\n' as u8 {
+                    i = i + 1
+                }
+            }
+            a.free(raw)
+            fi = fi + 1
+        }
+        pi = pi + 1
+    }
+    return out, true
+}
+
+private fn strip_cr(text: str): str with (a: mem.Allocator) {
+    var buf = strbuilder.empty()
+    var i: usize = 0
+    for i < text.len {
+        if text.ptr[i] != '\r' as u8 {
+            buf.append(texts.slice(text, i, i + 1))
+        }
+        i = i + 1
+    }
+    return fs.copy_str(buf.str())
+}
+
+private fn split_lines(text: str): list.List<str> with (a: mem.Allocator) {
+    var out = list.empty<str>()
+    var i: usize = 0
+    for i < text.len {
+        val start = i
+        for i < text.len && text.ptr[i] != '\n' as u8 {
+            i = i + 1
+        }
+        out.push(texts.slice(text, start, i))
+        if i < text.len {
+            i = i + 1
+        }
+    }
+    return out
+}
+
+private fn print_titled(title: str, lines: list.List<str>) with (a: mem.Allocator) {
+    var buf = strbuilder.empty()
+    buf.append(title)
+    buf.append(" (")
+    buf.append_int(lines.len as i64, 10)
+    buf.append(")")
+    io.eprintln(buf.str())
+    for line in lines.items() {
+        io.eprint("  |")
+        io.eprint(line)
+        io.eprintln("|")
+    }
+}
+
+private fn expects_match(expect: list.List<str>, stdout_text: str): bool with (a: mem.Allocator) {
+    val got = split_lines(stdout_text)
+    var same = got.len == expect.len
+    var i: usize = 0
+    for same && i < got.len {
+        if got.get(i) != expect.get(i) {
+            same = false
+        }
+        i = i + 1
+    }
+    if !same {
+        print_titled("expected", expect)
+        print_titled("actual", got)
+    }
+    return same
+}
+
+private fn parent_dir(path: str): str {
+    var i = path.len
+    for i > 0 {
+        i = i - 1
+        if path.ptr[i] == '/' as u8 || path.ptr[i] == '\\' as u8 {
+            if i == 0 {
+                return ""
+            }
+            return texts.slice(path, 0, i)
+        }
+    }
+    return ""
+}
+
+private fn with_suffix(name: str, suffix: str): str with (a: mem.Allocator) {
+    var buf = strbuilder.empty()
+    buf.append(name)
+    buf.append(suffix)
+    return fs.copy_str(buf.str())
+}
+
+private fn ends_with(path: str, suffix: str): bool {
+    if path.len < suffix.len {
+        return false
+    }
+    val start = path.len - suffix.len
+    var i: usize = 0
+    for i < suffix.len {
+        if path.ptr[start + i] != suffix.ptr[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+private fn run_program(exe: str, extra: list.List<str>): i32 with (a: mem.Allocator) {
+    var args = list.empty<str>()
+    args.push(exe)
+    for arg in extra.items() {
+        args.push(arg)
+    }
+    val (code, err) = proc.run_inherit(args.items())
+    if err != null {
+        var buf = strbuilder.empty()
+        buf.append("cannot run '")
+        buf.append(exe)
+        buf.append("'")
+        io.eprintln(buf.str())
+        return 1
+    }
+    return code
+}
+
+private fn run_tests(exe: str, expects: list.List<str>): i32 with (a: mem.Allocator) {
+    var args = list.empty<str>()
+    args.push(exe)
+    val (out, err) = proc.run(args.items())
+    if err != null {
+        var buf = strbuilder.empty()
+        buf.append("cannot run '")
+        buf.append(exe)
+        buf.append("'")
+        io.eprintln(buf.str())
+        return 1
+    }
+    val text = strip_cr(out.stdout as str)
+    if out.stderr.len > 0 {
+        _ = io.eprint(out.stderr as str)
+    }
+    _ = io.print(text)
+    var status = out.code
+    if out.code != 0 {
+        var buf = strbuilder.empty()
+        buf.append("test exited with status ")
+        buf.append_int(out.code as i64, 10)
+        io.eprintln(buf.str())
+        status = out.code
+    }
+    if expects.len > 0 && !expects_match(expects, text) {
+        io.eprintln("test output did not match // expect: lines")
+        if status == 0 {
+            status = 1
+        }
+    }
+    proc.free_output(out)
+    return status
+}
+
+fn drive(command: str): i32 with (a: mem.Allocator) {
+    var parsed: Drive
+    var pcode: i32 = 0
+    if command == "test" {
+        val (d, code) = parse_test()
+        parsed = d
+        pcode = code
+    } else {
+        val (d, code) = parse_build(command)
+        parsed = d
+        pcode = code
+    }
+    if pcode != 0 {
+        return pcode
+    }
+    var start = "."
+    if parsed.saw_start {
+        start = parsed.start
+    }
+    val (prog, loaded) = load.run(start, parsed.modules.items(), parsed.include_tests)
+    if loaded != 0 {
+        return loaded
+    }
+    if prog.is_library && (command == "build" || (command == "run" && !parsed.include_tests)) {
+        var buf = strbuilder.empty()
+        buf.append("module '")
+        buf.append(prog.root_module)
+        buf.append("' is a library; use jog check or jog test")
+        io.eprintln(buf.str())
+        return 1
+    }
+    val (checked, ccode) = check.run(prog)
+    if ccode != 0 {
+        return ccode
+    }
+    if parsed.include_tests && !program_has_test(checked) {
+        io.println("no tests")
+        return 0
+    }
+    var expects = list.empty<str>()
+    if parsed.include_tests {
+        val (got, ok) = collect_expects(checked)
+        if !ok {
+            io.eprintln("out of memory")
+            return 1
+        }
+        expects = got
+    }
+    if !lower.ready(checked) {
+        return 1
+    }
+    val (mod, lowered) = lower.build_steps(checked, parsed.steps)
+    if lowered != 0 {
+        return lowered
+    }
+    var module = mod
+    val (text, ecode) = emit_source(&module, parsed.mode == 2)
+    if ecode != 0 {
+        return ecode
+    }
+    val pkg = root_pkg(checked)
+    if pkg == null || pkg!!.module_root.len == 0 {
+        io.eprintln("missing module root")
+        return 1
+    }
+    var name = pkg!!.module_name
+    if name.len == 0 {
+        name = "jog"
+    }
+    val out_dir = fs.join(pkg!!.module_root, "out")
+    val c_path = fs.join(out_dir, with_suffix(name, ".c"))
+    var exe = ""
+    if parsed.saw_output {
+        exe = parsed.output
+    } else {
+        var suffix = ".exe"
+        if parsed.wasm {
+            suffix = ".wasm"
+        }
+        exe = fs.join(out_dir, with_suffix(name, suffix))
+    }
+    if parsed.wasm && !ends_with(exe, ".wasm") {
+        var buf = strbuilder.empty()
+        buf.append("wasm32 output '")
+        buf.append(exe)
+        buf.append("' must end in .wasm")
+        io.eprintln(buf.str())
+        return 1
+    }
+    if !parsed.wasm && ends_with(exe, ".wasm") {
+        var buf = strbuilder.empty()
+        buf.append("output '")
+        buf.append(exe)
+        buf.append("' ends in .wasm; pass --target wasm32")
+        io.eprintln(buf.str())
+        return 1
+    }
+    if !mkdir_p(out_dir) {
+        io.eprintln("cannot create output directory")
+        return 1
+    }
+    if parsed.saw_output {
+        val parent = parent_dir(exe)
+        if parent.len > 0 && !mkdir_p(parent) {
+            io.eprintln("cannot create output directory")
+            return 1
+        }
+    }
+    if !write_text(c_path, text) {
+        var buf = strbuilder.empty()
+        buf.append("cannot write '")
+        buf.append(c_path)
+        buf.append("'")
+        io.eprintln(buf.str())
+        return 1
+    }
+    val linked = link_c(c_path, exe, checked.runtime_root, parsed.mode, checked.links)
+    if linked != 0 {
+        return linked
+    }
+    if !parsed.keep_c {
+        remove_file(c_path)
+    }
+    if command == "build" {
+        return 0
+    }
+    if command == "test" {
+        return run_tests(exe, expects)
+    }
+    return run_program(exe, parsed.run_args)
+}

@@ -7,6 +7,7 @@ import std.fs
 import std.list
 import std.map
 import std.mem
+import std.os
 import std.strbuilder
 
 /**
@@ -116,6 +117,11 @@ struct Type {
     payload_offset: u64
     // STRUCT/ENUM/INTERFACE/DISTINCT declaring AST node
     decl: *parse.Node?
+    // Distinct @intrinsic(int|float|bool, …). 0 = none, 1 = int, 2 = float, 3 = bool.
+    intrinsic: u8
+    intrinsic_bits: u8
+    intrinsic_signed: bool
+    intrinsic_ptr: bool
 }
 
 /**
@@ -149,6 +155,115 @@ struct TypeTable {
     builtins: list.List<*Type>
     interned: map.Map<str, *Type>
     key: strbuilder.StrBuilder
+    // Optional probe log lines (JOG_TID_LOG); drained by dump_tid_log.
+    tid_log: list.List<str>
+}
+
+private fn kind_label(kind: TypeKind): str {
+    when kind {
+        ERROR -> {
+            return "ERROR"
+        }
+        UNIT -> {
+            return "UNIT"
+        }
+        BOOL -> {
+            return "BOOL"
+        }
+        INT -> {
+            return "INT"
+        }
+        FLOAT -> {
+            return "FLOAT"
+        }
+        UNTYPED_INT -> {
+            return "UNTYPED_INT"
+        }
+        UNTYPED_FLOAT -> {
+            return "UNTYPED_FLOAT"
+        }
+        NULL -> {
+            return "NULL"
+        }
+        BYTES_N -> {
+            return "BYTES_N"
+        }
+        BYTES -> {
+            return "BYTES"
+        }
+        PTR -> {
+            return "PTR"
+        }
+        SLICE -> {
+            return "SLICE"
+        }
+        ARRAY -> {
+            return "ARRAY"
+        }
+        OPTION -> {
+            return "OPTION"
+        }
+        TUPLE -> {
+            return "TUPLE"
+        }
+        FN -> {
+            return "FN"
+        }
+        STRUCT -> {
+            return "STRUCT"
+        }
+        ENUM -> {
+            return "ENUM"
+        }
+        INTERFACE -> {
+            return "INTERFACE"
+        }
+        DISTINCT -> {
+            return "DISTINCT"
+        }
+        TYPE_PARAM -> {
+            return "TYPE_PARAM"
+        }
+    }
+}
+
+private fn tid_log_alloc(table: *TypeTable, id: u32, kind: TypeKind) with (a: mem.Allocator) {
+    // Optional: set JOG_TID_LOG (any value) to record allocation order.
+    val (_, ok) = os.env("JOG_TID_LOG")
+    if !ok {
+        return
+    }
+    var b = strbuilder.empty()
+    b.append("id=")
+    b.append_int(id as i64, 10)
+    b.append(" kind=")
+    b.append(kind_label(kind))
+    b.append("\n")
+    table.tid_log.push(fs.copy_str(b.str()))
+    b.free()
+}
+
+/** Write tid_log lines to path when JOG_TID_LOG was set during checking. */
+fn dump_tid_log(table: *TypeTable, path: str) with (a: mem.Allocator) {
+    if table.tid_log.len == 0 {
+        return
+    }
+    var b = strbuilder.empty()
+    for line in table.tid_log.items() {
+        b.append(line)
+    }
+    val text = b.str()
+    val (raw, err) = a.alloc(text.len, 1)
+    if err == null {
+        var i: usize = 0
+        for i < text.len {
+            raw.ptr[i] = text.ptr[i]
+            i = i + 1
+        }
+        _ = fs.write_all(path, raw)
+        a.free(raw)
+    }
+    b.free()
 }
 
 private fn alloc_type(table: *TypeTable, kind: TypeKind): *Type with (a: mem.Allocator) {
@@ -160,6 +275,7 @@ private fn alloc_type(table: *TypeTable, kind: TypeKind): *Type with (a: mem.All
     t.kind = kind
     t.id = table.next_id
     table.next_id = table.next_id + 1
+    tid_log_alloc(table, t.id, kind)
     t.is_const = false
     t.has_layout = false
     t.size = 0
@@ -192,7 +308,25 @@ private fn alloc_type(table: *TypeTable, kind: TypeKind): *Type with (a: mem.All
     t.variant_field_decls = list.empty<*parse.Node>()
     t.payload_offset = 0
     t.decl = null
+    t.intrinsic = 0
+    t.intrinsic_bits = 0
+    t.intrinsic_signed = false
+    t.intrinsic_ptr = false
     return t
+}
+
+/** Set @intrinsic machine shape on a distinct type (C jog_type_set_intrinsic). */
+fn type_set_intrinsic(ty: *Type, kind: u8, bits: u8, is_signed: bool, is_ptr: bool) {
+    ty.intrinsic = kind
+    ty.intrinsic_bits = bits
+    ty.intrinsic_signed = is_signed
+    ty.intrinsic_ptr = is_ptr
+    if (kind == 1 || kind == 2) && bits >= 8 {
+        val align_b = (bits as u32) / 8
+        if align_b > ty.align {
+            ty.align = align_b
+        }
+    }
 }
 
 /**
@@ -386,6 +520,7 @@ fn type_table_create(ptr_size: u32): TypeTable with (a: mem.Allocator) {
     table.builtins = list.empty<*Type>()
     table.interned = map.empty<str, *Type>()
     table.key = strbuilder.empty()
+    table.tid_log = list.empty<str>()
 
     val ptr_bits = (ptr_size * 8) as u8
     table.builtins.push(make_int(&table, 8, true, false))
@@ -473,6 +608,50 @@ fn type_builtin(table: *TypeTable, which: Builtin): *Type {
     return table.builtins.get(builtin_index(which))
 }
 
+fn type_bool(table: *TypeTable): *Type {
+    return type_builtin(table, Builtin.BOOL)
+}
+
+fn type_unit(table: *TypeTable): *Type {
+    return type_builtin(table, Builtin.UNIT)
+}
+
+fn type_usize(table: *TypeTable): *Type {
+    return type_builtin(table, Builtin.USIZE)
+}
+
+fn type_isize(table: *TypeTable): *Type {
+    return type_builtin(table, Builtin.ISIZE)
+}
+
+fn type_u8(table: *TypeTable): *Type {
+    return type_builtin(table, Builtin.U8)
+}
+
+fn type_u32(table: *TypeTable): *Type {
+    return type_builtin(table, Builtin.U32)
+}
+
+fn type_i32(table: *TypeTable): *Type {
+    return type_builtin(table, Builtin.I32)
+}
+
+fn type_i64(table: *TypeTable): *Type {
+    return type_builtin(table, Builtin.I64)
+}
+
+fn type_u64(table: *TypeTable): *Type {
+    return type_builtin(table, Builtin.U64)
+}
+
+fn type_f64(table: *TypeTable): *Type {
+    return type_builtin(table, Builtin.F64)
+}
+
+fn type_const_bytes(table: *TypeTable): *Type {
+    return type_builtin(table, Builtin.CONST_BYTES)
+}
+
 /**
  * Poison / error type.
  * @param table type table
@@ -508,14 +687,17 @@ private fn layout_elem(table: *TypeTable, t: *Type) {
         }
         OPTION -> {
             val elem = t.elem!!
-            // Niche layout for *T? comes later; step 1 uses the tagged shape.
-            var align_b = elem.align
-            if align_b < 1 {
-                align_b = 1
+            if type_option_is_niche(t) {
+                set_layout(t, elem.size, elem.align)
+            } else {
+                var align_b = elem.align
+                if align_b < 1 {
+                    align_b = 1
+                }
+                val value_off = (1 as u64 + (align_b as u64) - 1) / (align_b as u64) * (align_b as u64)
+                val total = (value_off + elem.size + (align_b as u64) - 1) / (align_b as u64) * (align_b as u64)
+                set_layout(t, total, align_b)
             }
-            val value_off = (1 as u64 + (align_b as u64) - 1) / (align_b as u64) * (align_b as u64)
-            val total = (value_off + elem.size + (align_b as u64) - 1) / (align_b as u64) * (align_b as u64)
-            set_layout(t, total, align_b)
         }
         TUPLE -> {
             var offset: u64 = 0

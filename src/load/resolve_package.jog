@@ -254,7 +254,18 @@ private fn bind_extern(r: *Resolve, pkg: *Package, file_index: usize, block: *pa
             r.failed = true
             continue
         }
-        kid.flag = block.flag
+        // C only copies visibility onto the function; is_extern stays on the
+        // FN. Jog packs both into flag, so keep mode words (extern/variadic)
+        // and only prefix the block's visibility when it is non-empty.
+        if block.flag.len > 0 {
+            var b = strbuilder.empty()
+            b.append(block.flag)
+            if kid.flag.len > 0 {
+                b.append(" ")
+                b.append(kid.flag)
+            }
+            kid.flag = b.str()
+        }
         bind_decl(r, pkg, file_index, kid, file, package_pass)
     }
 }
@@ -456,6 +467,26 @@ private fn bind_platform(r: *Resolve, pkg: *Package) with (a: mem.Allocator) {
     }
 }
 
+private fn attach_symbols(pkg: *Package) {
+    note_symbol_list(&pkg.scope.bindings)
+    var i: usize = 0
+    for i < pkg.methods.len {
+        val symbol = pkg.methods.at(i)
+        if symbol.decl != null {
+            val decl = symbol.decl!!
+            if parse.node_symbol(decl) == null {
+                parse.node_set_symbol(decl, symbol as *u8?)
+            }
+        }
+        i = i + 1
+    }
+    var fi: usize = 0
+    for fi < pkg.scope.file_scopes.len {
+        note_block_symbols(pkg.scope.file_scopes.get(fi))
+        fi = fi + 1
+    }
+}
+
 private fn build_package(r: *Resolve, pkg: *Package) with (a: mem.Allocator) {
     pkg.scope = empty_package_scope()
     pkg.scope.package = pkg as *Package?
@@ -479,6 +510,7 @@ private fn build_package(r: *Resolve, pkg: *Package) with (a: mem.Allocator) {
         i = i + 1
     }
     bind_platform(r, pkg)
+    attach_symbols(pkg)
 }
 
 /**

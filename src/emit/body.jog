@@ -1,0 +1,2054 @@
+// Function prototypes, signatures, locals, blocks, instructions, terminators.
+// Checked against compiler/src/emit_c.c. Step 5 adds enum aggregates, option
+// aggregates, enum tags, null checks, panic, switch, and unreachable.
+
+import src.check
+import src.ir
+import std.mem
+import std.strbuilder
+
+fn kept_func_params(e: *Emit, func: *ir.Func): usize {
+    var count: usize = 0
+    var limit = func.param_count as usize
+    if limit > func.locals.len {
+        limit = func.locals.len
+    }
+    for i in 0 as usize..limit {
+        if !skip_value(e, func.locals.get(i).ty) {
+            count = count + 1
+        }
+    }
+    return count
+}
+
+private fn func_variadic(e: *Emit, func: *ir.Func): bool {
+    if func.ty == null {
+        return false
+    }
+    val ty = func.ty!!
+    return ty.kind == e.kinds.FN && ty.fn_variadic
+}
+
+private fn func_va_dummy(e: *Emit, func: *ir.Func): bool {
+    return func_variadic(e, func) && kept_func_params(e, func) == 0
+}
+
+private fn kept_type_params(e: *Emit, ty: *check.Type?): usize {
+    if ty == null || ty!!.kind != e.kinds.FN {
+        return 0
+    }
+    val ft = ty!!
+    var count: usize = 0
+    for i in 0 as usize..ft.elems.len {
+        if !skip_value(e, ft.elems.get(i) as *check.Type?) {
+            count = count + 1
+        }
+    }
+    return count
+}
+
+private fn append_kept_param(e: *Emit, param: *check.Type?, any: bool): bool with (a: mem.Allocator) {
+    if skip_value(e, param) {
+        return any
+    }
+    if any {
+        e.out.append(", ")
+    }
+    append_type_name(e, param)
+    return true
+}
+
+fn append_fn_params(e: *Emit, ty: *check.Type) with (a: mem.Allocator) {
+    var any = false
+    for i in 0 as usize..ty.elems.len {
+        any = append_kept_param(e, ty.elems.get(i) as *check.Type?, any)
+    }
+    for i in 0 as usize..ty.contexts.len {
+        any = append_kept_param(e, ty.contexts.get(i) as *check.Type?, any)
+    }
+    if !ty.fn_extern {
+        if any {
+            e.out.append(", ")
+        }
+        e.out.append("void *env")
+        any = true
+    }
+    if ty.fn_variadic && !any {
+        e.out.append("int jog_va")
+        any = true
+    }
+    if ty.fn_variadic {
+        if any {
+            e.out.append(", ")
+        }
+        e.out.append("...")
+        any = true
+    }
+    if !any {
+        e.out.append("void")
+    }
+}
+
+private fn append_result_type(e: *Emit, func: *ir.Func) with (a: mem.Allocator) {
+    var ret: *check.Type? = null
+    if func.ty != null && func.ty!!.kind == e.kinds.FN {
+        ret = func.ty!!.elem
+    }
+    if skip_value(e, ret) {
+        e.out.append("void")
+        return
+    }
+    append_type_name(e, ret)
+}
+
+private fn append_def_params(e: *Emit, func: *ir.Func) with (a: mem.Allocator) {
+    var any = false
+    val variadic = func_variadic(e, func)
+    var limit = func.param_count as usize
+    if limit > func.locals.len {
+        limit = func.locals.len
+    }
+    for i in 0 as usize..limit {
+        val loc = func.locals.get(i)
+        if skip_value(e, loc.ty) {
+            continue
+        }
+        if any {
+            e.out.append(", ")
+        }
+        append_type_name(e, loc.ty)
+        e.out.append(" l")
+        e.out.append_int(i as i64, 10)
+        any = true
+    }
+    if variadic && !any {
+        e.out.append("int jog_va")
+        any = true
+    }
+    if variadic {
+        e.out.append(", ...")
+        any = true
+    }
+    if !any {
+        e.out.append("void")
+    }
+}
+
+fn emit_signature(e: *Emit, func: *ir.Func, prototype: bool) with (a: mem.Allocator) {
+    if func.linkage == e.links.INTERNAL {
+        e.out.append("static ")
+    } else if prototype && func.linkage == e.links.EXTERN {
+        e.out.append("extern ")
+    }
+    append_result_type(e, func)
+    e.out.append(" ")
+    if func.name.len == 0 {
+        fail(e, "C backend: function has no name")
+        e.out.append("jog_missing")
+    } else {
+        e.out.append(func.name)
+    }
+    e.out.append("(")
+    append_def_params(e, func)
+    e.out.append(")")
+}
+
+private fn sched_extern(e: *Emit, func: *ir.Func): bool {
+    if func.linkage != e.links.EXTERN || func.name.len == 0 {
+        return false
+    }
+    val name = func.name
+    if name == "jogrt_sched_boot" || name == "jogrt_scope_root" || name == "jogrt_scope_current" {
+        return true
+    }
+    if name == "jogrt_scope_enter" || name == "jogrt_scope_leave" || name == "jogrt_scope_cancel" {
+        return true
+    }
+    if name == "jogrt_scope_join" || name == "jogrt_scope_fail" || name == "jogrt_go" || name == "jogrt_yield" {
+        return true
+    }
+    if name == "jogrt_task_set" || name == "jogrt_task_join" || name == "jogrt_chan_init" {
+        return true
+    }
+    if name == "jogrt_chan_free" || name == "jogrt_chan_close" || name == "jogrt_chan_send" {
+        return true
+    }
+    if name == "jogrt_chan_recv" || name == "jogrt_select_begin" || name == "jogrt_select_add_recv" {
+        return true
+    }
+    if name == "jogrt_select_add_send" || name == "jogrt_select_add_default" || name == "jogrt_select_add_timeout" {
+        return true
+    }
+    if name == "jogrt_select_wait" || name == "jogrt_select_status" || name == "jogrt_sleep" {
+        return true
+    }
+    if name == "jogrt_err_cancelled" || name == "jogrt_err_closed" || name == "jogrt_cap_new" {
+        return true
+    }
+    if name == "jogrt_cap_set" || name == "jogrt_cap_get" {
+        return true
+    }
+    return false
+}
+
+fn emit_prototypes(e: *Emit) with (a: mem.Allocator) {
+    for i in 0 as usize..e.module.funcs.len {
+        val func = e.module.funcs.get(i)
+        if sched_extern(e, func) {
+            continue
+        }
+        emit_signature(e, func, true)
+        e.out.append(";\n")
+    }
+}
+
+fn append_c_literal(out: *strbuilder.StrBuilder, text: str) with (a: mem.Allocator) {
+    out.append_byte('"' as u8)
+    for i in 0 as usize..text.len {
+        val c = text.ptr[i]
+        if c == '\\' as u8 || c == '"' as u8 {
+            out.append_byte('\\' as u8)
+            out.append_byte(c)
+        } else if c == '\n' as u8 {
+            out.append("\\n")
+        } else if c == '\r' as u8 {
+            out.append("\\r")
+        } else if c < 32 as u8 || c >= 127 as u8 {
+            val n = c as i64
+            val d0 = (n / 64) % 8
+            val d1 = (n / 8) % 8
+            val d2 = n % 8
+            out.append_byte('\\' as u8)
+            out.append_byte(('0' as u8) + (d0 as u8))
+            out.append_byte(('0' as u8) + (d1 as u8))
+            out.append_byte(('0' as u8) + (d2 as u8))
+        } else {
+            out.append_byte(c)
+        }
+    }
+    out.append_byte('"' as u8)
+}
+
+fn begin_stmt(e: *Emit, pos: ir.Pos) with (a: mem.Allocator) {
+    if pos.file.len != 0 && pos.line != 0 {
+        e.out.append("#line ")
+        e.out.append_int(pos.line, 10)
+        e.out.append(" ")
+        append_c_literal(&e.out, pos.file)
+        e.out.append("\n")
+        e.lined = true
+    }
+    e.out.append("    ")
+}
+
+private fn read_int_bits(op: *ir.Operand): u64 {
+    var copy = ir.none_op()
+    copy.local = op.local
+    copy.global = op.global
+    return ir.int_operand_bits(copy)
+}
+
+private fn append_u64_digits(out: *strbuilder.StrBuilder, n: u64) with (a: mem.Allocator) {
+    if n > 9 {
+        append_u64_digits(out, n / 10)
+    }
+    val digit = (n % 10) as u8
+    out.append_byte(('0' as u8) + digit)
+}
+
+private fn append_unsigned(e: *Emit, bits: u64) with (a: mem.Allocator) {
+    append_u64_digits(&e.out, bits)
+    if bits > 4294967295 {
+        e.out.append("ull")
+    } else {
+        e.out.append("u")
+    }
+}
+
+private fn append_signed(e: *Emit, value: i64) with (a: mem.Allocator) {
+    e.out.append_int(value, 10)
+    if value > 2147483647 || value < -2147483647 {
+        e.out.append("LL")
+    }
+}
+
+private fn masked_bits(bits: u64, width: u8): u64 {
+    if width >= 64 {
+        return bits
+    }
+    if width == 8 {
+        return bits & 0xff
+    }
+    if width == 16 {
+        return bits & 0xffff
+    }
+    if width == 32 {
+        return bits & 0xffffffff
+    }
+    return bits
+}
+
+private fn append_int_bits(e: *Emit, width: u8, is_signed: bool, bits: u64) with (a: mem.Allocator) {
+    if width != 8 && width != 16 && width != 32 && width != 64 {
+        fail(e, "C backend: integer width has no C constant")
+        e.out.append("0")
+        return
+    }
+    val masked = masked_bits(bits, width)
+    if !is_signed {
+        append_unsigned(e, masked)
+        return
+    }
+    if masked == 0 {
+        e.out.append("0")
+        return
+    }
+    var neg = false
+    if width == 8 && (masked & 0x80) != 0 {
+        neg = true
+    } else if width == 16 && (masked & 0x8000) != 0 {
+        neg = true
+    } else if width == 32 && (masked & 0x80000000) != 0 {
+        neg = true
+    } else if width == 64 && (masked >> 63) != 0 {
+        neg = true
+    }
+    if !neg {
+        append_signed(e, masked as i64)
+        return
+    }
+    if width == 64 {
+        // Two's-complement magnitude. i64 min does not fit in a signed
+        // C literal, so spell it as a subtraction from i64 max.
+        val mag = (~masked) + 1
+        if (mag >> 63) != 0 {
+            e.out.append("(-9223372036854775807LL-1)")
+            return
+        }
+        e.out.append("-")
+        append_u64_digits(&e.out, mag)
+        if mag > 2147483647 {
+            e.out.append("LL")
+        }
+        return
+    }
+    var value: i64 = 0
+    if width == 8 {
+        value = (masked as i64) - 256
+    } else if width == 16 {
+        value = (masked as i64) - 65536
+    } else {
+        value = (masked as i64) - 4294967296
+    }
+    append_signed(e, value)
+}
+
+fn append_bits(e: *Emit, ty: *check.Type?, bits: u64) with (a: mem.Allocator) {
+    if ty != null && ty!!.intrinsic == 3 {
+        if (bits & 1) != 0 {
+            e.out.append("1")
+        } else {
+            e.out.append("0")
+        }
+        return
+    }
+    if ty != null && ty!!.intrinsic == 1 {
+        append_int_bits(e, ty!!.intrinsic_bits, ty!!.intrinsic_signed, bits)
+        return
+    }
+    if ty == null {
+        append_unsigned(e, bits)
+        return
+    }
+    val base = underlying(e, ty!!)
+    if base.kind == e.kinds.BOOL {
+        if (bits & 1) != 0 {
+            e.out.append("1")
+        } else {
+            e.out.append("0")
+        }
+        return
+    }
+    if base.kind == e.kinds.INT {
+        append_int_bits(e, base.int_bits, base.int_signed, bits)
+        return
+    }
+    if base.kind == e.kinds.UNTYPED_INT {
+        append_int_bits(e, 64, true, bits)
+        return
+    }
+    append_unsigned(e, bits)
+}
+
+private fn type_is_ptr(e: *Emit, ty: *check.Type?): bool {
+    if ty == null {
+        return false
+    }
+    return underlying(e, ty!!).kind == e.kinds.PTR
+}
+
+fn append_expr(e: *Emit, op: *ir.Operand) with (a: mem.Allocator) {
+    if op.kind == e.opnds.NONE {
+        e.out.append("0")
+        return
+    }
+    if op.kind == e.opnds.LOCAL {
+        e.out.append("l")
+        e.out.append_int(op.local as i64, 10)
+        return
+    }
+    if op.kind == e.opnds.INT {
+        append_bits(e, op.ty, read_int_bits(op))
+        return
+    }
+    if op.kind == e.opnds.STRING {
+        append_bytes_expr(e, op, false)
+        return
+    }
+    if op.kind == e.opnds.CSTRING {
+        append_bytes_expr(e, op, true)
+        return
+    }
+    if op.kind == e.opnds.NULL {
+        e.out.append("0")
+        return
+    }
+    if op.kind == e.opnds.FUNC {
+        append_func_expr(e, op)
+        return
+    }
+    if op.kind == e.opnds.FLOAT {
+        append_float_bits(e, op.ty, op.local, op.func)
+        return
+    }
+    if op.kind == e.opnds.GLOBAL {
+        val global = ir.global_at(e.module, op.global)
+        if global == null || !global_is_object(e, global!!) || !c_ident(global!!.name) {
+            fail(e, "C backend: global operand was not emitted")
+            e.out.append("0")
+            return
+        }
+        if vtable_global(e, op.global) {
+            e.out.append("(")
+            append_type_name(e, op.ty)
+            e.out.append(")&")
+            e.out.append(global!!.name)
+            return
+        }
+        e.out.append("&")
+        e.out.append(global!!.name)
+        return
+    }
+    e.out.append("0")
+}
+
+private fn append_bytes_expr(e: *Emit, op: *ir.Operand, cstring: bool) with (a: mem.Allocator) {
+    val id = find_bytes(e, op.str_ptr, cstring)
+    if id < 0 {
+        fail(e, "C backend: string operand was not emitted")
+        e.out.append("0")
+        return
+    }
+    val prefix = if cstring { "c" } else { "s" }
+    if cstring || type_is_ptr(e, op.ty) {
+        e.out.append("(")
+        append_type_name(e, op.ty)
+        e.out.append(")jog_")
+        e.out.append(prefix)
+        e.out.append_int(id as i64, 10)
+        return
+    }
+    e.out.append("(")
+    append_type_name(e, op.ty)
+    e.out.append("){jog_")
+    e.out.append(prefix)
+    e.out.append_int(id as i64, 10)
+    e.out.append(", ")
+    append_u64_digits(&e.out, op.str_ptr.len as u64)
+    e.out.append("}")
+}
+
+private fn append_func_expr(e: *Emit, op: *ir.Operand) with (a: mem.Allocator) {
+    val func = ir.func_at(e.module, op.func)
+    if func == null || func!!.name.len == 0 {
+        fail(e, "C backend: missing function operand")
+        e.out.append("0")
+        return
+    }
+    val f = func!!
+    var bare = f.linkage == e.links.EXTERN || f.ty == null
+    if f.ty != null && f.ty!!.kind == e.kinds.FN && f.ty!!.fn_extern {
+        bare = true
+    }
+    if bare {
+        e.out.append(f.name)
+        return
+    }
+    if f.ty != null && f.ty!!.kind == e.kinds.FN && f.ty!!.fn_variadic {
+        fail(e, "C backend: a Jog function used as a closure value needs a thunk")
+        e.out.append("0")
+        return
+    }
+    // A Jog definition has no env parameter. The closure is the thunk plus null.
+    e.out.append("(")
+    append_type_name(e, f.ty)
+    e.out.append("){jog_fnthunk_")
+    e.out.append_int(op.func as i64, 10)
+    e.out.append(", 0}")
+}
+
+fn append_paren(e: *Emit, op: *ir.Operand) with (a: mem.Allocator) {
+    e.out.append("(")
+    append_expr(e, op)
+    e.out.append(")")
+}
+
+private fn append_dst(e: *Emit, func: *ir.Func, dst: i32): bool with (a: mem.Allocator) {
+    if dst < 0 || (dst as usize) >= func.locals.len {
+        fail(e, "C backend: instruction has no destination")
+        return false
+    }
+    e.out.append("l")
+    e.out.append_int(dst as i64, 10)
+    e.out.append(" = ")
+    return true
+}
+
+private fn binop_spell(aux: u32): str {
+    val b = ir.bin_ops()
+    if aux == ir.binop_aux(b.ADD) {
+        return "+"
+    }
+    if aux == ir.binop_aux(b.SUB) {
+        return "-"
+    }
+    if aux == ir.binop_aux(b.MUL) {
+        return "*"
+    }
+    if aux == ir.binop_aux(b.DIV) {
+        return "/"
+    }
+    if aux == ir.binop_aux(b.REM) {
+        return "%"
+    }
+    if aux == ir.binop_aux(b.AND) {
+        return "&"
+    }
+    if aux == ir.binop_aux(b.OR) {
+        return "|"
+    }
+    if aux == ir.binop_aux(b.XOR) {
+        return "^"
+    }
+    if aux == ir.binop_aux(b.SHL) {
+        return "<<"
+    }
+    if aux == ir.binop_aux(b.SHR) {
+        return ">>"
+    }
+    if aux == ir.binop_aux(b.EQ) {
+        return "=="
+    }
+    if aux == ir.binop_aux(b.NE) {
+        return "!="
+    }
+    if aux == ir.binop_aux(b.LT) {
+        return "<"
+    }
+    if aux == ir.binop_aux(b.LE) {
+        return "<="
+    }
+    if aux == ir.binop_aux(b.GT) {
+        return ">"
+    }
+    if aux == ir.binop_aux(b.GE) {
+        return ">="
+    }
+    return ""
+}
+
+private fn base_ty(e: *Emit, ty: *check.Type?): *check.Type? {
+    if ty == null {
+        return null
+    }
+    return underlying(e, ty!!)
+}
+
+private fn type_is_bool_t(e: *Emit, ty: *check.Type?): bool {
+    val base = base_ty(e, ty)
+    if base == null {
+        return false
+    }
+    val t = base!!
+    return t.kind == e.kinds.BOOL || t.intrinsic == 3
+}
+
+fn type_is_float_t(e: *Emit, ty: *check.Type?): bool {
+    if ty == null {
+        return false
+    }
+    val t = ty!!
+    if t.intrinsic == 2 {
+        return true
+    }
+    val base = base_ty(e, ty)
+    if base == null {
+        return false
+    }
+    val u = base!!
+    return u.kind == e.kinds.FLOAT || u.kind == e.kinds.UNTYPED_FLOAT || u.intrinsic == 2
+}
+
+private fn float_width_of(e: *Emit, ty: *check.Type?): u8 {
+    if ty != null && ty!!.intrinsic == 2 && (ty!!.intrinsic_bits == 32 || ty!!.intrinsic_bits == 64) {
+        return ty!!.intrinsic_bits
+    }
+    val base = base_ty(e, ty)
+    if base != null && base!!.kind == e.kinds.FLOAT && (base!!.float_bits == 32 || base!!.float_bits == 64) {
+        return base!!.float_bits
+    }
+    if base != null && base!!.intrinsic == 2 && (base!!.intrinsic_bits == 32 || base!!.intrinsic_bits == 64) {
+        return base!!.intrinsic_bits
+    }
+    return 64
+}
+
+private fn type_is_int_t(e: *Emit, ty: *check.Type?): bool {
+    if type_is_bool_t(e, ty) {
+        return true
+    }
+    val base = base_ty(e, ty)
+    if base == null {
+        return false
+    }
+    val t = base!!
+    return t.kind == e.kinds.INT || t.intrinsic == 1 || t.kind == e.kinds.UNTYPED_INT
+}
+
+private fn int_width_of(e: *Emit, ty: *check.Type?): u8 {
+    if type_is_bool_t(e, ty) {
+        return 1
+    }
+    val base = base_ty(e, ty)
+    if base == null {
+        return 64
+    }
+    val t = base!!
+    if t.kind == e.kinds.INT && t.int_bits > 0 && t.int_bits <= 64 {
+        return t.int_bits
+    }
+    if t.intrinsic == 1 && t.intrinsic_bits > 0 && t.intrinsic_bits <= 64 {
+        return t.intrinsic_bits
+    }
+    return 64
+}
+
+private fn int_signed_of(e: *Emit, ty: *check.Type?): bool {
+    if type_is_bool_t(e, ty) {
+        return false
+    }
+    val base = base_ty(e, ty)
+    if base == null {
+        return false
+    }
+    val t = base!!
+    if t.kind == e.kinds.INT {
+        return t.int_signed
+    }
+    if t.intrinsic == 1 {
+        return t.intrinsic_signed
+    }
+    return t.kind == e.kinds.UNTYPED_INT
+}
+
+private fn int_is_size_of(e: *Emit, ty: *check.Type?): bool {
+    val base = base_ty(e, ty)
+    if base == null {
+        return false
+    }
+    val t = base!!
+    if t.kind == e.kinds.INT {
+        return t.int_is_size
+    }
+    if t.intrinsic == 1 {
+        return t.intrinsic_ptr
+    }
+    return false
+}
+
+private fn dst_is_int_num(e: *Emit, func: *ir.Func, dst: i32): bool {
+    if dst < 0 || (dst as usize) >= func.locals.len {
+        return false
+    }
+    val ty = func.locals.get(dst as usize).ty
+    return type_is_int_t(e, ty) && !type_is_bool_t(e, ty)
+}
+
+private fn append_loc(e: *Emit, pos: ir.Pos) with (a: mem.Allocator) {
+    append_c_literal(&e.out, pos.file)
+    e.out.append(", ")
+    e.out.append_int(pos.line, 10)
+}
+
+private fn overflow_builtin(aux: u32): str {
+    val b = ir.bin_ops()
+    if aux == ir.binop_aux(b.ADD) {
+        return "__builtin_add_overflow"
+    }
+    if aux == ir.binop_aux(b.SUB) {
+        return "__builtin_sub_overflow"
+    }
+    if aux == ir.binop_aux(b.MUL) {
+        return "__builtin_mul_overflow"
+    }
+    return ""
+}
+
+private fn emit_plain_binop(e: *Emit, func: *ir.Func, inst: *ir.Inst, spell: str) with (a: mem.Allocator) {
+    if !append_dst(e, func, inst.dst) {
+        return
+    }
+    append_paren(e, &inst.a)
+    e.out.append(" ")
+    e.out.append(spell)
+    e.out.append(" ")
+    append_paren(e, &inst.b)
+    e.out.append(";\n")
+}
+
+private fn append_signed_shift_guard(e: *Emit, inst: *ir.Inst, width: u8) with (a: mem.Allocator) {
+    val w = width as i64
+    val top = (width - 1) as i64
+    e.out.append("uint")
+    e.out.append_int(w, 10)
+    e.out.append("_t jog_mask = (jog_n + 1u >= ")
+    e.out.append_int(w, 10)
+    e.out.append("u) ? (uint")
+    e.out.append_int(w, 10)
+    e.out.append("_t)-1 : (uint")
+    e.out.append_int(w, 10)
+    e.out.append("_t)(((uint")
+    e.out.append_int(w, 10)
+    e.out.append("_t)1 << (jog_n + 1u)) - 1u);\n                uint")
+    e.out.append_int(w, 10)
+    e.out.append("_t jog_top = (uint")
+    e.out.append_int(w, 10)
+    e.out.append("_t)(jog_bits >> (")
+    e.out.append_int(w, 10)
+    e.out.append("u - 1u - jog_n));\n                uint")
+    e.out.append_int(w, 10)
+    e.out.append("_t jog_sign = (uint")
+    e.out.append_int(w, 10)
+    e.out.append("_t)(jog_bits >> ")
+    e.out.append_int(top, 10)
+    e.out.append("u);\n                if ((jog_top & jog_mask) != (jog_sign ? jog_mask : (uint")
+    e.out.append_int(w, 10)
+    e.out.append("_t)0)) {\n                    jogrt_panic_overflow(")
+    append_loc(e, inst.pos)
+    e.out.append(");\n                }\n")
+}
+
+private fn emit_checked_shift(e: *Emit, func: *ir.Func, inst: *ir.Inst, spell: str) with (a: mem.Allocator) {
+    if inst.b.ty == null {
+        fail(e, "C backend: shift is missing a type")
+        return
+    }
+    val width = int_width_of(e, inst.a.ty)
+    e.out.append("{\n        ")
+    append_type_name(e, inst.b.ty)
+    e.out.append(" jog_rhs = ")
+    append_paren(e, &inst.b)
+    e.out.append(";\n        if (")
+    if int_signed_of(e, inst.b.ty) {
+        e.out.append("jog_rhs < 0 || ")
+    }
+    e.out.append("jog_rhs >= ")
+    e.out.append_int(width as i64, 10)
+    e.out.append(") {\n            jogrt_panic_overflow(")
+    append_loc(e, inst.pos)
+    e.out.append(");\n        }\n        ")
+    if spell == "<<" && (width == 8 || width == 16 || width == 32 || width == 64) {
+        e.out.append("{\n            uint")
+        e.out.append_int(width as i64, 10)
+        e.out.append("_t jog_bits = (uint")
+        e.out.append_int(width as i64, 10)
+        e.out.append("_t)")
+        append_paren(e, &inst.a)
+        e.out.append(";\n            unsigned jog_n = (unsigned)jog_rhs;\n            if (jog_n > 0u && jog_n < ")
+        e.out.append_int(width as i64, 10)
+        e.out.append("u) {\n                ")
+        if int_signed_of(e, inst.a.ty) {
+            append_signed_shift_guard(e, inst, width)
+        } else {
+            e.out.append("if ((jog_bits >> (")
+            e.out.append_int(width as i64, 10)
+            e.out.append("u - jog_n)) != 0) {\n                    jogrt_panic_overflow(")
+            append_loc(e, inst.pos)
+            e.out.append(");\n                }\n")
+        }
+        e.out.append("            }\n        }\n        ")
+    }
+    if !append_dst(e, func, inst.dst) {
+        return
+    }
+    append_paren(e, &inst.a)
+    e.out.append(" ")
+    e.out.append(spell)
+    e.out.append(" jog_rhs;\n    }\n")
+}
+
+private fn limit_name(e: *Emit, ty: *check.Type?, which: u8): str {
+    if int_is_size_of(e, ty) {
+        if which == 0 {
+            return "INTPTR_MIN"
+        }
+        if which == 1 {
+            return "INTPTR_MAX"
+        }
+        return "UINTPTR_MAX"
+    }
+    val w = int_width_of(e, ty)
+    if w == 8 {
+        if which == 0 {
+            return "INT8_MIN"
+        }
+        if which == 1 {
+            return "INT8_MAX"
+        }
+        return "UINT8_MAX"
+    }
+    if w == 16 {
+        if which == 0 {
+            return "INT16_MIN"
+        }
+        if which == 1 {
+            return "INT16_MAX"
+        }
+        return "UINT16_MAX"
+    }
+    if w == 32 {
+        if which == 0 {
+            return "INT32_MIN"
+        }
+        if which == 1 {
+            return "INT32_MAX"
+        }
+        return "UINT32_MAX"
+    }
+    if w == 64 {
+        if which == 0 {
+            return "INT64_MIN"
+        }
+        if which == 1 {
+            return "INT64_MAX"
+        }
+        return "UINT64_MAX"
+    }
+    return ""
+}
+
+private fn append_limit(e: *Emit, name: str) with (a: mem.Allocator) {
+    if name.len == 0 {
+        fail(e, "C backend: integer limit has no C name")
+        e.out.append("0")
+        return
+    }
+    e.out.append(name)
+}
+
+private fn append_int_fits(e: *Emit, src: *ir.Operand, dst: *check.Type) with (a: mem.Allocator) {
+    if type_is_bool_t(e, dst) {
+        append_paren(e, src)
+        e.out.append(" == 0 || ")
+        append_paren(e, src)
+        e.out.append(" == 1")
+        return
+    }
+    val src_signed = int_signed_of(e, src.ty)
+    val dst_signed = int_signed_of(e, dst)
+    val src_bits = int_width_of(e, src.ty)
+    val dst_bits = int_width_of(e, dst)
+    if src_signed && !dst_signed {
+        append_paren(e, src)
+        e.out.append(" >= 0")
+        if dst_bits < src_bits {
+            e.out.append(" && ")
+            append_paren(e, src)
+            e.out.append(" <= ")
+            append_limit(e, limit_name(e, dst, 2))
+        }
+        return
+    }
+    if !src_signed && dst_signed {
+        append_paren(e, src)
+        e.out.append(" <= ")
+        append_limit(e, limit_name(e, dst, 1))
+        return
+    }
+    if !src_signed && !dst_signed {
+        append_paren(e, src)
+        e.out.append(" <= ")
+        append_limit(e, limit_name(e, dst, 2))
+        return
+    }
+    append_paren(e, src)
+    e.out.append(" >= ")
+    append_limit(e, limit_name(e, dst, 0))
+    e.out.append(" && ")
+    append_paren(e, src)
+    e.out.append(" <= ")
+    append_limit(e, limit_name(e, dst, 1))
+}
+
+private fn int_always_fits(e: *Emit, src: *check.Type?, dst: *check.Type?): bool {
+    if !type_is_int_t(e, src) || !type_is_int_t(e, dst) || type_is_bool_t(e, dst) {
+        return false
+    }
+    if type_is_bool_t(e, src) {
+        return true
+    }
+    val src_bits = int_width_of(e, src)
+    val dst_bits = int_width_of(e, dst)
+    val src_signed = int_signed_of(e, src)
+    val dst_signed = int_signed_of(e, dst)
+    if src_signed == dst_signed && dst_bits >= src_bits {
+        return true
+    }
+    return !src_signed && dst_signed && dst_bits > src_bits
+}
+
+private fn emit_convert_fail(e: *Emit, pos: ir.Pos) with (a: mem.Allocator) {
+    e.out.append(" {\n        jogrt_panic_convert(")
+    append_loc(e, pos)
+    e.out.append(");\n    }\n    ")
+}
+
+private fn emit_cast_assign(e: *Emit, func: *ir.Func, inst: *ir.Inst, dst_type: *check.Type?) with (a: mem.Allocator) {
+    if !append_dst(e, func, inst.dst) {
+        return
+    }
+    e.out.append("(")
+    append_type_name(e, dst_type)
+    e.out.append(")")
+    append_paren(e, &inst.a)
+    e.out.append(";\n")
+}
+
+private fn emit_copy(e: *Emit, func: *ir.Func, inst: *ir.Inst) with (a: mem.Allocator) {
+    begin_stmt(e, inst.pos)
+    if append_dst(e, func, inst.dst) {
+        append_paren(e, &inst.a)
+        e.out.append(";\n")
+    }
+}
+
+private fn emit_checked_divmod(e: *Emit, func: *ir.Func, inst: *ir.Inst, spell: str) with (a: mem.Allocator) {
+    if inst.b.ty == null {
+        fail(e, "C backend: division is missing a type")
+        return
+    }
+    e.out.append("{\n        ")
+    append_type_name(e, inst.b.ty)
+    e.out.append(" jog_rhs = ")
+    append_paren(e, &inst.b)
+    e.out.append(";\n        if (jog_rhs == 0) {\n            jogrt_panic_divide_by_zero(")
+    append_loc(e, inst.pos)
+    e.out.append(");\n        }\n")
+    if int_signed_of(e, inst.a.ty) {
+        val min_name = limit_name(e, inst.a.ty, 0)
+        if min_name.len == 0 {
+            fail(e, "C backend: signed division has no minimum constant")
+        } else {
+            e.out.append("        if (")
+            append_paren(e, &inst.a)
+            e.out.append(" == ")
+            e.out.append(min_name)
+            e.out.append(" && jog_rhs == -1) {\n            jogrt_panic_overflow(")
+            append_loc(e, inst.pos)
+            e.out.append(");\n        }\n")
+        }
+    }
+    e.out.append("        ")
+    if !append_dst(e, func, inst.dst) {
+        return
+    }
+    append_paren(e, &inst.a)
+    e.out.append(" ")
+    e.out.append(spell)
+    e.out.append(" jog_rhs;\n    }\n")
+}
+
+private fn hex_nib(n: u32): u8 {
+    if n < 10 {
+        return ('0' as u32 + n) as u8
+    }
+    return ('a' as u32 + (n - 10)) as u8
+}
+
+fn widen_f32(bits: u32): (u32, u32) {
+    val sign = (bits >> 31) & 1
+    val exp = (bits >> 23) & 0xff
+    val frac = bits & 0x7fffff
+    if exp == 0 && frac == 0 {
+        return 0, sign << 31
+    }
+    var dexp: u32 = 0
+    if exp == 0xff {
+        dexp = 0x7ff
+    } else if exp != 0 {
+        dexp = exp + 896
+    }
+    val hi = (sign << 31) | (dexp << 20) | (frac >> 3)
+    val lo = (frac & 7) << 29
+    return lo, hi
+}
+
+fn append_float_bits(e: *Emit, ty: *check.Type?, lo: u32, hi: u32) with (a: mem.Allocator) {
+    val single = type_is_float_t(e, ty) && float_width_of(e, ty) == 32
+    val sign = hi >> 31
+    val exp = (hi >> 20) & 0x7ff
+    val fhi = hi & 0xfffff
+    val flo = lo
+    val frac_zero = fhi == 0 && flo == 0
+    if exp == 0x7ff {
+        if frac_zero {
+            if sign != 0 {
+                e.out.append("(-1.0/0.0)")
+            } else {
+                e.out.append("(1.0/0.0)")
+            }
+        } else if single {
+            e.out.append("(0.0f/0.0f)")
+        } else {
+            e.out.append("(0.0/0.0)")
+        }
+        return
+    }
+    if exp == 0 && frac_zero {
+        if single {
+            e.out.append("(float)")
+        }
+        if sign != 0 {
+            e.out.append("-")
+        }
+        e.out.append("0x0p+0")
+        return
+    }
+    if single {
+        e.out.append("(float)")
+    }
+    if sign != 0 {
+        e.out.append("-")
+    }
+    e.out.append("0x1.")
+    var shift: u32 = 16
+    var n: u32 = 0
+    for n < 5 {
+        e.out.append_byte(hex_nib((fhi >> shift) & 0xf))
+        if n + 1 < 5 {
+            shift = shift - 4
+        }
+        n = n + 1
+    }
+    shift = 28
+    n = 0
+    for n < 8 {
+        e.out.append_byte(hex_nib((flo >> shift) & 0xf))
+        if n + 1 < 8 {
+            shift = shift - 4
+        }
+        n = n + 1
+    }
+    val unbiased = (exp as i32) - 1023
+    if unbiased >= 0 {
+        e.out.append("p+")
+        e.out.append_int(unbiased as i64, 10)
+    } else {
+        e.out.append("p")
+        e.out.append_int(unbiased as i64, 10)
+    }
+}
+
+private fn append_float_fits_int(e: *Emit, src: *ir.Operand, dst: *check.Type) with (a: mem.Allocator) {
+    append_paren(e, src)
+    e.out.append(" == ")
+    append_paren(e, src)
+    e.out.append(" && ")
+    if type_is_bool_t(e, dst) {
+        append_paren(e, src)
+        e.out.append(" == 0 || ")
+        append_paren(e, src)
+        e.out.append(" == 1")
+        return
+    }
+    if !int_signed_of(e, dst) && int_width_of(e, dst) >= 64 {
+        append_paren(e, src)
+        e.out.append(" >= 0 && ")
+        append_paren(e, src)
+        e.out.append(" < 18446744073709551616.0")
+        return
+    }
+    if int_signed_of(e, dst) && int_width_of(e, dst) >= 64 {
+        append_paren(e, src)
+        e.out.append(" >= -9223372036854775808.0 && ")
+        append_paren(e, src)
+        e.out.append(" < 9223372036854775808.0")
+        return
+    }
+    append_paren(e, src)
+    if !int_signed_of(e, dst) {
+        e.out.append(" >= 0 && ")
+        append_paren(e, src)
+        e.out.append(" <= (double)")
+        e.out.append(limit_name(e, dst, 2))
+        return
+    }
+    e.out.append(" >= (double)")
+    e.out.append(limit_name(e, dst, 0))
+    e.out.append(" && ")
+    append_paren(e, src)
+    e.out.append(" <= (double)")
+    e.out.append(limit_name(e, dst, 1))
+}
+
+private fn vtable_global(e: *Emit, index: u32): bool {
+    for i in 0 as usize..e.module.iface_tables.len {
+        if e.module.iface_tables.at(i).global == index as i32 {
+            return true
+        }
+    }
+    return false
+}
+
+private fn emit_binary(e: *Emit, func: *ir.Func, inst: *ir.Inst) with (a: mem.Allocator) {
+    val spell = binop_spell(inst.aux)
+    if spell.len == 0 {
+        fail(e, "C backend: unknown binary operator")
+        return
+    }
+    begin_stmt(e, inst.pos)
+    val builtin = overflow_builtin(inst.aux)
+    if inst.checked && builtin.len != 0 && dst_is_int_num(e, func, inst.dst) {
+        e.out.append("if (")
+        e.out.append(builtin)
+        e.out.append("(")
+        append_paren(e, &inst.a)
+        e.out.append(", ")
+        append_paren(e, &inst.b)
+        e.out.append(", &l")
+        e.out.append_int(inst.dst as i64, 10)
+        e.out.append(")) {\n        jogrt_panic_overflow(")
+        append_loc(e, inst.pos)
+        e.out.append(");\n    }\n")
+        return
+    }
+    val b = ir.bin_ops()
+    val is_div = inst.aux == ir.binop_aux(b.DIV) || inst.aux == ir.binop_aux(b.REM)
+    val is_shift = inst.aux == ir.binop_aux(b.SHL) || inst.aux == ir.binop_aux(b.SHR)
+    if inst.checked && is_div && type_is_int_t(e, inst.a.ty) && !type_is_bool_t(e, inst.a.ty) {
+        emit_checked_divmod(e, func, inst, spell)
+        return
+    }
+    if inst.checked && is_shift && type_is_int_t(e, inst.a.ty) && !type_is_bool_t(e, inst.a.ty) {
+        emit_checked_shift(e, func, inst, spell)
+        return
+    }
+    val bops = ir.bin_ops()
+    val is_float_div = inst.aux == ir.binop_aux(bops.DIV) && type_is_float_t(e, inst.a.ty)
+    val is_float_rem = inst.aux == ir.binop_aux(bops.REM) && type_is_float_t(e, inst.a.ty)
+    if inst.checked && is_float_div {
+        e.out.append("if (")
+        append_paren(e, &inst.b)
+        e.out.append(" == 0) {\n        jogrt_panic_divide_by_zero(")
+        append_loc(e, inst.pos)
+        e.out.append(");\n    }\n    ")
+        emit_plain_binop(e, func, inst, spell)
+        return
+    }
+    if is_float_rem {
+        if inst.checked {
+            e.out.append("if (")
+            append_paren(e, &inst.b)
+            e.out.append(" == 0) {\n        jogrt_panic_divide_by_zero(")
+            append_loc(e, inst.pos)
+            e.out.append(");\n    }\n    ")
+        }
+        if !append_dst(e, func, inst.dst) {
+            return
+        }
+        if float_width_of(e, inst.a.ty) == 32 {
+            e.out.append("jog_fmodf")
+        } else {
+            e.out.append("jog_fmod")
+        }
+        e.out.append("(")
+        append_paren(e, &inst.a)
+        e.out.append(", ")
+        append_paren(e, &inst.b)
+        e.out.append(");\n")
+        return
+    }
+    emit_plain_binop(e, func, inst, spell)
+}
+
+private fn emit_unary(e: *Emit, func: *ir.Func, inst: *ir.Inst) with (a: mem.Allocator) {
+    val u = ir.un_ops()
+    begin_stmt(e, inst.pos)
+    if inst.aux == ir.unop_aux(u.NEG) && inst.checked && dst_is_int_num(e, func, inst.dst) {
+        e.out.append("if (__builtin_sub_overflow(0, ")
+        append_paren(e, &inst.a)
+        e.out.append(", &l")
+        e.out.append_int(inst.dst as i64, 10)
+        e.out.append(")) {\n        jogrt_panic_overflow(")
+        append_loc(e, inst.pos)
+        e.out.append(");\n    }\n")
+        return
+    }
+    if !append_dst(e, func, inst.dst) {
+        return
+    }
+    if inst.aux == ir.unop_aux(u.NEG) {
+        e.out.append("-")
+    } else if inst.aux == ir.unop_aux(u.NOT) {
+        e.out.append("!")
+    } else if inst.aux == ir.unop_aux(u.BITNOT) {
+        e.out.append("~")
+    } else {
+        fail(e, "C backend: unknown unary operator")
+        e.out.append("0;\n")
+        return
+    }
+    append_paren(e, &inst.a)
+    e.out.append(";\n")
+}
+
+private fn emit_convert(e: *Emit, func: *ir.Func, inst: *ir.Inst) with (a: mem.Allocator) {
+    if inst.dst < 0 || (inst.dst as usize) >= func.locals.len {
+        fail(e, "C backend: convert has no destination")
+        return
+    }
+    val dst_type = func.locals.get(inst.dst as usize).ty
+    val src_type = inst.a.ty
+    begin_stmt(e, inst.pos)
+    var check = inst.checked && dst_type != null && src_type != null && !int_always_fits(e, src_type, dst_type)
+    if check && type_is_int_t(e, src_type) && type_is_float_t(e, dst_type) {
+        check = false
+    }
+    if check && type_is_int_t(e, src_type) && type_is_int_t(e, dst_type) {
+        e.out.append("if (!(")
+        append_int_fits(e, &inst.a, dst_type!!)
+        e.out.append("))")
+        emit_convert_fail(e, inst.pos)
+    } else if check && type_is_float_t(e, src_type) && type_is_int_t(e, dst_type) {
+        e.out.append("if (!(")
+        append_float_fits_int(e, &inst.a, dst_type!!)
+        e.out.append("))")
+        emit_convert_fail(e, inst.pos)
+    } else if check && type_is_float_t(e, src_type) && type_is_float_t(e, dst_type) &&
+        float_width_of(e, src_type) > float_width_of(e, dst_type) {
+        e.out.append("if (")
+        append_paren(e, &inst.a)
+        e.out.append(" > 3.4028234663852886e+38 || ")
+        append_paren(e, &inst.a)
+        e.out.append(" < -3.4028234663852886e+38)")
+        emit_convert_fail(e, inst.pos)
+    }
+    emit_cast_assign(e, func, inst, dst_type)
+}
+
+private fn append_call_args(e: *Emit, inst: *ir.Inst, leading_zero: bool, trailing_env: bool) with (a: mem.Allocator) {
+    var any = false
+    if leading_zero {
+        e.out.append("0")
+        any = true
+    }
+    for i in 0 as usize..inst.args.len {
+        val arg = inst.args.at(i)
+        if skip_value(e, arg.ty) {
+            continue
+        }
+        if any {
+            e.out.append(", ")
+        }
+        append_paren(e, arg)
+        any = true
+    }
+    if trailing_env {
+        if any {
+            e.out.append(", ")
+        }
+        append_paren(e, &inst.a)
+        e.out.append(".env")
+    }
+}
+
+private fn emit_call(e: *Emit, func: *ir.Func, inst: *ir.Inst) with (a: mem.Allocator) {
+    begin_stmt(e, inst.pos)
+    var ret: *check.Type? = null
+    val direct = inst.a.kind == e.opnds.FUNC
+    var callee: *ir.Func? = null
+    var fn_type: *check.Type? = null
+    if inst.a.ty != null {
+        fn_type = underlying(e, inst.a.ty!!) as *check.Type?
+    }
+    if direct {
+        callee = ir.func_at(e.module, inst.a.func)
+        if callee == null {
+            fail(e, "C backend: call target is missing")
+            return
+        }
+        fn_type = callee!!.ty
+    }
+    if fn_type != null && fn_type!!.kind == e.kinds.FN {
+        ret = fn_type!!.elem
+    }
+    if inst.dst >= 0 && !skip_value(e, ret) {
+        if !append_dst(e, func, inst.dst) {
+            return
+        }
+    }
+    var closure = false
+    if !direct && fn_type != null && fn_type!!.kind == e.kinds.FN && !fn_type!!.fn_extern {
+        closure = true
+    }
+    var variadic = false
+    if fn_type != null && fn_type!!.kind == e.kinds.FN && fn_type!!.fn_variadic {
+        variadic = true
+    }
+    var dummy = false
+    if direct {
+        if callee!!.name.len == 0 {
+            e.out.append("jog_missing")
+        } else {
+            e.out.append(callee!!.name)
+        }
+        dummy = func_va_dummy(e, callee!!)
+    } else if closure {
+        append_paren(e, &inst.a)
+        e.out.append(".code")
+    } else {
+        append_paren(e, &inst.a)
+        dummy = variadic && kept_type_params(e, fn_type) == 0
+    }
+    e.out.append("(")
+    append_call_args(e, inst, dummy, closure)
+    e.out.append(");\n")
+}
+
+private fn append_field_path(e: *Emit, ty: *check.Type?, aux: u32, aux2: u32) with (a: mem.Allocator) {
+    var base: *check.Type? = null
+    if ty != null {
+        base = underlying(e, ty!!)
+    }
+    if base == null {
+        fail(e, "C backend: field of an unknown type")
+        e.out.append("f_0")
+        return
+    }
+    val t = base!!
+    if t.kind == e.kinds.INTERFACE {
+        if aux > 1 {
+            fail(e, "C backend: interface field is out of range")
+        }
+        if aux == 0 {
+            e.out.append("ptr")
+        } else {
+            e.out.append("vtable")
+        }
+        return
+    }
+    if t.kind == e.kinds.SLICE || t.kind == e.kinds.BYTES {
+        if aux > 1 {
+            fail(e, "C backend: slice field is out of range")
+        }
+        if aux == 0 {
+            e.out.append("ptr")
+        } else {
+            e.out.append("len")
+        }
+        return
+    }
+    if t.kind == e.kinds.TUPLE {
+        if (aux as usize) >= t.elems.len {
+            fail(e, "C backend: tuple field is out of range")
+            e.out.append("f_0")
+            return
+        }
+        e.out.append("f_")
+        e.out.append_int(aux as i64, 10)
+        return
+    }
+    if t.kind == e.kinds.ENUM && aux2 > 0 {
+        val variant = (aux2 as usize) - 1
+        if variant >= t.variant_names.len {
+            fail(e, "C backend: enum variant is out of range")
+            e.out.append("tag")
+            return
+        }
+        e.out.append("payload.")
+        append_variant_ident(e, t, variant)
+        e.out.append(".")
+        val payload = check.type_variant_at(t, variant)
+        if (aux as usize) >= payload.field_count {
+            fail(e, "C backend: enum field is out of range")
+            e.out.append("f_0")
+            return
+        }
+        append_variant_field_ident(e, t, variant, aux as usize)
+        return
+    }
+    if t.kind == e.kinds.OPTION && !check.type_option_is_niche(t) {
+        if aux == 0 {
+            e.out.append("has")
+        } else {
+            e.out.append("value")
+        }
+        return
+    }
+    if t.kind == e.kinds.STRUCT {
+        if (aux as usize) >= t.field_names.len {
+            fail(e, "C backend: struct field is out of range")
+            e.out.append("f_0")
+            return
+        }
+        append_field_ident(e, t, aux as usize)
+        return
+    }
+    fail(e, "C backend: cannot address that field")
+    e.out.append("f_0")
+}
+
+private fn emit_addr(e: *Emit, func: *ir.Func, inst: *ir.Inst) with (a: mem.Allocator) {
+    begin_stmt(e, inst.pos)
+    if inst.a.kind != e.opnds.LOCAL {
+        fail(e, "C backend: addr needs a local")
+        return
+    }
+    if append_dst(e, func, inst.dst) {
+        e.out.append("&l")
+        e.out.append_int(inst.a.local as i64, 10)
+        e.out.append(";\n")
+    }
+}
+
+private fn emit_load(e: *Emit, func: *ir.Func, inst: *ir.Inst) with (a: mem.Allocator) {
+    begin_stmt(e, inst.pos)
+    if append_dst(e, func, inst.dst) {
+        e.out.append("*")
+        append_paren(e, &inst.a)
+        e.out.append(";\n")
+    }
+}
+
+private fn emit_store(e: *Emit, inst: *ir.Inst) with (a: mem.Allocator) {
+    begin_stmt(e, inst.pos)
+    e.out.append("*")
+    append_paren(e, &inst.a)
+    e.out.append(" = ")
+    append_paren(e, &inst.b)
+    e.out.append(";\n")
+}
+
+private fn emit_field_addr(e: *Emit, func: *ir.Func, inst: *ir.Inst) with (a: mem.Allocator) {
+    begin_stmt(e, inst.pos)
+    if !append_dst(e, func, inst.dst) {
+        return
+    }
+    e.out.append("&")
+    append_paren(e, &inst.a)
+    e.out.append("->")
+    var pointee: *check.Type? = null
+    if inst.a.ty != null {
+        val ptr = underlying(e, inst.a.ty!!)
+        if ptr.kind == e.kinds.PTR {
+            pointee = ptr.elem
+        }
+    }
+    append_field_path(e, pointee, inst.aux, inst.aux2)
+    e.out.append(";\n")
+}
+
+private fn emit_extract(e: *Emit, func: *ir.Func, inst: *ir.Inst) with (a: mem.Allocator) {
+    begin_stmt(e, inst.pos)
+    if !append_dst(e, func, inst.dst) {
+        return
+    }
+    append_paren(e, &inst.a)
+    e.out.append(".")
+    append_field_path(e, inst.a.ty, inst.aux, inst.aux2)
+    e.out.append(";\n")
+}
+
+private fn emit_aggregate(e: *Emit, func: *ir.Func, inst: *ir.Inst) with (a: mem.Allocator) {
+    if inst.dst < 0 || (inst.dst as usize) >= func.locals.len {
+        fail(e, "C backend: aggregate has no destination")
+        return
+    }
+    val dst_type = func.locals.get(inst.dst as usize).ty
+    var ty: *check.Type? = null
+    if dst_type != null {
+        ty = underlying(e, dst_type!!)
+    }
+    if ty == null || skip_value(e, dst_type) {
+        fail(e, "C backend: aggregate has no C representation")
+        return
+    }
+    val kind = ty!!.kind
+    val agg = ty!!
+    // A capturing lambda is { function, env }, not { thunk, null }.
+    // The function already takes void *env, so it is the code pointer.
+    if kind == e.kinds.FN && !agg.fn_extern {
+        if inst.args.len < 2 || inst.args.at(0).kind != e.opnds.FUNC {
+            fail(e, "C backend: function aggregate needs a code pointer and an env")
+            return
+        }
+        val code = ir.func_at(e.module, inst.args.at(0).func)
+        if code == null || code!!.name.len == 0 {
+            fail(e, "C backend: missing function")
+            return
+        }
+        begin_stmt(e, inst.pos)
+        if !append_dst(e, func, inst.dst) {
+            return
+        }
+        e.out.append("(")
+        append_type_name(e, dst_type)
+        e.out.append("){")
+        e.out.append(code!!.name)
+        e.out.append(", ")
+        append_expr(e, inst.args.at(1))
+        e.out.append("};\n")
+        return
+    }
+    begin_stmt(e, inst.pos)
+    if kind == e.kinds.OPTION && check.type_option_is_niche(agg) {
+        if inst.args.len < 2 {
+            fail(e, "C backend: niche option aggregate needs a tag and a value")
+            return
+        }
+        if !append_dst(e, func, inst.dst) {
+            return
+        }
+        append_paren(e, inst.args.at(0))
+        e.out.append(" ? ")
+        append_paren(e, inst.args.at(1))
+        e.out.append(" : 0;\n")
+        return
+    }
+    if !append_dst(e, func, inst.dst) {
+        return
+    }
+    e.out.append("(")
+    append_type_name(e, dst_type)
+    e.out.append("){0};\n")
+    if kind == e.kinds.SLICE || kind == e.kinds.BYTES {
+        if inst.args.len < 2 {
+            fail(e, "C backend: slice aggregate needs a pointer and a length")
+            return
+        }
+        e.out.append("    l")
+        e.out.append_int(inst.dst as i64, 10)
+        e.out.append(".")
+        append_field_path(e, agg, 0, 0)
+        e.out.append(" = ")
+        append_paren(e, inst.args.at(0))
+        e.out.append(";\n    l")
+        e.out.append_int(inst.dst as i64, 10)
+        e.out.append(".")
+        append_field_path(e, agg, 1, 0)
+        e.out.append(" = ")
+        append_paren(e, inst.args.at(1))
+        e.out.append(";\n")
+        return
+    }
+    if kind == e.kinds.INTERFACE {
+        if inst.args.len < 2 {
+            fail(e, "C backend: interface aggregate needs a pointer and a table")
+            return
+        }
+        e.out.append("    l")
+        e.out.append_int(inst.dst as i64, 10)
+        e.out.append(".ptr = ")
+        append_paren(e, inst.args.at(0))
+        e.out.append(";\n    l")
+        e.out.append_int(inst.dst as i64, 10)
+        e.out.append(".vtable = ")
+        append_paren(e, inst.args.at(1))
+        e.out.append(";\n")
+        return
+    }
+    if kind == e.kinds.ENUM {
+        if (inst.aux as usize) >= agg.variant_names.len {
+            fail(e, "C backend: enum aggregate variant is out of range")
+            return
+        }
+        val variant = check.type_variant_at(agg, inst.aux as usize)
+        e.out.append("    l")
+        e.out.append_int(inst.dst as i64, 10)
+        e.out.append(".tag = ")
+        e.out.append_int(variant.tag, 10)
+        e.out.append(";\n")
+        var argi: usize = 0
+        for field in 0 as usize..variant.field_count {
+            val field_ty = check.type_variant_field_at(agg, variant, field).field_type
+            if skip_value(e, field_ty) {
+                continue
+            }
+            for argi < inst.args.len && skip_value(e, inst.args.at(argi).ty) {
+                argi = argi + 1
+            }
+            if argi >= inst.args.len {
+                fail(e, "C backend: aggregate is missing a field")
+                return
+            }
+            e.out.append("    l")
+            e.out.append_int(inst.dst as i64, 10)
+            e.out.append(".")
+            append_field_path(e, agg, field as u32, inst.aux + 1)
+            e.out.append(" = ")
+            append_paren(e, inst.args.at(argi))
+            e.out.append(";\n")
+            argi = argi + 1
+        }
+        return
+    }
+    if kind == e.kinds.OPTION {
+        if inst.args.len < 1 {
+            fail(e, "C backend: option aggregate needs a tag")
+            return
+        }
+        e.out.append("    l")
+        e.out.append_int(inst.dst as i64, 10)
+        e.out.append(".has = ")
+        append_paren(e, inst.args.at(0))
+        e.out.append(";\n")
+        if !skip_value(e, agg.elem) {
+            if inst.args.len < 2 {
+                fail(e, "C backend: option aggregate needs a value")
+                return
+            }
+            e.out.append("    l")
+            e.out.append_int(inst.dst as i64, 10)
+            e.out.append(".value = ")
+            append_paren(e, inst.args.at(1))
+            e.out.append(";\n")
+        }
+        return
+    }
+    var fields: usize = 0
+    if kind == e.kinds.STRUCT {
+        fields = agg.field_names.len
+    } else if kind == e.kinds.TUPLE {
+        fields = agg.elems.len
+    } else {
+        fail(e, "C backend: aggregate type is not a struct, tuple, slice, or option")
+        return
+    }
+    var argi: usize = 0
+    var field: usize = 0
+    for field < fields {
+        var field_ty: *check.Type? = null
+        if kind == e.kinds.STRUCT {
+            if field < agg.field_types.len {
+                field_ty = agg.field_types.get(field) as *check.Type?
+            }
+        } else if field < agg.elems.len {
+            field_ty = agg.elems.get(field) as *check.Type?
+        }
+        if skip_value(e, field_ty) {
+            field = field + 1
+            continue
+        }
+        for argi < inst.args.len && skip_value(e, inst.args.at(argi).ty) {
+            argi = argi + 1
+        }
+        if argi >= inst.args.len {
+            fail(e, "C backend: aggregate is missing a field")
+            return
+        }
+        e.out.append("    l")
+        e.out.append_int(inst.dst as i64, 10)
+        e.out.append(".")
+        append_field_path(e, agg, field as u32, 0)
+        e.out.append(" = ")
+        append_paren(e, inst.args.at(argi))
+        e.out.append(";\n")
+        argi = argi + 1
+        field = field + 1
+    }
+}
+
+private fn emit_zero(e: *Emit, func: *ir.Func, inst: *ir.Inst) with (a: mem.Allocator) {
+    begin_stmt(e, inst.pos)
+    if !append_dst(e, func, inst.dst) {
+        return
+    }
+    var ty: *check.Type? = null
+    if inst.dst >= 0 && (inst.dst as usize) < func.locals.len {
+        ty = func.locals.get(inst.dst as usize).ty
+    }
+    e.out.append("(")
+    append_type_name(e, ty)
+    e.out.append("){0};\n")
+}
+
+private fn emit_bitcast(e: *Emit, func: *ir.Func, inst: *ir.Inst) with (a: mem.Allocator) {
+    if inst.dst < 0 || (inst.dst as usize) >= func.locals.len {
+        fail(e, "C backend: bitcast has no destination")
+        return
+    }
+    val dst_type = func.locals.get(inst.dst as usize).ty
+    if skip_value(e, dst_type) || skip_value(e, inst.a.ty) {
+        fail(e, "C backend: bitcast type has no C object")
+        return
+    }
+    begin_stmt(e, inst.pos)
+    e.out.append("{\n        union { ")
+    append_type_name(e, inst.a.ty)
+    e.out.append(" s; ")
+    append_type_name(e, dst_type)
+    e.out.append(" d; } jog_pun;\n        jog_pun.s = ")
+    append_paren(e, &inst.a)
+    e.out.append(";\n        l")
+    e.out.append_int(inst.dst as i64, 10)
+    e.out.append(" = jog_pun.d;\n    }\n")
+}
+
+private fn emit_elem_addr(e: *Emit, func: *ir.Func, inst: *ir.Inst) with (a: mem.Allocator) {
+    begin_stmt(e, inst.pos)
+    if !append_dst(e, func, inst.dst) {
+        return
+    }
+    append_paren(e, &inst.a)
+    e.out.append(" + ")
+    append_paren(e, &inst.b)
+    e.out.append(";\n")
+}
+
+private fn emit_bounds(e: *Emit, inst: *ir.Inst) with (a: mem.Allocator) {
+    if e.fast {
+        return
+    }
+    begin_stmt(e, inst.pos)
+    e.out.append("if (!(")
+    append_paren(e, &inst.a)
+    e.out.append(" < ")
+    append_paren(e, &inst.b)
+    e.out.append(")) {\n        jogrt_panic_bounds((size_t)")
+    append_paren(e, &inst.a)
+    e.out.append(", (size_t)")
+    append_paren(e, &inst.b)
+    e.out.append(", ")
+    append_loc(e, inst.pos)
+    e.out.append(");\n    }\n")
+}
+
+private fn emit_enum_tag(e: *Emit, func: *ir.Func, inst: *ir.Inst) with (a: mem.Allocator) {
+    begin_stmt(e, inst.pos)
+    if !append_dst(e, func, inst.dst) {
+        return
+    }
+    append_paren(e, &inst.a)
+    e.out.append(".tag;\n")
+}
+
+private fn type_is_bytes_or_slice(e: *Emit, ty: *check.Type?): bool {
+    if ty == null {
+        return false
+    }
+    val kind = underlying(e, ty!!).kind
+    return kind == e.kinds.BYTES || kind == e.kinds.SLICE
+}
+
+private fn emit_panic(e: *Emit, inst: *ir.Inst) with (a: mem.Allocator) {
+    e.out.append("jogrt_panic(")
+    if inst.a.kind == e.opnds.STRING || inst.a.kind == e.opnds.CSTRING {
+        val cstring = inst.a.kind == e.opnds.CSTRING
+        val id = find_bytes(e, inst.a.str_ptr, cstring)
+        if id < 0 {
+            fail(e, "C backend: panic string was not emitted")
+            e.out.append("0, 0")
+        } else {
+            e.out.append("(const char *)jog_")
+            if cstring {
+                e.out.append("c")
+            } else {
+                e.out.append("s")
+            }
+            e.out.append_int(id as i64, 10)
+            e.out.append(", ")
+            append_u64_digits(&e.out, inst.a.str_ptr.len as u64)
+        }
+    } else if type_is_bytes_or_slice(e, inst.a.ty) {
+        e.out.append("(const char *)")
+        append_paren(e, &inst.a)
+        e.out.append(".ptr, ")
+        append_paren(e, &inst.a)
+        e.out.append(".len")
+    } else {
+        fail(e, "C backend: panic message is not a string")
+        e.out.append("0, 0")
+    }
+    e.out.append(", ")
+    append_loc(e, inst.pos)
+    e.out.append(");\n")
+}
+
+private fn emit_null_check(e: *Emit, inst: *ir.Inst) with (a: mem.Allocator) {
+    begin_stmt(e, inst.pos)
+    var niche = true
+    if inst.a.ty != null {
+        val ty = underlying(e, inst.a.ty!!)
+        niche = ty.kind != e.kinds.OPTION || check.type_option_is_niche(ty)
+    }
+    e.out.append("if (!")
+    append_paren(e, &inst.a)
+    if !niche {
+        e.out.append(".has")
+    }
+    e.out.append(") {\n        jogrt_panic_null(")
+    append_loc(e, inst.pos)
+    e.out.append(");\n    }\n")
+}
+
+private fn emit_inst(e: *Emit, func: *ir.Func, inst: *ir.Inst) with (a: mem.Allocator) {
+    if e.failed {
+        return
+    }
+    if inst.op == e.ops.COPY {
+        emit_copy(e, func, inst)
+        return
+    }
+    if inst.op == e.ops.ZERO {
+        emit_zero(e, func, inst)
+        return
+    }
+    if inst.op == e.ops.CALL {
+        emit_call(e, func, inst)
+        return
+    }
+    if inst.op == e.ops.BINARY {
+        emit_binary(e, func, inst)
+        return
+    }
+    if inst.op == e.ops.UNARY {
+        emit_unary(e, func, inst)
+        return
+    }
+    if inst.op == e.ops.CONVERT {
+        emit_convert(e, func, inst)
+        return
+    }
+    if inst.op == e.ops.BITCAST {
+        emit_bitcast(e, func, inst)
+        return
+    }
+    if inst.op == e.ops.ADDR {
+        emit_addr(e, func, inst)
+        return
+    }
+    if inst.op == e.ops.LOAD {
+        emit_load(e, func, inst)
+        return
+    }
+    if inst.op == e.ops.STORE {
+        emit_store(e, inst)
+        return
+    }
+    if inst.op == e.ops.FIELD_ADDR {
+        emit_field_addr(e, func, inst)
+        return
+    }
+    if inst.op == e.ops.ELEM_ADDR {
+        emit_elem_addr(e, func, inst)
+        return
+    }
+    if inst.op == e.ops.EXTRACT {
+        emit_extract(e, func, inst)
+        return
+    }
+    if inst.op == e.ops.AGGREGATE {
+        emit_aggregate(e, func, inst)
+        return
+    }
+    if inst.op == e.ops.ENUM_TAG {
+        emit_enum_tag(e, func, inst)
+        return
+    }
+    if inst.op == e.ops.BOUNDS_CHECK {
+        emit_bounds(e, inst)
+        return
+    }
+    if inst.op == e.ops.NULL_CHECK {
+        emit_null_check(e, inst)
+        return
+    }
+    if inst.op == e.ops.PANIC {
+        begin_stmt(e, inst.pos)
+        emit_panic(e, inst)
+        return
+    }
+    fail(e, "C backend: instruction is not emitted yet")
+}
+
+private fn emit_ret(e: *Emit, func: *ir.Func, term: *ir.Term) with (a: mem.Allocator) {
+    var ret: *check.Type? = null
+    if func.ty != null && func.ty!!.kind == e.kinds.FN {
+        ret = func.ty!!.elem
+    }
+    begin_stmt(e, term.pos)
+    if skip_value(e, ret) {
+        e.out.append("return;\n")
+        return
+    }
+    e.out.append("return ")
+    if term.value.kind == e.opnds.NONE {
+        e.out.append("(")
+        append_type_name(e, ret)
+        e.out.append("){0};\n")
+        return
+    }
+    append_paren(e, &term.value)
+    e.out.append(";\n")
+}
+
+private fn emit_term(e: *Emit, func: *ir.Func, term: *ir.Term) with (a: mem.Allocator) {
+    if e.failed {
+        return
+    }
+    if term.kind == e.terms.BR {
+        begin_stmt(e, term.pos)
+        e.out.append("goto b")
+        e.out.append_int(term.target as i64, 10)
+        e.out.append(";\n")
+        return
+    }
+    if term.kind == e.terms.COND_BR {
+        begin_stmt(e, term.pos)
+        e.out.append("if (")
+        append_paren(e, &term.value)
+        e.out.append(") {\n        goto b")
+        e.out.append_int(term.target as i64, 10)
+        e.out.append(";\n    }\n    goto b")
+        e.out.append_int(term.else_target as i64, 10)
+        e.out.append(";\n")
+        return
+    }
+    if term.kind == e.terms.SWITCH {
+        begin_stmt(e, term.pos)
+        e.out.append("switch (")
+        append_paren(e, &term.value)
+        e.out.append(") {\n")
+        for i in 0 as usize..term.cases.len {
+            val c = term.cases.at(i)
+            e.out.append("    case ")
+            append_bits(e, term.value.ty, c.value as u64)
+            e.out.append(": goto b")
+            e.out.append_int(c.target as i64, 10)
+            e.out.append(";\n")
+        }
+        e.out.append("    default: goto b")
+        e.out.append_int(term.target as i64, 10)
+        e.out.append(";\n    }\n")
+        return
+    }
+    if term.kind == e.terms.RET {
+        emit_ret(e, func, term)
+        return
+    }
+    if term.kind == e.terms.UNREACHABLE {
+        begin_stmt(e, term.pos)
+        e.out.append("jogrt_panic_unreachable(")
+        append_loc(e, term.pos)
+        e.out.append(");\n")
+        return
+    }
+    if term.kind == e.terms.NONE {
+        fail(e, "C backend: block is not terminated")
+        return
+    }
+    fail(e, "C backend: terminator is not emitted yet")
+}
+
+private fn emit_body(e: *Emit, func: *ir.Func) with (a: mem.Allocator) {
+    e.lined = false
+    emit_signature(e, func, false)
+    e.out.append(" {\n")
+    if func.blocks.len == 0 {
+        fail(e, "C backend: function has no blocks")
+        e.out.append("    jogrt_panic_unreachable(\"\", 0);\n}\n")
+        return
+    }
+    var i = func.param_count as usize
+    for i < func.locals.len {
+        val loc = func.locals.get(i)
+        if !skip_value(e, loc.ty) {
+            e.out.append("    ")
+            append_type_name(e, loc.ty)
+            e.out.append(" l")
+            e.out.append_int(i as i64, 10)
+            e.out.append(";\n")
+        }
+        i = i + 1
+    }
+    if func_va_dummy(e, func) {
+        e.out.append("    (void)jog_va;\n")
+    }
+    for n in 0 as usize..func.locals.len {
+        if skip_value(e, func.locals.get(n).ty) {
+            continue
+        }
+        e.out.append("    (void)l")
+        e.out.append_int(n as i64, 10)
+        e.out.append(";\n")
+    }
+    e.out.append("    goto b0;\n")
+    if func.blocks.len > 1 {
+        e.out.append("    if (0) {\n")
+        for b in 1 as usize..func.blocks.len {
+            e.out.append("        goto b")
+            e.out.append_int(b as i64, 10)
+            e.out.append(";\n")
+        }
+        e.out.append("    }\n")
+    }
+    for bi in 0 as usize..func.blocks.len {
+        val block = func.blocks.at(bi)
+        e.out.append("b")
+        e.out.append_int(bi as i64, 10)
+        e.out.append(":;\n")
+        for ii in 0 as usize..block.insts.len {
+            emit_inst(e, func, block.insts.get(ii))
+            if e.failed {
+                return
+            }
+        }
+        emit_term(e, func, &block.term)
+        if e.failed {
+            return
+        }
+    }
+    e.out.append("}\n")
+    if e.lined {
+        e.out.append("#line 1 \"jog_emit.c\"\n")
+        e.lined = false
+    }
+}
+
+fn emit_bodies(e: *Emit) with (a: mem.Allocator) {
+    var any = false
+    for i in 0 as usize..e.module.funcs.len {
+        val func = e.module.funcs.get(i)
+        if func.linkage == e.links.EXTERN {
+            continue
+        }
+        if any {
+            e.out.append("\n")
+        }
+        emit_body(e, func)
+        any = true
+        if e.failed {
+            return
+        }
+    }
+}

@@ -60,13 +60,18 @@ fn parse_file(p: *Parser): *Node with (a: mem.Allocator) {
             IDENT -> {
                 // `expect` and `actual` are identifiers, and only immediately before `fn`.
                 if (p.peek().text == "expect" || p.peek().text == "actual") && p.kind_at(1) == k.KW_FN {
-                    val mode = p.peek().text
+                    val mode_tok = p.peek()
+                    val mode = mode_tok.text
                     if mode == "actual" && vis.len > 0 {
                         complain(p, "an actual function cannot have a visibility modifier")
                         vis = ""
                     }
                     p.advance()
-                    decls.push(parse_fn(p, attrs, vis, mode))
+                    // C attaches the FN node at `actual`/`expect` (col 1), not `fn`.
+                    val fn_node = parse_fn(p, attrs, vis, mode)
+                    fn_node.line = mode_tok.line
+                    fn_node.column = mode_tok.column
+                    decls.push(fn_node)
                 } else {
                     error_at(p, expect_found(p, "expected a declaration, found "))
                 }
@@ -989,7 +994,8 @@ fn parse_int_lit(p: *Parser): *Node? with (a: mem.Allocator) {
     }
     val tok = p.peek()
     val node = make_node(NodeKind.INT_LIT, tok.line, tok.column)
-    node.text = tok.text
+    // Copy digits so lowering can read them after the file view moves.
+    node.text = fs.copy_str(tok.text)
     p.advance()
     return node
 }

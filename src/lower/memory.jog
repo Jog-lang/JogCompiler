@@ -1,0 +1,1162 @@
+// Pointer / slice / array / index / tuple aggregate helpers.
+// Checked against compiler/src/lower_memory.c and lower_error.c (tuples).
+
+import src.check
+import src.ir
+import src.load
+import src.parse
+import std.list
+import std.mem
+
+fn emit_load(L: *Lower, ptr: ir.Operand, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    var elem: *check.Type? = null
+    if ptr.ty != null {
+        val (inner, ok) = check.type_peel_ptr(ptr.ty!!)
+        if ok {
+            elem = inner as *check.Type?
+        }
+    }
+    val dst = new_local(L, "", elem)
+    val inst = emit_inst(L, ir.op_kinds().LOAD, dst as i32, pos)
+    if inst != null {
+        inst!!.a = ptr
+    }
+    return local_operand(L, dst)
+}
+
+fn emit_store(L: *Lower, ptr: ir.Operand, value: ir.Operand, pos: ir.Pos) with (a: mem.Allocator) {
+    val inst = emit_inst(L, ir.op_kinds().STORE, -1, pos)
+    if inst != null {
+        inst!!.a = ptr
+        inst!!.b = value
+    }
+}
+
+fn emit_addr(L: *Lower, local: u32, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    var ptr_ty: *check.Type? = null
+    if L.func != null && (local as usize) < L.func!!.locals.len {
+        val lty = L.func!!.locals.at(local as usize).ty
+        if lty != null {
+            ptr_ty = check.type_ptr(L.types, lty!!, false) as *check.Type?
+        }
+    }
+    val dst = new_local(L, "", ptr_ty)
+    val inst = emit_inst(L, ir.op_kinds().ADDR, dst as i32, pos)
+    if inst != null {
+        inst!!.a = ir.local_op(L.func!!, local)
+    }
+    return local_operand(L, dst)
+}
+
+fn emit_field_addr(L: *Lower, base: ir.Operand, index: u32, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    var field_ty: *check.Type? = null
+    if base.ty != null {
+        val (inner, is_ptr) = check.type_peel_ptr(base.ty!!)
+        var st = inner
+        if !is_ptr {
+            st = base.ty!!
+        }
+        st = check.type_peel_distinct(st)
+        val tk = check.type_kinds()
+        if st.kind == tk.TUPLE && (index as usize) < st.elems.len {
+            field_ty = st.elems.get(index as usize) as *check.Type?
+        } else if st.kind == tk.STRUCT {
+            val n = check.type_field_count(st)
+            if (index as usize) < n {
+                field_ty = check.type_field_at(st, index as usize).field_type
+            }
+        }
+        if field_ty != null {
+            field_ty = check.type_ptr(L.types, field_ty!!, false) as *check.Type?
+        }
+    }
+    val dst = new_local(L, "", field_ty)
+    val inst = emit_inst(L, ir.op_kinds().FIELD_ADDR, dst as i32, pos)
+    if inst != null {
+        inst!!.a = base
+        inst!!.aux = index
+    }
+    return local_operand(L, dst)
+}
+
+fn emit_extract(L: *Lower, agg: ir.Operand, index: u32, field_ty: *check.Type?, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    return emit_extract_aux(L, agg, index, 0, field_ty, pos)
+}
+
+fn emit_extract_aux(
+    L: *Lower,
+    agg: ir.Operand,
+    index: u32,
+    aux2: u32,
+    field_ty: *check.Type?,
+    pos: ir.Pos,
+): ir.Operand with (a: mem.Allocator) {
+    // Materialize agg before allocating the extract dest so local numbers
+    // match C (copy/string first, then extract into the next local).
+    val src = as_local(L, agg, pos)
+    var ty = field_ty
+    if ty == null && src.ty != null {
+        val tk = check.type_kinds()
+        val peeled = check.type_peel_distinct(src.ty!!)
+        if peeled.kind == tk.TUPLE && (index as usize) < peeled.elems.len {
+            ty = peeled.elems.get(index as usize)
+        } else if peeled.kind == tk.SLICE {
+            if index == 0 && peeled.elem != null {
+                ty = check.type_ptr(L.types, peeled.elem!!, peeled.is_const) as *check.Type?
+            } else if index == 1 {
+                ty = check.type_usize(L.types) as *check.Type?
+            }
+        } else if peeled.kind == tk.BYTES {
+            if index == 0 {
+                ty = check.type_ptr(L.types, check.type_u8(L.types), peeled.is_const) as *check.Type?
+            } else if index == 1 {
+                ty = check.type_usize(L.types) as *check.Type?
+            }
+        }
+    }
+    val dst = new_local(L, "", ty)
+    val inst = emit_inst(L, ir.op_kinds().EXTRACT, dst as i32, pos)
+    if inst != null {
+        inst!!.a = src
+        inst!!.aux = index
+        inst!!.aux2 = aux2
+    }
+    return local_operand(L, dst)
+}
+
+fn fill_aggregate(
+    L: *Lower,
+    dst: u32,
+    aux: u32,
+    args: list.List<ir.Operand>,
+    pos: ir.Pos,
+) with (a: mem.Allocator) {
+    val inst = emit_inst(L, ir.op_kinds().AGGREGATE, dst as i32, pos)
+    if inst != null {
+        inst!!.aux = aux
+        ir.set_args(inst!!, args)
+    }
+}
+
+fn emit_aggregate(L: *Lower, ty: *check.Type?, args: list.List<ir.Operand>, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    return emit_aggregate_aux(L, ty, 0, args, pos)
+}
+
+fn emit_aggregate_aux(
+    L: *Lower,
+    ty: *check.Type?,
+    aux: u32,
+    args: list.List<ir.Operand>,
+    pos: ir.Pos,
+): ir.Operand with (a: mem.Allocator) {
+    val dst = new_local(L, "", ty)
+    fill_aggregate(L, dst, aux, args, pos)
+    return local_operand(L, dst)
+}
+
+fn emit_elem_addr(L: *Lower, base: ir.Operand, index: ir.Operand, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    var elem_ptr: *check.Type? = null
+    if base.ty != null {
+        val (inner, ok) = check.type_peel_ptr(base.ty!!)
+        if ok {
+            // Preserve *const T → *const T (C emit_elem keeps base constness).
+            elem_ptr = check.type_ptr(L.types, inner, base.ty!!.is_const) as *check.Type?
+        }
+    }
+    val dst = new_local(L, "", elem_ptr)
+    val inst = emit_inst(L, ir.op_kinds().ELEM_ADDR, dst as i32, pos)
+    if inst != null {
+        inst!!.a = base
+        inst!!.b = index
+    }
+    return local_operand(L, dst)
+}
+
+fn emit_bitcast(L: *Lower, src: ir.Operand, ty: *check.Type?, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    // C keeps GLOBAL/INT operands as-is (no as_local) and skips when types match.
+    if ty != null && src.ty != null && src.ty!! == ty!! {
+        return src
+    }
+    val dst = new_local(L, "", ty)
+    val inst = emit_inst(L, ir.op_kinds().BITCAST, dst as i32, pos)
+    if inst != null {
+        inst!!.a = src
+    }
+    return local_operand(L, dst)
+}
+
+// CONVERT into `dest` (same type → no-op). Default checked; string fmt uses
+// unchecked to match C lower_string convert_to.
+fn emit_convert_ex(
+    L: *Lower,
+    src: ir.Operand,
+    dest: *check.Type?,
+    pos: ir.Pos,
+    checked: bool,
+): ir.Operand with (a: mem.Allocator) {
+    if dest != null && src.ty != null && src.ty!! == dest!! {
+        return src
+    }
+    val dst = new_local(L, "", dest)
+    val inst = emit_inst(L, ir.op_kinds().CONVERT, dst as i32, pos)
+    if inst != null {
+        inst!!.checked = checked
+        inst!!.a = src
+    }
+    return local_operand(L, dst)
+}
+
+fn emit_convert(L: *Lower, src: ir.Operand, dest: *check.Type?, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    return emit_convert_ex(L, src, dest, pos, true)
+}
+
+// C pointer_sub_int: convert offset to isize, checked-neg, then elem_addr.
+private fn pointer_sub_int(L: *Lower, ptr: ir.Operand, offset: ir.Operand, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    val isize = check.type_isize(L.types) as *check.Type?
+    val as_isize = emit_convert(L, offset, isize, pos)
+    val neg = emit_unop(L, ir.un_ops().NEG, true, as_isize, isize, pos)
+    return emit_elem_addr(L, ptr, neg, pos)
+}
+
+fn emit_zero(L: *Lower, ty: *check.Type?, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    val dst = new_local(L, "", ty)
+    emit_inst(L, ir.op_kinds().ZERO, dst as i32, pos)
+    return local_operand(L, dst)
+}
+
+/** C jog_lower_zero: ZERO into an existing local (no extra temp). */
+fn zero_local(L: *Lower, dst: u32, pos: ir.Pos) with (a: mem.Allocator) {
+    emit_inst(L, ir.op_kinds().ZERO, dst as i32, pos)
+}
+
+fn parse_tuple_index(text: str): i64 {
+    if text.len == 0 {
+        return -1
+    }
+    var v: i64 = 0
+    var i: usize = 0
+    for i < text.len {
+        val c = text.ptr[i]
+        if c < '0' as u8 || c > '9' as u8 {
+            return -1
+        }
+        v = v * 10 + (c - '0' as u8) as i64
+        i = i + 1
+    }
+    return v
+}
+
+fn lower_tuple(L: *Lower, node: *parse.Node): ir.Operand with (a: mem.Allocator) {
+    val ty = check.get_node_ty(node)
+    var args = list.empty<ir.Operand>()
+    for kid in node.kids.items() {
+        args.push(lower_expr(L, kid))
+        if L.failed || L.terminated {
+            return none_value()
+        }
+    }
+    return emit_aggregate(L, ty, args, node_pos(L, node))
+}
+
+fn value_addr_at(L: *Lower, node: *parse.Node, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    if parse.is_ident(node) {
+        val sym = check.get_node_sym(node)
+        if sym != null {
+            val (local, ok) = find_local(L, sym!!)
+            if ok {
+                return emit_addr(L, local, pos)
+            }
+            val (g, gok) = global_addr(L, sym!!)
+            if gok {
+                return g
+            }
+        }
+        var name = node.name
+        if name.len == 0 {
+            name = node.text
+        }
+        if name.len > 0 {
+            val (local, ok) = find_local_by_name(L, name)
+            if ok {
+                return emit_addr(L, local, pos)
+            }
+        }
+        fail(L, node, "address of name not lowered yet")
+        return none_value()
+    }
+    if parse.is_unary(node) && node.text == "*" && node.kids.len > 0 {
+        return lower_expr(L, node.kids.get(0))
+    }
+    if parse.is_member(node) {
+        return lower_member_ptr(L, node)
+    }
+    if parse.is_index(node) {
+        return lower_index_ptr(L, node)
+    }
+    // C: rvalue (call, etc.) → temp local → ADDR. Needed for chained methods
+    // like `self.slice(...).starts_with(...)`.
+    val value = as_local(L, lower_expr(L, node), pos)
+    if L.failed || value.kind != ir.operand_kinds().LOCAL {
+        return none_value()
+    }
+    return emit_addr(L, value.local, pos)
+}
+
+fn value_addr(L: *Lower, node: *parse.Node): ir.Operand with (a: mem.Allocator) {
+    return value_addr_at(L, node, node_pos(L, node))
+}
+
+fn lower_memory_unary(L: *Lower, node: *parse.Node): ir.Operand with (a: mem.Allocator) {
+    if node.kids.len == 0 {
+        return none_value()
+    }
+    if node.text == "*" {
+        val ptr = lower_expr(L, node.kids.get(0))
+        return emit_load(L, ptr, node_pos(L, node))
+    }
+    if node.text == "&" {
+        var addr = value_addr(L, node.kids.get(0))
+        val ty = check.get_node_ty(node)
+        // Interface destinations are wrapped by maybe_iface_wrap (fat pointer),
+        // not a bare bitcast of the address.
+        if ty != null && ty!!.kind == check.type_kinds().INTERFACE {
+            return addr
+        }
+        if ty != null && addr.ty != null && addr.ty!! != ty!! && ty!!.kind == check.type_kinds().PTR {
+            addr = emit_bitcast(L, addr, ty, node_pos(L, node))
+        }
+        // C: &not_found typed as error? becomes the error fat pointer + Some.
+        return error_box(L, addr, ty, node_pos(L, node))
+    }
+    fail(L, node, "unary not lowered yet")
+    return none_value()
+}
+
+fn lower_member_ptr(L: *Lower, node: *parse.Node): ir.Operand with (a: mem.Allocator) {
+    if node.kids.len == 0 {
+        return none_value()
+    }
+    val base_node = node.kids.get(0)
+    var index: u32 = 0
+    if node.name.len == 0 {
+        val ti = parse_tuple_index(node.text)
+        if ti < 0 {
+            fail(L, node, "bad tuple field")
+            return none_value()
+        }
+        index = ti as u32
+        val base_ty = check.get_node_ty(base_node)
+        if base_ty != null {
+            val tk = check.type_kinds()
+            val (inner, is_ptr) = check.type_peel_ptr(base_ty!!)
+            if is_ptr && check.type_peel_distinct(inner).kind == tk.TUPLE {
+                val ptr = lower_expr(L, base_node)
+                return emit_field_addr(L, ptr, index, node_pos(L, node))
+            }
+        }
+        // Tuple `.N`: C keeps addr at the base ident pos; field_addr at the member.
+        val addr = value_addr(L, base_node)
+        return emit_field_addr(L, addr, index, node_pos(L, node))
+    }
+    // Named struct field (including promoted embeds): C collect_addr + along_path.
+    // Flatten nested `a.b.c` so every field_addr/load uses the outermost member pos.
+    var indices = list.empty<u32>()
+    val root = collect_member_root(L, node, &indices)
+    if root == null || indices.len == 0 {
+        fail(L, node, "unknown field")
+        return none_value()
+    }
+    val pos = node_pos(L, node)
+    var root_ty = check.get_node_ty(root!!)
+    if root_ty == null {
+        fail(L, node, "member has no type")
+        return none_value()
+    }
+    val root_subst = lower_type_subst(L, root_ty)
+    if root_subst != null {
+        root_ty = root_subst
+    }
+    val (outer, is_ptr) = check.type_peel_ptr(root_ty!!)
+    var cur: *check.Type? = check.type_peel_distinct(outer) as *check.Type?
+    var ptr = none_value()
+    if is_ptr {
+        ptr = lower_expr(L, root!!)
+    } else if parse.is_ident(root!!) {
+        val sym = check.get_node_sym(root!!)
+        var is_global = false
+        if sym != null {
+            val (_, gok) = global_addr(L, sym!!)
+            is_global = gok
+            // Local wins over global of the same name.
+            val (_, lok) = find_local(L, sym!!)
+            if lok {
+                is_global = false
+            }
+        }
+        if is_global {
+            // C pointer_to for globals: load + as_local + ADDR (not raw gN).
+            var held = lower_expr(L, root!!)
+            if L.failed || L.terminated {
+                return none_value()
+            }
+            held = as_local(L, held, pos)
+            if held.kind == ir.operand_kinds().LOCAL {
+                ptr = emit_addr(L, held.local, pos)
+            } else {
+                ptr = value_addr_at(L, root!!, pos)
+            }
+        } else {
+            ptr = value_addr_at(L, root!!, pos)
+        }
+    } else {
+        ptr = value_addr_at(L, root!!, pos)
+    }
+    val tk = check.type_kinds()
+    var pi: usize = 0
+    for pi < indices.len {
+        if cur == null {
+            fail(L, node, "missing field")
+            return none_value()
+        }
+        val (peeled, was_ptr) = check.type_peel_ptr(cur!!)
+        if was_ptr {
+            ptr = emit_load(L, ptr, pos)
+            cur = check.type_peel_distinct(peeled) as *check.Type?
+        }
+        if cur == null || cur!!.kind != tk.STRUCT {
+            fail(L, node, "missing field")
+            return none_value()
+        }
+        val fi = indices.get(pi)
+        ptr = emit_field_addr(L, ptr, fi, pos)
+        if (fi as usize) < check.type_field_count(cur!!) {
+            cur = check.type_field_at(cur!!, fi as usize).field_type
+        } else {
+            cur = null
+        }
+        pi = pi + 1
+    }
+    return ptr
+}
+
+/** Recursively collect field indices from nested members (C collect_addr). */
+private fn collect_member_root(L: *Lower, node: *parse.Node, indices: *list.List<u32>): *parse.Node? with (a: mem.Allocator) {
+    if !parse.is_member(node) || node.name.len == 0 || node.kids.len == 0 {
+        return node
+    }
+    val base = node.kids.get(0)
+    val base_ty = check.get_node_ty(base)
+    if base_ty == null {
+        return node
+    }
+    val (outer, _) = check.type_peel_ptr(base_ty!!)
+    // After monomorphization, type params become concrete (C jog_lower_type).
+    var subst = lower_type_subst(L, outer as *check.Type?)
+    if subst == null {
+        subst = outer as *check.Type?
+    }
+    var st = check.type_peel_distinct(subst!!)
+    val tk = check.type_kinds()
+    if st.kind != tk.STRUCT {
+        return node
+    }
+    var pkg: *load.Package? = null
+    if L.ast_fn != null {
+        val fsym = check.get_node_sym(L.ast_fn!!)
+        if fsym != null {
+            pkg = fsym!!.package
+        }
+    }
+    val hit = check.struct_lookup_field(st, node.name, L.ast_fn, pkg)
+    if !hit.found || hit.ambiguous || hit.indices.len == 0 {
+        return node
+    }
+    val root = collect_member_root(L, base, indices)
+    var i: usize = 0
+    for i < hit.indices.len {
+        indices.push(hit.indices.get(i))
+        i = i + 1
+    }
+    return root
+}
+
+/** `b.ptr =` / `b.len =` on bytes/slice (C jog_lower_package_view_assign). */
+fn lower_package_view_assign(L: *Lower, node: *parse.Node): bool with (a: mem.Allocator) {
+    if node.kids.len < 2 {
+        return false
+    }
+    val target = node.kids.get(0)
+    if !parse.is_member(target) || target.kids.len == 0 {
+        return false
+    }
+    var aux: u32 = 0
+    if target.name == "ptr" {
+        aux = 0
+    } else if target.name == "len" {
+        aux = 1
+    } else {
+        return false
+    }
+    val base = target.kids.get(0)
+    val base_ty = check.get_node_ty(base)
+    if base_ty == null {
+        return false
+    }
+    val peeled = check.type_peel_distinct(base_ty!!)
+    val tk = check.type_kinds()
+    if peeled.kind != tk.BYTES && peeled.kind != tk.SLICE {
+        return false
+    }
+    if node.text != "=" {
+        fail(L, node, "cannot assign to field")
+        return true
+    }
+    val value = lower_expr(L, node.kids.get(1))
+    if L.failed {
+        return true
+    }
+    var addr = none_value()
+    if parse.is_ident(base) {
+        val sym = check.get_node_sym(base)
+        if sym != null {
+            val (local, ok) = find_local(L, sym!!)
+            if ok {
+                addr = emit_addr(L, local, node_pos(L, node))
+            } else {
+                val (g, gok) = global_addr(L, sym!!)
+                if gok {
+                    addr = g
+                }
+            }
+        }
+    }
+    if addr.kind == ir.operand_kinds().NONE {
+        fail(L, node, "cannot assign to field")
+        return true
+    }
+    var field_ty = check.get_node_ty(target)
+    // Fallback when check left the MEMBER untyped: ptr → *u8 / *T, len → usize.
+    if field_ty == null {
+        if aux == 1 {
+            field_ty = check.type_usize(L.types) as *check.Type?
+        } else if peeled.kind == tk.BYTES {
+            field_ty = check.type_ptr(L.types, check.type_u8(L.types), peeled.is_const) as *check.Type?
+        } else if peeled.elem != null {
+            field_ty = check.type_ptr(L.types, peeled.elem!!, peeled.is_const) as *check.Type?
+        }
+    }
+    var field_ptr: *check.Type? = null
+    if field_ty != null {
+        field_ptr = check.type_ptr(L.types, field_ty!!, false) as *check.Type?
+    }
+    val slot_l = new_local(L, "", field_ptr)
+    val inst = emit_inst(L, ir.op_kinds().FIELD_ADDR, slot_l as i32, node_pos(L, node))
+    if inst != null {
+        inst!!.a = addr
+        inst!!.aux = aux
+    }
+    emit_store(L, local_operand(L, slot_l), value, node_pos(L, node))
+    return true
+}
+
+/** `x.ptr` / `x.len` on str/bytes/slice — extract header fields (C jog_lower_package_view). */
+fn lower_package_view(L: *Lower, node: *parse.Node): (ir.Operand, bool) with (a: mem.Allocator) {
+    if !parse.is_member(node) || node.kids.len == 0 {
+        return none_value(), false
+    }
+    var aux: u32 = 0
+    if node.name == "ptr" {
+        aux = 0
+    } else if node.name == "len" {
+        aux = 1
+    } else {
+        return none_value(), false
+    }
+    val base_node = node.kids.get(0)
+    val base_ty = check.get_node_ty(base_node)
+    if base_ty == null {
+        return none_value(), false
+    }
+    val peeled = check.type_peel_distinct(base_ty!!)
+    val tk = check.type_kinds()
+    if peeled.kind != tk.BYTES && peeled.kind != tk.SLICE {
+        return none_value(), false
+    }
+    val field_ty = check.get_node_ty(node)
+    if field_ty == null {
+        return none_value(), false
+    }
+    val value = lower_expr(L, base_node)
+    if L.failed {
+        return none_value(), true
+    }
+    if L.terminated {
+        fail(L, node, "expression does not produce a value")
+        return none_value(), true
+    }
+    return emit_extract(L, value, aux, field_ty, node_pos(L, node)), true
+}
+
+fn lower_member_value(L: *Lower, node: *parse.Node): ir.Operand with (a: mem.Allocator) {
+    if node.kids.len == 0 {
+        return none_value()
+    }
+    val base_node = node.kids.get(0)
+    val base_ty = check.get_node_ty(base_node)
+    // Value extract for non-pointer tuple `.N`.
+    if node.name.len == 0 && base_ty != null {
+        val tk = check.type_kinds()
+        val (inner, is_ptr) = check.type_peel_ptr(base_ty!!)
+        if !is_ptr && check.type_peel_distinct(inner).kind == tk.TUPLE {
+            val ti = parse_tuple_index(node.text)
+            if ti < 0 {
+                fail(L, node, "bad tuple field")
+                return none_value()
+            }
+            val base = lower_expr(L, base_node)
+            var field_ty: *check.Type? = null
+            val tup = check.type_peel_distinct(inner)
+            if (ti as usize) < tup.elems.len {
+                field_ty = tup.elems.get(ti as usize) as *check.Type?
+            }
+            return emit_extract(L, base, ti as u32, field_ty, node_pos(L, node))
+        }
+        // (*p).N — load then extract when C does that for non-addr context.
+        if is_ptr && check.type_peel_distinct(inner).kind == tk.TUPLE {
+            // Prefer field_addr+load when used as value from pointer (p.0).
+            // C uses field_addr+load for p.0 when p is pointer.
+            val ptr = lower_member_ptr(L, node)
+            return emit_load(L, ptr, node_pos(L, node))
+        }
+    }
+    val ptr = lower_member_ptr(L, node)
+    return emit_load(L, ptr, node_pos(L, node))
+}
+
+fn lower_index_ptr(L: *Lower, node: *parse.Node): ir.Operand with (a: mem.Allocator) {
+    if node.kids.len < 2 {
+        fail(L, node, "index missing operands")
+        return none_value()
+    }
+    val base_node = node.kids.get(0)
+    val idx_node = node.kids.get(1)
+    val base_ty = check.get_node_ty(base_node)
+    val idx = lower_expr(L, idx_node)
+    if base_ty == null {
+        fail(L, node, "cannot index this value")
+        return none_value()
+    }
+    val pos = node_pos(L, node)
+    val usz = check.type_usize(L.types) as *check.Type?
+    val tk = check.type_kinds()
+    val peeled = check.type_peel_distinct(base_ty!!)
+    if peeled.kind == tk.PTR {
+        val base = lower_expr(L, base_node)
+        return emit_elem_addr(L, base, idx, pos)
+    }
+    var raw = none_value()
+    var len = none_value()
+    var ptr_ty: *check.Type? = null
+    var bounded = false
+    if peeled.kind == tk.SLICE {
+        var elem = peeled.elem
+        if elem != null {
+            ptr_ty = check.type_ptr(L.types, elem!!, peeled.is_const) as *check.Type?
+        }
+        val header = lower_expr(L, base_node)
+        raw = emit_extract(L, header, 0, ptr_ty, pos)
+        len = emit_extract(L, header, 1, usz, pos)
+        bounded = true
+    } else if peeled.kind == tk.ARRAY {
+        val n = peeled.len
+        var elem = peeled.elem
+        if elem != null {
+            ptr_ty = check.type_ptr(L.types, elem!!, false) as *check.Type?
+        }
+        val storage = value_addr(L, base_node)
+        raw = emit_bitcast(L, storage, ptr_ty, pos)
+        len = ir.int_op(usz, n as i64)
+        bounded = true
+    } else if peeled.kind == tk.BYTES_N {
+        // Index as *[1]byte (C lower_memory BYTES_N), not *u8.
+        val byte1 = check.type_bytes_n(L.types, 1)
+        ptr_ty = check.type_ptr(L.types, byte1, false) as *check.Type?
+        val storage = value_addr(L, base_node)
+        raw = emit_bitcast(L, storage, ptr_ty, pos)
+        len = ir.int_op(usz, peeled.len as i64)
+        bounded = true
+    } else if peeled.kind == tk.BYTES {
+        // Extract as *u8 then bitcast to *[1]byte (C lower_memory BYTES).
+        val u8t = check.type_u8(L.types)
+        val byte1 = check.type_bytes_n(L.types, 1)
+        val u8_ptr = check.type_ptr(L.types, u8t, peeled.is_const) as *check.Type?
+        ptr_ty = check.type_ptr(L.types, byte1, peeled.is_const) as *check.Type?
+        val header = lower_expr(L, base_node)
+        raw = emit_extract(L, header, 0, u8_ptr, pos)
+        len = emit_extract(L, header, 1, usz, pos)
+        raw = emit_bitcast(L, raw, ptr_ty, pos)
+        bounded = true
+    } else {
+        fail(L, node, "cannot index this value")
+        return none_value()
+    }
+    if ptr_ty == null || L.failed {
+        return none_value()
+    }
+    if bounded {
+        emit_bounds(L, idx, len, pos)
+    }
+    return emit_elem_addr(L, raw, idx, pos)
+}
+
+fn lower_index_value(L: *Lower, node: *parse.Node): ir.Operand with (a: mem.Allocator) {
+    val ptr = lower_index_ptr(L, node)
+    return emit_load(L, ptr, node_pos(L, node))
+}
+
+fn emit_bounds(L: *Lower, index: ir.Operand, limit: ir.Operand, pos: ir.Pos) with (a: mem.Allocator) {
+    if L.unchecked {
+        return
+    }
+    val inst = emit_inst(L, ir.op_kinds().BOUNDS_CHECK, -1, pos)
+    if inst != null {
+        inst!!.a = index
+        inst!!.b = limit
+    }
+}
+
+fn usize_add1(L: *Lower, src: ir.Operand, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    val usz = check.type_usize(L.types) as *check.Type?
+    return emit_binop(L, ir.bin_ops().ADD, true, src, ir.int_op(usz, 1), usz, pos)
+}
+
+/**
+ * `a[lo..hi]` / `a[lo..]` / `a[..hi]` / `a[..]`.
+ * SLICE kids: [0]=base; head bits: 1=has lo, 2=has hi; then optional lo/hi kids.
+ */
+fn lower_slice_expr(L: *Lower, node: *parse.Node): ir.Operand with (a: mem.Allocator) {
+    if node.kids.len == 0 {
+        fail(L, node, "slice missing base")
+        return none_value()
+    }
+    val base_node = node.kids.get(0)
+    val base_ty = check.get_node_ty(base_node)
+    val result_ty = check.get_node_ty(node)
+    if base_ty == null || result_ty == null {
+        fail(L, node, "cannot slice this value")
+        return none_value()
+    }
+    val usz = check.type_usize(L.types) as *check.Type?
+    val tk = check.type_kinds()
+    val peeled = check.type_peel_distinct(base_ty!!)
+    var first = none_value()
+    var len = none_value()
+    var ptr_ty: *check.Type? = null
+    if peeled.kind == tk.SLICE {
+        val header = lower_expr(L, base_node)
+        if peeled.elem != null {
+            ptr_ty = check.type_ptr(L.types, peeled.elem!!, peeled.is_const) as *check.Type?
+        }
+        first = emit_extract(L, header, 0, ptr_ty, node_pos(L, node))
+        len = emit_extract(L, header, 1, usz, node_pos(L, node))
+    } else if peeled.kind == tk.BYTES {
+        val u8t = check.type_u8(L.types)
+        ptr_ty = check.type_ptr(L.types, u8t, peeled.is_const) as *check.Type?
+        val header = lower_expr(L, base_node)
+        first = emit_extract(L, header, 0, ptr_ty, node_pos(L, node))
+        len = emit_extract(L, header, 1, usz, node_pos(L, node))
+    } else if peeled.kind == tk.ARRAY {
+        val elem = peeled.elem
+        if elem != null {
+            ptr_ty = check.type_ptr(L.types, elem!!, result_ty!!.is_const) as *check.Type?
+        }
+        val storage = value_addr(L, base_node)
+        first = emit_bitcast(L, storage, ptr_ty, node_pos(L, node))
+        len = ir.int_op(usz, peeled.len as i64)
+    } else if peeled.kind == tk.BYTES_N {
+        // `[N]byte` → slice/bytes view (C lower_memory slice BYTES_N).
+        val u8t = check.type_u8(L.types)
+        var view_const = false
+        val res0 = check.type_peel_distinct(result_ty!!)
+        val res_bytes = check.type_bytes_view(result_ty!!)
+        if res_bytes != null {
+            view_const = res_bytes!!.is_const
+        } else if res0.kind == tk.BYTES {
+            view_const = res0.is_const
+        } else if res0.kind == tk.SLICE {
+            view_const = res0.is_const
+        }
+        ptr_ty = check.type_ptr(L.types, u8t, view_const) as *check.Type?
+        val storage = value_addr(L, base_node)
+        first = emit_bitcast(L, storage, ptr_ty, node_pos(L, node))
+        len = ir.int_op(usz, peeled.len as i64)
+    } else {
+        fail(L, node, "cannot slice this value")
+        return none_value()
+    }
+    var kid: usize = 1
+    var lo = ir.int_op(usz, 0)
+    var hi = len
+    if (node.head % 2) == 1 {
+        if kid < node.kids.len {
+            lo = lower_expr(L, node.kids.get(kid))
+            kid = kid + 1
+        }
+    }
+    if ((node.head / 2) % 2) == 1 {
+        if kid < node.kids.len {
+            hi = lower_expr(L, node.kids.get(kid))
+        }
+    }
+    if !L.unchecked {
+        if (node.head % 2) == 1 && ((node.head / 2) % 2) == 1 {
+            emit_bounds(L, lo, usize_add1(L, hi, node_pos(L, node)), node_pos(L, node))
+            emit_bounds(L, hi, usize_add1(L, len, node_pos(L, node)), node_pos(L, node))
+        } else if (node.head % 2) == 1 {
+            emit_bounds(L, lo, usize_add1(L, len, node_pos(L, node)), node_pos(L, node))
+        } else if ((node.head / 2) % 2) == 1 {
+            emit_bounds(L, hi, usize_add1(L, len, node_pos(L, node)), node_pos(L, node))
+        }
+    }
+    val span = emit_binop(L, ir.bin_ops().SUB, true, hi, lo, usz, node_pos(L, node))
+    var ptr = emit_elem_addr(L, first, lo, node_pos(L, node))
+    val res = check.type_peel_distinct(result_ty!!)
+    var agg_ptr: *check.Type? = null
+    val res_view = check.type_bytes_view(result_ty!!)
+    if res_view != null || res.kind == tk.BYTES {
+        var bty = res
+        if res_view != null {
+            bty = res_view!!
+        }
+        agg_ptr = check.type_ptr(L.types, check.type_u8(L.types), bty.is_const) as *check.Type?
+    } else if res.kind == tk.SLICE && res.elem != null {
+        agg_ptr = check.type_ptr(L.types, res.elem!!, res.is_const) as *check.Type?
+    }
+    if agg_ptr != null {
+        ptr = emit_bitcast(L, ptr, agg_ptr, node_pos(L, node))
+    }
+    var args = list.empty<ir.Operand>()
+    args.push(ptr)
+    args.push(span)
+    return emit_aggregate(L, result_ty, args, node_pos(L, node))
+}
+
+/**
+ * Pointer arithmetic / comparison. Returns (op, true) when handled.
+ */
+fn lower_memory_binary(L: *Lower, node: *parse.Node, lhs: ir.Operand, rhs: ir.Operand): (ir.Operand, bool) with (a: mem.Allocator) {
+    val tk = check.type_kinds()
+    var lp = false
+    var rp = false
+    if lhs.ty != null && check.type_peel_distinct(lhs.ty!!).kind == tk.PTR {
+        lp = true
+    }
+    if rhs.ty != null && check.type_peel_distinct(rhs.ty!!).kind == tk.PTR {
+        rp = true
+    }
+    if !lp && !rp {
+        return none_value(), false
+    }
+    val result_ty = check.get_node_ty(node)
+    if lp && rp {
+        if node.text == "-" {
+            // ptr - ptr → (isize(lhs) - isize(rhs)) / sizeof(*lhs)
+            val isize = check.type_isize(L.types) as *check.Type?
+            val a = emit_bitcast(L, lhs, isize, node_pos(L, node))
+            val b = emit_bitcast(L, rhs, isize, node_pos(L, node))
+            // C emits unchecked `sub` for pointer difference (then checked div).
+            val diff = emit_binop(L, ir.bin_ops().SUB, false, a, b, isize, node_pos(L, node))
+            var sz: i64 = 1
+            if lhs.ty != null {
+                val (elem, ok) = check.type_peel_ptr(lhs.ty!!)
+                if ok && check.type_layout(L.types, elem) {
+                    sz = elem.size as i64
+                    if sz == 0 {
+                        sz = 1
+                    }
+                }
+            }
+            val denom = ir.int_op(isize, sz)
+            return emit_binop(L, ir.bin_ops().DIV, true, diff, denom, result_ty, node_pos(L, node)), true
+        }
+        // Pointer comparisons.
+        val (bin, checked, ok) = map_binop(node.text)
+        if ok {
+            return emit_binop(L, bin, false, lhs, rhs, result_ty, node_pos(L, node)), true
+        }
+        fail(L, node, "operator is not lowered yet")
+        return none_value(), true
+    }
+    if node.text == "+" {
+        val ptr = if lp {
+            lhs
+        } else {
+            rhs
+        }
+        val off = if lp {
+            rhs
+        } else {
+            lhs
+        }
+        return emit_elem_addr(L, ptr, off, node_pos(L, node)), true
+    }
+    if node.text == "-" && lp {
+        // C pointer_sub_int: isize convert, checked neg, elem_addr.
+        return pointer_sub_int(L, lhs, rhs, node_pos(L, node)), true
+    }
+    fail(L, node, "operator is not lowered yet")
+    return none_value(), true
+}
+
+fn lower_array_lit(L: *Lower, node: *parse.Node): ir.Operand with (a: mem.Allocator) {
+    // ARRAY_LIT kids: [0]=type, [1..]=ARG values (same shape as a type ctor call).
+    val (op, handled) = lower_memory_call(L, node)
+    if handled {
+        return op
+    }
+    fail(L, node, "array literal not lowered yet")
+    return none_value()
+}
+
+fn lower_memory_call(L: *Lower, node: *parse.Node): (ir.Operand, bool) with (a: mem.Allocator) {
+    if node.kids.len == 0 {
+        return none_value(), false
+    }
+    val callee = node.kids.get(0)
+    val ty = check.get_node_ty(node)
+    val tk = check.type_kinds()
+    // C jog_lower_memory_call: `bytes()` with no args → zero.
+    if parse.is_call(node) && parse.is_ident(callee) {
+        val sym = check.get_node_sym(callee)
+        if sym != null && load.is_symbol_type(sym!!) {
+            var bty = check.get_sema(sym!!)
+            if bty == null {
+                bty = check.get_node_ty(callee)
+            }
+            if bty != null && bty!!.kind == tk.BYTES && !bty!!.is_const {
+                if parse.call_has_trailing(node) || parse.call_nctx(node) > 0 {
+                    return none_value(), false
+                }
+                if node.kids.len > 1 {
+                    fail(L, node, "bytes() does not take arguments")
+                    return none_value(), true
+                }
+                var out_ty = ty
+                if out_ty == null {
+                    out_ty = bty
+                }
+                return emit_zero(L, out_ty, node_pos(L, node)), true
+            }
+        }
+    }
+    // ARRAY_LIT or CALL with TYPE_ARRAY / TYPE_SLICE / ARRAY|SLICE result.
+    var is_ctor = parse.is_array_lit(node) || parse.is_type_array(callee) || parse.is_type_slice(callee)
+    if !is_ctor && parse.is_call(node) && ty != null {
+        val peeled0 = check.type_peel_distinct(ty!!)
+        if peeled0.kind == tk.ARRAY || peeled0.kind == tk.SLICE {
+            val callee_ty = check.get_node_ty(callee)
+            if callee_ty == null || !check.type_is_fn(callee_ty!!) {
+                is_ctor = true
+            }
+        }
+    }
+    if !is_ctor {
+        return none_value(), false
+    }
+    if ty == null {
+        fail(L, node, "array/slice literal has no type")
+        return none_value(), true
+    }
+    val peeled = check.type_peel_distinct(ty!!)
+    if peeled.kind != tk.ARRAY && peeled.kind != tk.SLICE {
+        return none_value(), false
+    }
+    if peeled.kind == tk.ARRAY {
+        val tmp = emit_zero(L, ty, node_pos(L, node))
+        val addr = emit_addr(L, tmp.local, node_pos(L, node))
+        var elem = peeled.elem
+        var ptr_ty: *check.Type? = null
+        if elem != null {
+            ptr_ty = check.type_ptr(L.types, elem!!, false) as *check.Type?
+        }
+        val cast = emit_bitcast(L, addr, ptr_ty, node_pos(L, node))
+        val arg_end = parse.call_arg_end(node)
+        var i: usize = 1
+        var ei: usize = 0
+        for i < arg_end {
+            val arg = node.kids.get(i)
+            var value_node = arg
+            if parse.is_arg(arg) && arg.kids.len > 0 {
+                value_node = arg.kids.get(0)
+            }
+            val v = lower_expr(L, value_node)
+            val epos = node_pos(L, value_node)
+            val at = emit_elem_addr(L, cast, ir.int_op(check.type_usize(L.types) as *check.Type?, ei as i64), epos)
+            emit_store(L, at, v, epos)
+            ei = ei + 1
+            i = i + 1
+        }
+        return tmp, true
+    }
+    // Slice: materialize a backing array then aggregate (ptr, len).
+    // Empty `[]T()` is a zero slice (C lower_slice_lit count==0) — no [0]T.
+    val arg_end = parse.call_arg_end(node)
+    val n = if arg_end > 1 {
+        arg_end - 1
+    } else {
+        0 as usize
+    }
+    if n == 0 {
+        return emit_zero(L, ty, node_pos(L, node)), true
+    }
+    var elem = peeled.elem
+    if elem == null {
+        fail(L, node, "slice element type missing")
+        return none_value(), true
+    }
+    val arr_ty = check.type_array(L.types, elem!!, n as u64)
+    val tmp = emit_zero(L, arr_ty as *check.Type?, node_pos(L, node))
+    val addr = emit_addr(L, tmp.local, node_pos(L, node))
+    // Fill uses mutable *T (C fill_array); aggregate header uses slice constness.
+    val fill_ptr = check.type_ptr(L.types, elem!!, false) as *check.Type?
+    val view_ptr = check.type_ptr(L.types, elem!!, peeled.is_const) as *check.Type?
+    val cast = emit_bitcast(L, addr, fill_ptr, node_pos(L, node))
+    var i: usize = 1
+    var ei: usize = 0
+    for i < arg_end {
+        val arg = node.kids.get(i)
+        var value_node = arg
+        if parse.is_arg(arg) && arg.kids.len > 0 {
+            value_node = arg.kids.get(0)
+        }
+        val v = lower_expr(L, value_node)
+        val epos = node_pos(L, value_node)
+        val at = emit_elem_addr(L, cast, ir.int_op(check.type_usize(L.types) as *check.Type?, ei as i64), epos)
+        emit_store(L, at, v, epos)
+        ei = ei + 1
+        i = i + 1
+    }
+    val addr2 = emit_addr(L, tmp.local, node_pos(L, node))
+    val cast2 = emit_bitcast(L, addr2, view_ptr, node_pos(L, node))
+    var args = list.empty<ir.Operand>()
+    args.push(cast2)
+    args.push(ir.int_op(check.type_usize(L.types) as *check.Type?, n as i64))
+    return emit_aggregate(L, ty, args, node_pos(L, node)), true
+}
+
+fn ptr_update(L: *Lower, slot: ir.Operand, op: str, rhs_node: *parse.Node, pos: ir.Pos) with (a: mem.Allocator) {
+    val cur = emit_load(L, slot, pos)
+    val off = lower_expr(L, rhs_node)
+    if L.failed || L.terminated {
+        return
+    }
+    var next = none_value()
+    if op == "-" || op == "-=" {
+        next = pointer_sub_int(L, cur, off, pos)
+    } else {
+        next = emit_elem_addr(L, cur, off, pos)
+    }
+    emit_store(L, slot, next, pos)
+}
+
+fn lower_memory_assign(L: *Lower, node: *parse.Node): bool with (a: mem.Allocator) {
+    if node.kids.len < 2 {
+        return false
+    }
+    val target = node.kids.get(0)
+    val rhs_node = node.kids.get(1)
+    val tk = check.type_kinds()
+    // `p += n` / `p -= n` on a pointer local/global: addr, load, elem_addr, store.
+    if parse.is_ident(target) && (node.text == "+=" || node.text == "-=") {
+        val tty = check.get_node_ty(target)
+        if tty != null && check.type_peel_distinct(tty!!).kind == tk.PTR {
+            var slot = none_value()
+            val sym = check.get_node_sym(target)
+            if sym != null {
+                val (local, ok) = find_local(L, sym!!)
+                if ok {
+                    slot = emit_addr(L, local, node_pos(L, target))
+                } else {
+                    val (g, gok) = global_addr(L, sym!!)
+                    if gok {
+                        slot = g
+                    }
+                }
+            }
+            if slot.kind == ir.operand_kinds().NONE {
+                // Inside `go`, the capture is not a local — defer to coro_store.
+                if L.in_coro {
+                    return false
+                }
+                fail(L, target, "missing pointer")
+                return true
+            }
+            ptr_update(L, slot, node.text, rhs_node, node_pos(L, node))
+            return true
+        }
+    }
+    if parse.is_unary(target) && target.text == "*" {
+        val ptr = lower_expr(L, target.kids.get(0))
+        if node.text == "+=" || node.text == "-=" {
+            val tty = check.get_node_ty(target)
+            if tty != null && check.type_peel_distinct(tty!!).kind == tk.PTR {
+                ptr_update(L, ptr, node.text, rhs_node, node_pos(L, node))
+                return true
+            }
+        }
+        val value = lower_expr(L, rhs_node)
+        if !L.terminated {
+            emit_store(L, ptr, value, node_pos(L, node))
+        }
+        return true
+    }
+    if parse.is_index(target) {
+        val ptr = lower_index_ptr(L, target)
+        if node.text == "+=" || node.text == "-=" {
+            val tty = check.get_node_ty(target)
+            if tty != null && check.type_peel_distinct(tty!!).kind == tk.PTR {
+                ptr_update(L, ptr, node.text, rhs_node, node_pos(L, node))
+                return true
+            }
+        }
+        val value = lower_expr(L, rhs_node)
+        if !L.terminated {
+            emit_store(L, ptr, value, node_pos(L, node))
+        }
+        return true
+    }
+    if parse.is_member(target) {
+        val ptr = lower_member_ptr(L, target)
+        var value = none_value()
+        if node.text != "=" && node.text.len > 0 {
+            val (bin, checked, ok_op) = assign_base_binop(node.text)
+            if !ok_op {
+                fail(L, node, "assignment not lowered yet")
+                return true
+            }
+            var tty = check.get_node_ty(target)
+            if (node.text == "+=" || node.text == "-=") && tty != null &&
+                check.type_peel_distinct(tty!!).kind == tk.PTR {
+                ptr_update(L, ptr, node.text, rhs_node, node_pos(L, node))
+                return true
+            }
+            val old = emit_load(L, ptr, node_pos(L, node))
+            val rhs = lower_expr(L, rhs_node)
+            if L.failed || L.terminated {
+                return true
+            }
+            // C: target->type ? target->type : lhs.type
+            if tty == null {
+                tty = old.ty
+            }
+            value = emit_binop(L, bin, checked, old, rhs, tty, node_pos(L, node))
+        } else {
+            value = lower_expr(L, rhs_node)
+        }
+        if !L.terminated {
+            emit_store(L, ptr, value, node_pos(L, node))
+        }
+        return true
+    }
+    return false
+}

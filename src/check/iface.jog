@@ -896,10 +896,7 @@ fn check_interface_call(env: *Env, call: *parse.Node, base_ty: *Type): (*Type?, 
         fi = fi + 1
     }
     val nctx = parse.call_nctx(call)
-    var arg_end = call.kids.len
-    if nctx > 0 && arg_end >= nctx {
-        arg_end = arg_end - nctx
-    }
+    val arg_end = parse.call_arg_end(call)
     var positional: usize = 0
     var seen_named = false
     var ai: usize = 1
@@ -971,9 +968,28 @@ fn check_interface_call(env: *Env, call: *parse.Node, base_ty: *Type): (*Type?, 
         }
         ai = ai + 1
     }
-    // Trailing lambda: bit on call.head / 256
-    if (call.head / 256) % 2 == 1 && !env.ck.stop {
-        // Trailing is last non-context kid; rare for iface fixtures — skip detailed for now if not present.
+    if parse.call_has_trailing(call) && !env.ck.stop {
+        val lam = call.kids.get(call.kids.len - 1 - nctx)
+        if count == 0 {
+            check_fail(env.ck, env.job.file, lam.line, lam.column, "trailing lambda needs a function parameter")
+            check_expr(env, lam, null)
+        } else if filled.get(count - 1) {
+            check_fail(env.ck, env.job.file, lam.line, lam.column, "trailing lambda does not fit")
+            check_expr(env, lam, null)
+        } else {
+            val want = fn_ty!!.elems.get(count - 1)
+            var under = want
+            if under.kind == TypeKind.DISTINCT && under.elem != null {
+                under = under.elem!!
+            }
+            if under.kind != TypeKind.FN {
+                check_fail(env.ck, env.job.file, lam.line, lam.column, "trailing lambda needs a function parameter")
+                check_expr(env, lam, null)
+            } else {
+                filled = filled_set_bool(filled, count - 1, true)
+                check_expr(env, lam, want as *Type?)
+            }
+        }
     }
     var mi: usize = 0
     for mi < count && !env.ck.stop {
@@ -1110,6 +1126,12 @@ fn check_interface_member(ck: *Check, job: *CheckJob, member: *parse.Node, iface
     if prop != null {
         val pty = prop_type(ck, job, prop!!)
         if pty != null && pty!!.kind != TypeKind.ERROR {
+            // C attaches prop symbol + type on the MEMBER access node.
+            set_node_ty(member, pty)
+            val psym = get_node_sym(prop!!)
+            if psym != null {
+                set_node_sym(member, psym)
+            }
             return pty, 1
         }
     }
@@ -1507,7 +1529,12 @@ fn check_interface(ck: *Check, job: *CheckJob): *Type? with (a: mem.Allocator) {
             if fn_ty == null {
                 return null
             }
-            _ = fn_ty
+            if member_bad || fn_ty!!.kind != TypeKind.FN {
+                i = i + 1
+                continue
+            }
+            // C: member->type = fn_ty + METHOD symbol. Lower reads req type off the FN node.
+            set_node_ty(member, fn_ty)
             i = i + 1
             continue
         }

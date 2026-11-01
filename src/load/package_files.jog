@@ -36,6 +36,7 @@ private struct Walk {
     stack: list.List<str>
     order: list.List<*Package>
     failed: bool
+    include_tests: bool
 }
 
 private fn has_suffix(name: str, suffix: str): bool {
@@ -675,7 +676,7 @@ private fn load_package(w: *Walk, has_mod: bool, mod: Module, path: str, name: s
     w.states.push(state)
     w.stack.push(pkg.path)
 
-    val include_tests = false
+    val include_tests = w.include_tests && has_mod && mod.is_root
     val allow_empty = has_mod && mod.is_library && mod.manifest.exports.len > 0 && dir == mod.root
     var refs = list.empty<ImportRef>()
     var files_ok = load_files(pkg, include_tests, allow_empty, err_file, err_line, err_column, &refs)
@@ -719,7 +720,7 @@ private fn load_package(w: *Walk, has_mod: bool, mod: Module, path: str, name: s
  * @context a allocator
  * @return the program and true, or an empty program and false on error
  */
-fn load_root_sources(root_mod: Module, man_path: str, roots: Roots, mods: list.List<Module>): (Program, bool) with (a: mem.Allocator) {
+fn load_root_sources(root_mod: Module, man_path: str, roots: Roots, mods: list.List<Module>, include_tests: bool): (Program, bool) with (a: mem.Allocator) {
     var w: Walk
     w.roots = roots
     w.root_mod = root_mod
@@ -729,6 +730,7 @@ fn load_root_sources(root_mod: Module, man_path: str, roots: Roots, mods: list.L
     w.stack = list.empty<str>()
     w.order = list.empty<*Package>()
     w.failed = false
+    w.include_tests = include_tests
 
     var back = false
     val root = load_package(&w, true, root_mod, "", root_mod.name, root_mod.root, man_path, root_mod.manifest.name_line, root_mod.manifest.name_column, &back)

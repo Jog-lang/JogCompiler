@@ -158,10 +158,11 @@ private fn parse_int_text(text: str): (i64, bool) {
 }
 
 private fn int_fits_u64(value: u64, ty: *Type): bool {
-    if ty.kind != TypeKind.INT || ty.int_signed {
+    val (bits_u, is_signed, ok) = type_host_int_info(ty)
+    if !ok || is_signed {
         return false
     }
-    var bits = ty.int_bits as i32
+    var bits = bits_u as i32
     if bits <= 0 || bits > 64 {
         return false
     }
@@ -178,15 +179,16 @@ private fn int_fits_u64(value: u64, ty: *Type): bool {
 }
 
 private fn int_fits(value: i64, ty: *Type): bool {
-    if ty.kind != TypeKind.INT {
+    val (bits_u, is_signed, ok) = type_host_int_info(ty)
+    if !ok {
         return false
     }
-    var bits = ty.int_bits as i32
+    var bits = bits_u as i32
     if bits <= 0 || bits > 64 {
         return false
     }
     // Hardcoded limits: Jog i64 shifts of 31+ are not reliable for bound math.
-    if !ty.int_signed {
+    if !is_signed {
         if value < 0 {
             return false
         }

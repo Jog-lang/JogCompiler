@@ -8,18 +8,21 @@ import std.mem
 
 /**
  * Type-check a loaded program. Step 4 checks core function bodies.
+ * On success, prog.types holds the type table for lowering.
  * @param prog packages in dependency order from load.run
  * @context a allocator for the type table and jobs
- * @return 0 on success; non-zero on failure
+ * @return updated program and 0 on success; non-zero on failure
  */
-fn run(prog: load.Program): i32 with (a: mem.Allocator) {
-    if prog.packages.len == 0 {
+fn run(prog: load.Program): (load.Program, i32) with (a: mem.Allocator) {
+    var out = prog
+    out.types = null
+    if out.packages.len == 0 {
         io.eprintln("jogc: check received no packages")
-        return 1
+        return out, 1
     }
-    var ck = check_new(prog, 8)
+    var ck = check_new(out, 8)
     if !collect_jobs(&ck) {
-        return 1
+        return out, 1
     }
     if ck.jobs.len > 0 {
         // run_jobs returns false when failed; still run duplicate-method
@@ -29,18 +32,26 @@ fn run(prog: load.Program): i32 with (a: mem.Allocator) {
             check_method_duplicates(&ck)
         }
         if !ok || ck.failed || ck.stop {
-            return 1
+            return out, 1
         }
     }
     if ck.failed || ck.stop {
-        return 1
+        return out, 1
     }
     if !check_platform(&ck) {
-        return 1
+        return out, 1
     }
     check_package_tests(&ck)
     if ck.failed || ck.stop {
-        return 1
+        return out, 1
     }
-    return 0
+    // Keep the type table for emit-ir / lowering (lists share heap storage).
+    val (raw, err) = a.alloc(size(TypeTable), align(TypeTable))
+    if err != null {
+        panic("out of memory")
+    }
+    val table = raw.ptr as *TypeTable
+    *table = ck.types
+    out.types = table as *u8?
+    return out, 0
 }

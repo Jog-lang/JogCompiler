@@ -66,6 +66,8 @@ struct Check {
     coro_insts: list.List<CoroInst>
     // Self-alias on-demand cycles deferred so other decls' first errors match stage0.
     deferred_cycles: list.List<usize>
+    // When true, check_decl_types publishes FN signatures but skips bodies.
+    defer_fn_bodies: bool
 }
 
 private fn is_scheduled(node: *parse.Node): bool {
@@ -160,15 +162,68 @@ private fn schedule_node(ck: *Check, pkg: *load.Package, file_index: usize, file
     push_job(ck, pkg, file_index, file, node)
 }
 
-/**
- * Build one job per top-level declaration that needs checking.
- * @param ck checker
- * @context a allocator for jobs
- * @return false when collection failed
- */
+// head bit 262144 is the function body (parse.fn_shape).
+private fn fn_has_body_shape(node: *parse.Node): bool {
+    return (node.head / 262144) % 2 == 1
+}
+
+// True when a signature ident or type name is `name`. The body is skipped:
+// a call parks after the function type already exists.
+private fn signature_mentions(node: *parse.Node, name: str): bool {
+    if (parse.is_type_name(node) || parse.is_ident(node)) && node.name == name {
+        return true
+    }
+    var limit = node.kids.len
+    if parse.is_fn(node) && fn_has_body_shape(node) && limit > 0 {
+        limit = limit - 1
+    }
+    var i: usize = 0
+    for i < limit {
+        if signature_mentions(node.kids.get(i), name) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// C starts every job, and an extern signature that names a later decl
+// parks while later functions run. puts waits on c_char, so main's
+// () -> () is allocated before *const i8 and the extern fn type.
+// Other functions stay in source order.
+private fn signature_waits_later(file: *parse.Node, index: usize): bool {
+    val node = file.kids.get(index)
+    // A signature that names a later decl parks, same as an extern waiting
+    // on c_char. Functions that do not name a later decl keep source order,
+    // so their type is allocated before a struct that follows them.
+    if !parse.is_fn(node) && !parse.is_extern_block(node) {
+        return false
+    }
+    var j = index + 1
+    for j < file.kids.len {
+        val later = file.kids.get(j)
+        if later.name.len > 0 && signature_mentions(node, later.name) {
+            return true
+        }
+        if parse.is_extern_block(later) {
+            for kid in later.kids.items() {
+                if kid.name.len > 0 && signature_mentions(node, kid.name) {
+                    return true
+                }
+            }
+        }
+        j = j + 1
+    }
+    return false
+}
+
 fn collect_jobs(ck: *Check): bool with (a: mem.Allocator) {
     var n: usize = 0
     for pkg in ck.prog.packages.items() {
+        // Only reorder user/e2e packages. Reordering std shifts ErrorArena
+        // and friends (stdio −1 cluster). Iface +2 is from user-file extern
+        // puts before structs under the single sequential worker.
+        val reorder = !pkg.is_std
         var fi: usize = 0
         for fi < pkg.files.len {
             val source = pkg.files.get(fi)
@@ -177,11 +232,46 @@ fn collect_jobs(ck: *Check): bool with (a: mem.Allocator) {
                 continue
             }
             val file_node = source.ast!!
-            for kid in file_node.kids.items() {
-                schedule_node(ck, pkg, fi, source.path, kid)
-                n = n + 1
-                if n % 64 == 0 {
-                    yield()
+            if reorder {
+                // Source order, except a signature that names a later decl.
+                // That parks the way puts waits on c_char, so the later
+                // struct or type is allocated first. A function that does
+                // not name a later decl stays ahead of a following struct.
+                var ki: usize = 0
+                for ki < file_node.kids.len {
+                    if signature_waits_later(file_node, ki) {
+                        ki = ki + 1
+                        continue
+                    }
+                    val kid = file_node.kids.get(ki)
+                    schedule_node(ck, pkg, fi, source.path, kid)
+                    n = n + 1
+                    if n % 64 == 0 {
+                        yield()
+                    }
+                    ki = ki + 1
+                }
+                ki = 0
+                for ki < file_node.kids.len {
+                    if !signature_waits_later(file_node, ki) {
+                        ki = ki + 1
+                        continue
+                    }
+                    val kid = file_node.kids.get(ki)
+                    schedule_node(ck, pkg, fi, source.path, kid)
+                    n = n + 1
+                    if n % 64 == 0 {
+                        yield()
+                    }
+                    ki = ki + 1
+                }
+            } else {
+                for kid in file_node.kids.items() {
+                    schedule_node(ck, pkg, fi, source.path, kid)
+                    n = n + 1
+                    if n % 64 == 0 {
+                        yield()
+                    }
                 }
             }
             fi = fi + 1
@@ -290,20 +380,55 @@ fn wait_for_symbol(ck: *Check, self: *CheckJob, symbol: *load.Symbol, until_done
             }
         }
     }
-    // Worker pool: run an unstarted callee on this stack (on-demand). If it
-    // is already running, park — unless it is an on-demand ancestor on this
-    // same stack (real cycle). "Started but not parked" alone is not a
-    // cycle: another pool worker may be mid-check.
-    //
-    // Mark self parked while on-demand runs so a third job waiting on self
-    // can form a visible wait chain (otherwise self is stuck in a sync call
-    // and blocked() never fires → "declaration check did not finish").
+    // On-demand: drain intervening method sigs + type/val decls in a bounded
+    // window (Malloc→ErrorArena). Freestanding FN bodies are never nested.
     if !o.started {
         self.waiting_for = other
         self.parked = true
-        o.on_demand_caller = self as *CheckJob?
-        run_job(ck, o, a)
-        o.on_demand_caller = null
+        val oi = job_index(ck, o)
+        val si = job_index(ck, self)
+        if oi > si && oi - si <= 24 {
+            val saved_defer = ck.defer_fn_bodies
+            var i = si + 1
+            for i < oi {
+                val mid = ck.jobs.get(i)
+                if mid.started || mid.done {
+                    i = i + 1
+                    continue
+                }
+                val d = mid.decl
+                val is_method = parse.is_fn(d) && parse.fn_has_receiver(d)
+                val is_typeish = parse.is_type_decl(d) || parse.is_struct(d) || parse.is_enum(d) ||
+                    parse.is_interface(d) || parse.is_val(d) || parse.is_var(d) || parse.is_context(d)
+                val is_plain_fn = parse.is_fn(d) && !parse.fn_has_receiver(d)
+                if !is_method && !is_typeish && !is_plain_fn {
+                    i = i + 1
+                    continue
+                }
+                // Methods and plain FNs: signature only. Type/val: full check.
+                // Nesting plain FN bodies here breaks std/io (undefined locals)
+                // and error iface returns (open_failed / ErrIO wrap).
+                ck.defer_fn_bodies = is_method || is_plain_fn
+                mid.on_demand_caller = self as *CheckJob?
+                run_job(ck, mid, a)
+                mid.on_demand_caller = null
+                ck.current = self as *CheckJob?
+                if ck.stop {
+                    ck.defer_fn_bodies = saved_defer
+                    self.parked = false
+                    self.waiting_for = null
+                    return false
+                }
+                i = i + 1
+            }
+            ck.defer_fn_bodies = saved_defer
+        }
+        if !o.started {
+            o.on_demand_caller = self as *CheckJob?
+            run_job(ck, o, a)
+            o.on_demand_caller = null
+            ck.current = self as *CheckJob?
+        }
         self.parked = false
         self.waiting_for = null
         if o.done || ck.stop {
@@ -551,24 +676,21 @@ private fn run_job(ck: *Check, job: *CheckJob, stack: mem.Allocator) {
  * @return false when a cycle or other failure was reported
  */
 fn run_jobs(ck: *Check): bool with (a: mem.Allocator) {
-    // C launches one coroutine per job. Jog's default stacks are 256 KiB, so
-    // one go per decl OOMs on a full module, and nested on-demand waits on a
-    // 256 KiB worker overflow (ACCESS_VIOLATION) when checking JogCompiler.
-    // Fixed worker pool with 1 MiB stacks; wait_for_symbol still parks with
-    // yield (needed for context inference). Capture the allocator in a local:
-    // `go with (a)` on a context parameter fails with "global values are not
-    // lowered yet".
+    // C: one go per job (OOMs here). Pool of workers + intervening sig-drain
+    // so on-demand jumps still publish method FN types before later structs.
     val stack = a
-    var next_i: usize = 0
-    var workers_left: usize = 8
-    if ck.jobs.len < workers_left {
-        workers_left = ck.jobs.len
-    }
-    if workers_left == 0 {
+    if ck.jobs.len == 0 {
         return !ck.failed
     }
-    val nworkers = workers_left
-    val worker_stack: usize = 1 << 20
+    var next_i: usize = 0
+    // One claim worker: Type.id follows decl order. Narrow on-demand drain
+    // covers Malloc→ErrorArena without nesting freestanding FN bodies.
+    val workers_left: usize = 1
+    // 8 MiB of usable stack, plus the runtime's 64 KiB guard. 1 MiB was
+    // too small to check jogc. This size is what stage 1 `check .` and
+    // `build .` of jogc both pass.
+    val worker_stack: usize = 8 << 20
+    ck.defer_fn_bodies = false
     scope {
         go(stack: worker_stack) with (stack) {
             var idle: usize = 0
@@ -606,23 +728,87 @@ fn run_jobs(ck: *Check): bool with (a: mem.Allocator) {
                 }
             }
         }
-        var w: usize = 0
-        for w < nworkers {
-            go(stack: worker_stack) with (stack) {
-                for {
-                    if ck.stop {
-                        return
+        go(stack: worker_stack) with (stack) {
+            for {
+                if ck.stop {
+                    return
+                }
+                if next_i >= ck.jobs.len {
+                    return
+                }
+                val i = next_i
+                next_i = next_i + 1
+                run_job(ck, ck.jobs.get(i), stack)
+                yield()
+            }
+        }
+    }
+    // Bodies deferred during on-demand sig-drain.
+    if !ck.stop && !ck.failed {
+        var any_sig = false
+        for j in ck.jobs.items() {
+            if j.sig_ready {
+                any_sig = true
+                break
+            }
+        }
+        if any_sig {
+            // Re-enter a tiny pool so deferred bodies can park/yield if needed.
+            var body_i: usize = 0
+            scope {
+                go(stack: worker_stack) with (stack) {
+                    var idle: usize = 0
+                    for {
+                        yield()
+                        if ck.stop {
+                            return
+                        }
+                        var left: usize = 0
+                        for j in ck.jobs.items() {
+                            if j.sig_ready {
+                                left = left + 1
+                            }
+                        }
+                        if left == 0 {
+                            return
+                        }
+                        idle = idle + 1
+                        if idle > ck.jobs.len + 64 {
+                            load.print_bare_error("declaration check did not finish")
+                            ck.failed = true
+                            ck.stop = true
+                            return
+                        }
                     }
-                    if next_i >= ck.jobs.len {
-                        return
+                }
+                go(stack: worker_stack) with (stack) {
+                    for {
+                        if ck.stop {
+                            return
+                        }
+                        var claimed: *CheckJob? = null
+                        for {
+                            if body_i >= ck.jobs.len {
+                                break
+                            }
+                            val j = ck.jobs.get(body_i)
+                            body_i = body_i + 1
+                            if j.sig_ready {
+                                claimed = j as *CheckJob?
+                                break
+                            }
+                        }
+                        if claimed == null {
+                            return
+                        }
+                        val job = claimed!!
+                        job.sig_ready = false
+                        ck.current = job as *CheckJob?
+                        check_fn_body(ck, job) with (stack)
+                        yield()
                     }
-                    val i = next_i
-                    next_i = next_i + 1
-                    run_job(ck, ck.jobs.get(i), stack)
-                    yield()
                 }
             }
-            w = w + 1
         }
     }
     // Flush deferred self-alias cycles after other jobs have reported.
@@ -656,6 +842,7 @@ fn check_new(prog: load.Program, ptr_size: u32): Check with (a: mem.Allocator) {
     ck.allow_typeset = false
     ck.coro_insts = list.empty<CoroInst>()
     ck.deferred_cycles = list.empty<usize>()
+    ck.defer_fn_bodies = false
     attach_universe_types(&ck)
     return ck
 }

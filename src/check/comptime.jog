@@ -3,8 +3,10 @@
 // Operator intrinsics (@add, ...) are gated in body.jog (check_op_intrinsic).
 
 import src.parse
+import std.fs
 import std.mem
 import std.strbuilder
+import std.text as texts
 
 private fn arg_value(arg: *parse.Node?): *parse.Node? {
     if arg == null {
@@ -29,13 +31,146 @@ fn is_op_intrinsic_name(name: str): bool {
         name == "bitnot" || name == "not"
 }
 
+private fn is_path_sep(b: u8): bool {
+    return b == '/' as u8 || b == '\\' as u8
+}
+
+private fn parent_dir(path: str): str {
+    if path.len == 0 {
+        return "."
+    }
+    var end = path.len
+    for end > 1 && is_path_sep(path.ptr[end - 1]) {
+        end = end - 1
+    }
+    var slash = end
+    for slash > 0 && !is_path_sep(path.ptr[slash - 1]) {
+        slash = slash - 1
+    }
+    if slash == 0 {
+        return "."
+    }
+    if slash == 1 {
+        // Keep the leading separator as root.
+        return texts.slice(path, 0, 1)
+    }
+    return texts.slice(path, 0, slash - 1)
+}
+
+private fn is_absolute_embed(path: str): bool {
+    if path.len == 0 {
+        return false
+    }
+    if is_path_sep(path.ptr[0]) {
+        return true
+    }
+    if path.len >= 2 && path.ptr[1] == ':' as u8 {
+        val c = path.ptr[0]
+        if (c >= 'A' as u8 && c <= 'Z' as u8) || (c >= 'a' as u8 && c <= 'z' as u8) {
+            return true
+        }
+    }
+    return false
+}
+
+private fn fold_ascii(b: u8): u8 {
+    if b >= 'A' as u8 && b <= 'Z' as u8 {
+        return b + 32
+    }
+    if b == '\\' as u8 {
+        return '/' as u8
+    }
+    return b
+}
+
+private fn path_inside(root: str, full: str): bool {
+    if root.len == 0 || full.len < root.len {
+        return false
+    }
+    var i: usize = 0
+    for i < root.len {
+        if fold_ascii(root.ptr[i]) != fold_ascii(full.ptr[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    if full.len == root.len {
+        return true
+    }
+    if is_path_sep(root.ptr[root.len - 1]) {
+        return true
+    }
+    return is_path_sep(full.ptr[root.len])
+}
+
+private fn module_boundary(ck: *Check, source_file: str): str {
+    for pkg in ck.prog.packages.items() {
+        if pkg.module_root.len == 0 {
+            continue
+        }
+        for sf in pkg.files.items() {
+            if sf.path == source_file {
+                return pkg.module_root
+            }
+        }
+    }
+    return ""
+}
+
+private fn check_embed(env: *Env, node: *parse.Node): *Type? with (a: mem.Allocator) {
+    if node.kids.len != 1 {
+        env_fail(env, node, "@embed expects one argument")
+        return err_ty(env.ck) as *Type?
+    }
+    val expr = arg_value(node.kids.get(0) as *parse.Node?)
+    if expr == null {
+        env_fail(env, node, "@embed expects one argument")
+        return err_ty(env.ck) as *Type?
+    }
+    if !parse.is_string_lit(expr!!) {
+        env_fail(env, node, "@embed expects a string literal")
+        return err_ty(env.ck) as *Type?
+    }
+    val literal = expr!!.text
+    if is_absolute_embed(literal) {
+        env_fail(env, node, "@embed path must be a relative file path")
+        return err_ty(env.ck) as *Type?
+    }
+    val source = env.job.file
+    if source.len == 0 {
+        env_fail(env, node, "@embed path escapes the module")
+        return err_ty(env.ck) as *Type?
+    }
+    val parent = parent_dir(source)
+    val joined = fs.join(parent, literal)
+    var boundary = module_boundary(env.ck, source)
+    if boundary.len == 0 {
+        boundary = parent
+    }
+    if !path_inside(boundary, joined) {
+        env_fail(env, node, "@embed path escapes the module")
+        return err_ty(env.ck) as *Type?
+    }
+    if !fs.exists(joined) {
+        var b = strbuilder.empty()
+        b.append("cannot embed '")
+        b.append(literal)
+        b.append("': file is missing")
+        env_fail(env, node, b.str())
+        b.free()
+        return err_ty(env.ck) as *Type?
+    }
+    val got = type_builtin(&env.ck.types, Builtin.CONST_BYTES) as *Type?
+    set_node_ty(node, got)
+    return got
+}
+
 /**
- * Type-check @comptime(expr). @embed is not implemented yet.
+ * Type-check @comptime(expr) or @embed("path").
  */
 fn check_comptime(env: *Env, node: *parse.Node, target: *Type?): *Type? with (a: mem.Allocator) {
     if node.name == "embed" {
-        env_fail(env, node, "attribute 'embed' is not checked yet")
-        return err_ty(env.ck) as *Type?
+        return check_embed(env, node)
     }
     if node.name != "comptime" {
         var b = strbuilder.empty()
@@ -55,4 +190,24 @@ fn check_comptime(env: *Env, node: *parse.Node, target: *Type?): *Type? with (a:
         return err_ty(env.ck) as *Type?
     }
     return check_expr(env, expr!!, target)
+}
+
+/**
+ * Full path for an @embed literal relative to `source_file`.
+ * `module_root` is the package module root (or empty to use the source parent).
+ */
+fn embed_resolve(source_file: str, literal: str, module_root: str): str with (a: mem.Allocator) {
+    if is_absolute_embed(literal) || source_file.len == 0 {
+        return ""
+    }
+    val parent = parent_dir(source_file)
+    val joined = fs.join(parent, literal)
+    var boundary = module_root
+    if boundary.len == 0 {
+        boundary = parent
+    }
+    if !path_inside(boundary, joined) {
+        return ""
+    }
+    return joined
 }

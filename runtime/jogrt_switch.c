@@ -177,7 +177,7 @@ static size_t jogrt_page_size(void) {
     return page;
 }
 
-enum { JOGRT_STACK_DEFAULT = 256 * 1024, JOGRT_REGION_MAX = 4096 };
+enum { JOGRT_STACK_DEFAULT = 256 * 1024, JOGRT_GUARD_BYTES = 64 * 1024, JOGRT_REGION_MAX = 4096 };
 
 typedef struct JogrtRegion {
     uintptr_t base;
@@ -195,6 +195,26 @@ static void jogrt_guard_hit(void) {
 }
 
 #if defined(_WIN32)
+/* jogrt_panic does not fit in the bytes left above a guard hit. The POSIX
+   handler already runs on an alt stack. This is that stack for Windows. */
+static unsigned char g_fault_stack[64 * 1024];
+
+__attribute__((noreturn))
+static void jogrt_guard_hit_switched(void) {
+    uintptr_t top = (uintptr_t)(g_fault_stack + sizeof g_fault_stack);
+    void (*hit)(void) = jogrt_guard_hit;
+    top &= ~(uintptr_t)15u;
+    __asm__ volatile (
+        "movq %0, %%rsp\n\t"
+        "subq $32, %%rsp\n\t"
+        "call *%1\n\t"
+        :
+        : "r"(top), "r"(hit)
+        : "memory"
+    );
+    __builtin_unreachable();
+}
+
 static LONG CALLBACK jogrt_guard_fault(EXCEPTION_POINTERS *info) {
     uintptr_t addr;
     size_t i;
@@ -210,7 +230,7 @@ static LONG CALLBACK jogrt_guard_fault(EXCEPTION_POINTERS *info) {
     addr = (uintptr_t)info->ExceptionRecord->ExceptionInformation[1];
     for (i = 0; i < g_region_count; i++) {
         if (addr >= g_regions[i].base && addr < g_regions[i].guard_end) {
-            jogrt_guard_hit();
+            jogrt_guard_hit_switched();
         }
     }
     return EXCEPTION_CONTINUE_SEARCH;
@@ -279,19 +299,32 @@ void jogrt_stack_guard_init(void) {
     g_guard_ready = 1;
 }
 
-static void jogrt_note_region(void *base, size_t page, size_t bytes) {
+/* 64 KiB, or one page when the page is larger, rounded up to whole pages. */
+static size_t jogrt_guard_bytes(size_t page) {
+    size_t guard = JOGRT_GUARD_BYTES;
+    if (page == 0) {
+        return guard;
+    }
+    if (guard < page) {
+        guard = page;
+    }
+    return (guard + page - 1u) & ~(page - 1u);
+}
+
+static void jogrt_note_region(void *base, size_t guard, size_t bytes) {
     JogrtRegion region;
     if (g_region_count >= JOGRT_REGION_MAX) {
         return;
     }
     region.base = (uintptr_t)base;
-    region.guard_end = region.base + page;
+    region.guard_end = region.base + guard;
     region.end = region.base + bytes;
     g_regions[g_region_count++] = region;
 }
 
 bool jogrt_stack_alloc(size_t usable, void **base, void **top) {
     size_t page;
+    size_t guard;
     size_t bytes;
     uintptr_t aligned;
     if (!base || !top) {
@@ -310,7 +343,8 @@ bool jogrt_stack_alloc(size_t usable, void **base, void **top) {
         usable = page;
     }
     usable = (usable + page - 1u) & ~(page - 1u);
-    bytes = page + usable;
+    guard = jogrt_guard_bytes(page);
+    bytes = guard + usable;
     jogrt_stack_guard_init();
 
 #if defined(_WIN32)
@@ -320,11 +354,11 @@ bool jogrt_stack_alloc(size_t usable, void **base, void **top) {
         if (!block) {
             return false;
         }
-        if (!VirtualProtect(block, page, PAGE_NOACCESS, &previous)) {
+        if (!VirtualProtect(block, guard, PAGE_NOACCESS, &previous)) {
             VirtualFree(block, 0, MEM_RELEASE);
             return false;
         }
-        jogrt_note_region(block, page, bytes);
+        jogrt_note_region(block, guard, bytes);
         aligned = (uintptr_t)block + bytes;
         aligned &= ~(uintptr_t)15u;
         *base = block;
@@ -337,11 +371,11 @@ bool jogrt_stack_alloc(size_t usable, void **base, void **top) {
         if (posix_memalign(&block, page, bytes) != 0 || !block) {
             return false;
         }
-        if (mprotect(block, page, PROT_NONE) != 0) {
+        if (mprotect(block, guard, PROT_NONE) != 0) {
             free(block);
             return false;
         }
-        jogrt_note_region(block, page, bytes);
+        jogrt_note_region(block, guard, bytes);
         aligned = (uintptr_t)block + bytes;
         aligned &= ~(uintptr_t)15u;
         *base = block;

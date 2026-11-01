@@ -331,12 +331,13 @@ fn generic_subst(
     }
 }
 
-private fn nominal_symbol(ck: *Check, ty: *Type): *load.Symbol? {
+/** Find the template symbol for a nominal type via its decl (used by lower subst). */
+fn find_nominal_symbol(prog: load.Program, ty: *Type): *load.Symbol? {
     if ty.decl == null {
         return null
     }
     val decl = ty.decl
-    for pkg in ck.prog.packages.items() {
+    for pkg in prog.packages.items() {
         for i in 0 as usize..pkg.scope.bindings.len {
             val s = pkg.scope.bindings.at(i)
             if ptr_eq_node(s.decl, decl) {
@@ -354,6 +355,15 @@ private fn nominal_symbol(ck: *Check, ty: *Type): *load.Symbol? {
         }
     }
     return null
+}
+
+private fn nominal_symbol(ck: *Check, ty: *Type): *load.Symbol? {
+    return find_nominal_symbol(ck.prog, ty)
+}
+
+/** Look up an existing monomorphized struct/enum instance (checker already built it). */
+fn find_nominal_instance(sym: *load.Symbol, args: list.List<*Type>): *Type? {
+    return find_nominal(sym, args)
 }
 
 private fn fn_has_attr(node: *parse.Node, name: str): bool {
@@ -1726,6 +1736,10 @@ fn generic_instantiate(
     if !(cerr == null) {
         return cerr
     }
+    call.solved_type_args = list.empty<*u8>()
+    for a_ty in args.items() {
+        call.solved_type_args.push(a_ty as *u8)
+    }
     return generic_subst(ck, fn_type as *Type?, params, args)
 }
 
@@ -1939,6 +1953,10 @@ fn generic_instantiate_method(
     }
     if !(cerr == null) {
         return cerr
+    }
+    call.solved_type_args = list.empty<*u8>()
+    for a_ty in args.items() {
+        call.solved_type_args.push(a_ty as *u8)
     }
     return generic_subst(ck, fn_type as *Type?, params, args)
 }

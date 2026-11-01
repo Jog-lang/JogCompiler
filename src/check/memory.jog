@@ -278,6 +278,9 @@ fn check_memory_call(env: *Env, node: *parse.Node): (*Type?, i32) with (a: mem.A
     if nctx > 0 {
         return null, 0
     }
+    // C attaches the TYPE symbol on the callee so lower can match bytes().
+    set_node_sym(callee, sym)
+    set_node_ty(callee, ty)
     if node.kids.len > 1 {
         env_fail(env, node, "bytes() does not take arguments")
         var i: usize = 1
@@ -293,6 +296,7 @@ fn check_memory_call(env: *Env, node: *parse.Node): (*Type?, i32) with (a: mem.A
         }
         return err_ty(env.ck) as *Type?, 1
     }
+    set_node_ty(node, ty)
     return ty, 1
 }
 
@@ -824,6 +828,8 @@ fn check_memory_assign(env: *Env, node: *parse.Node) with (a: mem.Allocator) {
     if elem == null || env.ck.stop {
         return
     }
+    // C sets target->type so lower can detect PTR compound (*p += n → elem_addr).
+    set_node_ty(target, elem)
     if !type_is_error(elem!!) {
         val place = place_of(env, target)
         if place == Place.NO {

@@ -361,6 +361,42 @@ static void touch_guard(void) {
     guard[0] = 1;
 }
 
+/* One recursive step stores 12 KiB below the live stack pointer and does
+   not touch the pages in between. That is wider than a 4 KiB guard and
+   narrower than the 64 KiB guard. The usable stack is 8 KiB, so the first
+   call is already past the usable range. A skipped guard returns; a hit
+   panics with "stack overflow". */
+static void wide_frame(void *env);
+
+static void (*wide_hop)(void *) = wide_frame;
+
+static void wide_frame(void *env) {
+    volatile char anchor;
+    volatile char *low;
+    int depth = env ? *(int *)env : 0;
+    int next;
+    anchor = (char)depth;
+    low = &anchor - (12 * 1024);
+    if (depth >= 6) {
+        fputs("wide-returned\n", stderr);
+        return;
+    }
+    next = depth + 1;
+    low[0] = 1;
+    wide_hop(&next);
+    anchor = low[0];
+}
+
+static void run_wide(void) {
+    int depth = 0;
+    if (!jogrt_go(wide_frame, &depth, 8 * 1024, NULL, "wide", 1)) {
+        fputs("no-go\n", stderr);
+        return;
+    }
+    jogrt_yield();
+    fputs("wide-returned\n", stderr);
+}
+
 static void boom_fn(void *env) {
     (void)env;
     jogrt_panic("boom", 4, "rt.c", 12);
@@ -465,6 +501,10 @@ static int child_main(int argc, char **argv) {
     if (strcmp(mode, "stack") == 0) {
         touch_guard();
         fputs("stack-returned\n", stderr);
+        return 2;
+    }
+    if (strcmp(mode, "wide") == 0) {
+        run_wide();
         return 2;
     }
     if (strcmp(mode, "uncatch") == 0) {
@@ -578,26 +618,31 @@ static void test_panics(void) {
     expect_panic("uncatch", "panic: after\n  at rt.c:7\n");
 }
 
-static void test_stack_overflow(void) {
+static void expect_stack_panic(const char *mode) {
     int code = -1;
     char *got = NULL;
-    int ran = run_mode("stack", NULL, &code, &got);
+    int ran = run_mode(mode, NULL, &code, &got);
     CHECK(ran);
     if (!ran) {
-        fprintf(stderr, "  stack did not start\n");
+        fprintf(stderr, "  %s did not start\n", mode);
         free(got);
         return;
     }
     if (!is_abort_status(code)) {
-        fprintf(stderr, "  stack status %d (0x%x)\n", code, (unsigned)code);
+        fprintf(stderr, "  %s status %d (0x%x)\n", mode, code, (unsigned)code);
     }
     CHECK(is_abort_status(code));
     int saw = got && strstr(got, "panic: stack overflow\n");
     if (!saw) {
-        fprintf(stderr, "  stack stderr:\n%s\n", got ? got : "(null)");
+        fprintf(stderr, "  %s stderr:\n%s\n", mode, got ? got : "(null)");
     }
     CHECK(saw);
     free(got);
+}
+
+static void test_stack_overflow(void) {
+    expect_stack_panic("stack");
+    expect_stack_panic("wide");
 }
 
 static void test_exit(void) {

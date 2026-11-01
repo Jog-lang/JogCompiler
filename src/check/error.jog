@@ -633,10 +633,13 @@ fn check_error_binding(env: *Env, node: *parse.Node) with (a: mem.Allocator) {
     }
     if annotated != null && !is_poison(annotated) {
         bind_elements(env, node, annotated!!, init != null)
+        // bind_local overwrites node.ty with each element; restore the tuple.
+        set_node_ty(node, annotated)
         return
     }
     if got != null && !is_poison(got) {
         bind_elements(env, node, got!!, true)
+        set_node_ty(node, got)
         return
     }
 }
@@ -835,6 +838,8 @@ private fn fill_expect(env: *Env, target: *parse.Node?, out: *Expect): i32 with 
         if !wait_for_symbol(env.ck, env.job, symbol!!, false) {
             return -1
         }
+        set_node_sym(target!!, symbol)
+        set_node_ty(target!!, get_sema(symbol!!))
         out.ty = get_sema(symbol!!)
         if !load.is_symbol_variable(symbol!!) && symbol!!.kind != load.kind_parameter() {
             var b = strbuilder.empty()
@@ -876,6 +881,7 @@ private fn fill_expect(env: *Env, target: *parse.Node?, out: *Expect): i32 with 
         }
         if complete {
             out.ty = type_tuple(&env.ck.types, elems) as *Type?
+            set_node_ty(target!!, out.ty)
         }
         return 1
     }
@@ -932,7 +938,9 @@ private fn check_against(
         if env.ck.stop {
             return null
         }
-        return type_tuple(&env.ck.types, elems) as *Type?
+        val built = type_tuple(&env.ck.types, elems) as *Type?
+        set_node_ty(node, built)
+        return built
     }
     val built = check_expr(env, node, null)
     if built == null || env.ck.stop {
@@ -960,6 +968,9 @@ private fn accept_slots(
         val slot = slots.get(i)
         val target = slot.target
         if slot.discard {
+            if target != null {
+                set_node_ty(target!!, elem)
+            }
             i = i + 1
             continue
         }
@@ -1054,6 +1065,7 @@ fn check_error_destructure(env: *Env, node: *parse.Node) with (a: mem.Allocator)
     if !is_poison(got) {
         accept_slots(env, slots, count, got!!, literal)
     }
+    set_node_ty(node, type_builtin(&env.ck.types, Builtin.UNIT) as *Type?)
 }
 
 /**

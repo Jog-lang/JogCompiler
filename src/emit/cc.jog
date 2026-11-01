@@ -1,0 +1,450 @@
+// C compiler driver. Checked against compiler/src/cc.c (jog_cc_build).
+// std.proc does not search PATH, so find_compiler resolves the binary first.
+// std.fs has no mkdir or remove; directory and delete go through Win32.
+
+import std.c
+import std.fs
+import std.io
+import std.list
+import std.mem
+import std.os
+import std.proc
+import std.strbuilder
+import std.text as texts
+
+private fn say(text: str) {
+    io.eprintln(text)
+}
+
+private fn say3(a: str, b: str, c: str) with (alloc: mem.Allocator) {
+    var buf = strbuilder.empty()
+    buf.append(a)
+    buf.append(b)
+    buf.append(c)
+    say(buf.str())
+}
+
+private fn is_sep(b: u8): bool {
+    return b == '/' as u8 || b == '\\' as u8
+}
+
+private fn attributes(path: str): (c.unsigned_long, bool) {
+    if path.len == 0 || path.len >= 4096 {
+        return 0, false
+    }
+    var wide: [4096]u16
+    if !c.utf8_to_wide(path, wide[..].ptr, 4096) {
+        return 0, false
+    }
+    val attr = c.GetFileAttributesW(wide[..].ptr)
+    if attr == 4294967295 {
+        return 0, false
+    }
+    return attr, true
+}
+
+private fn is_dir(path: str): bool {
+    val (attr, ok) = attributes(path)
+    if !ok {
+        return false
+    }
+    val dir: c.unsigned_long = 16
+    return (attr & dir) != 0
+}
+
+private fn is_file(path: str): bool {
+    val (attr, ok) = attributes(path)
+    if !ok {
+        return false
+    }
+    val dir: c.unsigned_long = 16
+    return (attr & dir) == 0
+}
+
+private fn ensure_dir(path: str): bool {
+    if path.len == 0 {
+        return false
+    }
+    if is_dir(path) {
+        return true
+    }
+    if path.len >= 4096 {
+        return false
+    }
+    var wide: [4096]u16
+    if !c.utf8_to_wide(path, wide[..].ptr, 4096) {
+        return false
+    }
+    if c.CreateDirectoryW(wide[..].ptr, 0) != 0 {
+        return true
+    }
+    return is_dir(path)
+}
+
+// Create path and any missing parents.
+fn mkdir_p(path: str): bool {
+    if path.len == 0 {
+        return false
+    }
+    if is_dir(path) {
+        return true
+    }
+    var i: usize = 0
+    if path.len >= 2 && path.ptr[1] == ':' as u8 {
+        i = 2
+    }
+    for i < path.len && is_sep(path.ptr[i]) {
+        i = i + 1
+    }
+    var k = i
+    for k < path.len {
+        if is_sep(path.ptr[k]) && k > 0 {
+            val prefix = texts.slice(path, 0, k)
+            if prefix.len > 0 && !ensure_dir(prefix) {
+                return false
+            }
+        }
+        k = k + 1
+    }
+    return ensure_dir(path)
+}
+
+fn remove_file(path: str) {
+    if path.len == 0 || path.len >= 4096 {
+        return
+    }
+    var wide: [4096]u16
+    if !c.utf8_to_wide(path, wide[..].ptr, 4096) {
+        return
+    }
+    _ = c.DeleteFileW(wide[..].ptr)
+}
+
+fn write_text(path: str, text: str): bool with (a: mem.Allocator) {
+    if text.len == 0 {
+        val err = fs.write_all(path, bytes())
+        return err == null
+    }
+    val (raw, err) = a.alloc(text.len, 1)
+    if err != null {
+        return false
+    }
+    var i: usize = 0
+    for i < text.len {
+        raw.ptr[i] = text.ptr[i]
+        i = i + 1
+    }
+    val werr = fs.write_all(path, raw)
+    a.free(raw)
+    return werr == null
+}
+
+private fn base_name(path: str): str {
+    var i = path.len
+    for i > 0 {
+        i = i - 1
+        if is_sep(path.ptr[i]) {
+            return texts.slice(path, i + 1, path.len)
+        }
+    }
+    return path
+}
+
+private fn base_has_dot(name: str): bool {
+    val base = base_name(name)
+    var i: usize = 0
+    for i < base.len {
+        if base.ptr[i] == '.' as u8 {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+private fn has_sep(path: str): bool {
+    var i: usize = 0
+    for i < path.len {
+        if is_sep(path.ptr[i]) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+private fn ascii_lower(b: u8): u8 {
+    if b >= 'A' as u8 && b <= 'Z' as u8 {
+        return b + 32
+    }
+    return b
+}
+
+private fn base_has(path: str, needle: str): bool {
+    val base = base_name(path)
+    if needle.len == 0 || base.len < needle.len {
+        return false
+    }
+    var i: usize = 0
+    for i + needle.len <= base.len {
+        var ok = true
+        var j: usize = 0
+        for j < needle.len {
+            if ascii_lower(base.ptr[i + j]) != needle.ptr[j] {
+                ok = false
+                break
+            }
+            j = j + 1
+        }
+        if ok {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+private fn file_in_dir(dir: str, name: str): str with (a: mem.Allocator) {
+    var path = name
+    var owned = false
+    if dir.len > 0 {
+        path = fs.join(dir, name)
+        owned = true
+    }
+    if is_file(path) {
+        if owned {
+            return path
+        }
+        return fs.copy_str(path)
+    }
+    if !base_has_dot(name) {
+        var exe = strbuilder.empty()
+        exe.append(path)
+        exe.append(".exe")
+        val candidate = fs.copy_str(exe.str())
+        if is_file(candidate) {
+            if owned {
+                fs.free_str(path)
+            }
+            return candidate
+        }
+        fs.free_str(candidate)
+    }
+    if owned {
+        fs.free_str(path)
+    }
+    return ""
+}
+
+private fn search_path(name: str): str with (a: mem.Allocator) {
+    val (raw, has) = os.env("PATH")
+    if !has || raw.len == 0 {
+        return ""
+    }
+    val path = fs.copy_str(raw)
+    var start: usize = 0
+    var i: usize = 0
+    var found = ""
+    for {
+        val at_end = i >= path.len
+        var sep = false
+        if !at_end && path.ptr[i] == ';' as u8 {
+            sep = true
+        }
+        if at_end || sep {
+            var dir = "."
+            if i > start {
+                dir = texts.slice(path, start, i)
+            }
+            val hit = file_in_dir(dir, name)
+            if hit.len > 0 {
+                found = hit
+                break
+            }
+            if at_end {
+                break
+            }
+            i = i + 1
+            start = i
+            continue
+        }
+        i = i + 1
+    }
+    fs.free_str(path)
+    return found
+}
+
+// Path of the compiler, and the JOG_CC text when that variable selected it.
+private fn find_compiler(): (str, str) with (a: mem.Allocator) {
+    val (cc_view, has_cc) = os.env("JOG_CC")
+    var override = ""
+    if has_cc && cc_view.len > 0 {
+        override = fs.copy_str(cc_view)
+    }
+    if override.len > 0 {
+        if has_sep(override) {
+            return file_in_dir("", override), override
+        }
+        return search_path(override), override
+    }
+    val clang = search_path("clang")
+    if clang.len > 0 {
+        return clang, ""
+    }
+    return search_path("gcc"), ""
+}
+
+private fn ends_with(path: str, suffix: str): bool {
+    if path.len < suffix.len {
+        return false
+    }
+    val start = path.len - suffix.len
+    var i: usize = 0
+    for i < suffix.len {
+        if path.ptr[start + i] != suffix.ptr[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+private fn push_mode(args: *list.List<str>, mode: i32): bool {
+    if mode == 0 {
+        args.push("-O0")
+        args.push("-g")
+        return true
+    }
+    if mode == 1 || mode == 2 {
+        args.push("-O2")
+        return true
+    }
+    return false
+}
+
+private fn push_warnings(args: *list.List<str>, compiler: str) {
+    if base_has(compiler, "clang") {
+        args.push("-Wno-incompatible-library-redeclaration")
+        args.push("-Wno-builtin-requires-header")
+        return
+    }
+    args.push("-Wno-builtin-declaration-mismatch")
+}
+
+private fn run_cc(args: list.List<str>, compiler: str): i32 with (a: mem.Allocator) {
+    val (code, err) = proc.run_inherit(args.items())
+    if err != null {
+        say3("cannot run the C compiler '", compiler, "'")
+        return 1
+    }
+    if code != 0 {
+        var buf = strbuilder.empty()
+        buf.append("the C compiler exited with status ")
+        buf.append_int(code as i64, 10)
+        say(buf.str())
+        return 1
+    }
+    return 0
+}
+
+fn link_c(c_path: str, exe_path: str, runtime: str, mode: i32, libs: list.List<str>): i32 with (a: mem.Allocator) {
+    if c_path.len == 0 || exe_path.len == 0 || runtime.len == 0 {
+        say("cannot invoke the C compiler: missing input, output, or runtime path")
+        return 1
+    }
+    if mode != 0 && mode != 1 && mode != 2 {
+        say("cannot invoke the C compiler: unknown build mode")
+        return 1
+    }
+    val wasm = ends_with(exe_path, ".wasm")
+    if wasm && libs.len > 0 {
+        say("wasm32 does not link host libraries; extern functions are env imports")
+        return 1
+    }
+    val (compiler, override) = find_compiler()
+    if compiler.len == 0 {
+        if override.len > 0 {
+            say3("C compiler '", override, "' from JOG_CC was not found")
+        } else {
+            say("C compiler not found; looked for clang, then gcc, on PATH")
+        }
+        return 1
+    }
+    if wasm && !base_has(compiler, "clang") {
+        var shown = compiler
+        if override.len > 0 {
+            shown = override
+        }
+        say3("wasm32 needs clang; '", shown, "' cannot target wasm32")
+        return 1
+    }
+    if !is_file(c_path) {
+        say3("C input '", c_path, "' was not found")
+        return 1
+    }
+    var args = list.empty<str>()
+    args.push(compiler)
+    if wasm {
+        args.push("--target=wasm32-unknown-unknown")
+    }
+    args.push("-std=gnu17")
+    if !push_mode(&args, mode) {
+        say("cannot invoke the C compiler: unknown build mode")
+        return 1
+    }
+    push_warnings(&args, compiler)
+    if wasm {
+        args.push("-ffreestanding")
+        args.push("-fno-builtin")
+        args.push("-nostdlib")
+    }
+    args.push("-I")
+    args.push(runtime)
+    args.push(c_path)
+    if wasm {
+        val wasm_rt = fs.join(runtime, "wasm/jogrt_wasm.c")
+        val jogrt_main = fs.join(runtime, "jogrt_main.c")
+        if !is_file(wasm_rt) || !is_file(jogrt_main) {
+            say3("runtime '", runtime, "' is missing wasm/jogrt_wasm.c or jogrt_main.c")
+            return 1
+        }
+        args.push(wasm_rt)
+        args.push(jogrt_main)
+        args.push("-Wl,--no-entry")
+        args.push("-Wl,--export=main")
+        args.push("-Wl,--export=memory")
+        args.push("-Wl,--allow-undefined")
+        args.push("-Wl,-z,stack-size=1048576")
+    } else {
+        val jogrt_c = fs.join(runtime, "jogrt.c")
+        val jogrt_sched = fs.join(runtime, "jogrt_sched.c")
+        val jogrt_switch = fs.join(runtime, "jogrt_switch.c")
+        val jogrt_main = fs.join(runtime, "jogrt_main.c")
+        if !is_file(jogrt_c) || !is_file(jogrt_sched) || !is_file(jogrt_switch) || !is_file(jogrt_main) {
+            say3("runtime '", runtime, "' is missing jogrt.c, jogrt_sched.c, jogrt_switch.c, or jogrt_main.c")
+            return 1
+        }
+        args.push(jogrt_c)
+        args.push(jogrt_sched)
+        args.push(jogrt_switch)
+        args.push(jogrt_main)
+    }
+    args.push("-o")
+    args.push(exe_path)
+    if !wasm {
+        var li: usize = 0
+        for li < libs.len {
+            val lib = libs.get(li)
+            if lib.len == 0 {
+                say("empty link library")
+                return 1
+            }
+            var flag = strbuilder.empty()
+            flag.append("-l")
+            flag.append(lib)
+            args.push(fs.copy_str(flag.str()))
+            li = li + 1
+        }
+    }
+    return run_cc(args, compiler)
+}

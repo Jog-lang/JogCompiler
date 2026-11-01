@@ -1,0 +1,295 @@
+// Constraint method / operator calls on type parameters after monomorphization.
+// Checked against compiler/src/lower_constraint.c.
+
+import src.check
+import src.ir
+import src.parse
+import std.list
+import std.mem
+
+private fn is_builtin_operand(ty: *check.Type?): bool {
+    if ty == null {
+        return false
+    }
+    val base = check.type_peel_distinct(ty!!)
+    val tk = check.type_kinds()
+    return base.kind == tk.INT || base.kind == tk.BOOL || base.kind == tk.BYTES || base.kind == tk.FLOAT
+}
+
+/**
+ * `x.method(...)` where x is a constrained type param: call the concrete method.
+ * Returns (result, true) when handled.
+ */
+fn lower_constraint_call(L: *Lower, node: *parse.Node): (ir.Operand, bool) with (a: mem.Allocator) {
+    if node.kids.len == 0 {
+        return none_value(), false
+    }
+    val callee = node.kids.get(0)
+    if !parse.is_member(callee) || callee.name.len == 0 || callee.kids.len == 0 {
+        return none_value(), false
+    }
+    val base = callee.kids.get(0)
+    val base_ty = check.get_node_ty(base)
+    if base_ty == null {
+        return none_value(), false
+    }
+    val (inner, _) = check.type_peel_ptr(base_ty!!)
+    var param = check.type_peel_distinct(inner)
+    if param.kind != check.type_kinds().TYPE_PARAM {
+        return none_value(), false
+    }
+    var concrete = lower_type_subst(L, param as *check.Type?)
+    if concrete == null {
+        concrete = param as *check.Type?
+    }
+    concrete = check.type_peel_distinct(concrete!!) as *check.Type?
+    if concrete == null || is_builtin_operand(concrete) {
+        fail(L, node, "missing method")
+        return none_value(), true
+    }
+    val index = find_method_fn(L, concrete!!, callee.name)
+    if index < 0 {
+        fail(L, node, "missing method")
+        return none_value(), true
+    }
+    var mty = check.get_node_ty(callee)
+    if mty == null || !check.type_is_fn(mty!!) {
+        val f = ir.func_at(&L.module, index as u32)
+        if f != null {
+            mty = f!!.ty
+        }
+    }
+    if mty == null || !check.type_is_fn(mty!!) {
+        fail(L, node, "method has no type")
+        return none_value(), true
+    }
+    val sig = mty!!
+    val (_, is_ptr) = check.type_peel_ptr(base_ty!!)
+    val pos = node_pos(L, node)
+    var recv = none_value()
+    if sig.elems.len > 0 {
+        val want = sig.elems.get(0)
+        val tk = check.type_kinds()
+        if want.kind == tk.PTR {
+            if is_ptr {
+                recv = lower_expr(L, base)
+            } else {
+                // C receiver_value uses the call site pos for addr.
+                recv = value_addr_at(L, base, pos)
+            }
+        } else {
+            if is_ptr {
+                recv = emit_load(L, lower_expr(L, base), pos)
+            } else {
+                val addr = value_addr_at(L, base, pos)
+                recv = emit_load(L, addr, pos)
+            }
+        }
+    }
+    var args = list.empty<ir.Operand>()
+    args.push(recv)
+    val arg_end = parse.call_arg_end(node)
+    var i: usize = 1
+    for i < arg_end {
+        val arg = node.kids.get(i)
+        var value_node = arg
+        if parse.is_arg(arg) && arg.kids.len > 0 {
+            value_node = arg.kids.get(0)
+        }
+        args.push(lower_expr(L, value_node))
+        i = i + 1
+    }
+    // Prefer substituted call site type for the result.
+    var ret = lower_type_subst(L, check.get_node_ty(node))
+    if ret == null {
+        ret = sig.elem
+    }
+    var dst: i32 = -1
+    if ret != null && !check.type_is_unit(ret!!) {
+        dst = new_local(L, "", ret) as i32
+    }
+    val inst = emit_inst(L, ir.op_kinds().CALL, dst, node_pos(L, node))
+    if inst != null {
+        inst!!.a = ir.func_ref(&L.module, index as u32)
+        ir.set_args(inst!!, args)
+    }
+    if dst >= 0 {
+        return local_operand(L, dst as u32), true
+    }
+    return none_value(), true
+}
+
+private fn constraint_op_name(op: str): (str, i32) {
+    // Returns (method name, derived): 0=direct, 1=compare via Ordering, 2=neq via ==.
+    if op == "+" {
+        return "op+", 0
+    }
+    if op == "-" {
+        return "op-", 0
+    }
+    if op == "*" {
+        return "op*", 0
+    }
+    if op == "/" {
+        return "op/", 0
+    }
+    if op == "%" {
+        return "op%", 0
+    }
+    if op == "&" {
+        return "op&", 0
+    }
+    if op == "|" {
+        return "op|", 0
+    }
+    if op == "^" {
+        return "op^", 0
+    }
+    if op == "<<" {
+        return "op<<", 0
+    }
+    if op == ">>" {
+        return "op>>", 0
+    }
+    if op == "==" {
+        return "op==", 0
+    }
+    if op == "!=" {
+        return "op==", 2
+    }
+    if op == "<" || op == "<=" || op == ">" || op == ">=" {
+        return "op<=>", 1
+    }
+    return "", -1
+}
+
+private fn compare_order(
+    L: *Lower,
+    node: *parse.Node,
+    order: ir.Operand,
+    op: str,
+    bool_ty: *check.Type?
+): ir.Operand with (a: mem.Allocator) {
+    val pos = node_pos(L, node)
+    var tag = order
+    var tag_ty = order.ty
+    if order.ty != null {
+        val ot = order.ty!!
+        if ot.kind == check.type_kinds().ENUM {
+            val base = ot.elem
+            if base == null {
+                fail(L, node, "operator compare failed")
+                return none_value()
+            }
+            val dst = new_local(L, "", base)
+            val inst = emit_inst(L, ir.op_kinds().ENUM_TAG, dst as i32, pos)
+            if inst != null {
+                inst!!.a = order
+            }
+            tag = local_operand(L, dst)
+            tag_ty = base
+        } else {
+            val u = check.type_peel_distinct(ot)
+            if u.kind != check.type_kinds().INT {
+                fail(L, node, "operator compare failed")
+                return none_value()
+            }
+        }
+    }
+    if tag_ty == null {
+        fail(L, node, "operator compare failed")
+        return none_value()
+    }
+    val zero = ir.int_op(tag_ty!!, 0)
+    val b = ir.bin_ops()
+    var bin = b.LE
+    if op == ">" {
+        bin = b.GT
+    } else if op == "<" {
+        bin = b.LT
+    } else if op == ">=" {
+        bin = b.GE
+    }
+    return emit_binop(L, bin, false, tag, zero, bool_ty, pos)
+}
+
+/**
+ * Binary op on a constrained type param: call op* / op<=> etc.
+ * Returns (result, true) when handled (including hard fail).
+ */
+fn lower_constraint_binop(
+    L: *Lower,
+    node: *parse.Node,
+    lhs: ir.Operand,
+    rhs: ir.Operand
+): (ir.Operand, bool) with (a: mem.Allocator) {
+    if node.kids.len < 2 {
+        return none_value(), false
+    }
+    val orig = check.get_node_ty(node.kids.get(0))
+    if orig == null {
+        return none_value(), false
+    }
+    if orig!!.kind != check.type_kinds().TYPE_PARAM && !check.generic_has_param(orig) {
+        return none_value(), false
+    }
+    var concrete = lower_type_subst(L, orig)
+    if concrete == null {
+        fail(L, node, "generic type was not instantiated")
+        return none_value(), true
+    }
+    concrete = check.type_peel_distinct(concrete!!) as *check.Type?
+    if concrete == null || is_builtin_operand(concrete) {
+        return none_value(), false
+    }
+    val (name, derived) = constraint_op_name(node.text)
+    if derived < 0 || name.len == 0 {
+        return none_value(), false
+    }
+    val index = find_method_fn(L, concrete!!, name)
+    if index < 0 {
+        fail(L, node, "operator not lowered yet")
+        return none_value(), true
+    }
+    var mty: *check.Type? = null
+    val f = ir.func_at(&L.module, index as u32)
+    if f != null {
+        mty = f!!.ty
+    }
+    if mty == null || !check.type_is_fn(mty!!) {
+        fail(L, node, "operator not lowered yet")
+        return none_value(), true
+    }
+    val ret = mty!!.elem
+    var dst: i32 = -1
+    if ret != null && !check.type_is_unit(ret!!) {
+        dst = new_local(L, "", ret) as i32
+    }
+    var args = list.empty<ir.Operand>()
+    args.push(lhs)
+    args.push(rhs)
+    val inst = emit_inst(L, ir.op_kinds().CALL, dst, node_pos(L, node))
+    if inst != null {
+        inst!!.a = ir.func_ref(&L.module, index as u32)
+        ir.set_args(inst!!, args)
+    }
+    var called = none_value()
+    if dst >= 0 {
+        called = local_operand(L, dst as u32)
+    }
+    if derived == 0 {
+        return called, true
+    }
+    if derived == 2 {
+        val bool_ty = lower_type_subst(L, check.get_node_ty(node))
+        val nd = new_local(L, "", bool_ty)
+        val ni = emit_inst(L, ir.op_kinds().UNARY, nd as i32, node_pos(L, node))
+        if ni != null {
+            ni!!.aux = ir.unop_aux(ir.un_ops().NOT)
+            ni!!.a = called
+        }
+        return local_operand(L, nd), true
+    }
+    val bool_ty = lower_type_subst(L, check.get_node_ty(node))
+    return compare_order(L, node, called, node.text, bool_ty), true
+}

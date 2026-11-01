@@ -18,6 +18,7 @@
 // and clone return a new list; the caller frees it. reverse swaps the
 // live prefix in place.
 
+import std.c
 import std.mem
 
 // ptr is null until the first allocation. len is the live count. cap is
@@ -32,6 +33,12 @@ fn empty<T>(): List<T> {
     return List<T>()
 }
 
+// Copies size(T) bytes. Element assignment of a wide T can drop fields
+// under stage 0, and the regions here do not overlap.
+private fn store_elem<T>(dest: *T, src: *T) {
+    c.memcpy(dest as *void, src as *const void, size(T))
+}
+
 // Copies every packed element into a new buffer. No elements means the
 // zero list and no allocation.
 fn new<T>(...T: elements): List<T> with (a: mem.Allocator) {
@@ -41,14 +48,15 @@ fn new<T>(...T: elements): List<T> with (a: mem.Allocator) {
     }
     xs.reserve(elements.len)
     for i in 0 as usize..elements.len {
-        xs.ptr!![i] = elements[i]
+        store_elem(xs.ptr!! + i, elements.ptr + i)
     }
     xs.len = elements.len
     return xs
 }
 
-// alloc, copy the live values, free the old block. raw.ptr as *T is the
-// typed pointer. bytes as []T is still rejected.
+// Allocates a new block and copies the live bytes. The old block is not
+// freed: a List is copied by value, so another header may still point at
+// it. raw.ptr as *T is the typed pointer. bytes as []T is still rejected.
 private fn *List<T>.grow(minCap: usize) with (a: mem.Allocator) {
     var newCap: usize = 8
     if self.cap != 0 {
@@ -63,16 +71,7 @@ private fn *List<T>.grow(minCap: usize) with (a: mem.Allocator) {
     }
     val fresh = raw.ptr as *T
     if self.len > 0 {
-        val old = self.ptr!!
-        for i in 0 as usize..self.len {
-            fresh[i] = old[i]
-        }
-    }
-    if self.cap > 0 {
-        var block = bytes()
-        block.ptr = self.ptr!! as *u8
-        block.len = size(T) * self.cap
-        a.free(block)
+        c.memcpy(fresh as *void, self.ptr!! as *const void, size(T) * self.len)
     }
     self.ptr = fresh as *T?
     self.cap = newCap
@@ -88,7 +87,7 @@ fn *List<T>.push(...T: elements) with (a: mem.Allocator) {
     }
     val p = self.ptr!!
     for i in 0 as usize..elements.len {
-        p[self.len] = elements[i]
+        store_elem(p + self.len, elements.ptr + i)
         self.len = self.len + 1
     }
 }
@@ -121,7 +120,7 @@ fn *List<T>.set(i: usize, x: T) {
     if i >= self.len {
         panic("index out of range")
     }
-    self.ptr!![i] = x
+    store_elem(self.ptr!! + i, &x)
 }
 
 fn *List<T>.clear() {
@@ -139,10 +138,10 @@ fn *List<T>.insert(i: usize, x: T) with (a: mem.Allocator) {
     val p = self.ptr!!
     var k = self.len
     for k > i {
-        p[k] = p[k - 1]
+        store_elem(p + k, p + (k - 1))
         k = k - 1
     }
-    p[i] = x
+    store_elem(p + i, &x)
     self.len = self.len + 1
 }
 
@@ -155,7 +154,7 @@ fn *List<T>.remove(i: usize): T {
     val removed = p[i]
     var k = i
     for k + 1 < self.len {
-        p[k] = p[k + 1]
+        store_elem(p + k, p + (k + 1))
         k = k + 1
     }
     self.len = self.len - 1

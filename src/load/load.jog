@@ -780,10 +780,11 @@ private fn check_modules(root_man_path: str, root: Module, mods: *list.List<Modu
  * Program for the checker and 0.
  * @param start file or folder, as given on the command line; `.` when omitted
  * @param module_flags --module values without the flag name
+ * @param include_tests keep *.test.jog in the root module (jog test)
  * @context a allocator for the walk and the file bytes
  * @return the program and 0, or an empty program and 1 on a loader error
  */
-fn run(start: str, module_flags: []str): (Program, i32) with (a: mem.Allocator) {
+fn run(start: str, module_flags: []str, include_tests: bool): (Program, i32) with (a: mem.Allocator) {
     val (roots, roots_ok) = locate_roots()
     if !roots_ok {
         free_roots(roots)
@@ -841,9 +842,14 @@ fn run(start: str, module_flags: []str): (Program, i32) with (a: mem.Allocator) 
     var prog = empty_program()
     var files_ok = true
     if shadows_ok && mapped_ok && modules_ok {
-        val (loaded, load_ok) = load_root_sources(root_mod, man_path, roots, mods)
+        val (loaded, load_ok) = load_root_sources(root_mod, man_path, roots, mods, include_tests)
         prog = loaded
         files_ok = load_ok
+        if load_ok {
+            prog.runtime_root = fs.copy_str(roots.runtime_root)
+            prog.is_library = root_mod.is_library
+            prog.links = root_mod.manifest.links
+        }
     }
 
     fs.free_str(man_path)

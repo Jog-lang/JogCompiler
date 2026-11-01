@@ -73,7 +73,7 @@ private fn scope_method_sees(here: *parse.Node?, pkg: *load.Package, owner: *Typ
     return type_in_package(owner, pkg)
 }
 
-private fn field_is_visible(here: *parse.Node?, pkg: *load.Package, owner: *Type, field: StructField): bool {
+private fn field_is_visible(here: *parse.Node?, pkg: *load.Package?, owner: *Type, field: StructField): bool {
     val decl = field.decl
     if decl == null {
         return true
@@ -82,10 +82,13 @@ private fn field_is_visible(here: *parse.Node?, pkg: *load.Package, owner: *Type
     if vis.len == 0 {
         return true
     }
-    if vis == "private(scope)" {
-        return scope_method_sees(here, pkg, owner)
+    if pkg == null {
+        return false
     }
-    return type_in_package(owner, pkg)
+    if vis == "private(scope)" {
+        return scope_method_sees(here, pkg!!, owner)
+    }
+    return type_in_package(owner, pkg!!)
 }
 
 private fn embed_name(ty: *Type): str {
@@ -532,6 +535,17 @@ fn check_bind_self(ck: *Check, job: *CheckJob, scope: *load.BlockScope) with (a:
     s.nominal_insts = list.empty<*u8>()
     set_sema(&s, self_ty as *Type?)
     load.block_scope_bind(scope, s)
+    // Attach the bound symbol to the receiver PARAM (if present) so lowering
+    // can bind_local(self → l0) the same way as ordinary params.
+    val shape = job.decl.head
+    val nattrs = (shape / 268435456) % 256
+    val at = nattrs as usize
+    if at < job.decl.kids.len {
+        val recv = job.decl.kids.get(at)
+        val bound = load.block_scope_lookup_local(scope, "self")
+        set_node_sym(recv, bound)
+        set_node_ty(recv, self_ty as *Type?)
+    }
 }
 
 /**
@@ -589,6 +603,8 @@ struct FieldPath {
     ambiguous: bool
     hidden: bool
     field: StructField
+    /** Field indices from outer struct to the named field (includes the field itself). */
+    indices: list.List<u32>
 }
 
 private fn empty_field(): StructField {
@@ -605,38 +621,47 @@ private struct FieldHit {
     field: StructField
     depth: i64
     found: bool
+    indices: list.List<u32>
 }
 
 private fn collect_field(
     ty: *Type,
     name: str,
     here: *parse.Node?,
-    pkg: *load.Package,
-    depth: i64,
+    pkg: *load.Package?,
+    prefix: list.List<u32>,
     best: *FieldHit,
     count: *i64,
     hidden: *i64,
-) {
-    if ty.kind != TypeKind.STRUCT || depth > 16 {
+) with (a: mem.Allocator) {
+    if ty.kind != TypeKind.STRUCT || prefix.len > 16 {
         return
     }
     var i: usize = 0
     for i < type_field_count(ty) {
         val f = type_field_at(ty, i)
+        var path = list.empty<u32>()
+        var pi: usize = 0
+        for pi < prefix.len {
+            path.push(prefix.get(pi))
+            pi = pi + 1
+        }
+        path.push(i as u32)
         if f.name == name {
             if !field_is_visible(here, pkg, ty, f) {
                 hidden[0] = 1
-            } else if !best.found || depth < best.depth {
+            } else if !best.found || (path.len as i64) < best.depth {
                 best.found = true
                 best.field = f
-                best.depth = depth
+                best.depth = path.len as i64
+                best.indices = path
                 count[0] = 1
-            } else if depth == best.depth {
+            } else if (path.len as i64) == best.depth {
                 count[0] = count[0] + 1
             }
         }
         if f.embedded && f.field_type != null && f.field_type!!.kind == TypeKind.STRUCT {
-            collect_field(f.field_type!!, name, here, pkg, depth + 1, best, count, hidden)
+            collect_field(f.field_type!!, name, here, pkg, path, best, count, hidden)
         }
         i = i + 1
     }
@@ -645,21 +670,25 @@ private fn collect_field(
 /**
  * Look up a field by name, including embeds.
  */
-fn struct_lookup_field(ty: *Type, name: str, here: *parse.Node?, pkg: *load.Package): FieldPath {
+fn struct_lookup_field(ty: *Type, name: str, here: *parse.Node?, pkg: *load.Package?): FieldPath with (a: mem.Allocator) {
     var hit: FieldHit
     hit.found = false
     hit.depth = 0
     hit.field = empty_field()
+    hit.indices = list.empty<u32>()
     var count: i64 = 0
     var hidden: i64 = 0
-    collect_field(ty, name, here, pkg, 0, &hit, &count, &hidden)
+    var prefix = list.empty<u32>()
+    collect_field(ty, name, here, pkg, prefix, &hit, &count, &hidden)
     var out: FieldPath
     out.found = hit.found
     out.ambiguous = count > 1
     out.hidden = !hit.found && hidden != 0
     out.field = hit.field
+    out.indices = hit.indices
     if out.ambiguous {
         out.field = empty_field()
+        out.indices = list.empty<u32>()
     }
     return out
 }

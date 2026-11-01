@@ -1,0 +1,2052 @@
+// Compile-time JIR interpreter. Port of compiler/src/interp.c.
+// Pointers are offsets into a byte arena; offset 0 is null. Integers are
+// little-endian target-width. Each call has its own memory.
+
+import src.check
+import src.load
+import std.io
+import std.list
+import std.mem
+import std.strbuilder
+
+private val INTERP_MEM: u32 = 64 * 1024 * 1024
+private val INTERP_DEPTH: usize = 4096
+
+private struct GSlot {
+    off: u32
+    size: u32
+    is_const: bool
+}
+
+private struct Frame {
+    func: *Func?
+    block: u32
+    ip: u32
+    used_at: u32
+    off: list.List<u32>
+    nlocal: u32
+    ret_dst: i32
+}
+
+private struct Interp {
+    module: *Module?
+    budget: u64
+    steps: u64
+    ptr_size: u32
+    mem: list.List<u8>
+    used: u32
+    globals: list.List<GSlot>
+    frames: list.List<Frame>
+    depth: usize
+    result: list.List<u8>
+    failed: bool
+}
+
+private fn underlying(ty: *check.Type?): *check.Type? {
+    if ty == null {
+        return null
+    }
+    return check.type_peel_distinct(ty!!) as *check.Type?
+}
+
+private fn ty_size(ty: *check.Type?): usize {
+    if ty == null || !ty!!.has_layout {
+        return 0
+    }
+    return ty!!.size as usize
+}
+
+private fn ty_align(ty: *check.Type?): u32 {
+    if ty == null || !ty!!.has_layout || ty!!.align == 0 {
+        return 1
+    }
+    return ty!!.align
+}
+
+private fn is_float_ty(ty: *check.Type?): bool {
+    val t = underlying(ty)
+    if t == null {
+        return false
+    }
+    val k = t!!.kind
+    return k == check.type_kinds().FLOAT || k == check.type_kinds().UNTYPED_FLOAT
+}
+
+private fn int_width(ty: *check.Type?): u32 {
+    val t = underlying(ty)
+    if t == null {
+        return 64
+    }
+    val tk = check.type_kinds()
+    if t!!.kind == tk.BOOL {
+        return 1
+    }
+    if t!!.kind == tk.UNTYPED_INT {
+        return 64
+    }
+    if t!!.kind == tk.INT && t!!.int_bits > 0 && t!!.int_bits <= 64 {
+        return t!!.int_bits as u32
+    }
+    return 64
+}
+
+private fn int_signed(ty: *check.Type?): bool {
+    val t = underlying(ty)
+    if t == null || t!!.kind == check.type_kinds().BOOL {
+        return false
+    }
+    if t!!.kind == check.type_kinds().UNTYPED_INT {
+        return true
+    }
+    return t!!.kind == check.type_kinds().INT && t!!.int_signed
+}
+
+private fn u64_all_ones(): u64 {
+    var neg: i64 = -1
+    val p: *u8 = &neg as *u8
+    var out: u64 = 0
+    val op: *u8 = &out as *u8
+    var j: usize = 0
+    for j < 8 {
+        op[j] = p[j]
+        j = j + 1
+    }
+    return out
+}
+
+private fn mask_of(width: u32): u64 {
+    // Avoid `(1<<w)-1` when w==32/64: stage0 can drop the high half of u64
+    // shifts so `1<<32` becomes 0.
+    if width == 0 {
+        return 0
+    }
+    if width >= 64 {
+        return u64_all_ones()
+    }
+    var mask: u64 = 0
+    var i: u32 = 0
+    for i < width {
+        if i < 32 {
+            mask = mask | ((1 as u64) << (i as u64))
+        } else {
+            // Set bit i in the high half via a u32 then splice.
+            val bit = (1 as u32) << (i - 32)
+            var hi: u32 = 0
+            val hp: *u8 = &hi as *u8
+            var mp: *u8 = &mask as *u8
+            hp[0] = mp[4]
+            hp[1] = mp[5]
+            hp[2] = mp[6]
+            hp[3] = mp[7]
+            hi = hi | bit
+            mp[4] = hp[0]
+            mp[5] = hp[1]
+            mp[6] = hp[2]
+            mp[7] = hp[3]
+        }
+        i = i + 1
+    }
+    return mask
+}
+
+private fn sext(bits: u64, width: u32): i64 {
+    if width == 0 {
+        return 0
+    }
+    if width >= 64 {
+        return u64_as_i64(bits)
+    }
+    // Avoid `(1<<width)-1` / `(sign<<1)-1`: stage0 can drop the high half of
+    // u64 shifts so `1<<32` becomes 0 (same Friction as mask_of).
+    val mask = mask_of(width)
+    var sign: u64 = 0
+    if width > 0 {
+        sign = mask - mask_of(width - 1)
+    }
+    var v = bits & mask
+    if (v & sign) != 0 {
+        v = v | ~mask
+    }
+    return u64_as_i64(v)
+}
+
+private fn signed_min(width: u32): i64 {
+    if width == 0 || width > 64 {
+        return 0
+    }
+    // -signed_max(w)-1 avoids `1<<(w-1)` i64 shifts that stage0 miscompiles.
+    return -signed_max(width) - 1
+}
+
+private fn signed_max(width: u32): i64 {
+    if width == 0 || width > 64 {
+        return 0
+    }
+    if width == 64 {
+        // i64::MAX = 0x7fffffffffffffff — set bytes (no `1<<63`).
+        var bits: u64 = 0
+        val p: *u8 = &bits as *u8
+        p[0] = 0xff
+        p[1] = 0xff
+        p[2] = 0xff
+        p[3] = 0xff
+        p[4] = 0xff
+        p[5] = 0xff
+        p[6] = 0xff
+        p[7] = 0x7f
+        return u64_as_i64(bits)
+    }
+    return u64_as_i64(mask_of(width - 1))
+}
+
+private fn i64_as_u64(v: i64): u64 {
+    var w = v
+    val p: *u8 = &w as *u8
+    var out: u64 = 0
+    val op: *u8 = &out as *u8
+    var i: usize = 0
+    for i < 8 {
+        op[i] = p[i]
+        i = i + 1
+    }
+    return out
+}
+
+private fn u64_as_i64(v: u64): i64 {
+    var w = v
+    val p: *u8 = &w as *u8
+    var out: i64 = 0
+    val op: *u8 = &out as *u8
+    var i: usize = 0
+    for i < 8 {
+        op[i] = p[i]
+        i = i + 1
+    }
+    return out
+}
+
+private fn align_up(v: u32, a: u32): (u32, bool) {
+    if a <= 1 {
+        return v, true
+    }
+    val x = (v as u64) + ((a - 1) as u64)
+    val aligned = x & ~((a as u64) - 1)
+    if aligned > 0xffffffff {
+        return 0, false
+    }
+    return aligned as u32, true
+}
+
+private fn error_msg(ip: *Interp, pos: Pos, message: str) with (a: mem.Allocator) {
+    if ip.failed {
+        return
+    }
+    ip.failed = true
+    if pos.file.len > 0 && pos.line > 0 {
+        load.print_pos_error(pos.file, pos.line, pos.column, message)
+    } else {
+        load.print_bare_error(message)
+    }
+    var i = ip.depth
+    for i > 0 {
+        i = i - 1
+        val fr = ip.frames.at(i)
+        var name = "?"
+        if fr.func != null {
+            if fr.func!!.jog_name.len > 0 {
+                name = fr.func!!.jog_name
+            } else if fr.func!!.name.len > 0 {
+                name = fr.func!!.name
+            }
+        }
+        io.eprint("note: at ")
+        io.eprintln(name)
+    }
+}
+
+private fn panic_msg(ip: *Interp, pos: Pos, msg: str) with (a: mem.Allocator) {
+    var text = msg
+    if text.len == 0 {
+        text = "panic"
+    }
+    var b = strbuilder.empty()
+    b.append("compile-time panic: ")
+    b.append(text)
+    error_msg(ip, pos, b.str())
+    b.free()
+}
+
+private fn ensure_cap(ip: *Interp, need: usize): bool with (a: mem.Allocator) {
+    if need <= ip.mem.len {
+        return true
+    }
+    if need > INTERP_MEM as usize {
+        return false
+    }
+    for ip.mem.len < need {
+        ip.mem.push(0)
+    }
+    return true
+}
+
+private fn bump(ip: *Interp, align: u32, size: u32): (u32, bool) with (a: mem.Allocator) {
+    val (at, aok) = align_up(ip.used, align)
+    if !aok {
+        error_msg(ip, pos_none(), "compile-time memory limit exceeded")
+        return 0, false
+    }
+    val end = (at as u64) + (size as u64)
+    if end > INTERP_MEM as u64 || end > 0xffffffff {
+        error_msg(ip, pos_none(), "compile-time memory limit exceeded")
+        return 0, false
+    }
+    if !ensure_cap(ip, end as usize) {
+        error_msg(ip, pos_none(), "out of memory")
+        return 0, false
+    }
+    ip.used = end as u32
+    return at, !ip.failed
+}
+
+private fn mem_write(ip: *Interp, off: u32, n: u32, bits: u64) {
+    if (off as u64) + (n as u64) > ip.used as u64 {
+        return
+    }
+    var i: u32 = 0
+    for i < n && i < 8 {
+        ip.mem.set((off + i) as usize, ((bits >> ((i as u64) * 8)) & 0xff) as u8)
+        i = i + 1
+    }
+    for i < n {
+        ip.mem.set((off + i) as usize, 0)
+        i = i + 1
+    }
+}
+
+private fn range_ok(ip: *Interp, off: u32, n: u32): bool {
+    return (off as u64) + (n as u64) <= ip.used as u64
+}
+
+private fn overlaps(a: u32, asz: u32, b: u32, bsz: u32): bool {
+    if asz == 0 || bsz == 0 {
+        return false
+    }
+    val ae = (a as u64) + (asz as u64)
+    val be = (b as u64) + (bsz as u64)
+    return (a as u64) < be && (b as u64) < ae
+}
+
+private fn hits_var(ip: *Interp, off: u32, n: u32): bool {
+    var i: usize = 0
+    for i < ip.globals.len {
+        val g = ip.globals.get(i)
+        if !g.is_const && overlaps(off, n, g.off, g.size) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+private fn hits_global(ip: *Interp, off: u32, n: u32): bool {
+    var i: usize = 0
+    for i < ip.globals.len {
+        val g = ip.globals.get(i)
+        if overlaps(off, n, g.off, g.size) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+private fn local_at(fr: *Frame, index: u32): (u32, u32, bool) {
+    if fr.func == null || index >= fr.nlocal || (index as usize) >= fr.func!!.locals.len ||
+        (index as usize) >= fr.off.len {
+        return 0, 0, false
+    }
+    val loc = fr.func!!.locals.at(index as usize)
+    return fr.off.get(index as usize), ty_size(loc.ty) as u32, true
+}
+
+private fn place_bytes(ip: *Interp, bytes: str, n: usize): (u32, bool) with (a: mem.Allocator) {
+    if n > 0xffffffff {
+        error_msg(ip, pos_none(), "compile-time memory limit exceeded")
+        return 0, false
+    }
+    val (at, ok) = bump(ip, 1, n as u32)
+    if !ok {
+        return 0, false
+    }
+    var i: usize = 0
+    for i < n {
+        var b: u8 = 0
+        if i < bytes.len {
+            b = bytes.ptr[i]
+        }
+        ip.mem.set(at as usize + i, b)
+        i = i + 1
+    }
+    return at, true
+}
+
+private fn place_raw(ip: *Interp, src: *u8?, n: usize): (u32, bool) with (a: mem.Allocator) {
+    if n > 0xffffffff {
+        error_msg(ip, pos_none(), "compile-time memory limit exceeded")
+        return 0, false
+    }
+    val (at, ok) = bump(ip, 1, n as u32)
+    if !ok {
+        return 0, false
+    }
+    var i: usize = 0
+    for i < n {
+        var b: u8 = 0
+        if src != null {
+            b = src!![i]
+        }
+        ip.mem.set(at as usize + i, b)
+        i = i + 1
+    }
+    return at, true
+}
+
+private fn read_op(ip: *Interp, fr: *Frame?, op: Operand, dst: *list.List<u8>, n: usize, pos: Pos): bool with (
+    a: mem.Allocator,
+) {
+    for dst.len < n {
+        dst.push(0)
+    }
+    var i: usize = 0
+    for i < n {
+        dst.set(i, 0)
+        i = i + 1
+    }
+    if n == 0 {
+        return !ip.failed
+    }
+    if is_float_ty(op.ty) || op.kind == OperandKind.FLOAT {
+        error_msg(ip, pos, "float values are not available at compile time")
+        return false
+    }
+    val okinds = operand_kinds()
+    when op.kind {
+        NONE, NULL -> {
+            return true
+        }
+        INT -> {
+            val bits = int_operand_bits(op)
+            val w = n
+            var j: usize = 0
+            var lim = w
+            if lim > 8 {
+                lim = 8
+            }
+            for j < lim {
+                dst.set(j, ((bits >> ((j as u64) * 8)) & 0xff) as u8)
+                j = j + 1
+            }
+            return true
+        }
+        LOCAL -> {
+            if fr == null {
+                error_msg(ip, pos, "compile-time local is out of range")
+                return false
+            }
+            val (off, sz, lok) = local_at(fr!!, op.local)
+            if !lok || !range_ok(ip, off, sz) {
+                error_msg(ip, pos, "compile-time local is out of range")
+                return false
+            }
+            var m = n
+            if m > sz as usize {
+                m = sz as usize
+            }
+            var k: usize = 0
+            for k < m {
+                dst.set(k, ip.mem.get(off as usize + k))
+                k = k + 1
+            }
+            return true
+        }
+        GLOBAL -> {
+            if (op.global as usize) >= ip.globals.len {
+                error_msg(ip, pos, "compile-time global is out of range")
+                return false
+            }
+            val bits = ip.globals.get(op.global as usize).off as u64
+            var j: usize = 0
+            var lim = n
+            if lim > 8 {
+                lim = 8
+            }
+            for j < lim {
+                dst.set(j, ((bits >> ((j as u64) * 8)) & 0xff) as u8)
+                j = j + 1
+            }
+            return true
+        }
+        STRING -> {
+            if ip.ptr_size == 0 || n < (ip.ptr_size as usize) * 2 {
+                error_msg(ip, pos, "compile-time string has a bad size")
+                return false
+            }
+            val (off, pok) = place_bytes(ip, op.str_ptr, op.str_ptr.len)
+            if !pok {
+                return false
+            }
+            var bits = off as u64
+            var j: usize = 0
+            for j < ip.ptr_size as usize {
+                dst.set(j, ((bits >> ((j as u64) * 8)) & 0xff) as u8)
+                j = j + 1
+            }
+            bits = op.str_ptr.len as u64
+            j = 0
+            for j < ip.ptr_size as usize {
+                dst.set(ip.ptr_size as usize + j, ((bits >> ((j as u64) * 8)) & 0xff) as u8)
+                j = j + 1
+            }
+            return true
+        }
+        CSTRING -> {
+            if ip.ptr_size == 0 || n < ip.ptr_size as usize {
+                error_msg(ip, pos, "compile-time string has a bad size")
+                return false
+            }
+            val len = op.str_ptr.len
+            var raw = list.empty<u8>()
+            var j: usize = 0
+            for j < len {
+                raw.push(op.str_ptr.ptr[j])
+                j = j + 1
+            }
+            raw.push(0)
+            val (off, pok) = place_raw(ip, raw.ptr, raw.len)
+            if !pok {
+                return false
+            }
+            val bits = off as u64
+            j = 0
+            for j < ip.ptr_size as usize && j < n {
+                dst.set(j, ((bits >> ((j as u64) * 8)) & 0xff) as u8)
+                j = j + 1
+            }
+            return true
+        }
+        FUNC -> {
+            error_msg(ip, pos, "function values are not available at compile time")
+            return false
+        }
+        else -> {
+            error_msg(ip, pos, "compile-time operand is not supported")
+            return false
+        }
+    }
+}
+
+private fn read_int(ip: *Interp, fr: *Frame?, op: Operand, pos: Pos): (u64, bool) with (a: mem.Allocator) {
+    var buf = list.empty<u8>()
+    var n = ty_size(op.ty)
+    if n == 0 || n > 8 {
+        n = 8
+    }
+    if !read_op(ip, fr, op, &buf, n, pos) {
+        return 0, false
+    }
+    var v: u64 = 0
+    var i: usize = 0
+    for i < n {
+        v = v | ((buf.get(i) as u64) << ((i as u64) * 8))
+        i = i + 1
+    }
+    return v, true
+}
+
+private fn write_local(ip: *Interp, fr: *Frame, dst: i32, src: *list.List<u8>?, n: usize, pos: Pos): bool with (
+    a: mem.Allocator,
+) {
+    if dst < 0 {
+        return true
+    }
+    val (off, sz, lok) = local_at(fr, dst as u32)
+    if !lok || !range_ok(ip, off, sz) {
+        error_msg(ip, pos, "compile-time local is out of range")
+        return false
+    }
+    var i: usize = 0
+    for i < sz as usize {
+        ip.mem.set(off as usize + i, 0)
+        i = i + 1
+    }
+    if src != null && n > 0 {
+        var m = n
+        if m > sz as usize {
+            m = sz as usize
+        }
+        i = 0
+        for i < m {
+            ip.mem.set(off as usize + i, src!!.get(i))
+            i = i + 1
+        }
+    }
+    return true
+}
+
+private fn write_local_bits(ip: *Interp, fr: *Frame, dst: i32, bits: u64, pos: Pos): bool with (a: mem.Allocator) {
+    if dst < 0 {
+        return true
+    }
+    var buf = list.empty<u8>()
+    var i: usize = 0
+    for i < 8 {
+        buf.push(((bits >> ((i as u64) * 8)) & 0xff) as u8)
+        i = i + 1
+    }
+    return write_local(ip, fr, dst, &buf, 8, pos)
+}
+
+private fn pop_frame(ip: *Interp): bool {
+    if ip.depth == 0 {
+        return false
+    }
+    val fr = ip.frames.at(ip.depth - 1)
+    ip.used = fr.used_at
+    if (ip.used as usize) < ip.mem.len {
+        ip.mem.len = ip.used as usize
+    }
+    ip.depth = ip.depth - 1
+    ip.frames.len = ip.depth
+    return true
+}
+
+private fn push_frame(ip: *Interp, func: *Func, ret_dst: i32): bool with (a: mem.Allocator) {
+    if ip.depth >= INTERP_DEPTH {
+        error_msg(ip, func.pos, "compile-time call stack exceeded")
+        return false
+    }
+    val nlocal = func.locals.len as u32
+    var offs = list.empty<u32>()
+    var fr: Frame
+    fr.func = func as *Func?
+    fr.block = 0
+    fr.ip = 0
+    fr.used_at = ip.used
+    fr.off = offs
+    fr.nlocal = nlocal
+    fr.ret_dst = ret_dst
+    val saved = ip.used
+    ip.frames.push(fr)
+    ip.depth = ip.depth + 1
+    val top = ip.frames.at(ip.depth - 1)
+    var i: u32 = 0
+    for i < nlocal {
+        val loc = func.locals.at(i as usize)
+        val sz = ty_size(loc.ty) as u32
+        val al = ty_align(loc.ty)
+        val (at, ok) = bump(ip, al, sz)
+        if !ok {
+            ip.used = saved
+            if (saved as usize) < ip.mem.len {
+                ip.mem.len = saved as usize
+            }
+            ip.depth = ip.depth - 1
+            ip.frames.len = ip.depth
+            return false
+        }
+        top.off.push(at)
+        i = i + 1
+    }
+    if func.blocks.len == 0 {
+        error_msg(ip, func.pos, "compile-time function has no body")
+        pop_frame(ip)
+        return false
+    }
+    return true
+}
+
+private fn value_fits(bits: u64, src: *check.Type?, dst: *check.Type?): bool {
+    val sw = int_width(src)
+    val dw = int_width(dst)
+    val ss = int_signed(src)
+    val ds = int_signed(dst)
+    val db = underlying(dst)
+    val sb = underlying(src)
+    val tk = check.type_kinds()
+    if db != null && db!!.kind == tk.BOOL {
+        val v = bits & mask_of(if sw != 0 { sw } else { 8 })
+        return v == 0 || v == 1
+    }
+    if sb != null && sb!!.kind == tk.BOOL {
+        return true
+    }
+    if ss == ds && dw >= sw {
+        return true
+    }
+    if !ss && ds && dw > sw {
+        return true
+    }
+    if ss && !ds {
+        val v = sext(bits, sw)
+        if v < 0 {
+            return false
+        }
+        if dw >= sw {
+            return true
+        }
+        return (v as u64) <= mask_of(dw)
+    }
+    if !ss && ds {
+        val v = bits & mask_of(sw)
+        return v <= i64_as_u64(signed_max(dw))
+    }
+    if !ss && !ds {
+        return (bits & mask_of(sw)) <= mask_of(dw)
+    }
+    val v = sext(bits, sw)
+    return v >= signed_min(dw) && v <= signed_max(dw)
+}
+
+private fn mul_i64_ov(ua: u64, ub: u64): (u64, bool) {
+    val a = u64_as_i64(ua)
+    val b = u64_as_i64(ub)
+    val imin = signed_min(64)
+    val imax = signed_max(64)
+    if a == 0 || b == 0 {
+        return 0, false
+    }
+    if a == imin {
+        if b == 1 {
+            return i64_as_u64(imin), false
+        }
+        return 0, true
+    }
+    if b == imin {
+        if a == 1 {
+            return i64_as_u64(imin), false
+        }
+        return 0, true
+    }
+    if a > 0 {
+        if b > 0 {
+            if a > imax / b {
+                return 0, true
+            }
+        } else if b < imin / a {
+            return 0, true
+        }
+    } else if b > 0 {
+        if a < imin / b {
+            return 0, true
+        }
+    } else if b < imax / a {
+        return 0, true
+    }
+    return i64_as_u64(a * b), false
+}
+
+private fn tuple_field_off(ty: *check.Type, aux: u32): (u64, u64, bool) {
+    if (aux as usize) >= ty.elems.len {
+        return 0, 0, false
+    }
+    var off: u64 = 0
+    var i: usize = 0
+    for i <= aux as usize {
+        val ft = ty.elems.get(i)
+        var al = ft.align as u64
+        if al < 1 {
+            al = 1
+        }
+        off = (off + al - 1) / al * al
+        if i == aux as usize {
+            return off, ft.size, true
+        }
+        off = off + ft.size
+        i = i + 1
+    }
+    return 0, 0, false
+}
+
+private fn variant_field_off(ty: *check.Type, aux: u32, aux2: u32): (u64, u64, bool) {
+    if aux2 == 0 {
+        return 0, 0, false
+    }
+    val variant = (aux2 - 1) as usize
+    if variant >= check.type_variant_count(ty) {
+        return 0, 0, false
+    }
+    val v = check.type_variant_at(ty, variant)
+    if (aux as usize) >= v.field_count {
+        return 0, 0, false
+    }
+    var off: u64 = 0
+    var j: usize = 0
+    for j <= aux as usize {
+        val fld = check.type_variant_field_at(ty, v, j)
+        if fld.field_type == null {
+            return 0, 0, false
+        }
+        var al = fld.field_type!!.align as u64
+        if al < 1 {
+            al = 1
+        }
+        off = (off + al - 1) / al * al
+        if j == aux as usize {
+            return ty.payload_offset + off, fld.field_type!!.size, true
+        }
+        off = off + fld.field_type!!.size
+        j = j + 1
+    }
+    return 0, 0, false
+}
+
+private fn field_loc(ty0: *check.Type?, aux: u32, aux2: u32, ptr: u32): (u64, u64, bool) {
+    val ty = underlying(ty0)
+    if ty == null {
+        return 0, 0, false
+    }
+    val tk = check.type_kinds()
+    if ty!!.kind == tk.SLICE || ty!!.kind == tk.BYTES || ty!!.kind == tk.INTERFACE {
+        if aux > 1 || ptr == 0 {
+            return 0, 0, false
+        }
+        if aux == 0 {
+            return 0, ptr as u64, true
+        }
+        return ptr as u64, ptr as u64, true
+    }
+    if ty!!.kind == tk.TUPLE {
+        return tuple_field_off(ty!!, aux)
+    }
+    if ty!!.kind == tk.STRUCT {
+        if (aux as usize) >= ty!!.field_types.len {
+            return 0, 0, false
+        }
+        var off: u64 = 0
+        if (aux as usize) < ty!!.field_offsets.len {
+            off = ty!!.field_offsets.get(aux as usize)
+        }
+        return off, ty_size(ty!!.field_types.get(aux as usize) as *check.Type?) as u64, true
+    }
+    if ty!!.kind == tk.ENUM && aux2 > 0 {
+        return variant_field_off(ty!!, aux, aux2)
+    }
+    if ty!!.kind == tk.OPTION && !check.type_option_is_niche(ty!!) {
+        val elem = ty!!.elem
+        val al = ty_align(elem)
+        var value_off: u64 = 1
+        if al > 1 {
+            value_off = (1 as u64 + (al as u64) - 1) & ~((al as u64) - 1)
+        }
+        if aux == 0 {
+            return 0, 1, true
+        }
+        if aux == 1 {
+            return value_off, ty_size(elem) as u64, true
+        }
+    }
+    return 0, 0, false
+}
+
+private fn pointee_size(ptr_ty: *check.Type?): (u32, bool) {
+    val ty = underlying(ptr_ty)
+    if ty == null || ty!!.kind != check.type_kinds().PTR {
+        return 0, false
+    }
+    return ty_size(ty!!.elem) as u32, true
+}
+
+private fn exec_binary(ip: *Interp, fr: *Frame, inst: *Inst): bool with (a: mem.Allocator) {
+    val (ua0, ok_a) = read_int(ip, fr as *Frame?, inst.a, inst.pos)
+    val (ub0, ok_b) = read_int(ip, fr as *Frame?, inst.b, inst.pos)
+    if !ok_a || !ok_b {
+        return false
+    }
+    val width = int_width(inst.a.ty)
+    val sgn = int_signed(inst.a.ty)
+    var ua = ua0 & mask_of(width)
+    var ub = ub0 & mask_of(int_width(inst.b.ty))
+    var out: u64 = 0
+    var ov = false
+    val checked = inst.checked
+    val op = inst.aux
+    // Matches BinOp / binop_aux order.
+    if op == 0 || op == 1 || op == 2 {
+        // ADD SUB MUL
+        if !sgn && width >= 64 {
+            if op == 0 {
+                out = ua + ub
+                ov = out < ua
+            } else if op == 1 {
+                out = ua - ub
+                ov = ua < ub
+            } else if ub != 0 && ua > ((0xffffffff as u64 << 32) | 0xffffffff) / ub {
+                ov = true
+            } else {
+                out = ua * ub
+            }
+        } else if !sgn {
+            val m = mask_of(width)
+            if op == 0 {
+                out = ua + ub
+                ov = out > m
+                out = out & m
+            } else if op == 1 {
+                ov = ua < ub
+                out = (ua - ub) & m
+            } else {
+                out = ua * ub
+                ov = out > m
+                out = out & m
+            }
+        } else if width >= 64 {
+            if op == 0 {
+                out = ua + ub
+                ov = ((~(ua ^ ub) & (ua ^ out)) & ((1 as u64) << 63)) != 0
+            } else if op == 1 {
+                out = ua - ub
+                ov = ((ua ^ ub) & (ua ^ out) & ((1 as u64) << 63)) != 0
+            } else {
+                val (mo, mov) = mul_i64_ov(ua, ub)
+                out = mo
+                ov = mov
+            }
+        } else {
+            val sa = sext(ua, width)
+            val sb = sext(ub, width)
+            var r: i64 = 0
+            if op == 0 {
+                r = sa + sb
+            } else if op == 1 {
+                r = sa - sb
+            } else {
+                r = sa * sb
+            }
+            ov = r < signed_min(width) || r > signed_max(width)
+            out = i64_as_u64(r) & mask_of(width)
+        }
+        if checked && ov {
+            panic_msg(ip, inst.pos, "overflow")
+            return false
+        }
+    } else if op == 3 || op == 4 {
+        // DIV REM
+        val bw = int_width(inst.b.ty)
+        val bs = int_signed(inst.b.ty)
+        if !sgn && !bs {
+            if ub == 0 {
+                panic_msg(ip, inst.pos, "divide by zero")
+                return false
+            }
+            if op == 3 {
+                out = ua / ub
+            } else {
+                out = ua % ub
+            }
+            out = out & mask_of(width)
+        } else {
+            val sa = sext(ua, width)
+            val sb = sext(ub, bw)
+            if sb == 0 {
+                panic_msg(ip, inst.pos, "divide by zero")
+                return false
+            }
+            if width >= 64 && sa == signed_min(64) && sb == -1 {
+                if checked || op == 3 {
+                    panic_msg(ip, inst.pos, "overflow")
+                    return false
+                }
+                out = 0
+            } else {
+                var r: i64 = 0
+                if op == 3 {
+                    r = sa / sb
+                } else {
+                    r = sa % sb
+                }
+                if checked && width < 64 && (r < signed_min(width) || r > signed_max(width)) {
+                    panic_msg(ip, inst.pos, "overflow")
+                    return false
+                }
+                out = i64_as_u64(r) & mask_of(width)
+            }
+        }
+    } else if op == 5 {
+        out = ua & ub
+    } else if op == 6 {
+        out = ua | ub
+    } else if op == 7 {
+        out = ua ^ ub
+    } else if op == 8 || op == 9 {
+        // SHL SHR
+        val sw = int_width(inst.b.ty)
+        val ss = int_signed(inst.b.ty)
+        val sh = ub
+        var neg = false
+        if ss && sext(ub, sw) < 0 {
+            neg = true
+        }
+        if checked && (neg || sh >= width as u64) {
+            panic_msg(ip, inst.pos, "overflow")
+            return false
+        }
+        if checked && op == 8 && sh > 0 && sh < width as u64 {
+            var drop = false
+            val n = sh as u32
+            if !sgn {
+                drop = (ua >> ((width - n) as u64)) != 0
+            } else {
+                var mask_bits: u64 = 0
+                if n + 1 >= width {
+                    mask_bits = mask_of(width)
+                } else {
+                    mask_bits = ((1 as u64) << ((n + 1) as u64)) - 1
+                }
+                val top = ua >> ((width - 1 - n) as u64)
+                val sign = (ua >> ((width - 1) as u64)) & 1
+                if sign != 0 {
+                    drop = (top & mask_bits) != mask_bits
+                } else {
+                    drop = (top & mask_bits) != 0
+                }
+            }
+            if drop {
+                panic_msg(ip, inst.pos, "overflow")
+                return false
+            }
+        }
+        if neg || width == 0 || sh >= 64 || sh >= width as u64 {
+            if op == 9 && sgn && width > 0 && (ua & ((1 as u64) << ((width - 1) as u64))) != 0 {
+                out = mask_of(width)
+            } else {
+                out = 0
+            }
+        } else if op == 8 {
+            out = (ua << sh) & mask_of(width)
+        } else if !sgn {
+            out = (ua >> sh) & mask_of(width)
+        } else {
+            val logical = ua >> sh
+            val low = mask_of(width - (sh as u32))
+            val ones = mask_of(width)
+            if (ua & ((1 as u64) << ((width - 1) as u64))) != 0 {
+                out = (logical & low) | (ones & ~low)
+            } else {
+                out = logical & low
+            }
+        }
+    } else if op >= 10 && op <= 15 {
+        // comparisons
+        var cmp_s = sgn
+        var less = false
+        var eq = false
+        if cmp_s {
+            val sa = sext(ua, width)
+            val sb = sext(ub, int_width(inst.b.ty))
+            less = sa < sb
+            eq = sa == sb
+        } else {
+            less = ua < ub
+            eq = ua == ub
+        }
+        if op == 10 {
+            out = if eq { 1 } else { 0 }
+        } else if op == 11 {
+            out = if !eq { 1 } else { 0 }
+        } else if op == 12 {
+            out = if less { 1 } else { 0 }
+        } else if op == 14 {
+            out = if !less && !eq { 1 } else { 0 }
+        } else if op == 13 {
+            out = if less || eq { 1 } else { 0 }
+        } else {
+            out = if !less { 1 } else { 0 }
+        }
+    } else {
+        error_msg(ip, inst.pos, "compile-time operator is not supported")
+        return false
+    }
+    return write_local_bits(ip, fr, inst.dst, out, inst.pos)
+}
+
+private fn exec_unary(ip: *Interp, fr: *Frame, inst: *Inst): bool with (a: mem.Allocator) {
+    val (ua0, ok) = read_int(ip, fr as *Frame?, inst.a, inst.pos)
+    if !ok {
+        return false
+    }
+    val width = int_width(inst.a.ty)
+    var ua = ua0 & mask_of(width)
+    if inst.aux == 0 {
+        // NEG via SUB 0 - a
+        var sub: Inst
+        sub.op = Op.BINARY
+        sub.aux = 1
+        sub.aux2 = 0
+        sub.checked = inst.checked
+        sub.dst = inst.dst
+        sub.a = int_op(inst.a.ty, 0)
+        sub.b = inst.a
+        sub.args = list.empty<Operand>()
+        sub.pos = inst.pos
+        return exec_binary(ip, fr, &sub)
+    }
+    var out: u64 = 0
+    if inst.aux == 1 {
+        out = if ua == 0 { 1 } else { 0 }
+    } else if inst.aux == 2 {
+        out = (~ua) & mask_of(width)
+    } else {
+        error_msg(ip, inst.pos, "compile-time operator is not supported")
+        return false
+    }
+    return write_local_bits(ip, fr, inst.dst, out, inst.pos)
+}
+
+private fn exec_convert(ip: *Interp, fr: *Frame, inst: *Inst): bool with (a: mem.Allocator) {
+    if inst.dst < 0 {
+        error_msg(ip, inst.pos, "compile-time convert has no destination")
+        return false
+    }
+    val dst_loc = fr.func!!.locals.at(inst.dst as usize)
+    val dst_ty = dst_loc.ty
+    val src_ty = inst.a.ty
+    if is_float_ty(src_ty) || is_float_ty(dst_ty) {
+        error_msg(ip, inst.pos, "float values are not available at compile time")
+        return false
+    }
+    val (bits, ok) = read_int(ip, fr as *Frame?, inst.a, inst.pos)
+    if !ok {
+        return false
+    }
+    if inst.checked && !value_fits(bits, src_ty, dst_ty) {
+        panic_msg(ip, inst.pos, "convert")
+        return false
+    }
+    val sw = int_width(src_ty)
+    var written: u64 = 0
+    val tk = check.type_kinds()
+    if underlying(dst_ty) != null && underlying(dst_ty)!!.kind == tk.BOOL {
+        val m = mask_of(if sw != 0 { sw } else { 8 })
+        written = if (bits & m) != 0 { 1 } else { 0 }
+    } else if int_signed(dst_ty) {
+        var v: i64 = 0
+        if underlying(src_ty) != null && underlying(src_ty)!!.kind == tk.BOOL {
+            v = (bits & 1) as i64
+        } else if int_signed(src_ty) {
+            v = sext(bits, sw)
+        } else {
+            v = u64_as_i64(bits & mask_of(sw))
+        }
+        written = i64_as_u64(v)
+    } else if int_signed(src_ty) {
+        written = i64_as_u64(sext(bits, sw))
+    } else {
+        written = bits & mask_of(sw)
+    }
+    val (off, sz, lok) = local_at(fr, inst.dst as u32)
+    if !lok {
+        error_msg(ip, inst.pos, "compile-time local is out of range")
+        return false
+    }
+    var mask = mask_of(sz * 8)
+    if sz >= 8 {
+        mask = (0xffffffff as u64 << 32) | 0xffffffff
+    }
+    mem_write(ip, off, sz, written & mask)
+    return true
+}
+
+private fn exec_copy_op(ip: *Interp, fr: *Frame, dst: i32, src: Operand, pos: Pos): bool with (a: mem.Allocator) {
+    if dst < 0 {
+        return true
+    }
+    val (off, sz, lok) = local_at(fr, dst as u32)
+    if !lok {
+        error_msg(ip, pos, "compile-time local is out of range")
+        return false
+    }
+    if sz == 0 {
+        return true
+    }
+    if src.kind == OperandKind.LOCAL {
+        val (soff, ssz, sok) = local_at(fr, src.local)
+        if !sok || !range_ok(ip, soff, ssz) || !range_ok(ip, off, sz) {
+            error_msg(ip, pos, "compile-time local is out of range")
+            return false
+        }
+        var i: usize = 0
+        for i < sz as usize {
+            ip.mem.set(off as usize + i, 0)
+            i = i + 1
+        }
+        var m = ssz
+        if m > sz {
+            m = sz
+        }
+        i = 0
+        for i < m as usize {
+            ip.mem.set(off as usize + i, ip.mem.get(soff as usize + i))
+            i = i + 1
+        }
+        return true
+    }
+    var tmp = list.empty<u8>()
+    if !read_op(ip, fr as *Frame?, src, &tmp, sz as usize, pos) {
+        return false
+    }
+    if !range_ok(ip, off, sz) {
+        error_msg(ip, pos, "compile-time local is out of range")
+        return false
+    }
+    var i: usize = 0
+    for i < sz as usize {
+        ip.mem.set(off as usize + i, tmp.get(i))
+        i = i + 1
+    }
+    return true
+}
+
+private fn load_ptr(ip: *Interp, fr: *Frame?, op: Operand, pos: Pos): (u64, bool) with (a: mem.Allocator) {
+    val (bits, ok) = read_int(ip, fr, op, pos)
+    if !ok {
+        return 0, false
+    }
+    return bits & mask_of(ip.ptr_size * 8), true
+}
+
+private fn mem_copy_checked(
+    ip: *Interp,
+    off: u32,
+    n: u32,
+    dst: *list.List<u8>?,
+    store: bool,
+    src: *list.List<u8>?,
+    pos: Pos,
+): bool with (a: mem.Allocator) {
+    if off == 0 {
+        panic_msg(ip, pos, "null pointer")
+        return false
+    }
+    if !range_ok(ip, off, n) {
+        panic_msg(ip, pos, "bounds")
+        return false
+    }
+    if !store && hits_var(ip, off, n) {
+        error_msg(ip, pos, "cannot read a var at compile time")
+        return false
+    }
+    if store && hits_global(ip, off, n) {
+        error_msg(ip, pos, "cannot write a global at compile time")
+        return false
+    }
+    if n == 0 {
+        return true
+    }
+    var i: usize = 0
+    if store {
+        for i < n as usize {
+            ip.mem.set(off as usize + i, src!!.get(i))
+            i = i + 1
+        }
+    } else {
+        for dst!!.len < n as usize {
+            dst!!.push(0)
+        }
+        for i < n as usize {
+            dst!!.set(i, ip.mem.get(off as usize + i))
+            i = i + 1
+        }
+    }
+    return true
+}
+
+private fn exec_aggregate(ip: *Interp, fr: *Frame, inst: *Inst): bool with (a: mem.Allocator) {
+    if inst.dst < 0 {
+        error_msg(ip, inst.pos, "compile-time aggregate has no destination")
+        return false
+    }
+    val (off, sz, lok) = local_at(fr, inst.dst as u32)
+    if !lok || !range_ok(ip, off, sz) {
+        error_msg(ip, inst.pos, "compile-time aggregate has no destination")
+        return false
+    }
+    var zi: usize = 0
+    for zi < sz as usize {
+        ip.mem.set(off as usize + zi, 0)
+        zi = zi + 1
+    }
+    val dst_loc = fr.func!!.locals.at(inst.dst as usize)
+    val type0 = underlying(dst_loc.ty)
+    if type0 == null {
+        error_msg(ip, inst.pos, "compile-time aggregate has no type")
+        return false
+    }
+    val ty = type0!!
+    val tk = check.type_kinds()
+    var argi: usize = 0
+    if ty.kind == tk.OPTION && check.type_option_is_niche(ty) {
+        if inst.args.len < 2 {
+            error_msg(ip, inst.pos, "compile-time aggregate is missing a field")
+            return false
+        }
+        val (tag, tok) = read_int(ip, fr as *Frame?, inst.args.get(0), inst.pos)
+        if !tok {
+            return false
+        }
+        if tag != 0 {
+            return exec_copy_op(ip, fr, inst.dst, inst.args.get(1), inst.pos)
+        }
+        return true
+    }
+    if ty.kind == tk.SLICE || ty.kind == tk.BYTES || ty.kind == tk.INTERFACE {
+        if inst.args.len < 2 {
+            error_msg(ip, inst.pos, "compile-time aggregate is missing a field")
+            return false
+        }
+        var tmp = list.empty<u8>()
+        if !read_op(ip, fr as *Frame?, inst.args.get(0), &tmp, ip.ptr_size as usize, inst.pos) {
+            return false
+        }
+        var i: usize = 0
+        for i < ip.ptr_size as usize {
+            ip.mem.set(off as usize + i, tmp.get(i))
+            i = i + 1
+        }
+        tmp = list.empty<u8>()
+        if !read_op(ip, fr as *Frame?, inst.args.get(1), &tmp, ip.ptr_size as usize, inst.pos) {
+            return false
+        }
+        i = 0
+        for i < ip.ptr_size as usize {
+            ip.mem.set(off as usize + ip.ptr_size as usize + i, tmp.get(i))
+            i = i + 1
+        }
+        return true
+    }
+    if ty.kind == tk.ENUM {
+        if (inst.aux as usize) >= check.type_variant_count(ty) {
+            error_msg(ip, inst.pos, "compile-time aggregate is missing a field")
+            return false
+        }
+        val variant = check.type_variant_at(ty, inst.aux as usize)
+        mem_write(ip, off, ty_size(ty.elem) as u32, variant.tag as u64)
+        var field: usize = 0
+        for field < variant.field_count {
+            val fld = check.type_variant_field_at(ty, variant, field)
+            val ft = fld.field_type
+            val (foff, fsz0, fok) = variant_field_off(ty, field as u32, (inst.aux + 1))
+            // recompute: use payload + running offset already in variant_field_off
+            val fsz = ty_size(ft)
+            if fsz == 0 {
+                field = field + 1
+                continue
+            }
+            for argi < inst.args.len && ty_size(inst.args.get(argi).ty) == 0 {
+                argi = argi + 1
+            }
+            if argi >= inst.args.len {
+                error_msg(ip, inst.pos, "compile-time aggregate is missing a field")
+                return false
+            }
+            if !fok || foff + (fsz as u64) > sz as u64 {
+                error_msg(ip, inst.pos, "compile-time aggregate is missing a field")
+                return false
+            }
+            var tmp = list.empty<u8>()
+            if !read_op(ip, fr as *Frame?, inst.args.get(argi), &tmp, fsz, inst.pos) {
+                return false
+            }
+            var i: usize = 0
+            for i < fsz {
+                ip.mem.set(off as usize + (foff as usize) + i, tmp.get(i))
+                i = i + 1
+            }
+            argi = argi + 1
+            field = field + 1
+        }
+        return true
+    }
+    if ty.kind == tk.OPTION {
+        val elem = ty.elem
+        val al = ty_align(elem)
+        var value_off: u64 = 1
+        if al > 1 {
+            value_off = (1 as u64 + (al as u64) - 1) & ~((al as u64) - 1)
+        }
+        if inst.args.len < 1 {
+            error_msg(ip, inst.pos, "compile-time aggregate is missing a field")
+            return false
+        }
+        var tmp = list.empty<u8>()
+        if !read_op(ip, fr as *Frame?, inst.args.get(0), &tmp, 1, inst.pos) {
+            return false
+        }
+        ip.mem.set(off as usize, tmp.get(0))
+        if ty_size(elem) == 0 {
+            return true
+        }
+        if inst.args.len < 2 {
+            error_msg(ip, inst.pos, "compile-time aggregate is missing a field")
+            return false
+        }
+        tmp = list.empty<u8>()
+        if !read_op(ip, fr as *Frame?, inst.args.get(1), &tmp, ty_size(elem), inst.pos) {
+            return false
+        }
+        var i: usize = 0
+        for i < ty_size(elem) {
+            ip.mem.set(off as usize + (value_off as usize) + i, tmp.get(i))
+            i = i + 1
+        }
+        return true
+    }
+    var fields: usize = 0
+    if ty.kind == tk.STRUCT {
+        fields = ty.field_types.len
+    } else if ty.kind == tk.TUPLE {
+        fields = ty.elems.len
+    } else {
+        error_msg(ip, inst.pos, "compile-time aggregate is not supported")
+        return false
+    }
+    var field: usize = 0
+    for field < fields {
+        var ft: *check.Type? = null
+        var foff: u64 = 0
+        if ty.kind == tk.STRUCT {
+            ft = ty.field_types.get(field) as *check.Type?
+            if field < ty.field_offsets.len {
+                foff = ty.field_offsets.get(field)
+            }
+        } else {
+            ft = ty.elems.get(field) as *check.Type?
+            val (to, _, tok) = tuple_field_off(ty, field as u32)
+            if tok {
+                foff = to
+            }
+        }
+        val fsz = ty_size(ft)
+        if fsz == 0 {
+            field = field + 1
+            continue
+        }
+        for argi < inst.args.len && ty_size(inst.args.get(argi).ty) == 0 {
+            argi = argi + 1
+        }
+        if argi >= inst.args.len {
+            error_msg(ip, inst.pos, "compile-time aggregate is missing a field")
+            return false
+        }
+        var tmp = list.empty<u8>()
+        if !read_op(ip, fr as *Frame?, inst.args.get(argi), &tmp, fsz, inst.pos) {
+            return false
+        }
+        var i: usize = 0
+        for i < fsz {
+            ip.mem.set(off as usize + (foff as usize) + i, tmp.get(i))
+            i = i + 1
+        }
+        argi = argi + 1
+        field = field + 1
+    }
+    return true
+}
+
+private fn exec_call(ip: *Interp, fr: *Frame, inst: *Inst): bool with (a: mem.Allocator) {
+    if inst.a.kind != OperandKind.FUNC {
+        error_msg(ip, inst.pos, "indirect calls are not available at compile time")
+        return false
+    }
+    val callee = func_at(ip.module!!, inst.a.func)
+    if callee == null {
+        error_msg(ip, inst.pos, "compile-time function is missing")
+        return false
+    }
+    if callee!!.linkage == Linkage.EXTERN {
+        var name = callee!!.jog_name
+        if name.len == 0 {
+            name = callee!!.name
+        }
+        if name.len == 0 {
+            name = "?"
+        }
+        var b = strbuilder.empty()
+        b.append("cannot call an extern function '")
+        b.append(name)
+        b.append("' at compile time")
+        error_msg(ip, inst.pos, b.str())
+        b.free()
+        return false
+    }
+    val nparam = callee!!.param_count as usize
+    if inst.args.len != nparam {
+        error_msg(ip, inst.pos, "compile-time call has the wrong number of arguments")
+        return false
+    }
+    var bufs = list.empty<list.List<u8>>()
+    var i: usize = 0
+    for i < nparam {
+        val param = callee!!.locals.at(i)
+        val sz = ty_size(param.ty)
+        var buf = list.empty<u8>()
+        var z: usize = 0
+        for z < (if sz > 0 { sz } else { 1 }) {
+            buf.push(0)
+            z = z + 1
+        }
+        if sz > 0 && !read_op(ip, fr as *Frame?, inst.args.get(i), &buf, sz, inst.pos) {
+            return false
+        }
+        bufs.push(buf)
+        i = i + 1
+    }
+    val ret_dst = inst.dst
+    if !push_frame(ip, callee!!, ret_dst) {
+        return false
+    }
+    val child = ip.frames.at(ip.depth - 1)
+    i = 0
+    for i < nparam {
+        val param = callee!!.locals.at(i)
+        val sz = ty_size(param.ty)
+        if sz > 0 {
+            val base = child.off.get(i)
+            var j: usize = 0
+            val buf = bufs.at(i)
+            for j < sz {
+                ip.mem.set(base as usize + j, buf.get(j))
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    return true
+}
+private fn exec_inst(ip: *Interp, fr: *Frame, inst: *Inst): (bool, bool) with (a: mem.Allocator) {
+    // returns (ok, advance)
+    if false {
+        return false, true
+    }
+    when inst.op {
+        COPY -> {
+            return exec_copy_op(ip, fr, inst.dst, inst.a, inst.pos), true
+        }
+        ZERO -> {
+            if inst.dst < 0 {
+                error_msg(ip, inst.pos, "compile-time local is out of range")
+                return false, true
+            }
+            val (off, sz, lok) = local_at(fr, inst.dst as u32)
+            if !lok || !range_ok(ip, off, sz) {
+                error_msg(ip, inst.pos, "compile-time local is out of range")
+                return false, true
+            }
+            var i: usize = 0
+            for i < sz as usize {
+                ip.mem.set(off as usize + i, 0)
+                i = i + 1
+            }
+            return true, true
+        }
+        BINARY -> {
+            return exec_binary(ip, fr, inst), true
+        }
+        UNARY -> {
+            return exec_unary(ip, fr, inst), true
+        }
+        CONVERT -> {
+            return exec_convert(ip, fr, inst), true
+        }
+        BITCAST -> {
+            return exec_copy_op(ip, fr, inst.dst, inst.a, inst.pos), true
+        }
+        LOAD -> {
+            if inst.dst < 0 {
+                error_msg(ip, inst.pos, "compile-time load has no destination")
+                return false, true
+            }
+            val (off, sz, lok) = local_at(fr, inst.dst as u32)
+            if !lok {
+                error_msg(ip, inst.pos, "compile-time load has no destination")
+                return false, true
+            }
+            val (addr, aok) = load_ptr(ip, fr as *Frame?, inst.a, inst.pos)
+            if !aok {
+                return false, true
+            }
+            if sz == 0 {
+                return true, true
+            }
+            if addr > 0xffffffff {
+                panic_msg(ip, inst.pos, "bounds")
+                return false, true
+            }
+            var tmp = list.empty<u8>()
+            if !mem_copy_checked(ip, addr as u32, sz, &tmp, false, null, inst.pos) {
+                return false, true
+            }
+            var i: usize = 0
+            for i < sz as usize {
+                ip.mem.set(off as usize + i, tmp.get(i))
+                i = i + 1
+            }
+            return true, true
+        }
+        STORE -> {
+            var n = ty_size(inst.b.ty)
+            if n == 0 {
+                val (psz, pok) = pointee_size(inst.a.ty)
+                if !pok {
+                    return true, true
+                }
+                n = psz as usize
+            }
+            val (addr, aok) = load_ptr(ip, fr as *Frame?, inst.a, inst.pos)
+            if !aok {
+                return false, true
+            }
+            if n == 0 {
+                return true, true
+            }
+            var tmp = list.empty<u8>()
+            if !read_op(ip, fr as *Frame?, inst.b, &tmp, n, inst.pos) {
+                return false, true
+            }
+            if addr > 0xffffffff || !mem_copy_checked(ip, addr as u32, n as u32, null, true, &tmp, inst.pos) {
+                return false, true
+            }
+            return true, true
+        }
+        ADDR -> {
+            if inst.a.kind != OperandKind.LOCAL {
+                error_msg(ip, inst.pos, "compile-time addr needs a local")
+                return false, true
+            }
+            val (off, _, lok) = local_at(fr, inst.a.local)
+            if !lok {
+                error_msg(ip, inst.pos, "compile-time addr needs a local")
+                return false, true
+            }
+            return write_local_bits(ip, fr, inst.dst, off as u64, inst.pos), true
+        }
+        FIELD_ADDR -> {
+            val (addr, aok) = load_ptr(ip, fr as *Frame?, inst.a, inst.pos)
+            if !aok {
+                return false, true
+            }
+            val ptr = underlying(inst.a.ty)
+            var base: *check.Type? = null
+            if ptr != null && ptr!!.kind == check.type_kinds().PTR {
+                base = ptr!!.elem
+            }
+            val (foff, _, fok) = field_loc(base, inst.aux, inst.aux2, ip.ptr_size)
+            if !fok {
+                error_msg(ip, inst.pos, "compile-time field is out of range")
+                return false, true
+            }
+            return write_local_bits(ip, fr, inst.dst, addr + foff, inst.pos), true
+        }
+        ELEM_ADDR -> {
+            val (addr, aok) = load_ptr(ip, fr as *Frame?, inst.a, inst.pos)
+            val (index, iok) = read_int(ip, fr as *Frame?, inst.b, inst.pos)
+            if !aok || !iok {
+                return false, true
+            }
+            val (esz, eok) = pointee_size(inst.a.ty)
+            if !eok {
+                error_msg(ip, inst.pos, "compile-time element address has no type")
+                return false, true
+            }
+            return write_local_bits(ip, fr, inst.dst, addr + index * (esz as u64), inst.pos), true
+        }
+        EXTRACT -> {
+            if inst.a.kind != OperandKind.LOCAL {
+                error_msg(ip, inst.pos, "compile-time extract needs a local")
+                return false, true
+            }
+            val (off, _, lok) = local_at(fr, inst.a.local)
+            if !lok {
+                error_msg(ip, inst.pos, "compile-time extract needs a local")
+                return false, true
+            }
+            val (foff, fsz, fok) = field_loc(inst.a.ty, inst.aux, inst.aux2, ip.ptr_size)
+            if !fok {
+                error_msg(ip, inst.pos, "compile-time field is out of range")
+                return false, true
+            }
+            if (off as u64) + foff + fsz > ip.used as u64 {
+                panic_msg(ip, inst.pos, "bounds")
+                return false, true
+            }
+            if fsz == 0 {
+                return write_local(ip, fr, inst.dst, null, 0, inst.pos), true
+            }
+            var tmp = list.empty<u8>()
+            var i: usize = 0
+            for i < fsz as usize {
+                tmp.push(ip.mem.get(off as usize + (foff as usize) + i))
+                i = i + 1
+            }
+            return write_local(ip, fr, inst.dst, &tmp, fsz as usize, inst.pos), true
+        }
+        AGGREGATE -> {
+            return exec_aggregate(ip, fr, inst), true
+        }
+        ENUM_TAG -> {
+            if inst.a.kind != OperandKind.LOCAL {
+                error_msg(ip, inst.pos, "compile-time enum tag needs an enum")
+                return false, true
+            }
+            val (off, _, lok) = local_at(fr, inst.a.local)
+            val type0 = underlying(inst.a.ty)
+            if !lok || type0 == null || type0!!.kind != check.type_kinds().ENUM {
+                error_msg(ip, inst.pos, "compile-time enum tag needs an enum")
+                return false, true
+            }
+            val tsz = ty_size(type0!!.elem)
+            var tmp = list.empty<u8>()
+            var i: usize = 0
+            for i < (if tsz > 0 { tsz } else { 1 }) {
+                tmp.push(0)
+                i = i + 1
+            }
+            i = 0
+            for i < tsz {
+                tmp.set(i, ip.mem.get(off as usize + i))
+                i = i + 1
+            }
+            return write_local(ip, fr, inst.dst, &tmp, tsz, inst.pos), true
+        }
+        CALL -> {
+            if !exec_call(ip, fr, inst) {
+                return false, false
+            }
+            return true, false
+        }
+        BOUNDS_CHECK -> {
+            val (a, aok) = read_int(ip, fr as *Frame?, inst.a, inst.pos)
+            val (b, bok) = read_int(ip, fr as *Frame?, inst.b, inst.pos)
+            if !aok || !bok {
+                return false, true
+            }
+            val aa = a & mask_of(int_width(inst.a.ty))
+            val bb = b & mask_of(int_width(inst.b.ty))
+            if !(aa < bb) {
+                panic_msg(ip, inst.pos, "bounds")
+                return false, true
+            }
+            return true, true
+        }
+        NULL_CHECK -> {
+            val (bits, bok) = read_int(ip, fr as *Frame?, inst.a, inst.pos)
+            if !bok {
+                return false, true
+            }
+            val type0 = underlying(inst.a.ty)
+            if type0 != null && type0!!.kind == check.type_kinds().OPTION && !check.type_option_is_niche(type0!!) {
+                if (bits & 0xff) == 0 {
+                    panic_msg(ip, inst.pos, "null pointer")
+                    return false, true
+                }
+                return true, true
+            }
+            if (bits & mask_of(ip.ptr_size * 8)) == 0 {
+                panic_msg(ip, inst.pos, "null pointer")
+                return false, true
+            }
+            return true, true
+        }
+        PANIC -> {
+            var msg = "panic"
+            if inst.a.kind == OperandKind.STRING && inst.a.str_ptr.len > 0 {
+                msg = inst.a.str_ptr
+            }
+            panic_msg(ip, inst.pos, msg)
+            return false, true
+        }
+        else -> {
+            error_msg(ip, inst.pos, "compile-time instruction is not supported")
+            return false, true
+        }
+    }
+}
+
+private fn jump_block(ip: *Interp, fr: *Frame, target: u32, pos: Pos): bool with (a: mem.Allocator) {
+    if fr.func == null || (target as usize) >= fr.func!!.blocks.len {
+        error_msg(ip, pos, "compile-time branch is out of range")
+        return false
+    }
+    fr.block = target
+    fr.ip = 0
+    return true
+}
+
+private fn exec_term(ip: *Interp, fr: *Frame, term: *Term): bool with (a: mem.Allocator) {
+    var pos = term.pos
+    if fr.func != null && pos.line == 0 {
+        pos = fr.func!!.pos
+    }
+    when term.kind {
+        NONE -> {
+            error_msg(ip, pos, "compile-time function is missing a terminator")
+            return false
+        }
+        BR -> {
+            return jump_block(ip, fr, term.target, pos)
+        }
+        COND_BR -> {
+            val (cond, cok) = read_int(ip, fr as *Frame?, term.value, pos)
+            if !cok {
+                return false
+            }
+            if cond != 0 {
+                return jump_block(ip, fr, term.target, pos)
+            }
+            return jump_block(ip, fr, term.else_target, pos)
+        }
+        SWITCH -> {
+            val (value0, vok) = read_int(ip, fr as *Frame?, term.value, pos)
+            if !vok {
+                return false
+            }
+            val width = int_width(term.value.ty)
+            val value = value0 & mask_of(width)
+            var i: usize = 0
+            for i < term.cases.len {
+                val arm = (term.cases.get(i).value as u64) & mask_of(width)
+                if arm == value {
+                    return jump_block(ip, fr, term.cases.get(i).target, pos)
+                }
+                i = i + 1
+            }
+            return jump_block(ip, fr, term.target, pos)
+        }
+        RET -> {
+            val ret_dst = fr.ret_dst
+            var ret_ty: *check.Type? = null
+            if fr.func != null && fr.func!!.ty != null && fr.func!!.ty!!.kind == check.type_kinds().FN {
+                ret_ty = fr.func!!.ty!!.elem
+            }
+            val n = ty_size(ret_ty)
+            var buf = list.empty<u8>()
+            val root = ip.depth == 1
+            if n > 0 {
+                var z: usize = 0
+                for z < n {
+                    buf.push(0)
+                    z = z + 1
+                }
+                if term.value.kind != OperandKind.NONE && !read_op(ip, fr as *Frame?, term.value, &buf, n, pos) {
+                    return false
+                }
+            }
+            if !pop_frame(ip) {
+                return false
+            }
+            if root {
+                var m = n
+                if m > ip.result.len {
+                    m = ip.result.len
+                }
+                var i: usize = 0
+                for i < m {
+                    ip.result.set(i, buf.get(i))
+                    i = i + 1
+                }
+                return true
+            }
+            if ret_dst >= 0 && n > 0 {
+                val caller = ip.frames.at(ip.depth - 1)
+                if !write_local(ip, caller, ret_dst, &buf, n, pos) {
+                    return false
+                }
+            }
+            if ip.depth > 0 {
+                val caller = ip.frames.at(ip.depth - 1)
+                caller.ip = caller.ip + 1
+            }
+            return true
+        }
+        UNREACHABLE -> {
+            panic_msg(ip, pos, "unreachable")
+            return false
+        }
+        else -> {
+            error_msg(ip, pos, "compile-time terminator is not supported")
+            return false
+        }
+    }
+}
+
+private fn run_interp(ip: *Interp): bool with (a: mem.Allocator) {
+    for !ip.failed && ip.depth > 0 {
+        val fr = ip.frames.at(ip.depth - 1)
+        if fr.func == null || (fr.block as usize) >= fr.func!!.blocks.len {
+            error_msg(ip, fr.func!!.pos, "compile-time block is missing")
+            break
+        }
+        val block = fr.func!!.blocks.at(fr.block as usize)
+        if ip.steps >= ip.budget {
+            var p = block.term.pos
+            if p.line == 0 {
+                p = fr.func!!.pos
+            }
+            error_msg(ip, p, "compile-time step budget exceeded")
+            break
+        }
+        ip.steps = ip.steps + 1
+        val ninst = block.insts.len
+        if (fr.ip as usize) < ninst {
+            val inst = block.insts.get(fr.ip as usize)
+            val (ok, advance) = exec_inst(ip, fr, inst)
+            if !ok {
+                break
+            }
+            if !ip.failed && advance && ip.depth > 0 {
+                val cur = ip.frames.at(ip.depth - 1)
+                cur.ip = cur.ip + 1
+            }
+        } else {
+            if !exec_term(ip, fr, &block.term) {
+                break
+            }
+        }
+    }
+    return !ip.failed && ip.depth == 0
+}
+
+private fn place_globals(ip: *Interp): bool with (a: mem.Allocator) {
+    val n = ip.module!!.globals.len
+    ip.globals = list.empty<GSlot>()
+    ip.used = 16
+    if !ensure_cap(ip, 16) {
+        error_msg(ip, pos_none(), "out of memory")
+        return false
+    }
+    var i: usize = 0
+    for i < 16 {
+        ip.mem.set(i, 0)
+        i = i + 1
+    }
+    i = 0
+    for i < n {
+        val g = global_at(ip.module!!, i as u32)
+        if g == null {
+            error_msg(ip, pos_none(), "compile-time global is missing")
+            return false
+        }
+        val sz = ty_size(g!!.ty) as u32
+        val al = ty_align(g!!.ty)
+        val (off, ok) = bump(ip, al, sz)
+        if !ok {
+            return false
+        }
+        var slot: GSlot
+        slot.off = off
+        slot.size = sz
+        slot.is_const = g!!.is_const
+        ip.globals.push(slot)
+        if g!!.has_data && g!!.data_len > 0 && sz > 0 {
+            var m = g!!.data_len
+            if m > sz as usize {
+                m = sz as usize
+            }
+            if m > g!!.data.len {
+                m = g!!.data.len
+            }
+            var j: usize = 0
+            for j < m {
+                ip.mem.set(off as usize + j, g!!.data.get(j))
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    return !ip.failed
+}
+
+/**
+ * Run a JIR function at compile time. Publishes return-type-sized result bytes.
+ * @param module IR module (globals placed into interp memory first)
+ * @param func_index function to run (no args)
+ * @param step_budget max instruction steps (typically 10_000_000)
+ * @return result bytes and ok
+ */
+fn interp_call(module: *Module, func_index: u32, step_budget: u64): (list.List<u8>, bool) with (a: mem.Allocator) {
+    var empty = list.empty<u8>()
+    var ip: Interp
+    ip.module = module as *Module?
+    ip.budget = step_budget
+    ip.steps = 0
+    ip.ptr_size = 8
+    if module.types.ptr_size != 0 && module.types.ptr_size <= 8 {
+        ip.ptr_size = module.types.ptr_size
+    }
+    ip.mem = list.empty<u8>()
+    ip.used = 0
+    ip.globals = list.empty<GSlot>()
+    ip.frames = list.empty<Frame>()
+    ip.depth = 0
+    ip.result = list.empty<u8>()
+    ip.failed = false
+    val func = func_at(module, func_index)
+    if func == null {
+        load.print_bare_error("compile-time function is missing")
+        return empty, false
+    }
+    if func!!.linkage == Linkage.EXTERN {
+        var name = func!!.jog_name
+        if name.len == 0 {
+            name = func!!.name
+        }
+        var b = strbuilder.empty()
+        b.append("cannot call an extern function '")
+        b.append(name)
+        b.append("' at compile time")
+        if func!!.pos.file.len > 0 && func!!.pos.line > 0 {
+            load.print_pos_error(func!!.pos.file, func!!.pos.line, func!!.pos.column, b.str())
+        } else {
+            load.print_bare_error(b.str())
+        }
+        b.free()
+        return empty, false
+    }
+    var ret: *check.Type? = null
+    if func!!.ty != null && func!!.ty!!.kind == check.type_kinds().FN {
+        ret = func!!.ty!!.elem
+    }
+    val n = ty_size(ret)
+    if func!!.param_count != 0 {
+        if func!!.pos.file.len > 0 && func!!.pos.line > 0 {
+            load.print_pos_error(func!!.pos.file, func!!.pos.line, func!!.pos.column, "compile-time call has the wrong number of arguments")
+        } else {
+            load.print_bare_error("compile-time call has the wrong number of arguments")
+        }
+        return empty, false
+    }
+    if !place_globals(&ip) {
+        return empty, false
+    }
+    var ri: usize = 0
+    for ri < (if n > 0 { n } else { 1 }) {
+        ip.result.push(0)
+        ri = ri + 1
+    }
+    if n == 0 {
+        // keep one zero byte for empty result buffer shape; published len is still 0 via ty size path
+        ip.result.len = 0
+    }
+    if !push_frame(&ip, func!!, -1) {
+        return empty, false
+    }
+    if !run_interp(&ip) {
+        return empty, false
+    }
+    var published = list.empty<u8>()
+    var i: usize = 0
+    for i < n {
+        published.push(ip.result.get(i))
+        i = i + 1
+    }
+    return published, true
+}

@@ -1,0 +1,485 @@
+// with / context params. Checked against compiler/src/lower_context.c.
+// LowerGuide step 13.
+
+import src.check
+import src.ir
+import src.load
+import src.parse
+import std.list
+import std.mem
+
+struct CtxFrame {
+    ty: *check.Type?
+    local: u32
+}
+
+private fn with_values_and_body(stmt: *parse.Node): (usize, *parse.Node?) {
+    if stmt.kids.len == 0 {
+        return 0, null
+    }
+    val last = stmt.kids.get(stmt.kids.len - 1)
+    if parse.is_block(last) {
+        return stmt.kids.len - 1, last as *parse.Node?
+    }
+    return stmt.kids.len, null
+}
+
+// `with (&value)` stores *T. That pointer is the one value behind an
+// interface context parameter when it is the only such frame.
+private fn frame_supplies_iface(have: *check.Type?, want: *check.Type): bool {
+    if have == null || want.kind != check.type_kinds().INTERFACE {
+        return false
+    }
+    val tk = check.type_kinds()
+    if have!!.kind != tk.PTR || have!!.elem == null {
+        return false
+    }
+    val elem = have!!.elem!!
+    return elem.kind == tk.STRUCT || elem.kind == tk.ENUM
+}
+
+private fn types_match_ctx(lhs: *check.Type?, rhs: *check.Type?): bool with (a: mem.Allocator) {
+    if lhs == null || rhs == null {
+        return false
+    }
+    if lhs!! == rhs!! {
+        return true
+    }
+    return check.type_same(lhs!!, rhs!!)
+}
+
+/** Push a live context local for subsequent calls in this scope. */
+fn context_push_local(L: *Lower, ty: *check.Type?, local: u32) with (a: mem.Allocator) {
+    var fr: CtxFrame
+    fr.ty = ty
+    fr.local = local
+    L.ctx_frames.push(fr)
+}
+
+fn context_pop_n(L: *Lower, n: usize) {
+    var i: usize = 0
+    for i < n {
+        if L.ctx_frames.len == 0 {
+            return
+        }
+        L.ctx_frames.pop()
+        i = i + 1
+    }
+}
+
+/**
+ * `with (vals...) { body }`: evaluate each value into a local, push, lower body, pop.
+ */
+fn lower_context_with(L: *Lower, node: *parse.Node) with (a: mem.Allocator) {
+    val (nvals, body) = with_values_and_body(node)
+    var pushed: usize = 0
+    var i: usize = 0
+    for i < nvals && !L.failed {
+        val value = node.kids.get(i)
+        val op = lower_expr(L, value)
+        if L.failed {
+            return
+        }
+        var ty = check.get_node_ty(value)
+        if ty == null {
+            ty = op.ty
+        }
+        val local = new_local(L, "", ty)
+        emit_copy(L, local, op, node_pos(L, node))
+        context_push_local(L, ty, local)
+        pushed = pushed + 1
+        i = i + 1
+    }
+    if body != null && !L.failed {
+        lower_stmt(L, body!!)
+    }
+    context_pop_n(L, pushed)
+}
+
+/**
+ * `context name: T = init` inside a function: bind local and push as context.
+ */
+fn lower_context_binding(L: *Lower, node: *parse.Node) with (a: mem.Allocator) {
+    val ty = check.get_node_ty(node)
+    val sym = check.get_node_sym(node)
+    var name = node.name
+    if name.len == 0 && node.text.len > 0 {
+        name = node.text
+    }
+    val local = new_local(L, name, ty)
+    bind_local(L, sym, local)
+    // Initializer: last kid, or sole non-type kid (same as binding_init).
+    var init: *parse.Node? = null
+    if node.kids.len > 0 {
+        init = node.kids.get(node.kids.len - 1) as *parse.Node?
+    }
+    if init != null {
+        val value = lower_expr(L, init!!)
+        if !L.terminated {
+            emit_copy(L, local, value, node_pos(L, node))
+        }
+    }
+    context_push_local(L, ty, local)
+}
+
+private fn find_context_global(L: *Lower, want: *check.Type): (i32, bool) with (a: mem.Allocator) {
+    for g in L.globals.items() {
+        if g.symbol == null {
+            continue
+        }
+        val sym = g.symbol!!
+        if sym.kind != load.kind_context() {
+            continue
+        }
+        val sty = check.get_sema(sym)
+        if sty != null && types_match_ctx(sty, want as *check.Type?) {
+            return g.index, true
+        }
+    }
+    return -1, false
+}
+
+/** Distinct ↔ base `as` for context types (C jog_lower_context_cast). */
+fn lower_context_cast(L: *Lower, node: *parse.Node): (ir.Operand, bool) with (a: mem.Allocator) {
+    if !parse.is_cast(node) || node.text != "as" || node.kids.len < 1 {
+        return none_value(), false
+    }
+    val dest = check.get_node_ty(node)
+    val expr = node.kids.get(0)
+    val got = check.get_node_ty(expr)
+    if dest == null || got == null {
+        return none_value(), false
+    }
+    var ok = false
+    if got!!.kind == check.type_kinds().DISTINCT && got!!.elem != null && got!!.elem!! == dest!! {
+        ok = true
+    }
+    if dest!!.kind == check.type_kinds().DISTINCT && dest!!.elem != null && dest!!.elem!! == got!! {
+        ok = true
+    }
+    if !ok {
+        return none_value(), false
+    }
+    val src = lower_expr(L, expr)
+    if L.failed {
+        return none_value(), true
+    }
+    return emit_bitcast(L, src, dest, node_pos(L, node)), true
+}
+
+private fn bare_root_main_fn(L: *Lower): bool {
+    if L.ast_fn == null {
+        return false
+    }
+    val decl = L.ast_fn!!
+    if !parse.is_fn(decl) || parse.fn_has_receiver(decl) || decl.name != "main" {
+        return false
+    }
+    val nctx = (decl.head / 256) % 256
+    if nctx != 0 {
+        return false
+    }
+    if parse.flag_has_word(decl.flag, "test") {
+        return false
+    }
+    return true
+}
+
+private fn default_kind(want: *check.Type): i32 {
+    if want.kind == check.type_kinds().DISTINCT && want.decl == null && want.name == "Scope" {
+        return 3
+    }
+    if want.package == "std.mem" {
+        if want.kind == check.type_kinds().INTERFACE && want.name == "Allocator" {
+            return 1
+        }
+        if want.kind == check.type_kinds().DISTINCT && want.name == "ErrorAllocator" {
+            return 2
+        }
+    }
+    if want.package == "std.io" && want.kind == check.type_kinds().INTERFACE && want.name == "Logger" {
+        return 4
+    }
+    return 0
+}
+
+private fn pkg_fn_decl(L: *Lower, path: str, name: str): *parse.Node? {
+    for pkg in L.prog.packages.items() {
+        if pkg.path != path {
+            continue
+        }
+        val sym = load.package_scope_lookup(&pkg.scope, name)
+        if sym == null || sym!!.decl == null || !parse.is_fn(sym!!.decl!!) {
+            return null
+        }
+        return sym!!.decl
+    }
+    return null
+}
+
+fn call_pkg(L: *Lower, path: str, name: str, as_ty: *check.Type?, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    return call_pkg_fn0(L, path, name, as_ty, pos)
+}
+
+private fn call_pkg_fn0(L: *Lower, path: str, name: str, as_ty: *check.Type?, pos: ir.Pos): ir.Operand with (
+    a: mem.Allocator,
+) {
+    val decl = pkg_fn_decl(L, path, name)
+    if decl == null {
+        fail(L, null, "missing runtime default")
+        return none_value()
+    }
+    val index = find_fn(L, decl!!)
+    if index < 0 {
+        fail(L, null, "missing runtime default")
+        return none_value()
+    }
+    val f = ir.func_at(&L.module, index as u32)
+    var ret: *check.Type? = null
+    if f != null && f!!.ty != null {
+        ret = f!!.ty!!.elem
+    }
+    var local_ty = as_ty
+    if local_ty == null {
+        local_ty = ret
+    }
+    var dst: i32 = -1
+    if local_ty != null && !check.type_is_unit(local_ty!!) {
+        dst = new_local(L, "", local_ty) as i32
+    }
+    val inst = emit_inst(L, ir.op_kinds().CALL, dst, pos)
+    if inst != null {
+        inst!!.a = ir.func_ref(&L.module, index as u32)
+        ir.set_args(inst!!, list.empty<ir.Operand>())
+    }
+    if dst >= 0 {
+        return local_operand(L, dst as u32)
+    }
+    return none_value()
+}
+
+private fn find_named_module_fn(L: *Lower, name: str): i32 {
+    var i: usize = 0
+    for i < L.module.funcs.len {
+        val f = L.module.funcs.get(i)
+        if f.name == name {
+            return i as i32
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+private fn lower_scope_root(L: *Lower, scope: *check.Type, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    if scope.kind != check.type_kinds().DISTINCT || scope.elem == null {
+        fail(L, null, "missing runtime default Scope")
+        return none_value()
+    }
+    val ret = scope.elem!!
+    var index = find_named_module_fn(L, "jogrt_scope_root")
+    if index < 0 {
+        val empty = list.empty<*check.Type>()
+        val fn_ty = check.type_fn(L.types, empty, ret, empty, false, false, true)
+        index = ir.func_add(&L.module, "jogrt_scope_root", "jogrt_scope_root", ir.linkages().EXTERN, fn_ty, list.empty<str>())
+        if index < 0 {
+            fail(L, null, "out of memory")
+            return none_value()
+        }
+    }
+    val dst = new_local(L, "", ret as *check.Type?)
+    val inst = emit_inst(L, ir.op_kinds().CALL, dst as i32, pos)
+    if inst != null {
+        inst!!.a = ir.func_ref(&L.module, index as u32)
+        ir.set_args(inst!!, list.empty<ir.Operand>())
+    }
+    return emit_bitcast(L, local_operand(L, dst), scope as *check.Type?, pos)
+}
+
+private fn materialize_main_default(L: *Lower, want: *check.Type, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    val kind = default_kind(want)
+    if kind == 3 {
+        return lower_scope_root(L, want, pos)
+    }
+    if kind == 1 {
+        return call_pkg_fn0(L, "std.mem", "heap", want as *check.Type?, pos)
+    }
+    if kind == 2 {
+        val raw = call_pkg_fn0(L, "std.mem", "error_heap", null, pos)
+        if L.failed {
+            return none_value()
+        }
+        return emit_bitcast(L, raw, want as *check.Type?, pos)
+    }
+    if kind == 4 {
+        return call_pkg_fn0(L, "std.io", "logger", want as *check.Type?, pos)
+    }
+    fail(L, null, "runtime default has no value")
+    return none_value()
+}
+
+/** Resolve one context parameter to a local or loaded global. */
+fn lower_context_value(L: *Lower, want: *check.Type, pos: ir.Pos): ir.Operand with (a: mem.Allocator) {
+    // Innermost with / binding first. An exact type wins. A single *T / T
+    // frame also supplies an interface parameter; the call converts it.
+    var exact: u32 = 0
+    var loose: u32 = 0
+    var exact_n: i64 = 0
+    var loose_n: i64 = 0
+    var i = L.ctx_frames.len
+    for i != 0 {
+        i = i - 1
+        val fr = L.ctx_frames.at(i)
+        if types_match_ctx(fr.ty, want as *check.Type?) {
+            if exact_n == 0 {
+                exact = fr.local
+            }
+            exact_n = exact_n + 1
+        } else if frame_supplies_iface(fr.ty, want) {
+            if loose_n == 0 {
+                loose = fr.local
+            }
+            loose_n = loose_n + 1
+        }
+    }
+    if exact_n == 1 {
+        return local_operand(L, exact)
+    }
+    if exact_n == 0 && loose_n == 1 {
+        return local_operand(L, loose)
+    }
+    // Context-parameter locals (bind_params) when frames were cleared (go child
+    // before rebind) or a frame was missed.
+    var li = L.locals.len
+    for li != 0 {
+        li = li - 1
+        val b = L.locals.at(li)
+        if b.symbol == null || b.symbol!!.kind != load.kind_context() {
+            continue
+        }
+        val sty = check.get_sema(b.symbol!!)
+        if sty != null && types_match_ctx(sty, want as *check.Type?) {
+            return local_operand(L, b.local)
+        }
+    }
+    val (gi, ok) = find_context_global(L, want)
+    if ok {
+        val addr = ir.global_ref(&L.module, gi as u32)
+        // Prefer load into a temp (match stage0). Use enclosing fn pos
+        // (C make_ident uses job->decl->pos for top-level context idents).
+        var load_pos = pos
+        if L.ast_fn != null {
+            load_pos = node_pos(L, L.ast_fn!!)
+        }
+        val dst = new_local(L, "", want as *check.Type?)
+        val inst = emit_inst(L, ir.op_kinds().LOAD, dst as i32, load_pos)
+        if inst != null {
+            inst!!.a = addr
+        }
+        return local_operand(L, dst)
+    }
+    // Bare root main: materialize Allocator / ErrorAllocator / Scope / Logger (C jog_lower_context_default).
+    if bare_root_main_fn(L) && default_kind(want) != 0 {
+        var use_pos = pos
+        if L.ast_fn != null {
+            use_pos = node_pos(L, L.ast_fn!!)
+        }
+        val value = materialize_main_default(L, want, use_pos)
+        if L.failed || value.kind != ir.operand_kinds().LOCAL {
+            if !L.failed {
+                fail(L, null, "runtime default is not a value")
+            }
+            return none_value()
+        }
+        context_push_local(L, want as *check.Type?, value.local)
+        return value
+    }
+    fail(L, null, "missing context argument")
+    return none_value()
+}
+
+private fn call_context_start(call: *parse.Node): (usize, usize) {
+    val nctx = parse.call_nctx(call)
+    if nctx == 0 {
+        return 0, 0
+    }
+    var trailing: usize = 0
+    if parse.call_has_trailing(call) {
+        trailing = 1
+    }
+    if call.kids.len < nctx + trailing {
+        return 0, 0
+    }
+    return call.kids.len - nctx - trailing, nctx
+}
+
+private fn maybe_context_iface(
+    L: *Lower,
+    op_in: ir.Operand,
+    need: *check.Type,
+    pos: ir.Pos,
+): ir.Operand with (a: mem.Allocator) {
+    var op = op_in
+    if need.kind == check.type_kinds().INTERFACE && op.ty != null &&
+        op.ty!!.kind != check.type_kinds().INTERFACE && op.kind != ir.operand_kinds().NONE {
+        op = lower_iface_convert(L, op, need, pos)
+    }
+    return op
+}
+
+/** Append resolved context operands for a call (after ordinary args). */
+fn lower_context_args(L: *Lower, call: *parse.Node, fn_ty: *check.Type, args: *list.List<ir.Operand>) with (a: mem.Allocator) {
+    val need_n = fn_ty.contexts.len
+    if need_n == 0 {
+        return
+    }
+    val pos = node_pos(L, call)
+    val (start, nctx) = call_context_start(call)
+    // Explicit `f() with (…)` — C stores these on the call after check.
+    if nctx == need_n && nctx > 0 {
+        var i: usize = 0
+        for i < nctx && !L.failed {
+            val need = fn_ty.contexts.get(i)
+            var op = lower_expr(L, call.kids.get(start + i))
+            if L.failed {
+                return
+            }
+            op = maybe_context_iface(L, op, need, pos)
+            if L.failed {
+                return
+            }
+            args.push(op)
+            i = i + 1
+        }
+        return
+    }
+    // Match each needed context: prefer an explicit with-arg of that type, else frames/globals.
+    var i: usize = 0
+    for i < need_n && !L.failed {
+        val need = fn_ty.contexts.get(i)
+        var op = none_value()
+        var found = false
+        var ei: usize = 0
+        for ei < nctx {
+            val expr = call.kids.get(start + ei)
+            val ety = check.get_node_ty(expr)
+            if ety != null && types_match_ctx(ety, need as *check.Type?) {
+                op = lower_expr(L, expr)
+                found = true
+                break
+            }
+            ei = ei + 1
+        }
+        if !found {
+            op = lower_context_value(L, need, pos)
+        }
+        if L.failed {
+            return
+        }
+        op = maybe_context_iface(L, op, need, pos)
+        if L.failed {
+            return
+        }
+        args.push(op)
+        i = i + 1
+    }
+}

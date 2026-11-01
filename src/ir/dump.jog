@@ -1,0 +1,1014 @@
+// JIR text dump. Checked against compiler/src/ir_dump.c.
+// LowerGuide step 1.
+
+import src.check
+import std.mem
+import std.strbuilder
+
+private fn is_ident_start(c: u8): bool {
+    return (c >= 'a' as u8 && c <= 'z' as u8) || (c >= 'A' as u8 && c <= 'Z' as u8) || c == '_' as u8
+}
+
+private fn is_ident_char(c: u8): bool {
+    return is_ident_start(c) || (c >= '0' as u8 && c <= '9' as u8)
+}
+
+private fn is_plain_ident(s: str): bool {
+    if s.len == 0 || !is_ident_start(s.ptr[0]) {
+        return false
+    }
+    var i: usize = 1
+    for i < s.len {
+        if !is_ident_char(s.ptr[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+private fn append_escaped(out: *strbuilder.StrBuilder, text: str) with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < text.len {
+        val c = text.ptr[i]
+        if c == '\\' as u8 {
+            out.append("\\\\")
+        } else if c == '"' as u8 {
+            out.append("\\\"")
+        } else if c == '\n' as u8 {
+            out.append("\\n")
+        } else if c == '\r' as u8 {
+            out.append("\\r")
+        } else if c == '\t' as u8 {
+            out.append("\\t")
+        } else if c >= 32 as u8 && c < 127 as u8 {
+            out.append_byte(c)
+        } else {
+            out.append("\\x")
+            val hi = c / 16
+            val lo = c % 16
+            if hi < 10 {
+                out.append_byte(('0' as u8) + hi)
+            } else {
+                out.append_byte(('a' as u8) + (hi - 10))
+            }
+            if lo < 10 {
+                out.append_byte(('0' as u8) + lo)
+            } else {
+                out.append_byte(('a' as u8) + (lo - 10))
+            }
+        }
+        i = i + 1
+    }
+}
+
+private fn append_quoted(out: *strbuilder.StrBuilder, text: str) with (a: mem.Allocator) {
+    out.append_byte('"' as u8)
+    append_escaped(out, text)
+    out.append_byte('"' as u8)
+}
+
+private fn append_name(out: *strbuilder.StrBuilder, name: str) with (a: mem.Allocator) {
+    if name.len == 0 {
+        out.append("<anon>")
+        return
+    }
+    if is_plain_ident(name) {
+        out.append(name)
+        return
+    }
+    append_quoted(out, name)
+}
+
+private fn append_jog_name(out: *strbuilder.StrBuilder, name: str) with (a: mem.Allocator) {
+    if name.len == 0 {
+        out.append("\"\"")
+        return
+    }
+    append_quoted(out, name)
+}
+
+private fn append_pos(out: *strbuilder.StrBuilder, pos: Pos) with (a: mem.Allocator) {
+    if pos.file.len == 0 {
+        return
+    }
+    out.append("  ; ")
+    out.append(pos.file)
+    out.append_byte(':' as u8)
+    out.append_int(pos.line, 10)
+    out.append_byte(':' as u8)
+    out.append_int(pos.column, 10)
+}
+
+private fn append_bytes_literal(out: *strbuilder.StrBuilder, text: str, cstring: bool) with (a: mem.Allocator) {
+    if cstring {
+        out.append_byte('c' as u8)
+    }
+    append_quoted(out, text)
+}
+
+private fn low_bits_u32(bits: u32, width: u32): u32 {
+    if width >= 32 {
+        return bits
+    }
+    return bits & (((1 as u32) << width) - 1)
+}
+
+// bits is the two's-complement pattern (Operand.local for INT; see Friction).
+/** Mask low `width` bits of a two's-complement i64 payload (width <= 63). */
+private fn low_bits_i64(bits: i64, width: u32): i64 {
+    if width >= 63 {
+        // Keep full i64; unsigned u64::MAX cannot live in i64 — handled separately.
+        return bits
+    }
+    if width == 0 {
+        return 0
+    }
+    val mask = (1 as i64 << (width as i64)) - 1
+    return bits & mask
+}
+
+/** Decimal print of a non-negative magnitude held as i64 (bit pattern). */
+private fn append_nonneg_i64(out: *strbuilder.StrBuilder, n: i64) with (a: mem.Allocator) {
+    if n >= 0 {
+        out.append_int(n, 10)
+        return
+    }
+    // Bit pattern with high bit set but treated as unsigned magnitude via bytes.
+    var digits: [20]u8
+    var count: usize = 0
+    var buf: [8]u8
+    val p: *u8 = &n as *u8
+    var i: usize = 0
+    for i < 8 {
+        buf[i] = p[i]
+        i = i + 1
+    }
+    // Repeatedly divide the little-endian 8-byte magnitude by 10.
+    for true {
+        var rem: u32 = 0
+        i = 8
+        var all_zero = true
+        for i != 0 {
+            i = i - 1
+            val cur = (rem << 8) | (buf[i] as u32)
+            val q = cur / 10
+            rem = cur % 10
+            buf[i] = q as u8
+            if q != 0 {
+                all_zero = false
+            }
+        }
+        digits[count] = ('0' as u8) + (rem as u8)
+        count = count + 1
+        if all_zero {
+            break
+        }
+    }
+    for count != 0 {
+        count = count - 1
+        out.append_byte(digits[count])
+    }
+}
+
+/**
+ * Match ir_dump.c append_int_const.
+ * Avoid u64 locals/params entirely — stage0 Friction zeroes them.
+ */
+private fn append_int_const(out: *strbuilder.StrBuilder, ty: *check.Type?, bits: i64) with (a: mem.Allocator) {
+    val tk = check.type_kinds()
+    if ty != null && ty!!.kind == tk.BOOL {
+        if bits == 0 {
+            out.append("false")
+        } else if bits == 1 {
+            out.append("true")
+        } else {
+            append_nonneg_i64(out, bits)
+        }
+        return
+    }
+    var is_signed = false
+    var width: u32 = 64
+    if ty != null && ty!!.kind == tk.INT {
+        is_signed = ty!!.int_signed
+        width = ty!!.int_bits as u32
+        if width == 0 || width > 64 {
+            width = 64
+        }
+    } else if ty != null && ty!!.kind == tk.UNTYPED_INT {
+        is_signed = true
+        width = 64
+    } else {
+        append_nonneg_i64(out, bits)
+        return
+    }
+    // Unsigned dump: print low `width` bits as non-negative decimal.
+    // Signed dump: two's-complement with optional leading '-'.
+    if width <= 32 {
+        // Bit-pun low 32 — `bits as u32` panics on negatives (e.g. i8 -128).
+        var wide = bits
+        val wp: *u8 = &wide as *u8
+        var raw32: u32 = 0
+        val rp: *u8 = &raw32 as *u8
+        var ri: usize = 0
+        for ri < 4 {
+            rp[ri] = wp[ri]
+            ri = ri + 1
+        }
+        var v32 = low_bits_u32(raw32, width)
+        if is_signed {
+            val sign: u32 = 1 as u32 << (width - 1)
+            if (v32 & sign) != 0 {
+                var mag = (~v32 + 1) as u32
+                mag = low_bits_u32(mag, width)
+                out.append_byte('-' as u8)
+                out.append_int(mag as i64, 10)
+                return
+            }
+        }
+        out.append_int(v32 as i64, 10)
+        return
+    }
+    // width 33..64: work on full i64 bit pattern (unsigned via append_nonneg_i64).
+    var v = bits
+    if width < 64 {
+        v = low_bits_i64(bits, width)
+    }
+    if is_signed {
+        // Sign bit at position width-1 (for width==64, bit 63 = i64 sign).
+        if width == 64 {
+            if v < 0 {
+                // Magnitude = ~v + 1 as unsigned; ~v+1 for i64::MIN is itself.
+                if v == -9223372036854775807 - 1 {
+                    out.append("-9223372036854775808")
+                    return
+                }
+                out.append_byte('-' as u8)
+                out.append_int(-v, 10)
+                return
+            }
+            out.append_int(v, 10)
+            return
+        }
+        val sign_bit = 1 as i64 << ((width - 1) as i64)
+        if (v & sign_bit) != 0 {
+            var mag = (~v + 1) & ((1 as i64 << (width as i64)) - 1)
+            out.append_byte('-' as u8)
+            append_nonneg_i64(out, mag)
+            return
+        }
+    }
+    append_nonneg_i64(out, v)
+}
+
+private fn f64_bits(value: f64): u64 {
+    // Byte-fill only — `bits |= … <<` on u64 is zeroed by stage0 Friction.
+    var f = value
+    val p: *u8 = &f as *u8
+    var bits: u64 = 0
+    val up: *u8 = &bits as *u8
+    var i: usize = 0
+    for i < 8 {
+        up[i] = p[i]
+        i = i + 1
+    }
+    return bits
+}
+
+private fn float_as_i64(sign: u32, exp: u32, frac: u64): (i64, bool) {
+    if exp == 0 || exp == 0x7ff {
+        return 0, false
+    }
+    val e = (exp as i32) - 1023
+    if e < 0 || e > 63 {
+        return 0, false
+    }
+    val i64_max: u64 = 9223372036854775807
+    val u64_max: u64 = (0xffffffff as u64 << 32) | 0xffffffff
+    if e == 63 {
+        if sign == 0 || frac != 0 {
+            return 0, false
+        }
+        // INT64_MIN = -i64_max - 1
+        return -(i64_max as i64) - 1, true
+    }
+    var sig: u64 = (1 as u64 << 52) | frac
+    var mag: u64 = 0
+    if e >= 52 {
+        val sh = (e - 52) as u32
+        if sh > 0 && sig > (u64_max >> (sh as u64)) {
+            return 0, false
+        }
+        mag = sig << (sh as u64)
+    } else {
+        val sh = (52 - e) as u32
+        if (sig & ((1 as u64 << (sh as u64)) - 1)) != 0 {
+            return 0, false
+        }
+        mag = sig >> (sh as u64)
+    }
+    if sign != 0 {
+        if mag > i64_max + 1 {
+            return 0, false
+        }
+        if mag == i64_max + 1 {
+            return -(i64_max as i64) - 1, true
+        }
+        return -(mag as i64), true
+    }
+    if mag > i64_max {
+        return 0, false
+    }
+    return mag as i64, true
+}
+
+private fn append_hex_frac(out: *strbuilder.StrBuilder, frac: u64) with (a: mem.Allocator) {
+    var digits: [13]u8
+    var i: i32 = 0
+    for i < 13 {
+        val shift = (48 - i * 4) as u32
+        val d = ((frac >> (shift as u64)) & 0xf) as u32
+        if d < 10 {
+            digits[i as usize] = ('0' as u8) + (d as u8)
+        } else {
+            digits[i as usize] = ('a' as u8) + ((d - 10) as u8)
+        }
+        i = i + 1
+    }
+    var n: i32 = 13
+    for n > 0 && digits[(n - 1) as usize] == '0' as u8 {
+        n = n - 1
+    }
+    if n > 0 {
+        out.append(".")
+        var j: i32 = 0
+        for j < n {
+            out.append_char(digits[j as usize] as i64)
+            j = j + 1
+        }
+    }
+}
+
+/** 13 hex digits of the 52-bit fraction: top20 in `fhi`, low32 in `flo`. */
+private fn append_hex_frac_parts(out: *strbuilder.StrBuilder, flo: u32, fhi: u32) with (a: mem.Allocator) {
+    // 52-bit frac as nibbles [51..0]: fhi has [51..32], flo has [31..0].
+    var digits: [13]u8
+    var i: i32 = 0
+    for i < 13 {
+        var nibble: u32 = 0
+        val bit = 48 - i * 4 // top nibble starts at bit 48
+        if bit >= 32 {
+            nibble = (fhi >> ((bit - 32) as u32)) & 0xf
+        } else {
+            nibble = (flo >> (bit as u32)) & 0xf
+        }
+        if nibble < 10 {
+            digits[i as usize] = ('0' as u8) + (nibble as u8)
+        } else {
+            digits[i as usize] = ('a' as u8) + ((nibble - 10) as u8)
+        }
+        i = i + 1
+    }
+    var n: i32 = 13
+    for n > 0 && digits[(n - 1) as usize] == '0' as u8 {
+        n = n - 1
+    }
+    if n > 0 {
+        out.append(".")
+        var j: i32 = 0
+        for j < n {
+            out.append_char(digits[j as usize] as i64)
+            j = j + 1
+        }
+    }
+}
+
+/** Match ir_dump.c append_float using only u32 (u64 shifts are Friction-broken). */
+private fn append_float_parts(out: *strbuilder.StrBuilder, lo: u32, hi: u32) with (a: mem.Allocator) {
+    val sign = hi >> 31
+    val exp = (hi >> 20) & 0x7ff
+    val fhi = hi & 0xfffff
+    val flo = lo
+    val frac_zero = fhi == 0 && flo == 0
+    if exp == 0x7ff {
+        if frac_zero {
+            if sign != 0 {
+                out.append("-inf")
+            } else {
+                out.append("inf")
+            }
+        } else {
+            if sign != 0 {
+                out.append("-nan")
+            } else {
+                out.append("nan")
+            }
+        }
+        return
+    }
+    if exp == 0 && frac_zero {
+        if sign != 0 {
+            out.append("-0.0")
+        } else {
+            out.append("0.0")
+        }
+        return
+    }
+    // Integer-valued? Rebuild f64 locally and see if it matches an i64.
+    var f: f64 = 0.0
+    val fp: *u8 = &f as *u8
+    var l = lo
+    var h = hi
+    var bi: usize = 0
+    for bi < 4 {
+        fp[bi] = (l & 0xff) as u8
+        l = l >> 8
+        bi = bi + 1
+    }
+    bi = 0
+    for bi < 4 {
+        fp[bi + 4] = (h & 0xff) as u8
+        h = h >> 8
+        bi = bi + 1
+    }
+    if exp != 0 && exp != 0x7ff {
+        val as_int = f as i64
+        var back: f64 = as_int as f64
+        // Compare bit patterns of back vs f (avoid f64 == if flaky).
+        val bp: *u8 = &back as *u8
+        var same = true
+        bi = 0
+        for bi < 8 {
+            if bp[bi] != fp[bi] {
+                same = false
+            }
+            bi = bi + 1
+        }
+        if same {
+            out.append_int(as_int, 10)
+            out.append(".0")
+            return
+        }
+    }
+    if sign != 0 {
+        out.append("-")
+    }
+    if exp == 0 {
+        out.append("0x0")
+        append_hex_frac_parts(out, flo, fhi)
+        out.append("p-1022")
+        return
+    }
+    out.append("0x1")
+    append_hex_frac_parts(out, flo, fhi)
+    out.append("p")
+    out.append_int((exp as i64) - 1023, 10)
+}
+
+private fn binop_name(aux: u32): str {
+    when aux {
+        0 -> {
+            return "add"
+        }
+        1 -> {
+            return "sub"
+        }
+        2 -> {
+            return "mul"
+        }
+        3 -> {
+            return "div"
+        }
+        4 -> {
+            return "rem"
+        }
+        5 -> {
+            return "and"
+        }
+        6 -> {
+            return "or"
+        }
+        7 -> {
+            return "xor"
+        }
+        8 -> {
+            return "shl"
+        }
+        9 -> {
+            return "shr"
+        }
+        10 -> {
+            return "eq"
+        }
+        11 -> {
+            return "ne"
+        }
+        12 -> {
+            return "lt"
+        }
+        13 -> {
+            return "le"
+        }
+        14 -> {
+            return "gt"
+        }
+        15 -> {
+            return "ge"
+        }
+        else -> {
+            return ""
+        }
+    }
+}
+
+private fn unop_name(aux: u32): str {
+    when aux {
+        0 -> {
+            return "neg"
+        }
+        1 -> {
+            return "not"
+        }
+        2 -> {
+            return "bitnot"
+        }
+        else -> {
+            return ""
+        }
+    }
+}
+
+private fn append_type(out: *strbuilder.StrBuilder, ty: *check.Type?) with (a: mem.Allocator) {
+    out.append(check.type_print(ty))
+}
+
+private fn append_operand(out: *strbuilder.StrBuilder, op: Operand) with (a: mem.Allocator) {
+    when op.kind {
+        NONE -> {
+            out.append("none")
+        }
+        LOCAL -> {
+            out.append_byte('l' as u8)
+            out.append_int(op.local as i64, 10)
+        }
+        INT -> {
+            append_type(out, op.ty)
+            out.append_byte(' ' as u8)
+            // Stage0 Friction: u64 locals/params drop to 0. Rebuild i64 from
+            // local|global byte-wise (same slots int_op writes).
+            var buf: [8]u8
+            var bi: usize = 0
+            for bi < 8 {
+                buf[bi] = 0
+                bi = bi + 1
+            }
+            var lo = op.local
+            var hi = op.global
+            bi = 0
+            for bi < 4 {
+                buf[bi] = (lo & 0xff) as u8
+                lo = lo >> 8
+                bi = bi + 1
+            }
+            bi = 0
+            for bi < 4 {
+                buf[bi + 4] = (hi & 0xff) as u8
+                hi = hi >> 8
+                bi = bi + 1
+            }
+            var rebuilt: i64 = 0
+            val rp: *u8 = &rebuilt as *u8
+            bi = 0
+            for bi < 8 {
+                rp[bi] = buf[bi]
+                bi = bi + 1
+            }
+            append_int_const(out, op.ty, rebuilt)
+        }
+        FLOAT -> {
+            append_type(out, op.ty)
+            out.append_byte(' ' as u8)
+            append_float_parts(out, op.local, op.func)
+        }
+        STRING -> {
+            append_type(out, op.ty)
+            out.append_byte(' ' as u8)
+            append_bytes_literal(out, op.str_ptr, false)
+        }
+        CSTRING -> {
+            append_type(out, op.ty)
+            out.append_byte(' ' as u8)
+            append_bytes_literal(out, op.str_ptr, true)
+        }
+        NULL -> {
+            append_type(out, op.ty)
+            out.append(" null")
+        }
+        GLOBAL -> {
+            out.append_byte('g' as u8)
+            out.append_int(op.global as i64, 10)
+        }
+        FUNC -> {
+            out.append_byte('f' as u8)
+            out.append_int(op.func as i64, 10)
+        }
+    }
+}
+
+private fn append_args(out: *strbuilder.StrBuilder, inst: Inst) with (a: mem.Allocator) {
+    out.append_byte('(' as u8)
+    var i: usize = 0
+    for arg in inst.args.items() {
+        if i > 0 {
+            out.append(", ")
+        }
+        append_operand(out, arg)
+        i = i + 1
+    }
+    out.append_byte(')' as u8)
+}
+
+private fn append_a(out: *strbuilder.StrBuilder, op: str, arg: Operand) with (a: mem.Allocator) {
+    out.append(op)
+    out.append_byte(' ' as u8)
+    append_operand(out, arg)
+}
+
+private fn append_ab(out: *strbuilder.StrBuilder, op: str, left: Operand, right: Operand) with (a: mem.Allocator) {
+    append_a(out, op, left)
+    out.append(", ")
+    append_operand(out, right)
+}
+
+private fn dump_inst(out: *strbuilder.StrBuilder, inst: Inst) with (a: mem.Allocator) {
+    out.append("  ")
+    if inst.dst >= 0 {
+        out.append_byte('l' as u8)
+        out.append_int(inst.dst as i64, 10)
+        out.append(" = ")
+    } else if inst.dst != -1 {
+        out.append("dst ")
+        out.append_int(inst.dst as i64, 10)
+        out.append(" = ")
+    }
+    if inst.checked {
+        out.append("checked ")
+    }
+    when inst.op {
+        COPY -> {
+            append_a(out, "copy", inst.a)
+        }
+        ZERO -> {
+            out.append("zero")
+        }
+        BINARY -> {
+            val name = binop_name(inst.aux)
+            if name.len > 0 {
+                out.append(name)
+            } else {
+                out.append("binary ")
+                out.append_int(inst.aux as i64, 10)
+            }
+            out.append_byte(' ' as u8)
+            append_operand(out, inst.a)
+            out.append(", ")
+            append_operand(out, inst.b)
+        }
+        UNARY -> {
+            val name = unop_name(inst.aux)
+            if name.len > 0 {
+                append_a(out, name, inst.a)
+            } else {
+                out.append("unary ")
+                out.append_int(inst.aux as i64, 10)
+                out.append_byte(' ' as u8)
+                append_operand(out, inst.a)
+            }
+        }
+        CONVERT -> {
+            append_a(out, "convert", inst.a)
+        }
+        BITCAST -> {
+            append_a(out, "bitcast", inst.a)
+        }
+        LOAD -> {
+            append_a(out, "load", inst.a)
+        }
+        STORE -> {
+            append_ab(out, "store", inst.a, inst.b)
+        }
+        ADDR -> {
+            append_a(out, "addr", inst.a)
+        }
+        FIELD_ADDR -> {
+            out.append("field_addr ")
+            append_operand(out, inst.a)
+            if inst.aux2 != 0 {
+                out.append(", variant ")
+                out.append_int((inst.aux2 - 1) as i64, 10)
+                out.append(", field ")
+                out.append_int(inst.aux as i64, 10)
+            } else {
+                out.append(", ")
+                out.append_int(inst.aux as i64, 10)
+            }
+        }
+        ELEM_ADDR -> {
+            append_ab(out, "elem_addr", inst.a, inst.b)
+        }
+        EXTRACT -> {
+            out.append("extract ")
+            append_operand(out, inst.a)
+            out.append(", ")
+            out.append_int(inst.aux as i64, 10)
+            if inst.aux2 != 0 {
+                out.append(" aux2 ")
+                out.append_int(inst.aux2 as i64, 10)
+            }
+        }
+        AGGREGATE -> {
+            out.append("aggregate ")
+            append_args(out, inst)
+            if inst.aux != 0 {
+                out.append(" aux ")
+                out.append_int(inst.aux as i64, 10)
+            }
+        }
+        ENUM_TAG -> {
+            append_a(out, "enum_tag", inst.a)
+        }
+        CALL -> {
+            if inst.a.kind == OperandKind.FUNC {
+                out.append("call ")
+            } else {
+                out.append("call_indirect ")
+            }
+            append_operand(out, inst.a)
+            append_args(out, inst)
+        }
+        BOUNDS_CHECK -> {
+            append_ab(out, "bounds_check", inst.a, inst.b)
+        }
+        NULL_CHECK -> {
+            append_a(out, "null_check", inst.a)
+        }
+        PANIC -> {
+            append_a(out, "panic", inst.a)
+        }
+    }
+    append_pos(out, inst.pos)
+    out.append_byte('\n' as u8)
+}
+
+private fn append_target(out: *strbuilder.StrBuilder, func: *Func, target: u32) with (a: mem.Allocator) {
+    out.append_byte('b' as u8)
+    out.append_int(target as i64, 10)
+    if (target as usize) < func.blocks.len {
+        val block = func.blocks.at(target as usize)
+        if block.label.len > 0 {
+            out.append_byte(' ' as u8)
+            append_name(out, block.label)
+        }
+    }
+}
+
+private fn dump_term(out: *strbuilder.StrBuilder, func: *Func, term: Term) with (a: mem.Allocator) {
+    when term.kind {
+        NONE -> {
+            out.append("  unterminated")
+            append_pos(out, term.pos)
+            out.append_byte('\n' as u8)
+        }
+        BR -> {
+            out.append("  br ")
+            append_target(out, func, term.target)
+            append_pos(out, term.pos)
+            out.append_byte('\n' as u8)
+        }
+        COND_BR -> {
+            out.append("  cond_br ")
+            append_operand(out, term.value)
+            out.append(", ")
+            append_target(out, func, term.target)
+            out.append(", ")
+            append_target(out, func, term.else_target)
+            append_pos(out, term.pos)
+            out.append_byte('\n' as u8)
+        }
+        SWITCH -> {
+            out.append("  switch ")
+            append_operand(out, term.value)
+            out.append(", ")
+            append_target(out, func, term.target)
+            append_pos(out, term.pos)
+            out.append_byte('\n' as u8)
+            for c in term.cases.items() {
+                out.append("    ")
+                append_int_const(out, term.value.ty, c.value)
+                out.append(" -> ")
+                append_target(out, func, c.target)
+                out.append_byte('\n' as u8)
+            }
+        }
+        RET -> {
+            out.append("  ret")
+            if term.value.kind != OperandKind.NONE {
+                out.append_byte(' ' as u8)
+                append_operand(out, term.value)
+            }
+            append_pos(out, term.pos)
+            out.append_byte('\n' as u8)
+        }
+        UNREACHABLE -> {
+            out.append("  unreachable")
+            append_pos(out, term.pos)
+            out.append_byte('\n' as u8)
+        }
+    }
+}
+
+private fn dump_block(out: *strbuilder.StrBuilder, func: *Func, index: u32) with (a: mem.Allocator) {
+    val block = func.blocks.at(index as usize)
+    out.append_byte('b' as u8)
+    out.append_int(index as i64, 10)
+    if block.label.len > 0 {
+        out.append_byte(' ' as u8)
+        append_name(out, block.label)
+    }
+    out.append(":\n")
+    for ip in block.insts.items() {
+        dump_inst(out, ip[0])
+    }
+    dump_term(out, func, block.term)
+}
+
+private fn linkage_name(linkage: Linkage): str {
+    when linkage {
+        INTERNAL -> {
+            return "internal"
+        }
+        PUBLIC -> {
+            return "public"
+        }
+        EXPORT -> {
+            return "export"
+        }
+        EXTERN -> {
+            return "extern"
+        }
+    }
+}
+
+private fn dump_global(out: *strbuilder.StrBuilder, global: *Global, index: u32) with (a: mem.Allocator) {
+    out.append("global g")
+    out.append_int(index as i64, 10)
+    out.append_byte(' ' as u8)
+    if global.is_const {
+        out.append("const ")
+    } else {
+        out.append("var ")
+    }
+    append_name(out, global.name)
+    out.append(": ")
+    append_type(out, global.ty)
+    out.append(" = ")
+    if !global.has_data {
+        if global.data_len == 0 {
+            out.append("zero")
+        } else {
+            out.append("missing:")
+            out.append_int(global.data_len as i64, 10)
+        }
+    } else {
+        out.append("hex:")
+        var i: usize = 0
+        for i < global.data.len {
+            if i > 0 {
+                out.append_byte(' ' as u8)
+            }
+            val b = global.data.get(i)
+            val hi = b / 16
+            val lo = b % 16
+            if hi < 10 {
+                out.append_byte(('0' as u8) + hi)
+            } else {
+                out.append_byte(('a' as u8) + (hi - 10))
+            }
+            if lo < 10 {
+                out.append_byte(('0' as u8) + lo)
+            } else {
+                out.append_byte(('a' as u8) + (lo - 10))
+            }
+            i = i + 1
+        }
+        for rel in global.relocs.items() {
+            out.append(" reloc ")
+            out.append_int(rel.offset as i64, 10)
+            out.append_byte(' ' as u8)
+            when rel.kind {
+                STRING -> {
+                    out.append("str ")
+                    append_bytes_literal(out, rel.ptr, false)
+                }
+                CSTRING -> {
+                    out.append("cstr ")
+                    append_bytes_literal(out, rel.ptr, true)
+                }
+                GLOBAL -> {
+                    out.append("global g")
+                    out.append_int(rel.index as i64, 10)
+                    if rel.addend != 0 {
+                        out.append_byte('+' as u8)
+                        out.append_int(rel.addend as i64, 10)
+                    }
+                }
+                FUNC -> {
+                    out.append("func f")
+                    out.append_int(rel.index as i64, 10)
+                }
+                else -> {
+                    out.append("kind ?")
+                }
+            }
+        }
+    }
+    append_pos(out, global.pos)
+    out.append_byte('\n' as u8)
+}
+
+private fn dump_func(out: *strbuilder.StrBuilder, func: *Func, index: u32) with (a: mem.Allocator) {
+    out.append("fn f")
+    out.append_int(index as i64, 10)
+    out.append_byte(' ' as u8)
+    out.append(linkage_name(func.linkage))
+    out.append_byte(' ' as u8)
+    append_name(out, func.name)
+    out.append_byte(' ' as u8)
+    append_jog_name(out, func.jog_name)
+    out.append(": ")
+    append_type(out, func.ty)
+    append_pos(out, func.pos)
+    out.append_byte('\n' as u8)
+    for i in 0 as usize..func.locals.len {
+        val local = func.locals.at(i)
+        out.append("  l")
+        out.append_int(i as i64, 10)
+        if local.name.len > 0 {
+            out.append_byte(' ' as u8)
+            append_name(out, local.name)
+        }
+        out.append(": ")
+        append_type(out, local.ty)
+        if local.is_param {
+            out.append(" param")
+        }
+        if local.address_taken {
+            out.append(" addr")
+        }
+        out.append_byte('\n' as u8)
+    }
+    for b in 0 as usize..func.blocks.len {
+        dump_block(out, func, b as u32)
+    }
+}
+
+private fn append_entry(out: *strbuilder.StrBuilder, label: str, index: i32) with (a: mem.Allocator) {
+    out.append(label)
+    out.append_byte(' ' as u8)
+    if index == -1 {
+        out.append("none")
+    } else if index < 0 {
+        out.append_int(index as i64, 10)
+    } else {
+        out.append_byte('f' as u8)
+        out.append_int(index as i64, 10)
+    }
+    out.append_byte('\n' as u8)
+}
+
+/**
+ * Text form for tests and `jogc emit-ir`. Matches jir_dump.
+ */
+fn dump(module: *Module): str with (a: mem.Allocator) {
+    var out = strbuilder.empty()
+    append_entry(&out, "main", module.main_func)
+    append_entry(&out, "init", module.init_func)
+    val have_globals = module.globals.len > 0
+    val have_funcs = module.funcs.len > 0
+    if have_globals || have_funcs {
+        out.append_byte('\n' as u8)
+    }
+    for i in 0 as usize..module.globals.len {
+        dump_global(&out, module.globals.get(i), i as u32)
+    }
+    if have_globals && have_funcs {
+        out.append_byte('\n' as u8)
+    }
+    for i in 0 as usize..module.funcs.len {
+        if i > 0 {
+            out.append_byte('\n' as u8)
+        }
+        dump_func(&out, module.funcs.get(i), i as u32)
+    }
+    return out.str()
+}

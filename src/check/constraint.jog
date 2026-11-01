@@ -657,17 +657,30 @@ fn constraint_iface_member(
         if t == null || ck.stop {
             return !ck.stop
         }
+        // C sets member->type so lower can walk embedded iface props.
+        set_node_ty(member, t)
+        set_node_ty(member.kids.get(0), t)
         return !ck.stop
     }
     if parse.is_field(member) {
+        if member.name.len == 0 {
+            check_fail(ck, job.file, member.line, member.column, "missing property name")
+            return !ck.stop
+        }
         if member.kids.len == 0 {
             check_fail(ck, job.file, member.line, member.column, "missing type")
             return !ck.stop
+        }
+        if member.kids.len > 1 {
+            check_fail(ck, job.file, member.line, member.column, "an interface property cannot have a default")
         }
         val t = resolve_type(ck, job, member.kids.get(0))
         if t == null || ck.stop {
             return !ck.stop
         }
+        // C sets member->type (and a FIELD symbol). Type is enough for lower prop loads.
+        set_node_ty(member, t)
+        set_node_ty(member.kids.get(0), t)
         return !ck.stop
     }
     _ = iface

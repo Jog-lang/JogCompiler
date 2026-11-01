@@ -244,9 +244,7 @@ private fn string_format_method(
 }
 
 private fn check_interp_hole(env: *Env, node: *parse.Node): *Type? with (a: mem.Allocator) {
-    if parse.is_string_lit(node) || parse.is_cstring_lit(node) || parse.is_char_lit(node) {
-        return str_ty(env.ck) as *Type?
-    }
+    // C check_hole: always check_expr so string/char lits get node.ty = str.
     val got = check_expr(env, node, null)
     if got == null || env.ck.stop {
         return got

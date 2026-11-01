@@ -33,6 +33,36 @@ fn get_sema(symbol: *load.Symbol): *Type? {
     return symbol.sema!! as *Type?
 }
 
+fn set_node_ty(node: *parse.Node, ty: *Type?) {
+    if ty == null {
+        node.ty = null
+        return
+    }
+    node.ty = ty!! as *u8?
+}
+
+fn get_node_ty(node: *parse.Node): *Type? {
+    if node.ty == null {
+        return null
+    }
+    return node.ty!! as *Type?
+}
+
+fn set_node_sym(node: *parse.Node, symbol: *load.Symbol?) {
+    if symbol == null {
+        node.sym = null
+        return
+    }
+    node.sym = symbol!! as *u8?
+}
+
+fn get_node_sym(node: *parse.Node): *load.Symbol? {
+    if node.sym == null {
+        return null
+    }
+    return node.sym!! as *load.Symbol?
+}
+
 private fn layout_from_base(t: *Type, base: *Type) {
     t.elem = base as *Type?
     t.size = base.size
@@ -80,11 +110,27 @@ fn attach_universe_types(ck: *Check) with (a: mem.Allocator) {
     universe_bind(scope, "bool", type_builtin(&ck.types, Builtin.BOOL))
     universe_bind(scope, "bytes", type_builtin(&ck.types, Builtin.BYTES))
 
+    // Match C prelude allocation order from core/scalar.jog then bind_lang_items:
+    // rune, str, void, Option, Ordering, error, Scope/Chan/Task.
+    val rune_ty = type_new_nominal(&ck.types, TypeKind.DISTINCT, "rune", "")
+    layout_from_base(rune_ty, type_builtin(&ck.types, Builtin.U32))
+    universe_bind(scope, "rune", rune_ty)
+
+    val str_ty = type_new_nominal(&ck.types, TypeKind.DISTINCT, "str", "")
+    layout_from_base(str_ty, type_builtin(&ck.types, Builtin.CONST_BYTES))
+    universe_bind(scope, "str", str_ty)
+
     val void_ty = type_new_nominal(&ck.types, TypeKind.STRUCT, "void", "")
     universe_bind(scope, "void", void_ty)
 
-    val err_iface = type_new_nominal(&ck.types, TypeKind.INTERFACE, "error", "")
-    universe_bind(scope, "error", err_iface)
+    // Option is the structural constructor marker (C bind_option); no variants/layout.
+    // C sets type_param_count=1 without a TYPE_PARAM Type; Option<T> sugar does not need the slot.
+    val option_ty = type_new_nominal(&ck.types, TypeKind.ENUM, "Option", "")
+    val option_sym = load.package_scope_lookup(scope, "Option")
+    if option_sym != null {
+        option_ty.decl = option_sym!!.decl
+    }
+    universe_bind(scope, "Option", option_ty)
 
     // Ordering from core/scalar.jog: enum Ordering: i8 { Less = -1, Equal, Greater }.
     val ordering = type_new_nominal(&ck.types, TypeKind.ENUM, "Ordering", "")
@@ -108,13 +154,9 @@ fn attach_universe_types(ck: *Check) with (a: mem.Allocator) {
     type_layout(&ck.types, ordering)
     universe_bind(scope, "Ordering", ordering)
 
-    val str_ty = type_new_nominal(&ck.types, TypeKind.DISTINCT, "str", "")
-    layout_from_base(str_ty, type_builtin(&ck.types, Builtin.CONST_BYTES))
-    universe_bind(scope, "str", str_ty)
-
-    val rune_ty = type_new_nominal(&ck.types, TypeKind.DISTINCT, "rune", "")
-    layout_from_base(rune_ty, type_builtin(&ck.types, Builtin.U32))
-    universe_bind(scope, "rune", rune_ty)
+    val err_iface = type_new_nominal(&ck.types, TypeKind.INTERFACE, "error", "")
+    type_layout(&ck.types, err_iface)
+    universe_bind(scope, "error", err_iface)
 
     val void_ptr = type_ptr(&ck.types, void_ty, false)
     val scope_ty = type_new_nominal(&ck.types, TypeKind.DISTINCT, "Scope", "")
@@ -139,6 +181,13 @@ private fn same_decl(symbol: *load.Symbol, decl: *parse.Node): bool {
 }
 
 fn publish_job_type(job: *CheckJob, ty: *Type?) {
+    // Multi-bind: element types were already published onto each name symbol.
+    // Do not overwrite them with the whole tuple; only record it on the decl.
+    if (parse.is_val(job.decl) || parse.is_var(job.decl) || parse.is_context(job.decl)) &&
+        binding_is_multi(job.decl) {
+        set_node_ty(job.decl, ty)
+        return
+    }
     val pkg = job.pkg
     for i in 0 as usize..pkg.scope.bindings.len {
         val s = pkg.scope.bindings.at(i)
@@ -424,6 +473,54 @@ private fn type_decl_param_count(node: *parse.Node): usize {
     return n
 }
 
+/**
+ * `[size(T)]` / `[align(T)]` length: resolve T and read layout (C const_length + fold_layout_call).
+ */
+private fn array_len_from_layout_call(ck: *Check, job: *CheckJob, len_node: *parse.Node): (u64, bool) with (a: mem.Allocator) {
+    if !parse.is_call(len_node) || len_node.kids.len != 2 {
+        return 0, false
+    }
+    val callee = len_node.kids.get(0)
+    if !parse.is_ident(callee) || callee.kids.len > 0 {
+        return 0, false
+    }
+    var use_align = false
+    if callee.name == "align" {
+        use_align = true
+    } else if callee.name != "size" {
+        return 0, false
+    }
+    val arg = len_node.kids.get(1)
+    if !parse.is_arg(arg) || arg.kids.len == 0 {
+        return 0, false
+    }
+    val value = arg.kids.get(0)
+    // Resolve the type argument (TYPE_NAME or IDENT like `i32` in size(i32)).
+    var ty: *Type? = null
+    if parse.is_type_name(value) {
+        ty = resolve_type(ck, job, value)
+    } else if parse.is_ident(value) {
+        ty = resolve_type_name(ck, job, value)
+    } else {
+        return 0, false
+    }
+    if ty == null || ty!!.kind == TypeKind.ERROR {
+        return 0, false
+    }
+    if !ty!!.has_layout && !type_layout(&ck.types, ty!!) {
+        return 0, false
+    }
+    if !ty!!.has_layout {
+        return 0, false
+    }
+    set_node_ty(value, ty)
+    set_node_ty(len_node, type_usize(&ck.types) as *Type?)
+    if use_align {
+        return ty!!.align as u64, true
+    }
+    return ty!!.size, true
+}
+
 private fn parse_u64_lit(text: str): (u64, bool) {
     if text.len == 0 {
         return 0, false
@@ -502,14 +599,21 @@ fn resolve_type(ck: *Check, job: *CheckJob, node: *parse.Node): *Type? with (a: 
         }
         val len_node = node.kids.get(0)
         val elem_node = node.kids.get(1)
-        if !parse.is_int_lit(len_node) {
-            check_fail(ck, job.file, len_node.line, len_node.column, "array length is not a constant")
-            return err_ty(ck)
-        }
-        val (len, ok) = parse_u64_lit(len_node.text)
-        if !ok {
-            check_fail(ck, job.file, len_node.line, len_node.column, "array length is not a constant")
-            return err_ty(ck)
+        var len: u64 = 0
+        if parse.is_int_lit(len_node) {
+            val (n, ok) = parse_u64_lit(len_node.text)
+            if !ok {
+                check_fail(ck, job.file, len_node.line, len_node.column, "array length is not a constant")
+                return err_ty(ck)
+            }
+            len = n
+        } else {
+            val (n, ok) = array_len_from_layout_call(ck, job, len_node)
+            if !ok {
+                check_fail(ck, job.file, len_node.line, len_node.column, "array length is not a constant")
+                return err_ty(ck)
+            }
+            len = n
         }
         val elem = resolve_type(ck, job, elem_node)
         if elem == null {
@@ -680,11 +784,22 @@ private fn intrinsic_base_ok(target: *parse.Node, bits: u64, is_ptr: bool): bool
 }
 
 /**
- * Validate @intrinsic on a distinct type (C prelude scan_node).
- * @return true when an intrinsic attr was present (even if it failed)
+ * Validate @intrinsic on a distinct type (C prelude scan_node / jog_type_apply_intrinsic).
+ * Returns (saw, apply, kind, bits, signed, is_ptr). kind is JOG_INTRINSIC_*: 1=int, 2=float, 3=bool.
  */
-private fn check_type_intrinsic(ck: *Check, job: *CheckJob, node: *parse.Node, distinct: bool, target: *parse.Node?): bool with (a: mem.Allocator) {
+private fn check_type_intrinsic(
+    ck: *Check,
+    job: *CheckJob,
+    node: *parse.Node,
+    distinct: bool,
+    target: *parse.Node?,
+): (bool, bool, u8, u8, bool, bool) with (a: mem.Allocator) {
     var saw = false
+    var apply = false
+    var out_kind: u8 = 0
+    var out_bits: u8 = 0
+    var out_signed = false
+    var out_ptr = false
     var i: usize = 0
     for i < node.kids.len {
         val attr = node.kids.get(i)
@@ -705,6 +820,7 @@ private fn check_type_intrinsic(ck: *Check, job: *CheckJob, node: *parse.Node, d
         var kind = -1
         var unknown: str = ""
         var has_signed = false
+        var is_signed = false
         var has_bits = false
         var bits_ptr = false
         var bits: u64 = 0
@@ -747,6 +863,7 @@ private fn check_type_intrinsic(ck: *Check, job: *CheckJob, node: *parse.Node, d
                     break
                 }
                 has_signed = true
+                is_signed = value!!.text == "true"
                 continue
             }
             if arg.name == "bits" {
@@ -837,10 +954,24 @@ private fn check_type_intrinsic(ck: *Check, job: *CheckJob, node: *parse.Node, d
         }
         if target == null || !intrinsic_base_ok(target!!, width_bits, is_ptr) {
             check_fail(ck, job.file, attr.line, attr.column, "@intrinsic width does not match the base")
+            i = i + 1
+            continue
         }
+        // JOG_INTRINSIC_INT=1, FLOAT=2, BOOL=3
+        if kind == 0 {
+            out_kind = 1
+        } else if kind == 1 {
+            out_kind = 2
+        } else {
+            out_kind = 3
+        }
+        out_bits = width_bits as u8
+        out_signed = is_signed
+        out_ptr = is_ptr
+        apply = true
         i = i + 1
     }
-    return saw
+    return saw, apply, out_kind, out_bits, out_signed, out_ptr
 }
 
 fn check_type_decl(ck: *Check, job: *CheckJob): *Type? with (a: mem.Allocator) {
@@ -862,9 +993,8 @@ fn check_type_decl(ck: *Check, job: *CheckJob): *Type? with (a: mem.Allocator) {
         return err_ty(ck)
     }
     // Intrinsic attrs are scanned before resolving the target (C scan_node).
-    if check_type_intrinsic(ck, job, node, distinct, target) {
-        // Keep checking so layout errors still surface when needed.
-    }
+    val (saw_intr, apply_intr, ikind, ibits, isigned, iptr) = check_type_intrinsic(ck, job, node, distinct, target)
+    _ = saw_intr
     val base = resolve_type(ck, job, target!!)
     if base == null {
         // Self-alias cycle: publish an error type so later uses are quiet and
@@ -881,6 +1011,7 @@ fn check_type_decl(ck: *Check, job: *CheckJob): *Type? with (a: mem.Allocator) {
         return base
     }
     val named = type_new_nominal(&ck.types, TypeKind.DISTINCT, node.name, job.pkg.path)
+    named.decl = node as *parse.Node?
     layout_from_base(named, base!!)
     if !named.has_layout {
         var b = strbuilder.empty()
@@ -894,6 +1025,9 @@ fn check_type_decl(ck: *Check, job: *CheckJob): *Type? with (a: mem.Allocator) {
         check_fail(ck, job.file, node.line, node.column, b.str())
         b.free()
         return err_ty(ck)
+    }
+    if apply_intr {
+        type_set_intrinsic(named, ikind, ibits, isigned, iptr)
     }
     return named
 }
@@ -993,6 +1127,14 @@ fn check_binding(ck: *Check, job: *CheckJob): *Type? with (a: mem.Allocator) {
         b.append("' must be initialized")
         check_fail(ck, job.file, node.line, node.column, b.str())
         b.free()
+    }
+    // stdio −1: drain defers error_heap's body so *ErrorArena would land
+    // after method FN types. Intern it when the package var is checked
+    // (same relative slot C gets from `&error_arena_value`). Narrow to
+    // ErrorArena so other struct vars keep C's later & timing.
+    if parse.is_var(node) && annotated != null && annotated!!.kind == TypeKind.STRUCT &&
+        annotated!!.name == "ErrorArena" {
+        _ = type_ptr(&ck.types, annotated!!, false)
     }
     return annotated
 }
@@ -1255,7 +1397,11 @@ fn check_decl_types(ck: *Check, job: *CheckJob) with (a: mem.Allocator) {
         val shape = job.decl.head
         val has_body = (shape / 262144) % 2 == 1
         if has_body {
-            check_fn_body(ck, job)
+            if ck.defer_fn_bodies {
+                job.sig_ready = true
+            } else {
+                check_fn_body(ck, job)
+            }
         }
     }
 }

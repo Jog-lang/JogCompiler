@@ -154,6 +154,10 @@ fn is_symbol_field(symbol: *Symbol): bool {
  * @param symbol any symbol
  * @return whether kind is CONSTANT
  */
+fn is_symbol_variant(symbol: *Symbol): bool {
+    return symbol.kind == SymbolKind.VARIANT
+}
+
 fn is_symbol_constant(symbol: *Symbol): bool {
     return symbol.kind == SymbolKind.CONSTANT
 }
@@ -238,6 +242,26 @@ fn package_scope_bind(scope: *PackageScope, symbol: Symbol) with (a: mem.Allocat
  */
 fn block_scope_bind(scope: *BlockScope, symbol: Symbol) with (a: mem.Allocator) {
     scope.bindings.push(symbol)
+}
+
+// After every name in this list is bound. The decl points at the list
+// element. A later grow of this list would move that pointer.
+fn note_symbol_list(bindings: *list.List<Symbol>) {
+    var i: usize = 0
+    for i < bindings.len {
+        val symbol = bindings.at(i)
+        if symbol.decl != null {
+            val decl = symbol.decl!!
+            if parse.node_symbol(decl) == null {
+                parse.node_set_symbol(decl, symbol as *u8?)
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn note_block_symbols(scope: *BlockScope) {
+    note_symbol_list(&scope.bindings)
 }
 
 /**

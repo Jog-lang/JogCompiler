@@ -146,6 +146,19 @@ private fn check_coro_type_method(env: *Env, node: *parse.Node): (*Type?, i32) w
     if env.ck.stop {
         return null, -1
     }
+    // Type `with (...)` context exprs (e.g. `mem.heap()`), matching C.
+    val nctx = parse.call_nctx(node)
+    var ci: usize = 0
+    for ci < nctx {
+        val ix = arg_end + ci
+        if ix < node.kids.len {
+            check_expr(env, node.kids.get(ix), null)
+            if env.ck.stop {
+                return null, -1
+            }
+        }
+        ci = ci + 1
+    }
     return inst, 1
 }
 

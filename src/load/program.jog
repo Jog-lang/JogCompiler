@@ -12,6 +12,14 @@ import std.mem
 struct Program {
     packages: list.List<*Package>
     root_module: str
+    // *check.TypeTable after a successful check.run (LowerGuide). Opaque
+    // so load does not import check.
+    types: *u8?
+    // Runtime directory the loader found (JOG_ROOT/runtime, else next to std).
+    runtime_root: str
+    is_library: bool
+    // jog.mod `link` names for the root module.
+    links: list.List<str>
 }
 
 /**
@@ -23,5 +31,9 @@ fn empty_program(): Program with (a: mem.Allocator) {
     var p: Program
     p.packages = list.empty<*Package>()
     p.root_module = ""
+    p.types = null
+    p.runtime_root = ""
+    p.is_library = false
+    p.links = list.empty<str>()
     return p
 }

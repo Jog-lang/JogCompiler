@@ -61,7 +61,8 @@ private fn bind_local(env: *BodyEnv, node: *parse.Node, kind: SymbolKind, name: 
     if env.scope == null || is_discard(name) {
         return
     }
-    if block_scope_lookup_local(env.scope!!, name) != null {
+    val prev = block_scope_lookup_local(env.scope!!, name)
+    if prev != null {
         var b = strbuilder.empty()
         b.append("duplicate declaration of '")
         b.append(name)

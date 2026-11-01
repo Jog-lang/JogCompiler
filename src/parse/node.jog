@@ -17,6 +17,12 @@ struct Node {
     flag: str
     head: i64
     kids: list.List<*Node>
+    // Filled by the checker (LowerGuide). *Type / *load.Symbol as *u8 so
+    // parse does not import check or load.
+    ty: *u8?
+    sym: *u8?
+    // Concrete type arguments for a generic call (checker → lower).
+    solved_type_args: list.List<*u8>
 }
 
 /**
@@ -32,6 +38,15 @@ fn is_import(node: *Node): bool {
 
 fn is_fn(node: *Node): bool {
     return node.kind == NodeKind.FN
+}
+
+// The resolver stores *load.Symbol here as *u8. Empty until names are bound.
+fn node_symbol(node: *Node): *u8? {
+    return node.sym
+}
+
+fn node_set_symbol(node: *Node, symbol: *u8?) {
+    node.sym = symbol
 }
 
 fn is_var(node: *Node): bool {
@@ -384,6 +399,9 @@ fn make_node(kind: NodeKind, line: i64, column: i64): *Node with (a: mem.Allocat
     node.op = lex.kind().EOF
     node.head = 0
     node.kids = list.empty<*Node>()
+    node.ty = null
+    node.sym = null
+    node.solved_type_args = list.empty<*u8>()
     return node
 }
 

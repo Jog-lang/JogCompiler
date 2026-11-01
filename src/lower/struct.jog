@@ -1,0 +1,318 @@
+// Struct literals and method stubs. Checked against lower_struct.c.
+
+import src.check
+import src.ir
+import src.load
+import src.parse
+import std.list
+import std.mem
+
+// list used for aggregate args
+
+/**
+ * True when the call is a struct (or array) value construction, not a fn call.
+ */
+private fn is_type_ctor_callee(node: *parse.Node): bool {
+    if parse.is_ident(node) {
+        val sym = check.get_node_sym(node)
+        if sym != null {
+            if load.is_symbol_type(sym!!) {
+                return true
+            }
+            if sym!!.decl != null {
+                val d = sym!!.decl!!
+                return parse.is_struct(d) || parse.is_type_decl(d) || parse.is_enum(d)
+            }
+        }
+        val ty = check.get_node_ty(node)
+        if ty != null {
+            val tk = check.type_kinds()
+            val t = check.type_peel_distinct(ty!!)
+            return t.kind == tk.STRUCT || t.kind == tk.ARRAY || t.kind == tk.ENUM
+        }
+    }
+    // Fallback: result type of the call is STRUCT and callee is not a fn value.
+    return false
+}
+
+private fn call_looks_like_struct_lit(node: *parse.Node): bool {
+    val ty = check.get_node_ty(node)
+    if ty == null {
+        return false
+    }
+    val tk = check.type_kinds()
+    val t = check.type_peel_distinct(ty!!)
+    if t.kind != tk.STRUCT {
+        return false
+    }
+    if node.kids.len == 0 {
+        return false
+    }
+    val callee = node.kids.get(0)
+    val cty = check.get_node_ty(callee)
+    if cty != null && check.type_is_fn(cty!!) {
+        return false
+    }
+    return true
+}
+
+fn lower_struct_lit(L: *Lower, node: *parse.Node): (ir.Operand, bool) with (a: mem.Allocator) {
+    if node.kids.len == 0 {
+        return none_value(), false
+    }
+    val callee = node.kids.get(0)
+    if !is_type_ctor_callee(callee) && !call_looks_like_struct_lit(node) {
+        return none_value(), false
+    }
+    val ty = check.get_node_ty(node)
+    if ty == null {
+        fail(L, node, "struct literal has no type")
+        return none_value(), true
+    }
+    val tk = check.type_kinds()
+    val peeled = check.type_peel_distinct(ty!!)
+    if peeled.kind == tk.STRUCT {
+        val n = check.type_field_count(peeled)
+        var slots = list.empty<ir.Operand>()
+        var present = list.empty<bool>()
+        for _ in 0 as usize..n {
+            slots.push(none_value())
+            present.push(false)
+        }
+        var positional: usize = 0
+        val arg_end = parse.call_arg_end(node)
+        var i: usize = 1
+        for i < arg_end {
+            val arg = node.kids.get(i)
+            var value_node = arg
+            if parse.is_arg(arg) && arg.kids.len > 0 {
+                value_node = arg.kids.get(0)
+            }
+            val lowered = lower_expr(L, value_node)
+            if parse.is_arg(arg) && arg.name.len > 0 {
+                var fi: usize = 0
+                var found = false
+                for fi < n {
+                    if check.type_field_at(peeled, fi).name == arg.name {
+                        slots.set(fi, lowered)
+                        present.set(fi, true)
+                        found = true
+                        break
+                    }
+                    fi = fi + 1
+                }
+                if !found {
+                    fail(L, arg, "unknown field")
+                    return none_value(), true
+                }
+            } else if positional < n {
+                slots.set(positional, lowered)
+                present.set(positional, true)
+                positional = positional + 1
+            }
+            i = i + 1
+        }
+        for fi in 0 as usize..n {
+            if !present.get(fi) {
+                val fty = check.type_field_at(peeled, fi).field_type
+                slots.set(fi, emit_zero(L, fty, node_pos(L, node)))
+            }
+        }
+        var args = list.empty<ir.Operand>()
+        for fi in 0 as usize..n {
+            args.push(slots.get(fi))
+        }
+        return emit_aggregate(L, ty, args, node_pos(L, node)), true
+    }
+    return none_value(), false
+}
+
+fn find_method_fn(L: *Lower, recv_ty: *check.Type, name: str): i32 {
+    val peeled = check.type_peel_distinct(recv_ty)
+    for i in 0 as usize..L.fns.len {
+        val b = L.fns.at(i)
+        if b.decl == null || !parse.fn_has_receiver(b.decl!!) {
+            continue
+        }
+        if b.decl!!.name != name {
+            continue
+        }
+        // Match by receiver type name for now (flat methods).
+        val want = receiver_type_name(b.decl!!)
+        if want.len > 0 && want == peeled.name {
+            return b.index
+        }
+    }
+    return -1
+}
+
+fn lower_method_call(L: *Lower, node: *parse.Node): (ir.Operand, bool) with (a: mem.Allocator) {
+    if node.kids.len == 0 {
+        return none_value(), false
+    }
+    val callee = node.kids.get(0)
+    if !parse.is_member(callee) || callee.name.len == 0 || callee.kids.len == 0 {
+        return none_value(), false
+    }
+    val sym = check.get_node_sym(callee)
+    // Only method symbols — leave ordinary member calls to lower_call.
+    if sym == null || !load.is_symbol_method(sym!!) {
+        // Fallback: non-generic methods without a bound symbol.
+        if node.solved_type_args.len > 0 {
+            return none_value(), false
+        }
+    }
+    val base = callee.kids.get(0)
+    val base_ty = check.get_node_ty(base)
+    if base_ty == null {
+        return none_value(), false
+    }
+    val (outer, is_ptr) = check.type_peel_ptr(base_ty!!)
+    var index: i32 = -1
+    var mty = check.get_node_ty(callee)
+    if node.solved_type_args.len > 0 {
+        index = generic_callee(L, node)
+        if index < 0 {
+            return none_value(), true
+        }
+        // Prefer instantiated FN type from pending / callee.
+        if mty == null || !check.type_is_fn(mty!!) {
+            var pi: usize = 0
+            for pi < L.generic_pending.len {
+                if L.generic_pending.at(pi).jir_index == index {
+                    mty = L.generic_pending.at(pi).fn_type
+                    break
+                }
+                pi = pi + 1
+            }
+        }
+    } else {
+        index = find_method_fn(L, outer, callee.name)
+        if index < 0 && sym != null && sym!!.decl != null {
+            index = find_fn(L, sym!!.decl!!)
+        }
+        if index < 0 {
+            return none_value(), false
+        }
+        if mty == null || !check.type_is_fn(mty!!) {
+            val f = ir.func_at(&L.module, index as u32)
+            if f != null {
+                mty = f!!.ty
+            }
+        }
+    }
+    if mty == null || !check.type_is_fn(mty!!) {
+        fail(L, node, "method has no type")
+        return none_value(), true
+    }
+    val sig = mty!!
+    // First param is receiver (C lower_method_call).
+    var recv_arg = none_value()
+    if sig.elems.len > 0 {
+        val want = sig.elems.get(0)
+        val tk = check.type_kinds()
+        if want.kind == tk.PTR {
+            if is_ptr {
+                recv_arg = lower_expr(L, base)
+            } else {
+                recv_arg = value_addr(L, base)
+            }
+        } else {
+            if is_ptr {
+                recv_arg = emit_load(L, lower_expr(L, base), node_pos(L, node))
+            } else {
+                // Value receiver: evaluate rvalue directly. value_addr+load
+                // matches C for idents; for calls (chained methods) lower_expr
+                // avoids re-entering addr on the call node.
+                if parse.is_ident(base) || parse.is_member(base) || parse.is_index(base) ||
+                    (parse.is_unary(base) && base.text == "*") {
+                    val addr = value_addr(L, base)
+                    recv_arg = emit_load(L, addr, node_pos(L, node))
+                } else {
+                    recv_arg = lower_expr(L, base)
+                }
+            }
+        }
+    }
+    var args = list.empty<ir.Operand>()
+    args.push(recv_arg)
+    // Pack slot is last FN param when the method's last AST param is `...T: name`.
+    var pack: i32 = -1
+    if sym != null && sym!!.decl != null && sig.elems.len > 0 {
+        pack = pack_slot_of(sym!!.decl, sig.elems.len)
+    }
+    var pack_elems = list.empty<ir.Operand>()
+    val arg_end = parse.call_arg_end(node)
+    var i: usize = 1
+    var positional: usize = 1 // receiver already filled slot 0
+    for i < arg_end {
+        val arg = node.kids.get(i)
+        var value_node = arg
+        if parse.is_arg(arg) && arg.kids.len > 0 {
+            value_node = arg.kids.get(0)
+        }
+        val lowered = lower_expr(L, value_node)
+        if L.failed {
+            return none_value(), true
+        }
+        if pack >= 0 && positional >= (pack as usize) {
+            pack_elems.push(lowered)
+            positional = positional + 1
+        } else {
+            args.push(lowered)
+            positional = positional + 1
+        }
+        i = i + 1
+    }
+    if pack >= 0 {
+        var slice_ty: *check.Type? = null
+        if (pack as usize) < sig.elems.len {
+            slice_ty = sig.elems.get(pack as usize) as *check.Type?
+        }
+        args.push(lower_pack_slice(L, slice_ty, pack_elems, node_pos(L, node)))
+        if L.failed {
+            return none_value(), true
+        }
+    }
+    // Prefer the checker FN (contexts still separate). IR `f.ty` folds them.
+    var ctx_ty = check.get_node_ty(callee)
+    if ctx_ty == null || !check.type_is_fn(ctx_ty!!) || ctx_ty!!.contexts.len == 0 {
+        if sym != null {
+            val sema = check.get_sema(sym!!)
+            if sema != null && check.type_is_fn(sema!!) {
+                ctx_ty = sema
+            }
+        }
+    }
+    if ctx_ty != null && check.type_is_fn(ctx_ty!!) {
+        lower_context_args(L, node, ctx_ty!!, &args)
+        if L.failed {
+            return none_value(), true
+        }
+    }
+    val ret = sig.elem
+    var dst: i32 = -1
+    if ret != null && !check.type_is_unit(ret!!) {
+        dst = new_local(L, "", ret) as i32
+    }
+    val inst = emit_inst(L, ir.op_kinds().CALL, dst, node_pos(L, node))
+    if inst != null {
+        inst!!.a = ir.func_ref(&L.module, index as u32)
+        ir.set_args(inst!!, args)
+    }
+    if dst >= 0 {
+        return local_operand(L, dst as u32), true
+    }
+    return none_value(), true
+}
+
+/**
+ * Try struct literal / method call. Returns true when handled.
+ */
+fn lower_struct_call(L: *Lower, node: *parse.Node): (ir.Operand, bool) with (a: mem.Allocator) {
+    val (lit, lit_ok) = lower_struct_lit(L, node)
+    if lit_ok {
+        return lit, true
+    }
+    return lower_method_call(L, node)
+}

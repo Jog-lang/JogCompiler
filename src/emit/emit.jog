@@ -1,12 +1,1169 @@
-// C emitter and driver. Checked against compiler/src/emit_c.c and
-// compiler/src/cc.c.
-// Study note: JogDocs bootstrap/study/CodeGen.
+// C emitter. Checked against compiler/src/emit_c.c (jog_emit_c).
+// Step 5 spells enum bodies, non-niche option structs, niche option
+// typedefs, and the error interface shape. Vtables stay unwired.
 
+import src.check
+import src.ir
+import std.fs
 import std.io
+import std.list
+import std.mem
+import std.strbuilder
 
-fn run(command: str): i32 {
-    io.eprint("jogc: ")
-    io.eprint(command)
-    io.eprintln(" is not implemented")
-    return 1
+struct EmitStr {
+    text: str
+    cstring: bool
+}
+
+struct Emit {
+    module: *ir.Module
+    out: strbuilder.StrBuilder
+    scratch: strbuilder.StrBuilder
+    types: list.List<*check.Type>
+    id_index: list.List<i32>
+    names: list.List<str>
+    color: list.List<u8>
+    order: list.List<i32>
+    strings: list.List<EmitStr>
+    kinds: check.TypeKinds
+    ops: ir.OpKinds
+    terms: ir.TermKinds
+    opnds: ir.OperandKinds
+    links: ir.Linkages
+    lined: bool
+    failed: bool
+    // release-fast omits bounds checks. Debug and release keep them.
+    fast: bool
+}
+
+fn fail(e: *Emit, message: str) {
+    e.failed = true
+    io.eprintln(message)
+}
+
+fn run(command: str): i32 with (a: mem.Allocator) {
+    return drive(command)
+}
+
+/**
+ * C text for a lowered module. fast omits bounds checks (release-fast).
+ * The returned text is an owned copy. 1 means the emitter failed.
+ */
+fn emit_source(module: *ir.Module, fast: bool): (str, i32) with (a: mem.Allocator) {
+    var e = Emit(
+        module: module,
+        out: strbuilder.empty(),
+        scratch: strbuilder.empty(),
+        types: list.empty<*check.Type>(),
+        id_index: list.empty<i32>(),
+        names: list.empty<str>(),
+        color: list.empty<u8>(),
+        order: list.empty<i32>(),
+        strings: list.empty<EmitStr>(),
+        kinds: check.type_kinds(),
+        ops: ir.op_kinds(),
+        terms: ir.term_kinds(),
+        opnds: ir.operand_kinds(),
+        links: ir.linkages(),
+        lined: false,
+        failed: false,
+        fast: fast,
+    )
+    emit_prelude(&e)
+    if !reach_module(&e) || !assign_names(&e) || !order_defs(&e) {
+        return "", 1
+    }
+    emit_type_section(&e)
+    if e.failed || !emit_functions(&e) {
+        return "", 1
+    }
+    val text = e.out.str()
+    if text.len == 0 {
+        return "", 0
+    }
+    val (raw, err) = a.alloc(text.len, 1)
+    if err != null {
+        return "", 1
+    }
+    var i: usize = 0
+    for i < text.len {
+        raw.ptr[i] = text.ptr[i]
+        i = i + 1
+    }
+    return raw as str, 0
+}
+
+/**
+ * Print C for a lowered module. Debug mode.
+ */
+fn emit_c(module: *ir.Module): i32 with (a: mem.Allocator) {
+    val (text, code) = emit_source(module, false)
+    if code != 0 {
+        return code
+    }
+    _ = io.print(text)
+    return 0
+}
+
+private fn emit_prelude(e: *Emit) with (a: mem.Allocator) {
+    e.out.append("#include <stdint.h>\n")
+    e.out.append("#include <stddef.h>\n")
+    e.out.append("#include <stdbool.h>\n")
+    e.out.append("#include \"jogrt.h\"\n")
+}
+
+private fn is_universe_void(e: *Emit, ty: *check.Type): bool {
+    if ty.kind != e.kinds.STRUCT || ty.has_layout {
+        return false
+    }
+    if ty.field_names.len != 0 || ty.elems.len != 0 {
+        return false
+    }
+    if ty.package.len != 0 || ty.decl != null {
+        return false
+    }
+    return ty.name == "void"
+}
+
+private fn type_is_incomplete(e: *Emit, ty: *check.Type): bool {
+    if is_universe_void(e, ty) {
+        return false
+    }
+    val k = ty.kind
+    if k == e.kinds.NULL || k == e.kinds.ERROR || k == e.kinds.TYPE_PARAM {
+        return true
+    }
+    if k == e.kinds.BYTES_N {
+        return ty.len == 0
+    }
+    if k == e.kinds.ARRAY {
+        if ty.len == 0 || ty.elem == null {
+            return true
+        }
+        return ty.elem!!.size == 0
+    }
+    if k == e.kinds.TUPLE || k == e.kinds.STRUCT {
+        return ty.size == 0
+    }
+    return false
+}
+
+fn type_is_struct_form(e: *Emit, ty: *check.Type): bool {
+    if type_is_incomplete(e, ty) {
+        return false
+    }
+    val k = ty.kind
+    if k == e.kinds.BYTES_N {
+        return ty.len > 0
+    }
+    if k == e.kinds.BYTES || k == e.kinds.SLICE || k == e.kinds.ENUM || k == e.kinds.INTERFACE {
+        return true
+    }
+    if k == e.kinds.ARRAY || k == e.kinds.TUPLE || k == e.kinds.STRUCT {
+        return ty.size > 0
+    }
+    if k == e.kinds.OPTION {
+        return !check.type_option_is_niche(ty)
+    }
+    if k == e.kinds.FN {
+        return !ty.fn_extern
+    }
+    return false
+}
+
+private fn needs_def(e: *Emit, ty: *check.Type): bool {
+    if type_is_incomplete(e, ty) {
+        return false
+    }
+    val k = ty.kind
+    if k == e.kinds.BYTES_N || k == e.kinds.BYTES || k == e.kinds.SLICE || k == e.kinds.ARRAY ||
+        k == e.kinds.TUPLE || k == e.kinds.STRUCT || k == e.kinds.ENUM || k == e.kinds.INTERFACE {
+        return type_is_struct_form(e, ty)
+    }
+    if k == e.kinds.PTR || k == e.kinds.DISTINCT || k == e.kinds.OPTION || k == e.kinds.FN {
+        return true
+    }
+    return false
+}
+
+private fn has_c_name(e: *Emit, ty: *check.Type): bool {
+    return needs_def(e, ty) || type_is_incomplete(e, ty)
+}
+
+private fn index_of(e: *Emit, ty: *check.Type): i32 {
+    if (ty.id as usize) >= e.id_index.len {
+        return -1
+    }
+    return e.id_index.get(ty.id as usize)
+}
+
+private fn type_c_name(e: *Emit, ty: *check.Type): str {
+    val index = index_of(e, ty)
+    if index < 0 || (index as usize) >= e.names.len {
+        return ""
+    }
+    return e.names.get(index as usize)
+}
+
+fn underlying(e: *Emit, ty: *check.Type): *check.Type {
+    var cur = ty
+    for cur.kind == e.kinds.DISTINCT && cur.elem != null {
+        cur = cur.elem!!
+    }
+    return cur
+}
+
+fn skip_value(e: *Emit, ty: *check.Type?): bool {
+    if ty == null {
+        return true
+    }
+    val t = ty!!
+    if t.kind == e.kinds.UNIT || is_universe_void(e, t) || type_is_incomplete(e, t) {
+        return true
+    }
+    if t.kind == e.kinds.UNTYPED_INT || t.kind == e.kinds.UNTYPED_FLOAT {
+        return false
+    }
+    return t.size == 0
+}
+
+private fn ensure_layout(e: *Emit, ty: *check.Type): bool with (a: mem.Allocator) {
+    if is_universe_void(e, ty) {
+        return true
+    }
+    val k = ty.kind
+    val structural = k == e.kinds.PTR || k == e.kinds.SLICE || k == e.kinds.INTERFACE || k == e.kinds.FN ||
+        k == e.kinds.ARRAY || k == e.kinds.OPTION || k == e.kinds.TUPLE || k == e.kinds.STRUCT ||
+        k == e.kinds.ENUM || k == e.kinds.DISTINCT || k == e.kinds.BYTES || k == e.kinds.BYTES_N
+    if !structural || ty.has_layout {
+        return true
+    }
+    if check.type_layout(e.module.types, ty) {
+        return true
+    }
+    fail(e, "C backend: type has no layout")
+    return false
+}
+
+private fn reach_list(e: *Emit, items: list.List<*check.Type>): bool with (a: mem.Allocator) {
+    for i in 0 as usize..items.len {
+        if !reach(e, items.get(i) as *check.Type?) {
+            return false
+        }
+    }
+    return true
+}
+
+private fn reach(e: *Emit, ty: *check.Type?): bool with (a: mem.Allocator) {
+    if e.failed {
+        return false
+    }
+    if ty == null {
+        return true
+    }
+    val t = ty!!
+    for e.id_index.len <= (t.id as usize) {
+        e.id_index.push(-1)
+    }
+    if e.id_index.get(t.id as usize) >= 0 {
+        return true
+    }
+    if !ensure_layout(e, t) {
+        return false
+    }
+    e.id_index.set(t.id as usize, e.types.len as i32)
+    e.types.push(t)
+    val k = t.kind
+    if k == e.kinds.PTR || k == e.kinds.SLICE || k == e.kinds.OPTION || k == e.kinds.ARRAY ||
+        k == e.kinds.TYPE_PARAM {
+        return reach(e, t.elem)
+    }
+    if k == e.kinds.TUPLE {
+        return reach_list(e, t.elems)
+    }
+    if k == e.kinds.FN {
+        if !reach_list(e, t.elems) || !reach(e, t.elem) || !reach_list(e, t.contexts) {
+            return false
+        }
+        return true
+    }
+    if k == e.kinds.STRUCT {
+        if t.field_names.len > 0 && t.field_types.len == 0 {
+            fail(e, "C backend: missing fields")
+            return false
+        }
+        if !reach_list(e, t.field_types) || !reach_list(e, t.elems) {
+            return false
+        }
+        return true
+    }
+    if k == e.kinds.ENUM {
+        if !reach(e, t.elem) || !reach_list(e, t.variant_field_types) || !reach_list(e, t.elems) {
+            return false
+        }
+        return true
+    }
+    if k == e.kinds.INTERFACE {
+        return reach_list(e, t.elems)
+    }
+    if k == e.kinds.DISTINCT {
+        if !reach(e, t.elem) || !reach_list(e, t.elems) {
+            return false
+        }
+        return true
+    }
+    return true
+}
+
+private fn reach_module(e: *Emit): bool with (a: mem.Allocator) {
+    for i in 0 as usize..e.module.globals.len {
+        if !reach(e, e.module.globals.get(i).ty) {
+            return false
+        }
+    }
+    for fi in 0 as usize..e.module.funcs.len {
+        val func = e.module.funcs.get(fi)
+        if !reach(e, func.ty) {
+            return false
+        }
+        for li in 0 as usize..func.locals.len {
+            if !reach(e, func.locals.get(li).ty) {
+                return false
+            }
+        }
+        for bi in 0 as usize..func.blocks.len {
+            val block = func.blocks.at(bi)
+            for ii in 0 as usize..block.insts.len {
+                val inst = block.insts.get(ii)
+                if !reach(e, inst.a.ty) || !reach(e, inst.b.ty) {
+                    return false
+                }
+                for ai in 0 as usize..inst.args.len {
+                    if !reach(e, inst.args.at(ai).ty) {
+                        return false
+                    }
+                }
+            }
+            if !reach(e, block.term.value.ty) {
+                return false
+            }
+        }
+    }
+    return !e.failed
+}
+
+private fn is_ident_start(c: u8): bool {
+    return (c >= 'a' as u8 && c <= 'z' as u8) || (c >= 'A' as u8 && c <= 'Z' as u8) || c == '_' as u8
+}
+
+private fn is_ident_char(c: u8): bool {
+    return is_ident_start(c) || (c >= '0' as u8 && c <= '9' as u8)
+}
+
+private fn append_sanitized(b: *strbuilder.StrBuilder, src: str) with (a: mem.Allocator) {
+    var first = true
+    for i in 0 as usize..src.len {
+        var c = src.ptr[i]
+        if c == '.' as u8 {
+            c = '_' as u8
+        }
+        val ok = if first { is_ident_start(c) } else { is_ident_char(c) }
+        if !ok {
+            c = '_' as u8
+        }
+        b.append_byte(c)
+        first = false
+    }
+}
+
+private fn is_nominal(e: *Emit, ty: *check.Type): bool {
+    val k = ty.kind
+    return k == e.kinds.STRUCT || k == e.kinds.ENUM || k == e.kinds.INTERFACE || k == e.kinds.DISTINCT
+}
+
+private fn make_nominal(e: *Emit, ty: *check.Type): str with (a: mem.Allocator) {
+    e.scratch.clear()
+    e.scratch.append("jog_")
+    if ty.package.len > 0 {
+        append_sanitized(&e.scratch, ty.package)
+    }
+    e.scratch.append("__")
+    val before = e.scratch.len
+    if ty.name.len > 0 {
+        append_sanitized(&e.scratch, ty.name)
+    }
+    if e.scratch.len == before {
+        e.scratch.append("t")
+        e.scratch.append_int(ty.id as i64, 10)
+    }
+    // Nominal type-argument ids. File-private `__file` needs a path on the
+    // decl; hello.jog's types are public.
+    if ty.elems.len > 0 {
+        e.scratch.append("__")
+        for i in 0 as usize..ty.elems.len {
+            if i > 0 {
+                e.scratch.append_byte('_' as u8)
+            }
+            e.scratch.append_int(ty.elems.get(i).id as i64, 10)
+        }
+    }
+    return fs.copy_str(e.scratch.str())
+}
+
+private fn make_name(e: *Emit, ty: *check.Type): str with (a: mem.Allocator) {
+    if is_nominal(e, ty) {
+        return make_nominal(e, ty)
+    }
+    e.scratch.clear()
+    e.scratch.append("jt")
+    e.scratch.append_int(ty.id as i64, 10)
+    return fs.copy_str(e.scratch.str())
+}
+
+private fn assign_names(e: *Emit): bool with (a: mem.Allocator) {
+    for i in 0 as usize..e.types.len {
+        val ty = e.types.get(i)
+        if has_c_name(e, ty) {
+            val name = make_name(e, ty)
+            if e.failed || name.len == 0 {
+                return false
+            }
+            e.names.push(name)
+        } else {
+            e.names.push("")
+        }
+    }
+    return !e.failed
+}
+
+private fn child_first(e: *Emit, child: *check.Type?, by_value: bool): bool {
+    if child == null || !needs_def(e, child!!) {
+        return false
+    }
+    if !by_value && type_is_struct_form(e, child!!) {
+        return false
+    }
+    return true
+}
+
+private fn visit_if(e: *Emit, child: *check.Type?, by_value: bool): bool with (a: mem.Allocator) {
+    if !child_first(e, child, by_value) {
+        return true
+    }
+    return visit_type(e, child!!)
+}
+
+private fn visit_list(e: *Emit, items: list.List<*check.Type>, by_value: bool): bool with (a: mem.Allocator) {
+    for i in 0 as usize..items.len {
+        if !visit_if(e, items.get(i) as *check.Type?, by_value) {
+            return false
+        }
+    }
+    return true
+}
+
+private fn visit_type(e: *Emit, ty: *check.Type): bool with (a: mem.Allocator) {
+    val index = index_of(e, ty)
+    if index < 0 || !needs_def(e, ty) {
+        return true
+    }
+    val at = index as usize
+    if e.color.get(at) == 2 {
+        return true
+    }
+    if e.color.get(at) == 1 {
+        fail(e, "C backend: recursive value type")
+        return false
+    }
+    e.color.set(at, 1)
+    val k = ty.kind
+    if k == e.kinds.PTR || k == e.kinds.SLICE {
+        if !visit_if(e, ty.elem, false) {
+            return false
+        }
+    } else if k == e.kinds.ARRAY || k == e.kinds.OPTION || k == e.kinds.DISTINCT {
+        if !visit_if(e, ty.elem, true) {
+            return false
+        }
+    } else if k == e.kinds.TUPLE {
+        if !visit_list(e, ty.elems, true) {
+            return false
+        }
+    } else if k == e.kinds.FN {
+        if !visit_list(e, ty.elems, true) || !visit_if(e, ty.elem, true) {
+            return false
+        }
+    } else if k == e.kinds.STRUCT {
+        if !visit_list(e, ty.field_types, true) {
+            return false
+        }
+    } else if k == e.kinds.ENUM {
+        if !visit_if(e, ty.elem, true) || !visit_list(e, ty.variant_field_types, true) {
+            return false
+        }
+    }
+    if e.failed {
+        return false
+    }
+    e.color.set(at, 2)
+    e.order.push(index)
+    return true
+}
+
+private fn order_defs(e: *Emit): bool with (a: mem.Allocator) {
+    if e.types.len == 0 {
+        return true
+    }
+    for _i in 0 as usize..e.types.len {
+        e.color.push(0)
+    }
+    for id in 0 as usize..e.id_index.len {
+        val index = e.id_index.get(id)
+        if index < 0 {
+            continue
+        }
+        if !visit_type(e, e.types.get(index as usize)) {
+            return false
+        }
+    }
+    return !e.failed
+}
+
+fn append_type_name(e: *Emit, ty: *check.Type?) with (a: mem.Allocator) {
+    if ty == null {
+        e.out.append("void")
+        return
+    }
+    val t = ty!!
+    if t.kind == e.kinds.INT {
+        append_int_name(e, t)
+        return
+    }
+    if t.kind == e.kinds.FLOAT {
+        if t.float_bits == 32 {
+            e.out.append("float")
+        } else if t.float_bits == 64 {
+            e.out.append("double")
+        } else {
+            fail(e, "C backend: float width has no C name")
+            e.out.append("double")
+        }
+        return
+    }
+    if t.kind == e.kinds.BOOL {
+        e.out.append("_Bool")
+        return
+    }
+    if t.kind == e.kinds.UNIT {
+        e.out.append("void")
+        return
+    }
+    if t.kind == e.kinds.UNTYPED_INT {
+        e.out.append("int64_t")
+        return
+    }
+    if t.kind == e.kinds.UNTYPED_FLOAT {
+        e.out.append("double")
+        return
+    }
+    if is_universe_void(e, t) {
+        e.out.append("void")
+        return
+    }
+    val name = type_c_name(e, t)
+    if name.len == 0 {
+        fail(e, "C backend: type has no C name")
+        e.out.append("void")
+        return
+    }
+    e.out.append(name)
+}
+
+private fn append_int_name(e: *Emit, ty: *check.Type) with (a: mem.Allocator) {
+    if ty.int_is_size {
+        if ty.int_signed {
+            e.out.append("intptr_t")
+        } else {
+            e.out.append("uintptr_t")
+        }
+        return
+    }
+    val bits = ty.int_bits
+    if bits != 8 && bits != 16 && bits != 32 && bits != 64 {
+        fail(e, "C backend: integer width has no stdint name")
+        e.out.append("int64_t")
+        return
+    }
+    if ty.int_signed {
+        e.out.append("int")
+    } else {
+        e.out.append("uint")
+    }
+    e.out.append_int(bits as i64, 10)
+    e.out.append("_t")
+}
+
+/** C name of an @intrinsic distinct type (C append_machine_c_name). */
+private fn append_machine_c_name(e: *Emit, ty: *check.Type) with (a: mem.Allocator) {
+    if ty.intrinsic == 3 {
+        e.out.append("_Bool")
+        return
+    }
+    if ty.intrinsic == 2 {
+        if ty.intrinsic_bits == 32 {
+            e.out.append("float")
+        } else if ty.intrinsic_bits == 64 {
+            e.out.append("double")
+        } else {
+            fail(e, "C backend: float width has no C name")
+            e.out.append("double")
+        }
+        return
+    }
+    if ty.intrinsic == 1 {
+        if ty.intrinsic_ptr {
+            if ty.intrinsic_signed {
+                e.out.append("intptr_t")
+            } else {
+                e.out.append("uintptr_t")
+            }
+            return
+        }
+        val bits = ty.intrinsic_bits
+        if bits != 8 && bits != 16 && bits != 32 && bits != 64 {
+            fail(e, "C backend: integer width has no stdint name")
+            e.out.append("int64_t")
+            return
+        }
+        if ty.intrinsic_signed {
+            e.out.append("int")
+        } else {
+            e.out.append("uint")
+        }
+        e.out.append_int(bits as i64, 10)
+        e.out.append("_t")
+        return
+    }
+    e.out.append("void")
+}
+
+private fn append_type_comment(e: *Emit, ty: *check.Type) with (a: mem.Allocator) {
+    e.out.append(" /* ")
+    e.out.append(check.type_print(ty as *check.Type?))
+    e.out.append(" */")
+}
+
+private fn emit_forwards(e: *Emit): bool with (a: mem.Allocator) {
+    var any = false
+    for id in 0 as usize..e.id_index.len {
+        val index = e.id_index.get(id)
+        if index < 0 {
+            continue
+        }
+        val ty = e.types.get(index as usize)
+        if !type_is_struct_form(e, ty) && !type_is_incomplete(e, ty) {
+            continue
+        }
+        val name = type_c_name(e, ty)
+        if name.len == 0 {
+            fail(e, "C backend: type has no C name")
+            return any
+        }
+        e.out.append("typedef struct ")
+        e.out.append(name)
+        e.out.append(" ")
+        e.out.append(name)
+        e.out.append(";")
+        if type_is_incomplete(e, ty) {
+            append_type_comment(e, ty)
+        }
+        e.out.append("\n")
+        any = true
+    }
+    return any
+}
+
+private fn any_forward(e: *Emit): bool {
+    for id in 0 as usize..e.id_index.len {
+        val index = e.id_index.get(id)
+        if index < 0 {
+            continue
+        }
+        val ty = e.types.get(index as usize)
+        if type_is_struct_form(e, ty) || type_is_incomplete(e, ty) {
+            return true
+        }
+    }
+    return false
+}
+
+private fn field_name_at(ty: *check.Type, index: usize): str {
+    if index >= ty.field_names.len {
+        return ""
+    }
+    return ty.field_names.get(index)
+}
+
+fn append_field_ident(e: *Emit, ty: *check.Type, index: usize) with (a: mem.Allocator) {
+    var buf = strbuilder.empty()
+    append_sanitized(&buf, field_name_at(ty, index))
+    if buf.len == 0 {
+        e.out.append("f_")
+        e.out.append_int(index as i64, 10)
+        buf.free()
+        return
+    }
+    var dup = false
+    var i: usize = 0
+    for i < index {
+        var earlier = strbuilder.empty()
+        append_sanitized(&earlier, field_name_at(ty, i))
+        if earlier.str() == buf.str() {
+            dup = true
+        }
+        earlier.free()
+        if dup {
+            break
+        }
+        i = i + 1
+    }
+    e.out.append("f_")
+    e.out.append(buf.str())
+    if dup {
+        e.out.append("_")
+        e.out.append_int(index as i64, 10)
+    }
+    buf.free()
+}
+
+private fn append_value_fields(e: *Emit, ty: *check.Type) with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < ty.field_names.len {
+        var field: *check.Type? = null
+        if i < ty.field_types.len {
+            field = ty.field_types.get(i) as *check.Type?
+        }
+        e.out.append("    ")
+        if skip_value(e, field) {
+            e.out.append("/* ")
+            append_field_ident(e, ty, i)
+            e.out.append(": ")
+            e.out.append(check.type_print(field))
+            e.out.append(" */\n")
+        } else {
+            append_type_name(e, field)
+            e.out.append(" ")
+            append_field_ident(e, ty, i)
+            e.out.append(";\n")
+        }
+        i = i + 1
+    }
+}
+
+private fn variant_field_name(ty: *check.Type, variant: check.EnumVariant, index: usize): str {
+    val at = variant.field_start + index
+    if at >= ty.variant_field_names.len {
+        return ""
+    }
+    return ty.variant_field_names.get(at)
+}
+
+fn append_variant_ident(e: *Emit, ty: *check.Type, index: usize) with (a: mem.Allocator) {
+    var name = ""
+    if index < ty.variant_names.len {
+        name = ty.variant_names.get(index)
+    }
+    var buf = strbuilder.empty()
+    append_sanitized(&buf, name)
+    if buf.len == 0 {
+        e.out.append("f_v")
+        e.out.append_int(index as i64, 10)
+        buf.free()
+        return
+    }
+    var dup = false
+    var i: usize = 0
+    for i < index {
+        var earlier_name = ""
+        if i < ty.variant_names.len {
+            earlier_name = ty.variant_names.get(i)
+        }
+        var earlier = strbuilder.empty()
+        append_sanitized(&earlier, earlier_name)
+        if earlier.str() == buf.str() {
+            dup = true
+        }
+        earlier.free()
+        if dup {
+            break
+        }
+        i = i + 1
+    }
+    e.out.append("f_")
+    e.out.append(buf.str())
+    if dup {
+        e.out.append("_")
+        e.out.append_int(index as i64, 10)
+    }
+    buf.free()
+}
+
+fn append_variant_field_ident(e: *Emit, ty: *check.Type, variant_index: usize, index: usize) with (a: mem.Allocator) {
+    val variant = check.type_variant_at(ty, variant_index)
+    var buf = strbuilder.empty()
+    append_sanitized(&buf, variant_field_name(ty, variant, index))
+    if buf.len == 0 {
+        e.out.append("f_")
+        e.out.append_int(index as i64, 10)
+        buf.free()
+        return
+    }
+    var dup = false
+    var i: usize = 0
+    for i < index {
+        var earlier = strbuilder.empty()
+        append_sanitized(&earlier, variant_field_name(ty, variant, i))
+        if earlier.str() == buf.str() {
+            dup = true
+        }
+        earlier.free()
+        if dup {
+            break
+        }
+        i = i + 1
+    }
+    e.out.append("f_")
+    e.out.append(buf.str())
+    if dup {
+        e.out.append("_")
+        e.out.append_int(index as i64, 10)
+    }
+    buf.free()
+}
+
+private fn variant_has_payload(e: *Emit, ty: *check.Type, index: usize): bool {
+    val variant = check.type_variant_at(ty, index)
+    for fi in 0 as usize..variant.field_count {
+        val field = check.type_variant_field_at(ty, variant, fi)
+        if !skip_value(e, field.field_type) {
+            return true
+        }
+    }
+    return false
+}
+
+private fn append_variant_comment(e: *Emit, ty: *check.Type, index: usize, indent: str) with (a: mem.Allocator) {
+    val variant = check.type_variant_at(ty, index)
+    e.out.append(indent)
+    e.out.append("/* ")
+    append_variant_ident(e, ty, index)
+    e.out.append(" tag ")
+    e.out.append_int(variant.tag, 10)
+    e.out.append(" */\n")
+}
+
+private fn append_variant_fields(e: *Emit, ty: *check.Type, index: usize) with (a: mem.Allocator) {
+    val variant = check.type_variant_at(ty, index)
+    for fi in 0 as usize..variant.field_count {
+        val field = check.type_variant_field_at(ty, variant, fi)
+        e.out.append("            ")
+        if skip_value(e, field.field_type) {
+            e.out.append("/* ")
+            append_variant_field_ident(e, ty, index, fi)
+            e.out.append(": ")
+            e.out.append(check.type_print(field.field_type))
+            e.out.append(" */\n")
+        } else {
+            append_type_name(e, field.field_type)
+            e.out.append(" ")
+            append_variant_field_ident(e, ty, index, fi)
+            e.out.append(";\n")
+        }
+    }
+}
+
+private fn emit_enum(e: *Emit, ty: *check.Type) with (a: mem.Allocator) {
+    val name = type_c_name(e, ty)
+    begin_struct(e, name, ty)
+    e.out.append("    ")
+    append_type_name(e, ty.elem)
+    e.out.append(" tag;\n")
+    var any = false
+    for i in 0 as usize..ty.variant_names.len {
+        if variant_has_payload(e, ty, i) {
+            any = true
+            break
+        }
+    }
+    if !any {
+        for i in 0 as usize..ty.variant_names.len {
+            append_variant_comment(e, ty, i, "    ")
+        }
+        e.out.append("};\n")
+        return
+    }
+    e.out.append("    union {\n")
+    for i in 0 as usize..ty.variant_names.len {
+        if !variant_has_payload(e, ty, i) {
+            append_variant_comment(e, ty, i, "        ")
+            continue
+        }
+        val variant = check.type_variant_at(ty, i)
+        e.out.append("        struct {\n")
+        append_variant_fields(e, ty, i)
+        e.out.append("        } ")
+        append_variant_ident(e, ty, i)
+        e.out.append("; /* tag ")
+        e.out.append_int(variant.tag, 10)
+        e.out.append(" */\n")
+    }
+    e.out.append("    } payload;\n};\n")
+}
+
+private fn append_u64(out: *strbuilder.StrBuilder, n: u64) with (a: mem.Allocator) {
+    if n > 9 {
+        append_u64(out, n / 10)
+    }
+    out.append_byte(('0' as u8) + ((n % 10) as u8))
+}
+
+private fn append_tuple_fields(e: *Emit, ty: *check.Type) with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < ty.elems.len {
+        var elem: *check.Type? = null
+        if i < ty.elems.len {
+            elem = ty.elems.get(i) as *check.Type?
+        }
+        if skip_value(e, elem) {
+            e.out.append("    /* f_")
+            e.out.append_int(i as i64, 10)
+            e.out.append(": ")
+            e.out.append(check.type_print(elem))
+            e.out.append(" */\n")
+        } else {
+            e.out.append("    ")
+            append_type_name(e, elem)
+            e.out.append(" f_")
+            e.out.append_int(i as i64, 10)
+            e.out.append(";\n")
+        }
+        i = i + 1
+    }
+}
+
+private fn begin_struct(e: *Emit, name: str, ty: *check.Type) with (a: mem.Allocator) {
+    e.out.append("struct ")
+    e.out.append(name)
+    e.out.append(" {")
+    append_type_comment(e, ty)
+    e.out.append("\n")
+}
+
+private fn emit_struct_body(e: *Emit, ty: *check.Type) with (a: mem.Allocator) {
+    val name = type_c_name(e, ty)
+    if name.len == 0 {
+        fail(e, "C backend: type has no C name")
+        return
+    }
+    if ty.kind == e.kinds.BYTES_N {
+        begin_struct(e, name, ty)
+        e.out.append("    uint8_t b[")
+        append_u64(&e.out, ty.len)
+        e.out.append("];\n};\n")
+        return
+    }
+    if ty.kind == e.kinds.BYTES {
+        begin_struct(e, name, ty)
+        if ty.is_const {
+            e.out.append("    const uint8_t *ptr;\n")
+        } else {
+            e.out.append("    uint8_t *ptr;\n")
+        }
+        e.out.append("    size_t len;\n};\n")
+        return
+    }
+    if ty.kind == e.kinds.SLICE {
+        begin_struct(e, name, ty)
+        e.out.append("    ")
+        if ty.is_const {
+            e.out.append("const ")
+        }
+        append_type_name(e, ty.elem)
+        e.out.append(" *ptr;\n    size_t len;\n};\n")
+        return
+    }
+    if ty.kind == e.kinds.ARRAY {
+        begin_struct(e, name, ty)
+        e.out.append("    ")
+        append_type_name(e, ty.elem)
+        e.out.append(" v[")
+        append_u64(&e.out, ty.len)
+        e.out.append("];\n};\n")
+        return
+    }
+    if ty.kind == e.kinds.TUPLE {
+        begin_struct(e, name, ty)
+        append_tuple_fields(e, ty)
+        e.out.append("};\n")
+        return
+    }
+    if ty.kind == e.kinds.FN {
+        begin_struct(e, name, ty)
+        e.out.append("    ")
+        append_type_name(e, ty.elem)
+        e.out.append(" (*code)(")
+        append_fn_params(e, ty)
+        e.out.append(");\n    void *env;\n};\n")
+        return
+    }
+    if ty.kind == e.kinds.STRUCT {
+        begin_struct(e, name, ty)
+        append_value_fields(e, ty)
+        e.out.append("};\n")
+        return
+    }
+    if ty.kind == e.kinds.ENUM {
+        emit_enum(e, ty)
+        return
+    }
+    if ty.kind == e.kinds.OPTION {
+        begin_struct(e, name, ty)
+        e.out.append("    _Bool has;\n")
+        if skip_value(e, ty.elem) {
+            e.out.append("    /* value: ")
+            e.out.append(check.type_print(ty.elem))
+            e.out.append(" */\n};\n")
+        } else {
+            e.out.append("    ")
+            append_type_name(e, ty.elem)
+            e.out.append(" value;\n};\n")
+        }
+        return
+    }
+    if ty.kind == e.kinds.INTERFACE {
+        begin_struct(e, name, ty)
+        e.out.append("    void *ptr;\n    void *vtable;\n};\n")
+        return
+    }
+    fail(e, "C backend: struct body is not emitted yet")
+}
+
+private fn emit_alias(e: *Emit, ty: *check.Type) with (a: mem.Allocator) {
+    val name = type_c_name(e, ty)
+    if name.len == 0 {
+        fail(e, "C backend: type has no C name")
+        return
+    }
+    if ty.kind == e.kinds.PTR {
+        e.out.append("typedef ")
+        if ty.is_const {
+            e.out.append("const ")
+        }
+        append_type_name(e, ty.elem)
+        e.out.append(" *")
+        e.out.append(name)
+        e.out.append(";")
+    } else if ty.kind == e.kinds.FN {
+        e.out.append("typedef ")
+        append_type_name(e, ty.elem)
+        e.out.append(" (*")
+        e.out.append(name)
+        e.out.append(")(")
+        append_fn_params(e, ty)
+        e.out.append(");")
+    } else if ty.kind == e.kinds.DISTINCT {
+        e.out.append("typedef ")
+        if ty.intrinsic != 0 {
+            append_machine_c_name(e, ty)
+        } else {
+            append_type_name(e, ty.elem)
+        }
+        e.out.append(" ")
+        e.out.append(name)
+        e.out.append(";")
+    } else if ty.kind == e.kinds.OPTION {
+        e.out.append("typedef ")
+        append_type_name(e, ty.elem)
+        e.out.append(" ")
+        e.out.append(name)
+        e.out.append(";")
+    } else {
+        fail(e, "C backend: typedef is not emitted yet")
+        return
+    }
+    append_type_comment(e, ty)
+    e.out.append("\n")
+}
+
+private fn emit_def(e: *Emit, ty: *check.Type) with (a: mem.Allocator) {
+    if type_is_struct_form(e, ty) {
+        emit_struct_body(e, ty)
+    } else {
+        emit_alias(e, ty)
+    }
+}
+
+private fn emit_type_section(e: *Emit) with (a: mem.Allocator) {
+    val forwarded_needed = any_forward(e)
+    val any_def = e.order.len > 0
+    if forwarded_needed || any_def {
+        e.out.append("\n")
+    }
+    val forwarded = emit_forwards(e)
+    if e.failed {
+        return
+    }
+    if forwarded && any_def {
+        e.out.append("\n")
+    }
+    for i in 0 as usize..e.order.len {
+        if i > 0 {
+            e.out.append("\n")
+        }
+        emit_def(e, e.types.get(e.order.get(i) as usize))
+        if e.failed {
+            return
+        }
+    }
+}
+
+private fn emit_functions(e: *Emit): bool with (a: mem.Allocator) {
+    note_strings(e)
+    if e.failed {
+        return false
+    }
+    if e.module.funcs.len > 0 {
+        e.out.append("\n")
+        emit_prototypes(e)
+        if e.failed {
+            return false
+        }
+    }
+    if e.strings.len > 0 {
+        e.out.append("\n")
+        emit_string_data(e)
+    }
+    if e.failed || !emit_globals(e) {
+        return false
+    }
+    if module_needs_fmod(e) {
+        e.out.append("\n")
+        emit_fmod_helpers(e)
+    }
+    emit_fn_thunks(e)
+    if e.failed {
+        return false
+    }
+    if e.module.funcs.len > 0 {
+        e.out.append("\n")
+        emit_bodies(e)
+        if e.failed {
+            return false
+        }
+    }
+    e.out.append("\n")
+    emit_entry(e, "jog_entry_init", e.module.init_func)
+    e.out.append("\n")
+    emit_entry(e, "jog_entry_main", e.module.main_func)
+    return !e.failed
 }
