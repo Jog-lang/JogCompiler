@@ -1,17 +1,13 @@
-// jogc: the self-hosted compiler. main reads os.argv, dispatches one
-// command, and exits with that command's code. std.os has no exit, so
-// the code goes through c.jogrt_exit, as in Jog-build.
-//
-// lex and parse call that stage. check calls the loader, then the
-// checker. emit-ir lowers and prints JIR. emit-c lowers and prints C.
-// build, run, and test stay on the emitter stub.
+// jogc CLI: reads os.argv, dispatches one command, exits with that code.
+// Frontend packages come from the jogc library (require jogc ..).
+// std.os has no exit, so the code goes through c.jogrt_exit.
 
-import src.check
-import src.emit
-import src.lex
-import src.load
-import src.lower
-import src.parse
+import jogc.src.check
+import jogc.src.emit
+import jogc.src.lex
+import jogc.src.load
+import jogc.src.lower
+import jogc.src.parse
 import std.c
 import std.io
 import std.list

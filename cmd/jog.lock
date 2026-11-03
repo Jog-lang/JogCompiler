@@ -1,0 +1,3 @@
+# jog.lock: written by jog-build, do not edit
+lock 1
+dep jogc 0.1.0 path ../. -

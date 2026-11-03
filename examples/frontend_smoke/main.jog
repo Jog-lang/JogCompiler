@@ -1,0 +1,23 @@
+// Smoke: require the jogc library, run load+check only (no emit).
+import jogc.src.frontend
+import std.c
+import std.io
+import std.list
+import std.mem
+import std.os
+
+fn main() {
+    var code: i32 = 1
+    with (mem.heap()) {
+        var start = "ok"
+        if os.argc() >= 2 {
+            start = os.argv(1)
+        }
+        var flags = list.empty<str>()
+        code = frontend.run(start, flags.items())
+        if code == 0 {
+            io.println("frontend_smoke: check ok")
+        }
+    }
+    c.jogrt_exit(code)
+}

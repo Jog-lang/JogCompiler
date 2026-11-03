@@ -1,0 +1,23 @@
+// Package src.frontend: load + check for tools (JogLSP) that must not
+// run the CLI or pull in emit / lower. Lex and parse stay available as
+// jogc.src.lex and jogc.src.parse for callers that need those stages alone.
+
+import src.check
+import src.load
+import std.mem
+
+/**
+ * Load a module at start (with optional --module name=dir flags) and
+ * typecheck it. Does not lower or emit C.
+ * @param start file or folder; walks up to jog.mod
+ * @param module_flags each entry is name=dir (no --module prefix)
+ * @return 0 on success; non-zero on load or check failure
+ */
+fn run(start: str, module_flags: []str): i32 with (a: mem.Allocator) {
+    val (prog, loaded) = load.run(start, module_flags, false)
+    if loaded != 0 {
+        return loaded
+    }
+    val (_, code) = check.run(prog)
+    return code
+}
