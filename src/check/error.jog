@@ -672,7 +672,7 @@ fn check_error_top_binding(ck: *Check, job: *CheckJob, node: *parse.Node): *Type
             return null
         }
         if !is_poison(annotated) {
-            var env = Env(ck: ck, job: job, scope: null, ret: null, reachable: true, loop_depth: 0)
+            var env = Env(ck: ck, job: job, scope: null, ret: null, reachable: true, loop_depth: 0, loop_broke: false)
             annotated = require_tuple(&env, annotated_node!!, annotated, count)
             if annotated == null || ck.stop {
                 return null
@@ -697,11 +697,11 @@ fn check_error_top_binding(ck: *Check, job: *CheckJob, node: *parse.Node): *Type
             return null
         }
         if annotated == null {
-            var env = Env(ck: ck, job: job, scope: null, ret: null, reachable: true, loop_depth: 0)
+            var env = Env(ck: ck, job: job, scope: null, ret: null, reachable: true, loop_depth: 0, loop_broke: false)
             got = require_tuple(&env, init!!, got, count)
         } else if got != null && !is_poison(got) && annotated != null && !is_poison(annotated) &&
             !type_same(got!!, annotated!!) {
-            var env = Env(ck: ck, job: job, scope: null, ret: null, reachable: true, loop_depth: 0)
+            var env = Env(ck: ck, job: job, scope: null, ret: null, reachable: true, loop_depth: 0, loop_broke: false)
             fail_mismatch(&env, init!!, annotated!!, got!!)
             got = err_ty(ck) as *Type?
         }

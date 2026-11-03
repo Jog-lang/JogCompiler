@@ -22,6 +22,9 @@ struct Env {
     ret: *Type?
     reachable: bool
     loop_depth: i64
+    // Set when a `break` runs in the loop body currently being checked.
+    // Forever loops only fall through when this is true.
+    loop_broke: bool
 }
 
 /** Retype an untyped float lit tree onto `node` (match C type_float_tree). */
@@ -2756,6 +2759,7 @@ fn check_block(env: *Env, block: *parse.Node) with (a: mem.Allocator) {
     }
     context_reset(env.job, mark)
     env.reachable = nested.reachable
+    env.loop_broke = nested.loop_broke
 }
 
 private fn block_tail_expr(block: *parse.Node): *parse.Node? {
@@ -2798,6 +2802,7 @@ fn check_block_value(env: *Env, block: *parse.Node, target: *Type?): *Type? with
         }
         env_fail(env, block, "if branch has no value")
         env.reachable = nested.reachable
+        env.loop_broke = nested.loop_broke
         context_reset(env.job, mark)
         return err_ty(env.ck) as *Type?
     }
@@ -2808,6 +2813,7 @@ fn check_block_value(env: *Env, block: *parse.Node, target: *Type?): *Type? with
         got = check_expr(&nested, tail!!, target)
     }
     env.reachable = nested.reachable
+    env.loop_broke = nested.loop_broke
     context_reset(env.job, mark)
     return got
 }
@@ -3304,6 +3310,7 @@ private fn check_for(env: *Env, node: *parse.Node) with (a: mem.Allocator) {
     body.scope = loop_scope
     body.loop_depth = env.loop_depth + 1
     body.reachable = true
+    body.loop_broke = false
     if node.text == "in" && elem != null && !type_is_error(elem!!) {
         if collection {
             if node.flag.len > 0 {
@@ -3345,10 +3352,12 @@ private fn check_for(env: *Env, node: *parse.Node) with (a: mem.Allocator) {
         check_block(&body, body_node!!)
     }
     if forever {
-        if body.reachable {
-            env.reachable = false
-        } else {
+        // `for { }` only continues past the loop when a break is taken.
+        // return/continue leave after-loop code unreachable (no fake trailing return).
+        if body.loop_broke {
             env.reachable = entry_reach
+        } else {
+            env.reachable = false
         }
     } else {
         env.reachable = entry_reach
@@ -3399,6 +3408,7 @@ fn check_stmt(env: *Env, stmt: *parse.Node) with (a: mem.Allocator) {
                 env_fail(env, stmt, "break outside of a loop")
             }
             env.reachable = false
+            env.loop_broke = true
         }
         parse.is_continue(stmt) -> {
             if env.loop_depth <= 0 {
@@ -3688,6 +3698,7 @@ fn check_fn_body(ck: *Check, job: *CheckJob) with (a: mem.Allocator) {
         ret: ret,
         reachable: true,
         loop_depth: 0,
+        loop_broke: false,
     )
     val fn_scope = new_scope(&env, null)
     if fn_scope == null {
@@ -3736,6 +3747,7 @@ fn check_expr_job(ck: *Check, job: *CheckJob, node: *parse.Node, target: *Type?)
         ret: null,
         reachable: true,
         loop_depth: 0,
+        loop_broke: false,
     )
     return check_expr(&env, node, target)
 }

@@ -20,3 +20,22 @@ fn after_break(): *i32 {
     }
     return p
 }
+
+fn forever_returns(c: bool): i32 {
+    for {
+        if c {
+            return 1
+        }
+        continue
+    }
+}
+
+// Forever loop that only returns/continues: no trailing return needed.
+fn forever_return(c: bool): i32 {
+    for {
+        if c {
+            return 1
+        }
+        continue
+    }
+}
