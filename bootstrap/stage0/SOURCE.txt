@@ -1,3 +1,0 @@
-e64191a502a31b414c060f7376f6945a98fbbbdf
-Rebuild from that commit: cmake -S . -B build -G Ninja && cmake --build build
-This copy is build/jog.exe from that commit. bootstrap/stage0 looks one directory higher for both std and core (the locate_roots rule already in compiler/src/loader.c).

@@ -4,7 +4,17 @@ Jog is a low-level language. It works with functions, data whose layout is expli
 
 The specification is [JogDocs](https://github.com/Jog-lang/JogDocs). Start at its `AGENTS.md` and `guide/JogQuickRef.md`. The language overview is `design/Language.md`, and the language notes in `design/language/` are the spec. A local checkout is the sibling folder `../JogDocs`, or `../Jog/JogDocs` when the notes sit next to a `Jog` checkout.
 
-This repository is the C seed compiler, `jog`. It is stage 0: the reference a later compiler written in Jog is checked against.
+## Branches
+
+| Branch | Contents |
+|---|---|
+| **`seed` (this branch)** | Stage 0: the C compiler `jog` only. No jogc sources. |
+| **`develop`** | The Jog compiler `jogc` only. Build it with an external `jog` from `seed` (`JOG` or `PATH`). |
+| **`p3/jogc`** | Bootstrap record: both trees together at the self-host landing (`d147c63`). |
+| **`c-seed-compiler`** | Older public C seed from before jogc. History only; do not treat it as the live stage 0. |
+| **`main`** | Tiny initial commit until the default branch moves. |
+
+Do not merge `seed` and `develop` into each other. A fix that belongs in both (for example a shared `std/` bug) is two commits, one per branch, or a cherry-pick of a path that still exists on both.
 
 ## Status
 
@@ -35,7 +45,7 @@ On Linux:
 ```
 cmake -S . -B build-linux -G Ninja
 cmake --build build-linux
-scripts/check.sh
+bash scripts/check.sh
 ```
 
 `scripts/check.sh` does the same steps into `build-linux/` and prints `check: OK`. `CC=gcc` uses `build-linux-gcc/`, `CC=clang` uses `build-linux-clang/`, and `scripts/check.sh --both` runs the check with both compilers.
@@ -50,17 +60,14 @@ After a Windows build that binary is `build/jog.exe`. After the Linux build abov
 
 ## Layout
 
-- `compiler/` — the V1 compiler
+- `compiler/` — the V1 C compiler
 - `tools/` — shared C utilities
 - `runtime/` — the runtime linked into generated programs
+- `core/` — core prelude loaded by the seed
 - `std/` — the standard library, written in Jog
 - `tests/` — C tests and end-to-end Jog programs
 - `examples/` — small programs; `examples/hello` is hello world
 - `docs/plans/` — the V1 compiler plans for this repository
-
-## Self-hosting
-
-A compiler written in Jog will be checked against this one. This tree stays stage 0. The plan is JogDocs `bootstrap/Roadmap.md`.
 
 ## License
 
