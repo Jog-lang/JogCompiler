@@ -53,7 +53,7 @@ Use these as the Seed cleanup boxes in JogDocs Checks later.
 
 - [x] Inventory committed (`docs/plans/SeedCleanup.md`).
 - [x] Agent / compiler README wording matches the C-only `seed` branch.
-- [ ] Remove jogc-only scripts left on `seed` (`scripts/diff_stage.ps1`).
+- [x] Remove jogc-only scripts left on `seed` (`scripts/diff_stage.ps1`).
 - [ ] (Optional, later) Rename CMake static library target `jogc` → a seed-neutral name; update any docs that mention the target.
 - [ ] (Deferred) Prefix pass for newly exported symbols only; no mass rename of `static` helpers.
 - [ ] (Deferred) Named duplicate-helper collapses, one pair per commit, with `check: OK`.
