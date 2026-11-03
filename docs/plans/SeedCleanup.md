@@ -51,8 +51,8 @@ No clear “two owners of the same helper” that is safe to collapse without a 
 
 Use these as the Seed cleanup boxes in JogDocs Checks later.
 
-- [ ] Inventory committed (`docs/plans/SeedCleanup.md`).
-- [ ] Agent / compiler README wording matches the C-only `seed` branch.
+- [x] Inventory committed (`docs/plans/SeedCleanup.md`).
+- [x] Agent / compiler README wording matches the C-only `seed` branch.
 - [ ] Remove jogc-only scripts left on `seed` (`scripts/diff_stage.ps1`).
 - [ ] (Optional, later) Rename CMake static library target `jogc` → a seed-neutral name; update any docs that mention the target.
 - [ ] (Deferred) Prefix pass for newly exported symbols only; no mass rename of `static` helpers.
