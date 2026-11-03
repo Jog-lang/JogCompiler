@@ -13,3 +13,4 @@ bootstrap/stage0/*.exe
 .ninja_*
 .vscode/
 docs/.obsidian/
+jog.lock
