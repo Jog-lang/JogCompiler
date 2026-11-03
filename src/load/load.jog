@@ -836,13 +836,26 @@ fn run(start: str, module_flags: []str, include_tests: bool): (Program, i32) wit
     root_mod.is_library = manifest.is_library
     root_mod.manifest = manifest
 
+    var extra_dir = ""
+    if !is_dir(start) {
+        val (parent, pok) = parent_dir(start)
+        if pok {
+            val parent_native = native_abs_dir(parent)
+            fs.free_str(parent)
+            if parent_native != abs_root {
+                extra_dir = parent_native
+            } else {
+                fs.free_str(parent_native)
+            }
+        }
+    }
     var mods = list.empty<Module>()
     val mapped_ok = open_mapped(module_flags, root_mod.name, &mods)
     val modules_ok = check_modules(man_path, root_mod, &mods)
     var prog = empty_program()
     var files_ok = true
     if shadows_ok && mapped_ok && modules_ok {
-        val (loaded, load_ok) = load_root_sources(root_mod, man_path, roots, mods, include_tests)
+        val (loaded, load_ok) = load_root_sources(root_mod, man_path, roots, mods, include_tests, extra_dir)
         prog = loaded
         files_ok = load_ok
         if load_ok {
@@ -851,6 +864,7 @@ fn run(start: str, module_flags: []str, include_tests: bool): (Program, i32) wit
             prog.links = root_mod.manifest.links
         }
     }
+    fs.free_str(extra_dir)
 
     fs.free_str(man_path)
     free_roots(roots)

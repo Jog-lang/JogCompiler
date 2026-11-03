@@ -1,0 +1,414 @@
+// Hover, definition, and completion over a freshly analyzed program.
+
+import src.check
+import src.load
+import src.parse
+import std.fs
+import std.list
+import std.mem
+import std.strbuilder
+import std.text as texts
+
+struct Location {
+    path: str
+    line: i64
+    column: i64
+    ok: bool
+}
+
+private fn path_eq(a: str, b: str): bool with (a_alloc: mem.Allocator) {
+    val (ka, _) = normalize_key(a)
+    val (kb, _) = normalize_key(b)
+    val hit = ka == kb
+    fs.free_str(ka)
+    fs.free_str(kb)
+    return hit
+}
+
+private fn normalize_key(path: str): (str, bool) with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    var i: usize = 0
+    for i < path.len {
+        val c = path.ptr[i]
+        if c == '\\' as u8 {
+            b.append_byte('/' as u8)
+        } else {
+            b.append_byte(c)
+        }
+        i = i + 1
+    }
+    val out = fs.copy_str(b.str())
+    b.free()
+    return out, true
+}
+
+private fn node_before(node: *parse.Node, line: i64, column: i64): bool {
+    if node.line < line {
+        return true
+    }
+    if node.line == line && node.column <= column {
+        return true
+    }
+    return false
+}
+
+private struct BestNode {
+    node: *parse.Node?
+}
+
+private fn walk_best(node: *parse.Node, line: i64, column: i64, best: *BestNode) {
+    if !node_before(node, line, column) {
+        return
+    }
+    best.node = node as *parse.Node?
+    var i: usize = 0
+    for i < node.kids.len {
+        walk_best(node.kids.get(i), line, column, best)
+        i = i + 1
+    }
+}
+
+private fn find_in_file(file: *parse.Node, line: i64, column: i64): *parse.Node? {
+    var best: BestNode
+    best.node = null
+    walk_best(file, line, column, &best)
+    return best.node
+}
+
+private fn find_in_prog(prog: load.Program, path: str, line: i64, column: i64): *parse.Node? with (a: mem.Allocator) {
+    var pi: usize = 0
+    for pi < prog.packages.len {
+        val pkg = prog.packages.get(pi)
+        var fi: usize = 0
+        for fi < pkg.files.len {
+            val sf = pkg.files.get(fi)
+            if path_eq(sf.path, path) && sf.ast != null {
+                val hit = find_in_file(sf.ast!!, line, column)
+                if hit != null {
+                    return hit
+                }
+            }
+            fi = fi + 1
+        }
+        pi = pi + 1
+    }
+    return null
+}
+
+private fn load_and_check(
+    start: str,
+    module_flags: []str,
+    override_paths: []str,
+    override_texts: []str,
+): (load.Program, i32) with (a: mem.Allocator) {
+    load.begin_overrides(override_paths, override_texts)
+    load.set_soft_asts(true)
+    val (prog, loaded) = load.run(start, module_flags, false)
+    var code = loaded
+    if loaded == 0 {
+        val (checked, c) = check.run(prog)
+        code = c
+        load.set_soft_asts(false)
+        load.end_overrides()
+        return checked, code
+    }
+    load.set_soft_asts(false)
+    load.end_overrides()
+    return prog, code
+}
+
+private fn type_of_node(node: *parse.Node): str with (a: mem.Allocator) {
+    if node.ty == null {
+        return ""
+    }
+    val ty = node.ty!! as *check.Type?
+    return check.type_print(ty)
+}
+
+private fn sym_of_node(node: *parse.Node): *load.Symbol? {
+    if node.sym == null {
+        return null
+    }
+    return node.sym!! as *load.Symbol?
+}
+
+/**
+ * Hover text for the name at line/column (1-based). Empty when unknown.
+ */
+fn hover_at(
+    start: str,
+    module_flags: []str,
+    override_paths: []str,
+    override_texts: []str,
+    path: str,
+    line: i64,
+    column: i64,
+): str with (a: mem.Allocator) {
+    val (prog, _) = load_and_check(start, module_flags, override_paths, override_texts)
+    val node = find_in_prog(prog, path, line, column)
+    if node == null {
+        return ""
+    }
+    val n = node!!
+    val sym = sym_of_node(n)
+    var ty = type_of_node(n)
+    if ty.len == 0 && sym != null && sym!!.sema != null {
+        val sty = sym!!.sema!! as *check.Type?
+        ty = check.type_print(sty)
+    }
+    if ty.len == 0 && sym == null {
+        return ""
+    }
+    var b = strbuilder.empty()
+    if ty.len > 0 {
+        b.append(ty)
+        fs.free_str(ty)
+    }
+    if sym != null {
+        if b.len > 0 {
+            b.append("\n")
+        }
+        b.append("declared in ")
+        b.append(sym!!.file)
+        b.append(":")
+        b.append_int(sym!!.line, 10)
+        b.append(":")
+        b.append_int(sym!!.column, 10)
+    } else if ty.len == 0 {
+        // ty was freed above only when len > 0; nothing to free
+    }
+    val out = fs.copy_str(b.str())
+    b.free()
+    return out
+}
+
+/**
+ * Go-to-definition for the name at line/column (1-based).
+ */
+fn definition_at(
+    start: str,
+    module_flags: []str,
+    override_paths: []str,
+    override_texts: []str,
+    path: str,
+    line: i64,
+    column: i64,
+): Location with (a: mem.Allocator) {
+    var loc: Location
+    loc.path = ""
+    loc.line = 0
+    loc.column = 0
+    loc.ok = false
+    val (prog, _) = load_and_check(start, module_flags, override_paths, override_texts)
+    val node = find_in_prog(prog, path, line, column)
+    if node == null {
+        return loc
+    }
+    val sym = sym_of_node(node!!)
+    if sym == null {
+        return loc
+    }
+    loc.path = fs.copy_str(sym!!.file)
+    loc.line = sym!!.line
+    loc.column = sym!!.column
+    loc.ok = true
+    return loc
+}
+
+private fn push_unique(out: *list.List<str>, name: str) with (a: mem.Allocator) {
+    if name.len == 0 {
+        return
+    }
+    var i: usize = 0
+    for i < out.len {
+        if out.get(i) == name {
+            return
+        }
+        i = i + 1
+    }
+    out.push(fs.copy_str(name))
+}
+
+private fn collect_scope(pkg: *load.Package, out: *list.List<str>) with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < pkg.scope.bindings.len {
+        push_unique(out, pkg.scope.bindings.get(i).name)
+        i = i + 1
+    }
+    var fi: usize = 0
+    for fi < pkg.scope.file_scopes.len {
+        val scope = pkg.scope.file_scopes.get(fi)
+        var j: usize = 0
+        for j < scope.bindings.len {
+            push_unique(out, scope.bindings.get(j).name)
+            j = j + 1
+        }
+        fi = fi + 1
+    }
+    i = 0
+    for i < pkg.methods.len {
+        push_unique(out, pkg.methods.get(i).name)
+        i = i + 1
+    }
+}
+
+private fn collect_type_members(ty: *check.Type, pkg: *load.Package?, out: *list.List<str>) with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < ty.field_names.len {
+        push_unique(out, ty.field_names.get(i))
+        i = i + 1
+    }
+    if pkg != null {
+        i = 0
+        for i < pkg!!.methods.len {
+            push_unique(out, pkg!!.methods.get(i).name)
+            i = i + 1
+        }
+    }
+}
+
+private fn name_has_prefix(name: str, prefix: str): bool {
+    if prefix.len > name.len {
+        return false
+    }
+    var i: usize = 0
+    for i < prefix.len {
+        if name.ptr[i] != prefix.ptr[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+private fn ends_with_dot_prefix(text: str, line: i64, column: i64): (bool, str) {
+    // Walk to the byte offset of line/column and look back for `.` / `.partial`.
+    var cur_line: i64 = 1
+    var i: usize = 0
+    for i < text.len && cur_line < line {
+        if text.ptr[i] == '\n' as u8 {
+            cur_line = cur_line + 1
+        }
+        i = i + 1
+    }
+    if cur_line != line {
+        return false, ""
+    }
+    val col = column as usize
+    if col == 0 || col - 1 > text.len - i {
+        return false, ""
+    }
+    var pos = i + col - 1
+    if pos > text.len {
+        pos = text.len
+    }
+    // Skip back over an incomplete identifier.
+    var end = pos
+    for end > i {
+        val c = text.ptr[end - 1]
+        if (c >= 'a' as u8 && c <= 'z' as u8) || (c >= 'A' as u8 && c <= 'Z' as u8) ||
+            (c >= '0' as u8 && c <= '9' as u8) || c == '_' as u8 {
+            end = end - 1
+            continue
+        }
+        break
+    }
+    val prefix = texts.slice(text, end, pos)
+    if end > i && text.ptr[end - 1] == '.' as u8 {
+        return true, prefix
+    }
+    return false, ""
+}
+
+/**
+ * Completion names at line/column. After `.` offers fields/methods when typed;
+ * otherwise names in the file's package scope. Incomplete suffixes still match.
+ */
+fn complete_at(
+    start: str,
+    module_flags: []str,
+    override_paths: []str,
+    override_texts: []str,
+    path: str,
+    text: str,
+    line: i64,
+    column: i64,
+): list.List<str> with (a: mem.Allocator) {
+    var out = list.empty<str>()
+    val (prog, _) = load_and_check(start, module_flags, override_paths, override_texts)
+    val (is_member, prefix) = ends_with_dot_prefix(text, line, column)
+    var home: *load.Package? = null
+    var pi0: usize = 0
+    for pi0 < prog.packages.len {
+        val pkg = prog.packages.get(pi0)
+        var fi0: usize = 0
+        for fi0 < pkg.files.len {
+            if path_eq(pkg.files.get(fi0).path, path) {
+                home = pkg as *load.Package?
+                break
+            }
+            fi0 = fi0 + 1
+        }
+        if home != null {
+            break
+        }
+        pi0 = pi0 + 1
+    }
+    if is_member {
+        val node = find_in_prog(prog, path, line, column)
+        if node != null {
+            var cur = node!!
+            // Prefer the MEMBER node's left kid type when sitting on `.name`.
+            if parse.is_member(cur) && cur.kids.len > 0 {
+                val left = cur.kids.get(0)
+                if left.ty != null {
+                    collect_type_members(left.ty!! as *check.Type, home, &out)
+                }
+            } else if cur.ty != null {
+                collect_type_members(cur.ty!! as *check.Type, home, &out)
+            }
+        }
+        if prefix.len > 0 {
+            var filtered = list.empty<str>()
+            var i: usize = 0
+            for i < out.len {
+                val name = out.get(i)
+                if name_has_prefix(name, prefix) {
+                    filtered.push(name)
+                } else {
+                    fs.free_str(name)
+                }
+                i = i + 1
+            }
+            out.free()
+            return filtered
+        }
+        return out
+    }
+    var pi: usize = 0
+    for pi < prog.packages.len {
+        val pkg = prog.packages.get(pi)
+        var fi: usize = 0
+        for fi < pkg.files.len {
+            if path_eq(pkg.files.get(fi).path, path) {
+                collect_scope(pkg, &out)
+                return out
+            }
+            fi = fi + 1
+        }
+        pi = pi + 1
+    }
+    if prog.packages.len > 0 {
+        collect_scope(prog.packages.get(0), &out)
+    }
+    return out
+}
+
+fn free_strs(xs: *list.List<str>) with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < xs.len {
+        fs.free_str(xs.get(i))
+        i = i + 1
+    }
+    xs.free()
+}

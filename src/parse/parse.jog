@@ -1283,8 +1283,30 @@ fn parse_attr_block(p: *Parser): *Node with (a: mem.Allocator) {
 }
 
 /**
+ * True when the current token starts a declaration that cannot appear as a
+ * statement inside a block. `val` / `var` / `context` are excluded: they are
+ * both top-level and statement forms. Used so recovery and unclosed blocks
+ * stop before the next `fn` / `struct` / … instead of swallowing it.
+ */
+fn is_decl_start(p: *Parser): bool {
+    val k = lex.kind()
+    if p.at(k.KW_FN) || p.at(k.KW_STRUCT) || p.at(k.KW_INTERFACE) || p.at(k.KW_ENUM) ||
+        p.at(k.KW_TYPE) || p.at(k.KW_EXTERN) || p.at(k.KW_IMPORT) || p.at(k.KW_PRIVATE) {
+        return true
+    }
+    if p.at(k.IDENT) {
+        val t = p.peek().text
+        if (t == "expect" || t == "actual") && p.kind_at(1) == k.KW_FN {
+            return true
+        }
+    }
+    return false
+}
+
+/**
  * Skip to the next statement separator, or to a `}` that closes the current list.
  * A `{` raises the depth so a function body is skipped as a whole.
+ * Stops before a declaration keyword at depth 0 so the file loop can parse it.
  * @param p cursor on the bad token
  */
 fn recover(p: *Parser) {
@@ -1306,6 +1328,9 @@ fn recover(p: *Parser) {
         }
         if p.at(k.SEP) && depth == 0 {
             p.advance()
+            break
+        }
+        if depth == 0 && is_decl_start(p) {
             break
         }
         p.advance()
@@ -2921,6 +2946,11 @@ fn fill_block(p: *Parser, node: *Node) with (a: mem.Allocator) {
         if p.at(k.RBRACE) || p.at(k.EOF) {
             break
         }
+        // Missing `}`: a following top-level declaration closes this block
+        // so functions after the error still appear in the file tree.
+        if is_decl_start(p) {
+            break
+        }
         val at = p.index
         val pending = p.pending_gt
         val stmt = parse_stmt(p)
@@ -2936,6 +2966,9 @@ fn fill_block(p: *Parser, node: *Node) with (a: mem.Allocator) {
             }
             recover(p)
             if p.index == at && p.pending_gt == pending {
+                if is_decl_start(p) {
+                    break
+                }
                 p.advance()
             }
         }

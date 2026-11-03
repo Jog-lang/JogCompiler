@@ -165,10 +165,18 @@ private fn collect_file_imports(file_path: str, file: *parse.Node, out: *list.Li
 }
 
 private fn load_source_ast(full: str, is_test: bool, imports: *list.List<ImportRef>, out: *SourceFile): bool with (a: mem.Allocator) {
-    var (data, err) = fs.read_all(full)
-    if err != null {
-        print_path_error(full, "cannot read source file")
-        return false
+    var data = bytes()
+    val (over, has_over) = override_text(full)
+    if has_over {
+        data.ptr = over.ptr as *u8
+        data.len = over.len
+    } else {
+        var (read, err) = fs.read_all(full)
+        if err != null {
+            print_path_error(full, "cannot read source file")
+            return false
+        }
+        data = read
     }
     var ok = true
     var errors: list.List<lex.LexError>
@@ -185,16 +193,25 @@ private fn load_source_ast(full: str, is_test: bool, imports: *list.List<ImportR
     if errors.len > 0 {
         for e in errors.items() {
             lex.print_error(full, e)
+            collect_diag(full, e.line, e.column, "error", e.message)
         }
         ok = false
     }
     if p.errors.len > 0 {
         for e in p.errors.items() {
             parse.print_parse_error(full, e)
+            collect_diag(full, e.line, e.column, "error", e.message)
         }
         ok = false
     }
     return ok
+}
+
+private fn keep_source(ok: bool): bool {
+    if ok {
+        return true
+    }
+    return soft_asts_on()
 }
 
 private fn load_one_source(full: str, is_test: bool, pkg: *Package, imports: *list.List<ImportRef>): bool with (a: mem.Allocator) {
@@ -202,11 +219,15 @@ private fn load_one_source(full: str, is_test: bool, pkg: *Package, imports: *li
     sf.path = ""
     sf.is_test = false
     sf.ast = null
-    if !load_source_ast(full, is_test, imports, &sf) {
-        return false
+    val ok = load_source_ast(full, is_test, imports, &sf)
+    if sf.path.len > 0 && keep_source(ok) {
+        pkg.files.push(sf)
+        if soft_asts_on() {
+            return true
+        }
+        return ok
     }
-    pkg.files.push(sf)
-    return true
+    return false
 }
 
 private fn load_platform_source(full: str, is_test: bool, pkg: *Package, imports: *list.List<ImportRef>): bool with (a: mem.Allocator) {
@@ -214,11 +235,15 @@ private fn load_platform_source(full: str, is_test: bool, pkg: *Package, imports
     sf.path = ""
     sf.is_test = false
     sf.ast = null
-    if !load_source_ast(full, is_test, imports, &sf) {
-        return false
+    val ok = load_source_ast(full, is_test, imports, &sf)
+    if sf.path.len > 0 && keep_source(ok) {
+        pkg.platform_files.push(sf)
+        if soft_asts_on() {
+            return true
+        }
+        return ok
     }
-    pkg.platform_files.push(sf)
-    return true
+    return false
 }
 
 /**
@@ -708,6 +733,73 @@ private fn load_package(w: *Walk, has_mod: bool, mod: Module, path: str, name: s
     return pkg as *Package?
 }
 
+private fn slash_key(path: str): str with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    var i: usize = 0
+    for i < path.len {
+        val c = path.ptr[i]
+        if c == '\\' as u8 {
+            b.append_byte('/' as u8)
+        } else {
+            b.append_byte(c)
+        }
+        i = i + 1
+    }
+    val out = fs.copy_str(b.str())
+    b.free()
+    return out
+}
+
+/**
+ * Dotted package path of dir under module root, or empty when dir is the root.
+ */
+fn package_path_under(root: str, dir: str): str with (a: mem.Allocator) {
+    val rkey = slash_key(root)
+    val dkey = slash_key(dir)
+    if dkey == rkey {
+        fs.free_str(rkey)
+        fs.free_str(dkey)
+        return ""
+    }
+    var ok_prefix = true
+    if dkey.len <= rkey.len {
+        ok_prefix = false
+    } else {
+        var i: usize = 0
+        for i < rkey.len {
+            if dkey.ptr[i] != rkey.ptr[i] {
+                ok_prefix = false
+                break
+            }
+            i = i + 1
+        }
+        if ok_prefix && dkey.ptr[rkey.len] != '/' as u8 {
+            ok_prefix = false
+        }
+    }
+    if !ok_prefix {
+        fs.free_str(rkey)
+        fs.free_str(dkey)
+        return ""
+    }
+    var b = strbuilder.empty()
+    var i = rkey.len + 1
+    for i < dkey.len {
+        val c = dkey.ptr[i]
+        if c == '/' as u8 {
+            b.append_byte('.' as u8)
+        } else {
+            b.append_byte(c)
+        }
+        i = i + 1
+    }
+    val out = fs.copy_str(b.str())
+    b.free()
+    fs.free_str(rkey)
+    fs.free_str(dkey)
+    return out
+}
+
 /**
  * Load the root package and every import reachable from it. On success,
  * returns a Program whose packages list is the dependency order. std,
@@ -717,10 +809,11 @@ private fn load_package(w: *Walk, has_mod: bool, mod: Module, path: str, name: s
  * @param man_path root jog.mod path
  * @param roots std/core/runtime roots
  * @param mods --module libraries
+ * @param extra_dir optional package folder to force-load (start file's dir)
  * @context a allocator
  * @return the program and true, or an empty program and false on error
  */
-fn load_root_sources(root_mod: Module, man_path: str, roots: Roots, mods: list.List<Module>, include_tests: bool): (Program, bool) with (a: mem.Allocator) {
+fn load_root_sources(root_mod: Module, man_path: str, roots: Roots, mods: list.List<Module>, include_tests: bool, extra_dir: str): (Program, bool) with (a: mem.Allocator) {
     var w: Walk
     w.roots = roots
     w.root_mod = root_mod
@@ -736,6 +829,21 @@ fn load_root_sources(root_mod: Module, man_path: str, roots: Roots, mods: list.L
     val root = load_package(&w, true, root_mod, "", root_mod.name, root_mod.root, man_path, root_mod.manifest.name_line, root_mod.manifest.name_column, &back)
     if back {
         w.failed = true
+    }
+    if extra_dir.len > 0 {
+        val ipath = package_path_under(root_mod.root, extra_dir)
+        if ipath.len > 0 {
+            var idx: usize = 0
+            if !w.by_path.get(ipath, map.fnv1a(ipath), &idx) {
+                var back2 = false
+                val iname = last_segment(ipath)
+                val _dep = load_package(&w, true, root_mod, ipath, iname, extra_dir, man_path, root_mod.manifest.name_line, root_mod.manifest.name_column, &back2)
+                if back2 {
+                    w.failed = true
+                }
+            }
+            fs.free_str(ipath)
+        }
     }
     var ok = !w.failed && root != null
     if ok {

@@ -577,6 +577,7 @@ fn bind_prelude(scope: *PackageScope, core_root: str): bool with (a: mem.Allocat
     if errors.len > 0 {
         for e in errors.items() {
             lex.print_error(path, e)
+            collect_diag(path, e.line, e.column, "error", e.message)
         }
         a.free(data)
         fs.free_str(path)
@@ -590,6 +591,7 @@ fn bind_prelude(scope: *PackageScope, core_root: str): bool with (a: mem.Allocat
     if parser.errors.len > 0 {
         for e in parser.errors.items() {
             parse.print_parse_error(path, e)
+            collect_diag(path, e.line, e.column, "error", e.message)
         }
         a.free(data)
         fs.free_str(path)

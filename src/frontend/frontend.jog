@@ -4,7 +4,42 @@
 
 import src.check
 import src.load
+import src.lex
+import src.parse
+import std.fs
+import std.list
 import std.mem
+
+/**
+ * One diagnostic from an in-process check. Paths are as the loader printed them.
+ */
+struct Diag {
+    path: str
+    line: i64
+    column: i64
+    severity: str
+    message: str
+}
+
+/**
+ * Result of load+check with an optional collect sink.
+ */
+struct CheckResult {
+    code: i32
+    diags: list.List<Diag>
+}
+
+/**
+ * A top-level declaration name for document symbols.
+ */
+struct SymbolInfo {
+    name: str
+    kind: str
+    line: i64
+    column: i64
+    end_line: i64
+    end_column: i64
+}
 
 /**
  * Load a module at start (with optional --module name=dir flags) and
@@ -20,4 +55,179 @@ fn run(start: str, module_flags: []str): i32 with (a: mem.Allocator) {
     }
     val (_, code) = check.run(prog)
     return code
+}
+
+private fn take_collected(xs: list.List<load.CollectedDiag>): list.List<Diag> with (a: mem.Allocator) {
+    var out = list.empty<Diag>()
+    var i: usize = 0
+    for i < xs.len {
+        val c = xs.get(i)
+        var d: Diag
+        d.path = c.path
+        d.line = c.line
+        d.column = c.column
+        d.severity = c.severity
+        d.message = c.message
+        out.push(d)
+        i = i + 1
+    }
+    return out
+}
+
+fn free_diags(xs: *list.List<Diag>) with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < xs.len {
+        var d = xs.get(i)
+        fs.free_str(d.path)
+        fs.free_str(d.severity)
+        fs.free_str(d.message)
+        i = i + 1
+    }
+    xs.free()
+}
+
+fn free_symbols(xs: *list.List<SymbolInfo>) with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < xs.len {
+        var s = xs.get(i)
+        fs.free_str(s.name)
+        fs.free_str(s.kind)
+        i = i + 1
+    }
+    xs.free()
+}
+
+/**
+ * In-process load+check. Collects diagnostics instead of requiring
+ * --diag=json scraping. override_paths[i] is replaced by override_texts[i]
+ * when that file is read. Soft AST keep is on so a broken buffer still
+ * yields a tree for symbols when possible.
+ */
+fn analyze(
+    start: str,
+    module_flags: []str,
+    override_paths: []str,
+    override_texts: []str,
+): CheckResult with (a: mem.Allocator) {
+    load.begin_collect()
+    load.begin_overrides(override_paths, override_texts)
+    load.set_soft_asts(true)
+    val (prog, loaded) = load.run(start, module_flags, false)
+    var code = loaded
+    if loaded == 0 {
+        val (_, c) = check.run(prog)
+        code = c
+    }
+    load.set_soft_asts(false)
+    load.end_overrides()
+    val collected = load.end_collect()
+    var result: CheckResult
+    result.code = code
+    result.diags = take_collected(collected)
+    return result
+}
+
+private fn decl_kind_name(node: *parse.Node): str {
+    if parse.is_fn(node) {
+        return "function"
+    }
+    if parse.is_struct(node) {
+        return "struct"
+    }
+    if parse.is_enum(node) {
+        return "enum"
+    }
+    if parse.is_interface(node) {
+        return "interface"
+    }
+    if parse.is_type_decl(node) {
+        return "type"
+    }
+    if parse.is_var(node) {
+        return "variable"
+    }
+    if parse.is_val(node) {
+        return "constant"
+    }
+    if parse.is_context(node) {
+        return "context"
+    }
+    if parse.is_extern_block(node) {
+        return "namespace"
+    }
+    return ""
+}
+
+private fn node_end(node: *parse.Node): (i64, i64) {
+    var line = node.line
+    var column = node.column
+    if node.name.len > 0 {
+        column = column + (node.name.len as i64)
+    }
+    var i: usize = 0
+    for i < node.kids.len {
+        val kid = node.kids.get(i)
+        val (kl, kc) = node_end(kid)
+        if kl > line || (kl == line && kc > column) {
+            line = kl
+            column = kc
+        }
+        i = i + 1
+    }
+    return line, column
+}
+
+private fn push_symbol(out: *list.List<SymbolInfo>, node: *parse.Node) with (a: mem.Allocator) {
+    val kind = decl_kind_name(node)
+    if kind.len == 0 {
+        return
+    }
+    if node.name.len == 0 && !parse.is_extern_block(node) {
+        return
+    }
+    var s: SymbolInfo
+    if node.name.len > 0 {
+        s.name = fs.copy_str(node.name)
+    } else {
+        s.name = fs.copy_str("extern")
+    }
+    s.kind = fs.copy_str(kind)
+    s.line = node.line
+    s.column = node.column
+    val (el, ec) = node_end(node)
+    s.end_line = el
+    s.end_column = ec
+    out.push(s)
+}
+
+/**
+ * Lex and parse one buffer (no module load). Lists top-level declarations.
+ * Used for document symbols and to prove parse recovery.
+ */
+fn file_symbols(path: str, text: str): list.List<SymbolInfo> with (a: mem.Allocator) {
+    var out = list.empty<SymbolInfo>()
+    var data = bytes()
+    data.ptr = text.ptr as *u8
+    data.len = text.len
+    var errors: list.List<lex.LexError>
+    var tokens = lex.lex(data, &errors)
+    var p: parse.Parser
+    p.tokens = tokens
+    p.path = path
+    p.errors = list.empty<parse.ParseError>()
+    val file = parse.parse_file(&p)
+    for kid in file.kids.items() {
+        if parse.is_import(kid) {
+            continue
+        }
+        if parse.is_extern_block(kid) {
+            push_symbol(&out, kid)
+            for inner in kid.kids.items() {
+                push_symbol(&out, inner)
+            }
+            continue
+        }
+        push_symbol(&out, kid)
+    }
+    return out
 }

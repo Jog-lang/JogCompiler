@@ -3,10 +3,199 @@
 // `path:line:column: error: message`. Match tools/diag.c, not the lexer.
 // Step 1 still prints cannot-find with its own helpers in load.jog.
 // Later steps call these for jog.mod lines.
+//
+// When collecting is active (JogLSP / frontend.analyze), each message is
+// also appended to a package-level box so tools need not scrape stderr.
+// Optional source overrides let the loader lex/parse open editor buffers
+// instead of disk.
+//
+// Do not add `with (a: mem.Allocator)` to print_path_error / print_bare_error:
+// that signature change currently breaks lowering of programs that also have
+ // package-level vars ("global values are not lowered yet"). Collect from
+// those two with an inner `with (mem.heap())` instead. See Friction.
 
+import std.fs
 import std.io
+import std.list
 import std.mem
 import std.strbuilder
+
+struct CollectedDiag {
+    path: str
+    line: i64
+    column: i64
+    severity: str
+    message: str
+}
+
+struct SourceOverride {
+    path: str
+    text: str
+}
+
+private struct CollectBox {
+    active: bool
+    inited: bool
+    diags: list.List<CollectedDiag>
+}
+
+private struct OverrideBox {
+    active: bool
+    inited: bool
+    items: list.List<SourceOverride>
+}
+
+var collect_box: CollectBox
+var override_box: OverrideBox
+var soft_asts = false
+
+fn make_override(path: str, text: str): SourceOverride {
+    var o: SourceOverride
+    o.path = path
+    o.text = text
+    return o
+}
+
+private fn collect_ptr(): *CollectBox {
+    return &collect_box
+}
+
+private fn override_ptr(): *OverrideBox {
+    return &override_box
+}
+
+fn begin_collect() with (a: mem.Allocator) {
+    val b = collect_ptr()
+    if !b.inited {
+        b.diags = list.empty<CollectedDiag>()
+        b.inited = true
+    }
+    free_collected_items(&b.diags)
+    b.diags.clear()
+    b.active = true
+}
+
+fn end_collect(): list.List<CollectedDiag> with (a: mem.Allocator) {
+    val b = collect_ptr()
+    b.active = false
+    var out = b.diags
+    b.diags = list.empty<CollectedDiag>()
+    return out
+}
+
+fn begin_overrides(paths: []str, texts: []str) with (a: mem.Allocator) {
+    val b = override_ptr()
+    if !b.inited {
+        b.items = list.empty<SourceOverride>()
+        b.inited = true
+    }
+    b.items.clear()
+    var i: usize = 0
+    for i < paths.len && i < texts.len {
+        b.items.push(make_override(paths[i], texts[i]))
+        i = i + 1
+    }
+    b.active = true
+}
+
+fn end_overrides() {
+    val b = override_ptr()
+    b.active = false
+    b.items.clear()
+}
+
+fn set_soft_asts(on: bool) {
+    soft_asts = on
+}
+
+fn soft_asts_on(): bool {
+    return soft_asts
+}
+
+private fn free_collected_items(xs: *list.List<CollectedDiag>) with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < xs.len {
+        var d = xs.get(i)
+        fs.free_str(d.path)
+        fs.free_str(d.severity)
+        fs.free_str(d.message)
+        i = i + 1
+    }
+}
+
+fn free_collected(xs: *list.List<CollectedDiag>) with (a: mem.Allocator) {
+    free_collected_items(xs)
+    xs.free()
+}
+
+/**
+ * Append one diagnostic when collecting is active. Lex/parse printers
+ * that do not go through print_pos call this after they print.
+ */
+fn collect_diag(path: str, line: i64, column: i64, severity: str, message: str) with (a: mem.Allocator) {
+    push_collected(path, line, column, severity, message)
+}
+
+fn path_key(path: str): str with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    var i: usize = 0
+    for i < path.len {
+        val c = path.ptr[i]
+        if c == '\\' as u8 {
+            b.append_byte('/' as u8)
+        } else {
+            b.append_byte(c)
+        }
+        i = i + 1
+    }
+    val out = fs.copy_str(b.str())
+    b.free()
+    return out
+}
+
+/**
+ * Look up an open-buffer override for a source path.
+ * @return the buffer text and true when present
+ */
+fn override_text(path: str): (str, bool) with (a: mem.Allocator) {
+    val b = override_ptr()
+    if !b.active {
+        return "", false
+    }
+    val want = path_key(path)
+    var i: usize = 0
+    for i < b.items.len {
+        val o = b.items.get(i)
+        val key = path_key(o.path)
+        val hit = key == want
+        fs.free_str(key)
+        if hit {
+            fs.free_str(want)
+            return o.text, true
+        }
+        i = i + 1
+    }
+    fs.free_str(want)
+    return "", false
+}
+
+private fn push_collected(path: str, line: i64, column: i64, severity: str, message: str) with (a: mem.Allocator) {
+    val b = collect_ptr()
+    if !b.active {
+        return
+    }
+    if !b.inited {
+        b.diags = list.empty<CollectedDiag>()
+        b.inited = true
+    }
+    var d: CollectedDiag
+    d.path = fs.copy_str(path)
+    d.line = line
+    d.column = column
+    d.severity = fs.copy_str(severity)
+    d.message = fs.copy_str(message)
+    b.diags.push(d)
+}
 
 /**
  * Print a path-only error, the shape used for cannot find.
@@ -14,6 +203,9 @@ import std.strbuilder
  * @param message text after `error: `
  */
 fn print_path_error(path: str, message: str) {
+    with (mem.heap()) {
+        push_collected(path, 1, 1, "error", message)
+    }
     io.eprint(path)
     io.eprint(": error: ")
     io.eprintln(message)
@@ -25,6 +217,9 @@ fn print_path_error(path: str, message: str) {
  * @param message text after `error: `
  */
 fn print_bare_error(message: str) {
+    with (mem.heap()) {
+        push_collected("", 1, 1, "error", message)
+    }
     io.eprint("error: ")
     io.eprintln(message)
 }
@@ -54,6 +249,7 @@ fn print_pos_note(path: str, line: i64, column: i64, message: str) with (a: mem.
 }
 
 private fn print_pos(path: str, line: i64, column: i64, severity: str, message: str) with (a: mem.Allocator) {
+    push_collected(path, line, column, severity, message)
     io.eprint(path)
     io.eprint(":")
     var b = strbuilder.empty()

@@ -14,9 +14,47 @@ fn main() {
             start = os.argv(1)
         }
         var flags = list.empty<str>()
-        code = frontend.run(start, flags.items())
-        if code == 0 {
-            io.println("frontend_smoke: check ok")
+        if start == "analyze" {
+            var paths = list.empty<str>()
+            var texts = list.empty<str>()
+            var result = frontend.analyze("ok", flags.items(), paths.items(), texts.items())
+            if result.code == 0 && result.diags.len == 0 {
+                io.println("frontend_smoke: analyze ok")
+                code = 0
+            } else {
+                io.println("frontend_smoke: analyze failed")
+                code = 1
+            }
+            frontend.free_diags(&result.diags)
+        } else if start == "symbols" {
+            val text = "fn before() {\n}\nfn mid() {\n    if true {\n\nfn after() {\n}\n"
+            var syms = frontend.file_symbols("broken.jog", text)
+            var saw_before = false
+            var saw_after = false
+            var i: usize = 0
+            for i < syms.len {
+                val s = syms.get(i)
+                if s.name == "before" {
+                    saw_before = true
+                }
+                if s.name == "after" {
+                    saw_after = true
+                }
+                i = i + 1
+            }
+            if saw_before && saw_after {
+                io.println("frontend_smoke: symbols recover ok")
+                code = 0
+            } else {
+                io.println("frontend_smoke: symbols recover failed")
+                code = 1
+            }
+            frontend.free_symbols(&syms)
+        } else {
+            code = frontend.run(start, flags.items())
+            if code == 0 {
+                io.println("frontend_smoke: check ok")
+            }
         }
     }
     c.jogrt_exit(code)
