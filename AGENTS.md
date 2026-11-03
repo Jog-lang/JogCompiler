@@ -3,7 +3,9 @@
 - The Jog specification lives in the [JogDocs](https://github.com/Jog-lang/JogDocs) repository. Start at its `AGENTS.md` and `guide/JogQuickRef.md`. The language notes there (`design/language/`) are the specification. A local checkout is the sibling folder `../JogDocs`, or `../Jog/JogDocs` when the notes sit next to a `Jog` checkout.
 - The V1 plans stay in this repo, in `docs/plans/`. The V1 compiler architecture is `docs/plans/V1Compiler.md`. Parallel work is organized by `docs/plans/V1Parallel.md`: find your stream there, edit only the files it owns, and change contract headers only through the process it describes.
 - Log friction (anything in the language, compiler, std, or tooling that got in the way) in JogDocs `bootstrap/Friction.md`.
-- A change is done only when the check command prints `check: OK`. On Windows that is `pwsh scripts/check.ps1`. On Linux that is `scripts/check.sh`.
-- C17, warning-free on gcc and clang. Prefixes: `ct_` tools, `jog_` compiler, `jir_` IR, `jogrt_` runtime.
+- This branch (`develop`) is jogc only. There is no CMake seed tree and no `scripts/check.sh` here. Stage 0 is an external `jog` from the `seed` branch (set `JOG`, or put `jog` on `PATH`).
+- Build with `"$JOG" build -o out/jogc`. Judge a stage with `pwsh scripts/diff_stage.ps1 -Jog $env:JOG -Jogc out/jogc.exe` (pass `-Jog` explicitly).
+- Do not implement a jogc stage unless asked. Do not merge this branch with `seed`.
+- Ivan writes the Jog sources by hand. Prefer explaining and pointing at the spec over rewriting large amounts of Jog unless asked.
 
-P3 writes the self-hosted compiler `jogc` on branch `p3/jogc`. Do not implement a stage unless asked. `scripts/diff_stage.ps1` is how a stage is judged. The C `jog` on `c-seed-compiler` remains the reference, and stage 0 is the binary at `bootstrap/stage0/jog.exe`.
+P3 landed on `p3/jogc` (seed + jogc together). Ongoing jogc work is here on `develop`. The live C seed is branch `seed`; `c-seed-compiler` is history only.

@@ -2,65 +2,51 @@
 
 Jog is a low-level language. It works with functions, data whose layout is explicit, and pointers. Memory is managed by hand. On top of that it has coroutines and a few conveniences in the style of Go. Source files use `.jog`.
 
-The specification is [JogDocs](https://github.com/Jog-lang/JogDocs). Start at its `AGENTS.md` and `guide/JogQuickRef.md`. The language overview is `design/Language.md`, and the language notes in `design/language/` are the spec. A local checkout is the sibling folder `../JogDocs`, or `../Jog/JogDocs` when the notes sit next to a `Jog` checkout.
+The specification is [JogDocs](https://github.com/Jog-lang/JogDocs). Start at its `AGENTS.md` and `guide/JogQuickRef.md`.
 
-This repository is the C seed compiler, `jog`. It is stage 0: the reference a later compiler written in Jog is checked against.
+## Branches
 
-## Status
+| Branch | Contents |
+|---|---|
+| **`develop` (this branch)** | The Jog compiler `jogc` only. No C seed sources. |
+| **`seed`** | Stage 0: the C compiler `jog` only. Build that binary, then point `JOG` at it. |
+| **`p3/jogc`** | Bootstrap record: both trees together at the self-host landing (`d147c63`). |
+| **`c-seed-compiler`** | Older public C seed from before jogc. History only. |
+| **`main`** | Tiny initial commit until the default branch moves. |
 
-The seed reads a Jog module, checks it, lowers it to one intermediate representation, generates C, and builds that C with gcc or clang. WebAssembly is a second target through `clang --target=wasm32` and `wasm-ld` (`jog run --target wasm32`). The architecture and milestones are in `docs/plans/V1Compiler.md`. How the work is split is in `docs/plans/V1Parallel.md`.
+Do not merge `seed` and `develop` into each other. A fix that belongs in both (for example a shared `std/` bug) is two commits, one per branch, or a cherry-pick of a path that still exists on both.
 
-## Platforms
+## Build jogc
 
-- Windows x86-64, with MinGW gcc or clang
-- Linux x86-64, with gcc or clang
-- aarch64 is not supported
-
-You need CMake, Ninja, gcc, and clang.
-
-## Build and check
-
-On Windows:
+Stage 0 is an **external** `jog` binary. This checkout has no `compiler/` or CMake tree.
 
 ```
-cmake -S . -B build -G Ninja
-cmake --build build
-pwsh scripts/check.ps1
+export JOG=/path/to/seed/build-linux/jog   # or a backup such as ../bin-backup/d147c63/jog
+# JOG must be set, or `jog` must be on PATH
+"$JOG" build -o out/jogc
+./out/jogc version
 ```
 
-`scripts/check.ps1` configures, builds (a compiler warning fails the check), runs `ctest --test-dir build`, and syntax-checks the C sources with clang. It prints `check: OK` when that passes.
+On Windows the seed binary is `jog.exe` and the output is typically `out/jogc.exe`.
 
-On Linux:
-
-```
-cmake -S . -B build-linux -G Ninja
-cmake --build build-linux
-scripts/check.sh
-```
-
-`scripts/check.sh` does the same steps into `build-linux/` and prints `check: OK`. `CC=gcc` uses `build-linux-gcc/`, `CC=clang` uses `build-linux-clang/`, and `scripts/check.sh --both` runs the check with both compilers.
-
-## Example
+Compare stages against the seed with:
 
 ```
-jog run examples/hello
+pwsh scripts/diff_stage.ps1 -Stage check -Jog $env:JOG -Jogc out/jogc.exe
 ```
 
-After a Windows build that binary is `build/jog.exe`. After the Linux build above it is `build-linux/jog`. The program prints `Hello from Jog!`.
+Pass `-Jog` explicitly (or put the seed on `PATH`). Do not look for `build/jog` or `build-linux/jog` inside this tree.
 
 ## Layout
 
-- `compiler/` — the V1 compiler
-- `tools/` — shared C utilities
-- `runtime/` — the runtime linked into generated programs
-- `std/` — the standard library, written in Jog
-- `tests/` — C tests and end-to-end Jog programs
-- `examples/` — small programs; `examples/hello` is hello world
-- `docs/plans/` — the V1 compiler plans for this repository
-
-## Self-hosting
-
-A compiler written in Jog will be checked against this one. This tree stays stage 0. The plan is JogDocs `bootstrap/Roadmap.md`.
+- `src/`, `main.jog`, `jog.mod` — jogc
+- `core/`, `std/` — prelude and standard library (shared with `seed`)
+- `runtime/` — C runtime linked into programs jogc builds
+- `tests/jog`, `tests/check`, `tests/parse`, … — fixtures for stage diffs
+- `examples/`, `playground/` — sample modules
+- `scripts/diff_stage.ps1` — compare jogc to an external `jog`
+- `bootstrap/` — notes for the frozen stage-0 binary used on Windows bootstrap
+- `docs/plans/` — V1 process plans (masters for the parallel streams)
 
 ## License
 
