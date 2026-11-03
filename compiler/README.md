@@ -4,6 +4,6 @@ Supported hosts are Windows x86-64 (MinGW gcc or clang) and Linux x86-64 (gcc or
 
 The language specification is [JogDocs](https://github.com/Jog-lang/JogDocs). Start at its `AGENTS.md` and `guide/JogQuickRef.md`. A local checkout sits beside the repository root, at `../JogDocs` or `../Jog/JogDocs`.
 
-The architecture and milestones are in `docs/plans/V1Compiler.md`. Sources are in `src/`. The compiler uses the shared utilities in `tools/`.
+The architecture and milestones are in `docs/plans/V1Compiler.md`. Sources are in `compiler/src/`. The compiler uses the shared utilities in `tools/`. This branch (`seed`) has no jogc tree; that lives on `develop`.
 
 From the repository root, `pwsh scripts/check.ps1` on Windows, or `scripts/check.sh` on Linux, prints `check: OK` when the build and tests pass. See the repository README for the build commands and `jog run examples/hello`.
