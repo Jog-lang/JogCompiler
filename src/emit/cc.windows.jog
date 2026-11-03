@@ -1,0 +1,75 @@
+// Windows bodies for emit.cc. Paths cross Win32 as UTF-16.
+
+import std.c
+
+actual fn is_dir(path: str): bool {
+    val (attr, ok) = attributes(path)
+    if !ok {
+        return false
+    }
+    val dir: c.unsigned_long = 16
+    return (attr & dir) != 0
+}
+
+actual fn is_file(path: str): bool {
+    val (attr, ok) = attributes(path)
+    if !ok {
+        return false
+    }
+    val dir: c.unsigned_long = 16
+    return (attr & dir) == 0
+}
+
+actual fn ensure_dir(path: str): bool {
+    if path.len == 0 {
+        return false
+    }
+    if is_dir(path) {
+        return true
+    }
+    if path.len >= 4096 {
+        return false
+    }
+    var wide: [4096]u16
+    if !c.utf8_to_wide(path, wide[..].ptr, 4096) {
+        return false
+    }
+    if c.CreateDirectoryW(wide[..].ptr, 0) != 0 {
+        return true
+    }
+    return is_dir(path)
+}
+
+actual fn remove_file(path: str) {
+    if path.len == 0 || path.len >= 4096 {
+        return
+    }
+    var wide: [4096]u16
+    if !c.utf8_to_wide(path, wide[..].ptr, 4096) {
+        return
+    }
+    _ = c.DeleteFileW(wide[..].ptr)
+}
+
+actual fn path_sep(): u8 {
+    return ';' as u8
+}
+
+actual fn exe_suffix(): str {
+    return ".exe"
+}
+
+private fn attributes(path: str): (c.unsigned_long, bool) {
+    if path.len == 0 || path.len >= 4096 {
+        return 0, false
+    }
+    var wide: [4096]u16
+    if !c.utf8_to_wide(path, wide[..].ptr, 4096) {
+        return 0, false
+    }
+    val attr = c.GetFileAttributesW(wide[..].ptr)
+    if attr == 4294967295 {
+        return 0, false
+    }
+    return attr, true
+}

@@ -1,8 +1,8 @@
 // C compiler driver. Checked against compiler/src/cc.c (jog_cc_build).
 // std.proc does not search PATH, so find_compiler resolves the binary first.
-// std.fs has no mkdir or remove; directory and delete go through Win32.
+// std.fs has no mkdir or remove; directory and delete go through host APIs
+// in cc.windows.jog / cc.posix.jog (Friction: std.fs.mkdir / remove).
 
-import std.c
 import std.fs
 import std.io
 import std.list
@@ -11,6 +11,13 @@ import std.os
 import std.proc
 import std.strbuilder
 import std.text as texts
+
+expect fn is_dir(path: str): bool
+expect fn is_file(path: str): bool
+expect fn ensure_dir(path: str): bool
+expect fn remove_file(path: str)
+expect fn path_sep(): u8
+expect fn exe_suffix(): str
 
 private fn say(text: str) {
     io.eprintln(text)
@@ -26,59 +33,6 @@ private fn say3(a: str, b: str, c: str) with (alloc: mem.Allocator) {
 
 private fn is_sep(b: u8): bool {
     return b == '/' as u8 || b == '\\' as u8
-}
-
-private fn attributes(path: str): (c.unsigned_long, bool) {
-    if path.len == 0 || path.len >= 4096 {
-        return 0, false
-    }
-    var wide: [4096]u16
-    if !c.utf8_to_wide(path, wide[..].ptr, 4096) {
-        return 0, false
-    }
-    val attr = c.GetFileAttributesW(wide[..].ptr)
-    if attr == 4294967295 {
-        return 0, false
-    }
-    return attr, true
-}
-
-private fn is_dir(path: str): bool {
-    val (attr, ok) = attributes(path)
-    if !ok {
-        return false
-    }
-    val dir: c.unsigned_long = 16
-    return (attr & dir) != 0
-}
-
-private fn is_file(path: str): bool {
-    val (attr, ok) = attributes(path)
-    if !ok {
-        return false
-    }
-    val dir: c.unsigned_long = 16
-    return (attr & dir) == 0
-}
-
-private fn ensure_dir(path: str): bool {
-    if path.len == 0 {
-        return false
-    }
-    if is_dir(path) {
-        return true
-    }
-    if path.len >= 4096 {
-        return false
-    }
-    var wide: [4096]u16
-    if !c.utf8_to_wide(path, wide[..].ptr, 4096) {
-        return false
-    }
-    if c.CreateDirectoryW(wide[..].ptr, 0) != 0 {
-        return true
-    }
-    return is_dir(path)
 }
 
 // Create path and any missing parents.
@@ -107,17 +61,6 @@ fn mkdir_p(path: str): bool {
         k = k + 1
     }
     return ensure_dir(path)
-}
-
-fn remove_file(path: str) {
-    if path.len == 0 || path.len >= 4096 {
-        return
-    }
-    var wide: [4096]u16
-    if !c.utf8_to_wide(path, wide[..].ptr, 4096) {
-        return
-    }
-    _ = c.DeleteFileW(wide[..].ptr)
 }
 
 fn write_text(path: str, text: str): bool with (a: mem.Allocator) {
@@ -217,10 +160,11 @@ private fn file_in_dir(dir: str, name: str): str with (a: mem.Allocator) {
         }
         return fs.copy_str(path)
     }
-    if !base_has_dot(name) {
+    val suffix = exe_suffix()
+    if suffix.len > 0 && !base_has_dot(name) {
         var exe = strbuilder.empty()
         exe.append(path)
-        exe.append(".exe")
+        exe.append(suffix)
         val candidate = fs.copy_str(exe.str())
         if is_file(candidate) {
             if owned {
@@ -242,16 +186,17 @@ private fn search_path(name: str): str with (a: mem.Allocator) {
         return ""
     }
     val path = fs.copy_str(raw)
+    val sep = path_sep()
     var start: usize = 0
     var i: usize = 0
     var found = ""
     for {
         val at_end = i >= path.len
-        var sep = false
-        if !at_end && path.ptr[i] == ';' as u8 {
-            sep = true
+        var at_sep = false
+        if !at_end && path.ptr[i] == sep {
+            at_sep = true
         }
-        if at_end || sep {
+        if at_end || at_sep {
             var dir = "."
             if i > start {
                 dir = texts.slice(path, start, i)
