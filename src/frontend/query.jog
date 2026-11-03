@@ -52,8 +52,48 @@ private fn node_before(node: *parse.Node, line: i64, column: i64): bool {
     return false
 }
 
+/**
+ * Byte span of the selectable name on a node, when the name is stored on
+ * the node itself (IDENT, MEMBER after `.` / `?.`, FN / type decls, …).
+ */
+private fn name_span(node: *parse.Node): (i64, i64, i64, bool) {
+    if node.name.len == 0 {
+        return 0, 0, 0, false
+    }
+    var start = node.column
+    if parse.is_member(node) {
+        // MEMBER is positioned on `.` or `?.`; the name follows the token.
+        if node.flag == "?." {
+            start = node.column + 2
+        } else {
+            start = node.column + 1
+        }
+    }
+    val end = start + (node.name.len as i64) - 1
+    return node.line, start, end, true
+}
+
+private fn name_covers(node: *parse.Node, line: i64, column: i64): bool {
+    val (nl, start, end, ok) = name_span(node)
+    if !ok {
+        return false
+    }
+    return nl == line && column >= start && column <= end
+}
+
 private struct BestNode {
     node: *parse.Node?
+}
+
+private fn walk_cover(node: *parse.Node, line: i64, column: i64, best: *BestNode) {
+    if name_covers(node, line, column) {
+        best.node = node as *parse.Node?
+    }
+    var i: usize = 0
+    for i < node.kids.len {
+        walk_cover(node.kids.get(i), line, column, best)
+        i = i + 1
+    }
 }
 
 private fn walk_best(node: *parse.Node, line: i64, column: i64, best: *BestNode) {
@@ -69,6 +109,14 @@ private fn walk_best(node: *parse.Node, line: i64, column: i64, best: *BestNode)
 }
 
 private fn find_in_file(file: *parse.Node, line: i64, column: i64): *parse.Node? {
+    // Prefer a node whose name actually covers the caret. Deepest-before
+    // alone picks the left kid of `io.println` when the caret is on println.
+    var cover: BestNode
+    cover.node = null
+    walk_cover(file, line, column, &cover)
+    if cover.node != null {
+        return cover.node
+    }
     var best: BestNode
     best.node = null
     walk_best(file, line, column, &best)
@@ -132,6 +180,345 @@ private fn sym_of_node(node: *parse.Node): *load.Symbol? {
     return node.sym!! as *load.Symbol?
 }
 
+private fn lookup_scope_name(scope: *load.PackageScope, name: str): *load.Symbol? {
+    val hit = load.package_scope_lookup(scope, name)
+    if hit != null {
+        return hit
+    }
+    var fi: usize = 0
+    for fi < scope.file_scopes.len {
+        val local = load.block_scope_lookup_local(scope.file_scopes.get(fi), name)
+        if local != null {
+            return local
+        }
+        fi = fi + 1
+    }
+    if scope.universe != null {
+        return load.package_scope_lookup(scope.universe!!, name)
+    }
+    return null
+}
+
+private fn home_package(prog: load.Program, path: str): *load.Package? with (a: mem.Allocator) {
+    var pi: usize = 0
+    for pi < prog.packages.len {
+        val pkg = prog.packages.get(pi)
+        var fi: usize = 0
+        for fi < pkg.files.len {
+            if path_eq(pkg.files.get(fi).path, path) {
+                return pkg as *load.Package?
+            }
+            fi = fi + 1
+        }
+        pi = pi + 1
+    }
+    return null
+}
+
+/**
+ * Symbol for the caret node. Uses checker attachments when present, then
+ * CALL callee / package MEMBER / scope name fallbacks.
+ */
+private fn resolve_sym(prog: load.Program, path: str, node: *parse.Node): *load.Symbol? with (a: mem.Allocator) {
+    var cur = node
+    if parse.is_call(cur) && cur.kids.len > 0 {
+        cur = cur.kids.get(0)
+    }
+    val attached = sym_of_node(cur)
+    if attached != null {
+        return attached
+    }
+    if parse.is_member(cur) && cur.name.len > 0 && cur.flag != "?." && cur.kids.len > 0 {
+        val base = cur.kids.get(0)
+        if parse.is_ident(base) {
+            val home = home_package(prog, path)
+            if home != null {
+                val pkg_sym = lookup_scope_name(&home!!.scope, base.name)
+                if pkg_sym != null && load.is_symbol_package(pkg_sym!!) && pkg_sym!!.package != null {
+                    return load.package_scope_lookup(&pkg_sym!!.package!!.scope, cur.name)
+                }
+            }
+        }
+    }
+    // IDENT, TYPE_NAME, and other named nodes (return types, annotations).
+    if cur.name.len > 0 && !parse.is_member(cur) && !parse.is_call(cur) {
+        val home = home_package(prog, path)
+        if home != null {
+            return lookup_scope_name(&home!!.scope, cur.name)
+        }
+    }
+    return null
+}
+
+private fn override_source(path: str, override_paths: []str, override_texts: []str): (str, bool) with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < override_paths.len && i < override_texts.len {
+        if path_eq(override_paths[i], path) {
+            return override_texts[i], true
+        }
+        i = i + 1
+    }
+    return "", false
+}
+
+private fn file_source(path: str, override_paths: []str, override_texts: []str): (str, bool) with (a: mem.Allocator) {
+    val (over, has) = override_source(path, override_paths, override_texts)
+    if has {
+        return over, true
+    }
+    val (data, err) = fs.read_all(path)
+    if err != null {
+        return "", false
+    }
+    return data as str, true
+}
+
+/**
+ * Contiguous `//` lines immediately above `before_line` (1-based).
+ */
+private fn leading_comments(text: str, before_line: i64): str with (a: mem.Allocator) {
+    if before_line <= 1 || text.len == 0 {
+        return ""
+    }
+    var line_starts = list.empty<usize>()
+    line_starts.push(0)
+    var i: usize = 0
+    for i < text.len {
+        if text.ptr[i] == '\n' as u8 {
+            line_starts.push(i + 1)
+        }
+        i = i + 1
+    }
+    val want = (before_line - 1) as usize
+    if want == 0 || want > line_starts.len {
+        line_starts.free()
+        return ""
+    }
+    var b = strbuilder.empty()
+    var li = want
+    for li > 0 {
+        val idx = li - 1
+        val start = line_starts.get(idx)
+        var end = text.len
+        if idx + 1 < line_starts.len {
+            end = line_starts.get(idx + 1)
+            if end > start && text.ptr[end - 1] == '\n' as u8 {
+                end = end - 1
+            }
+        }
+        // Trim CR.
+        if end > start && text.ptr[end - 1] == '\r' as u8 {
+            end = end - 1
+        }
+        val line = texts.slice(text, start, end)
+        var j: usize = 0
+        for j < line.len {
+            val c = line.ptr[j]
+            if c == ' ' as u8 || c == '\t' as u8 {
+                j = j + 1
+                continue
+            }
+            break
+        }
+        if j + 1 < line.len && line.ptr[j] == '/' as u8 && line.ptr[j + 1] == '/' as u8 {
+            var rest = j + 2
+            if rest < line.len && line.ptr[rest] == ' ' as u8 {
+                rest = rest + 1
+            }
+            val body = texts.slice(line, rest, line.len)
+            // Collect upward; reverse later by rebuilding.
+            if b.len > 0 {
+                val prior = fs.copy_str(b.str())
+                b.free()
+                b = strbuilder.empty()
+                b.append(body)
+                b.append("\n")
+                b.append(prior)
+                fs.free_str(prior)
+            } else {
+                b.append(body)
+            }
+            li = li - 1
+            continue
+        }
+        if line.len == 0 || j == line.len {
+            // Blank line ends the doc block once we already have comments.
+            if b.len > 0 {
+                break
+            }
+            li = li - 1
+            continue
+        }
+        break
+    }
+    line_starts.free()
+    if b.len == 0 {
+        b.free()
+        return ""
+    }
+    val out = fs.copy_str(b.str())
+    b.free()
+    return out
+}
+
+private fn fn_param_start(fn_node: *parse.Node): (usize, usize, usize) {
+    val shape = fn_node.head
+    val nparams = shape % 256
+    val nctx = (shape / 256) % 256
+    val has_recv = (shape / 65536) % 2 == 1
+    val ntype = (shape / 1048576) % 256
+    val nattrs = (shape / 268435456) % 256
+    var i: i64 = nattrs
+    if has_recv {
+        i = i + 1
+    }
+    i = i + ntype
+    return i as usize, nparams as usize, nctx as usize
+}
+
+private fn append_type_node(b: *strbuilder.StrBuilder, ty_node: *parse.Node?) with (a: mem.Allocator) {
+    if ty_node == null {
+        b.append("?")
+        return
+    }
+    // Prefer checker spelling when the type node was typed.
+    if ty_node!!.ty != null {
+        val printed = check.type_print(ty_node!!.ty!! as *check.Type?)
+        if printed.len > 0 {
+            b.append(printed)
+            fs.free_str(printed)
+            return
+        }
+    }
+    if ty_node!!.name.len > 0 {
+        b.append(ty_node!!.name)
+        return
+    }
+    b.append("?")
+}
+
+/**
+ * Jog-facing signature with argument names when the declaration is a FN.
+ */
+private fn format_signature(sym: *load.Symbol, fallback_ty: str): str with (a: mem.Allocator) {
+    if sym.decl == null || !parse.is_fn(sym.decl!!) {
+        if fallback_ty.len > 0 {
+            return fs.copy_str(fallback_ty)
+        }
+        if sym.sema != null {
+            return check.type_print(sym.sema!! as *check.Type?)
+        }
+        return fs.copy_str(sym.name)
+    }
+    val fn_node = sym.decl!!
+    var b = strbuilder.empty()
+    var is_extern = parse.flag_has_word(fn_node.flag, "extern")
+    if !is_extern && sym.sema != null {
+        val sty = sym.sema!! as *check.Type
+        is_extern = sty.fn_extern
+    }
+    if is_extern {
+        b.append("extern ")
+    }
+    b.append("fn ")
+    b.append(sym.name)
+    b.append("(")
+    val (pstart, nparams, nctx) = fn_param_start(fn_node)
+    var fn_ty: *check.Type? = null
+    if sym.sema != null {
+        fn_ty = sym.sema!! as *check.Type?
+    }
+    var i: usize = 0
+    for i < nparams {
+        if i > 0 {
+            b.append(", ")
+        }
+        val at = pstart + i
+        var pname = "?"
+        var pty_node: *parse.Node? = null
+        if at < fn_node.kids.len {
+            val param = fn_node.kids.get(at)
+            if param.name.len > 0 {
+                pname = param.name
+            }
+            if param.kids.len > 0 {
+                pty_node = param.kids.get(0) as *parse.Node?
+            }
+        }
+        b.append(pname)
+        b.append(": ")
+        if fn_ty != null && i < fn_ty!!.elems.len {
+            val printed = check.type_print(fn_ty!!.elems.get(i) as *check.Type?)
+            b.append(printed)
+            fs.free_str(printed)
+        } else {
+            append_type_node(&b, pty_node)
+        }
+        i = i + 1
+    }
+    b.append(")")
+    // Return type: after params and contexts in kids, or from FN type.
+    val shape = fn_node.head
+    val has_ret = (shape / 131072) % 2 == 1
+    if has_ret {
+        b.append(": ")
+        val ret_at = pstart + nparams + nctx
+        var ret_node: *parse.Node? = null
+        if ret_at < fn_node.kids.len {
+            ret_node = fn_node.kids.get(ret_at) as *parse.Node?
+        }
+        if fn_ty != null && fn_ty!!.elem != null {
+            val printed = check.type_print(fn_ty!!.elem)
+            b.append(printed)
+            fs.free_str(printed)
+        } else {
+            append_type_node(&b, ret_node)
+        }
+    } else if fn_ty != null && fn_ty!!.elem != null {
+        val printed = check.type_print(fn_ty!!.elem)
+        if printed != "void" {
+            b.append(": ")
+            b.append(printed)
+        }
+        fs.free_str(printed)
+    }
+    if nctx > 0 {
+        b.append(" with (")
+        var c: usize = 0
+        for c < nctx {
+            if c > 0 {
+                b.append(", ")
+            }
+            val at = pstart + nparams + c
+            var cname = "?"
+            var cty_node: *parse.Node? = null
+            if at < fn_node.kids.len {
+                val param = fn_node.kids.get(at)
+                if param.name.len > 0 {
+                    cname = param.name
+                }
+                if param.kids.len > 0 {
+                    cty_node = param.kids.get(0) as *parse.Node?
+                }
+            }
+            b.append(cname)
+            b.append(": ")
+            if fn_ty != null && c < fn_ty!!.contexts.len {
+                val printed = check.type_print(fn_ty!!.contexts.get(c) as *check.Type?)
+                b.append(printed)
+                fs.free_str(printed)
+            } else {
+                append_type_node(&b, cty_node)
+            }
+            c = c + 1
+        }
+        b.append(")")
+    }
+    val out = fs.copy_str(b.str())
+    b.free()
+    return out
+}
+
 /**
  * Hover text for the name at line/column (1-based). Empty when unknown.
  */
@@ -150,8 +537,11 @@ fn hover_at(
         return ""
     }
     val n = node!!
-    val sym = sym_of_node(n)
+    val sym = resolve_sym(prog, path, n)
     var ty = type_of_node(n)
+    if ty.len == 0 && parse.is_call(n) && n.kids.len > 0 {
+        ty = type_of_node(n.kids.get(0))
+    }
     if ty.len == 0 && sym != null && sym!!.sema != null {
         val sty = sym!!.sema!! as *check.Type?
         ty = check.type_print(sty)
@@ -160,22 +550,37 @@ fn hover_at(
         return ""
     }
     var b = strbuilder.empty()
-    if ty.len > 0 {
+    if sym != null {
+        val (src, sok) = file_source(sym!!.file, override_paths, override_texts)
+        if sok {
+            val docs = leading_comments(src, sym!!.line)
+            if docs.len > 0 {
+                b.append(docs)
+                b.append("\n\n")
+                fs.free_str(docs)
+            }
+        }
+        val sig = format_signature(sym!!, ty)
+        b.append(sig)
+        fs.free_str(sig)
+        // Prelude / universe bindings have no source location.
+        if sym!!.file.len > 0 && sym!!.line > 0 {
+            if b.len > 0 {
+                b.append("\n")
+            }
+            b.append("declared in ")
+            b.append(sym!!.file)
+            b.append(":")
+            b.append_int(sym!!.line, 10)
+            b.append(":")
+            b.append_int(sym!!.column, 10)
+        }
+        if ty.len > 0 {
+            fs.free_str(ty)
+        }
+    } else if ty.len > 0 {
         b.append(ty)
         fs.free_str(ty)
-    }
-    if sym != null {
-        if b.len > 0 {
-            b.append("\n")
-        }
-        b.append("declared in ")
-        b.append(sym!!.file)
-        b.append(":")
-        b.append_int(sym!!.line, 10)
-        b.append(":")
-        b.append_int(sym!!.column, 10)
-    } else if ty.len == 0 {
-        // ty was freed above only when len > 0; nothing to free
     }
     val out = fs.copy_str(b.str())
     b.free()
@@ -204,8 +609,8 @@ fn definition_at(
     if node == null {
         return loc
     }
-    val sym = sym_of_node(node!!)
-    if sym == null {
+    val sym = resolve_sym(prog, path, node!!)
+    if sym == null || sym!!.file.len == 0 || sym!!.line <= 0 {
         return loc
     }
     loc.path = fs.copy_str(sym!!.file)

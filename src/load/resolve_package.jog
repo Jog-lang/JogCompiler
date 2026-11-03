@@ -249,6 +249,10 @@ private fn bind_extern(r: *Resolve, pkg: *Package, file_index: usize, block: *pa
         return
     }
     for kid in block.kids.items() {
+        // Attributes (@link, …) are kids of the block, same as in other decls.
+        if parse.is_attribute(kid) {
+            continue
+        }
         if !parse.is_fn(kid) {
             print_pos_error(file, kid.line, kid.column, "expected a function")
             r.failed = true
