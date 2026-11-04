@@ -273,10 +273,173 @@ private fn file_source(path: str, override_paths: []str, override_texts: []str):
     return data as str, true
 }
 
-/**
- * Contiguous `//` lines immediately above `before_line` (1-based).
- */
-private fn leading_comments(text: str, before_line: i64): str with (a: mem.Allocator) {
+private fn line_range(text: str, line_starts: list.List<usize>, idx: usize): (usize, usize) {
+    val start = line_starts.get(idx)
+    var end = text.len
+    if idx + 1 < line_starts.len {
+        end = line_starts.get(idx + 1)
+        if end > start && text.ptr[end - 1] == '\n' as u8 {
+            end = end - 1
+        }
+    }
+    if end > start && text.ptr[end - 1] == '\r' as u8 {
+        end = end - 1
+    }
+    return start, end
+}
+
+private fn trim_left_ws(line: str): usize {
+    var j: usize = 0
+    for j < line.len {
+        val c = line.ptr[j]
+        if c == ' ' as u8 || c == '\t' as u8 {
+            j = j + 1
+            continue
+        }
+        break
+    }
+    return j
+}
+
+private fn is_blank_line(line: str): bool {
+    return trim_left_ws(line) == line.len
+}
+
+/** True for `@link(...)` / `@opaque` lines between a decl and its docs. */
+private fn is_attribute_line(line: str): bool {
+    val j = trim_left_ws(line)
+    if j >= line.len || line.ptr[j] != '@' as u8 {
+        return false
+    }
+    if j + 1 >= line.len {
+        return false
+    }
+    val c = line.ptr[j + 1]
+    return (c >= 'A' as u8 && c <= 'Z' as u8) || (c >= 'a' as u8 && c <= 'z' as u8) || c == '_' as u8
+}
+
+private fn is_line_comment(line: str): bool {
+    val j = trim_left_ws(line)
+    return j + 1 < line.len && line.ptr[j] == '/' as u8 && line.ptr[j + 1] == '/' as u8
+}
+
+private fn line_comment_body(line: str): str {
+    val j = trim_left_ws(line)
+    var rest = j + 2
+    if rest < line.len && line.ptr[rest] == ' ' as u8 {
+        rest = rest + 1
+    }
+    return texts.slice(line, rest, line.len)
+}
+
+// Byte index of star-slash on this line, or line.len when absent.
+private fn close_comment_at(line: str): usize {
+    var i: usize = 0
+    for i + 1 < line.len {
+        if line.ptr[i] == '*' as u8 && line.ptr[i + 1] == '/' as u8 {
+            return i
+        }
+        i = i + 1
+    }
+    return line.len
+}
+
+// Find the slash-star that opens the block ending at close_at (the star of
+// the closer). Honors nesting the way the lexer does.
+private fn find_block_open(text: str, close_at: usize): (usize, bool) {
+    if close_at >= text.len {
+        return 0, false
+    }
+    var depth: i64 = 1
+    var i = close_at
+    for i > 0 {
+        i = i - 1
+        if i + 1 < text.len && text.ptr[i] == '*' as u8 && text.ptr[i + 1] == '/' as u8 {
+            depth = depth + 1
+            continue
+        }
+        if i + 1 < text.len && text.ptr[i] == '/' as u8 && text.ptr[i + 1] == '*' as u8 {
+            depth = depth - 1
+            if depth == 0 {
+                return i, true
+            }
+        }
+    }
+    return 0, false
+}
+
+// Strip a block-comment opener/closer and leading stars on each body line.
+private fn strip_block_comment(text: str, open_at: usize, close_at: usize): str with (a: mem.Allocator) {
+    var body_from = open_at + 2
+    if body_from < text.len && text.ptr[body_from] == '*' as u8 {
+        body_from = body_from + 1
+    }
+    if body_from < close_at && text.ptr[body_from] == '\n' as u8 {
+        body_from = body_from + 1
+    } else if body_from < close_at && text.ptr[body_from] == ' ' as u8 {
+        body_from = body_from + 1
+    }
+    var body_to = close_at
+    if body_to > body_from && text.ptr[body_to - 1] == '\n' as u8 {
+        body_to = body_to - 1
+    }
+    if body_to <= body_from {
+        return ""
+    }
+    val raw = texts.slice(text, body_from, body_to)
+    var b = strbuilder.empty()
+    var i: usize = 0
+    var first = true
+    for i <= raw.len {
+        var end = i
+        for end < raw.len && raw.ptr[end] != '\n' as u8 {
+            end = end + 1
+        }
+        var line = texts.slice(raw, i, end)
+        if line.len > 0 && line.ptr[line.len - 1] == '\r' as u8 {
+            line = texts.slice(raw, i, end - 1)
+        }
+        var j = trim_left_ws(line)
+        if j < line.len && line.ptr[j] == '*' as u8 {
+            j = j + 1
+            if j < line.len && line.ptr[j] == ' ' as u8 {
+                j = j + 1
+            }
+        }
+        val body = texts.slice(line, j, line.len)
+        if !first {
+            b.append("\n")
+        }
+        first = false
+        b.append(body)
+        if end >= raw.len {
+            break
+        }
+        i = end + 1
+    }
+    val out = fs.copy_str(b.str())
+    b.free()
+    return out
+}
+
+private fn prepend_line(b: *strbuilder.StrBuilder, line: str) with (a: mem.Allocator) {
+    if b.len == 0 {
+        b.append(line)
+        return
+    }
+    val prior = fs.copy_str(b.str())
+    b.clear()
+    b.append(line)
+    b.append("\n")
+    b.append(prior)
+    fs.free_str(prior)
+}
+
+// Docs immediately above before_line (1-based): prefer a block doc comment,
+// else contiguous // lines. Blank lines and @attr lines between the
+// declaration and the docs are skipped; a blank after docs have started
+// ends the scan.
+private fn leading_docs(text: str, before_line: i64): str with (a: mem.Allocator) {
     if before_line <= 1 || text.len == 0 {
         return ""
     }
@@ -294,71 +457,157 @@ private fn leading_comments(text: str, before_line: i64): str with (a: mem.Alloc
         line_starts.free()
         return ""
     }
-    var b = strbuilder.empty()
+    var slash = strbuilder.empty()
+    var saw_docs = false
     var li = want
     for li > 0 {
         val idx = li - 1
-        val start = line_starts.get(idx)
-        var end = text.len
-        if idx + 1 < line_starts.len {
-            end = line_starts.get(idx + 1)
-            if end > start && text.ptr[end - 1] == '\n' as u8 {
-                end = end - 1
-            }
-        }
-        // Trim CR.
-        if end > start && text.ptr[end - 1] == '\r' as u8 {
-            end = end - 1
-        }
+        val (start, end) = line_range(text, line_starts, idx)
         val line = texts.slice(text, start, end)
-        var j: usize = 0
-        for j < line.len {
-            val c = line.ptr[j]
-            if c == ' ' as u8 || c == '\t' as u8 {
-                j = j + 1
-                continue
-            }
-            break
-        }
-        if j + 1 < line.len && line.ptr[j] == '/' as u8 && line.ptr[j + 1] == '/' as u8 {
-            var rest = j + 2
-            if rest < line.len && line.ptr[rest] == ' ' as u8 {
-                rest = rest + 1
-            }
-            val body = texts.slice(line, rest, line.len)
-            // Collect upward; reverse later by rebuilding.
-            if b.len > 0 {
-                val prior = fs.copy_str(b.str())
-                b.free()
-                b = strbuilder.empty()
-                b.append(body)
-                b.append("\n")
-                b.append(prior)
-                fs.free_str(prior)
-            } else {
-                b.append(body)
+        if is_blank_line(line) {
+            if saw_docs {
+                break
             }
             li = li - 1
             continue
         }
-        if line.len == 0 || j == line.len {
-            // Blank line ends the doc block once we already have comments.
-            if b.len > 0 {
-                break
+        if !saw_docs && is_attribute_line(line) {
+            li = li - 1
+            continue
+        }
+        val close = close_comment_at(line)
+        if close < line.len {
+            val close_abs = start + close
+            val (open_at, ok) = find_block_open(text, close_abs)
+            if ok {
+                val body = strip_block_comment(text, open_at, close_abs)
+                slash.free()
+                line_starts.free()
+                return body
             }
+        }
+        if is_line_comment(line) {
+            prepend_line(&slash, line_comment_body(line))
+            saw_docs = true
             li = li - 1
             continue
         }
         break
     }
     line_starts.free()
-    if b.len == 0 {
-        b.free()
+    if slash.len == 0 {
+        slash.free()
         return ""
     }
-    val out = fs.copy_str(b.str())
-    b.free()
+    val out = fs.copy_str(slash.str())
+    slash.free()
     return out
+}
+
+private fn is_ident_byte(c: u8): bool {
+    return (c >= 'A' as u8 && c <= 'Z' as u8) || (c >= 'a' as u8 && c <= 'z' as u8) ||
+        (c >= '0' as u8 && c <= '9' as u8) || c == '_' as u8
+}
+
+/**
+ * Markdown for scraped docs: prose, then **@param** / **@return** lines.
+ */
+private fn format_docs_markdown(raw: str): str with (a: mem.Allocator) {
+    if raw.len == 0 {
+        return ""
+    }
+    var prose = strbuilder.empty()
+    var tags = strbuilder.empty()
+    var i: usize = 0
+    var prose_first = true
+    var tags_first = true
+    for i <= raw.len {
+        var end = i
+        for end < raw.len && raw.ptr[end] != '\n' as u8 {
+            end = end + 1
+        }
+        var line = texts.slice(raw, i, end)
+        if line.len > 0 && line.ptr[line.len - 1] == '\r' as u8 {
+            line = texts.slice(raw, i, end - 1)
+        }
+        val j0 = trim_left_ws(line)
+        val body = texts.slice(line, j0, line.len)
+        if body.len > 0 && body.ptr[0] == '@' as u8 {
+            var t: usize = 1
+            for t < body.len && is_ident_byte(body.ptr[t]) {
+                t = t + 1
+            }
+            val tag = texts.slice(body, 0, t)
+            var rest_at = t
+            for rest_at < body.len {
+                val c = body.ptr[rest_at]
+                if c == ' ' as u8 || c == '\t' as u8 {
+                    rest_at = rest_at + 1
+                    continue
+                }
+                break
+            }
+            if !tags_first {
+                tags.append("\n")
+            }
+            tags_first = false
+            tags.append("**")
+            tags.append(tag)
+            tags.append("**")
+            if tag == "@param" || tag == "@context" {
+                var name_end = rest_at
+                for name_end < body.len && is_ident_byte(body.ptr[name_end]) {
+                    name_end = name_end + 1
+                }
+                if name_end > rest_at {
+                    tags.append(" ")
+                    tags.append(texts.slice(body, rest_at, name_end))
+                    rest_at = name_end
+                    for rest_at < body.len {
+                        val c = body.ptr[rest_at]
+                        if c == ' ' as u8 || c == '\t' as u8 {
+                            rest_at = rest_at + 1
+                            continue
+                        }
+                        break
+                    }
+                }
+            }
+            if rest_at < body.len {
+                tags.append(" — ")
+                tags.append(texts.slice(body, rest_at, body.len))
+            }
+        } else if body.len > 0 || !prose_first {
+            if !prose_first {
+                prose.append("\n")
+            }
+            prose_first = false
+            prose.append(body)
+        }
+        if end >= raw.len {
+            break
+        }
+        i = end + 1
+    }
+    var out = strbuilder.empty()
+    if prose.len > 0 {
+        out.append(prose.str())
+    }
+    if tags.len > 0 {
+        if out.len > 0 {
+            out.append("\n\n")
+        }
+        out.append(tags.str())
+    }
+    prose.free()
+    tags.free()
+    if out.len == 0 {
+        out.free()
+        return ""
+    }
+    val copied = fs.copy_str(out.str())
+    out.free()
+    return copied
 }
 
 private fn fn_param_start(fn_node: *parse.Node): (usize, usize, usize) {
@@ -519,9 +768,8 @@ private fn format_signature(sym: *load.Symbol, fallback_ty: str): str with (a: m
     return out
 }
 
-/**
- * Hover text for the name at line/column (1-based). Empty when unknown.
- */
+// Hover markdown for the name at line/column (1-based). Empty when unknown.
+// Block and line docs come first; the signature is a jog code fence.
 fn hover_at(
     start: str,
     module_flags: []str,
@@ -553,33 +801,40 @@ fn hover_at(
     if sym != null {
         val (src, sok) = file_source(sym!!.file, override_paths, override_texts)
         if sok {
-            val docs = leading_comments(src, sym!!.line)
-            if docs.len > 0 {
-                b.append(docs)
-                b.append("\n\n")
-                fs.free_str(docs)
+            val raw = leading_docs(src, sym!!.line)
+            if raw.len > 0 {
+                val docs = format_docs_markdown(raw)
+                fs.free_str(raw)
+                if docs.len > 0 {
+                    b.append(docs)
+                    b.append("\n\n")
+                    fs.free_str(docs)
+                }
             }
         }
         val sig = format_signature(sym!!, ty)
+        b.append("```jog\n")
         b.append(sig)
+        b.append("\n```")
         fs.free_str(sig)
         // Prelude / universe bindings have no source location.
         if sym!!.file.len > 0 && sym!!.line > 0 {
-            if b.len > 0 {
-                b.append("\n")
-            }
-            b.append("declared in ")
+            b.append("\n\n")
+            b.append("*declared in* `")
             b.append(sym!!.file)
             b.append(":")
             b.append_int(sym!!.line, 10)
             b.append(":")
             b.append_int(sym!!.column, 10)
+            b.append("`")
         }
         if ty.len > 0 {
             fs.free_str(ty)
         }
     } else if ty.len > 0 {
+        b.append("```jog\n")
         b.append(ty)
+        b.append("\n```")
         fs.free_str(ty)
     }
     val out = fs.copy_str(b.str())

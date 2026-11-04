@@ -1,10 +1,41 @@
 // Smoke: require the jogc library, run load+check only (no emit).
 import jogc.src.frontend
 import std.c
+import std.fs
 import std.io
 import std.list
 import std.mem
 import std.os
+
+private fn has_sub(hay: str, needle: str): bool {
+    if needle.len == 0 {
+        return true
+    }
+    if needle.len > hay.len {
+        return false
+    }
+    var i: usize = 0
+    val last = hay.len - needle.len
+    for i <= last {
+        var j: usize = 0
+        var ok = true
+        for j < needle.len {
+            if hay.ptr[i + j] != needle.ptr[j] {
+                ok = false
+                break
+            }
+            j = j + 1
+        }
+        if ok {
+            return true
+        }
+        if i == last {
+            break
+        }
+        i = i + 1
+    }
+    return false
+}
 
 fn main() {
     var code: i32 = 1
@@ -50,6 +81,27 @@ fn main() {
                 code = 1
             }
             frontend.free_symbols(&syms)
+        } else if start == "hover" {
+            // hover_fixture: // lined docs, block @param on greet, calls in main.
+            var paths = list.empty<str>()
+            var bufs = list.empty<str>()
+            val (cwd, cok) = fs.cwd()
+            var root = "hover_fixture/main.jog"
+            if cok {
+                root = fs.join(cwd, root)
+            }
+            val hover = frontend.hover_at(root, flags.items(), paths.items(), bufs.items(), root, 15, 5)
+            val lined = frontend.hover_at(root, flags.items(), paths.items(), bufs.items(), root, 16, 5)
+            val ok = has_sub(hover, "**@param**") && has_sub(hover, "```jog") && has_sub(hover, "fn greet") &&
+                has_sub(lined, "Line docs still work")
+            if ok {
+                io.println("frontend_smoke: hover docs ok")
+                code = 0
+            } else {
+                io.println("frontend_smoke: hover docs failed")
+                io.println(hover)
+                code = 1
+            }
         } else {
             code = frontend.run(start, flags.items())
             if code == 0 {

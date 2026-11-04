@@ -1,0 +1,17 @@
+// Line docs still work.
+fn lined() {
+}
+
+/**
+ * Greets someone.
+ * @param name who to greet
+ * @return the same name
+ */
+fn greet(name: str): str {
+    return name
+}
+
+fn main() {
+    greet("Jog")
+    lined()
+}
