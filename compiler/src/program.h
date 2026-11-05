@@ -98,8 +98,12 @@ typedef struct JogProgram {
     const char **link_libs; /* link names for this target: the root's, then each module's in
                                --module order; a repeated name keeps its last position */
     size_t link_lib_count;
+    const char **lib_dirs; /* -L search paths: root libdir, then each module, then CLI; last wins */
+    size_t lib_dir_count;
     const JogModuleArg *module_args; /* --module mappings in command-line order; set before jog_load */
     size_t module_arg_count;
+    const char *const *cli_lib_dirs; /* --libdir / -L values from the driver; set before jog_load */
+    size_t cli_lib_dir_count;
     bool is_library;                 /* the root jog.mod says kind library */
 } JogProgram;
 

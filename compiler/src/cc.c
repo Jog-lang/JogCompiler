@@ -205,6 +205,23 @@ static const char *find_compiler(CtArena *arena, const char **override_out, bool
     return search_path(arena, "gcc", oom);
 }
 
+static const char *libdir_flag(CtArena *arena, const char *dir) {
+    size_t n;
+    char *flag;
+    if (!arena || !dir) {
+        return NULL;
+    }
+    n = strlen(dir);
+    flag = ct_arena_alloc(arena, n + 3, 1);
+    if (!flag) {
+        return NULL;
+    }
+    flag[0] = '-';
+    flag[1] = 'L';
+    memcpy(flag + 2, dir, n + 1);
+    return flag;
+}
+
 static const char *link_flag(CtArena *arena, const char *lib) {
     size_t len = strlen(lib);
     char *flag = ct_arena_alloc(arena, len + 3, 1);
@@ -623,7 +640,7 @@ static bool jog_cc_build_wasm(const JogCcRequest *request, CtDiag *diag) {
         ct_diag_emit(diag, CT_SEVERITY_ERROR, pos, "cannot invoke the C compiler: unknown build mode");
         goto done;
     }
-    if (request->extra_lib_count > 0) {
+    if (request->extra_lib_count > 0 || request->extra_lib_dir_count > 0) {
         ct_diag_emit(diag, CT_SEVERITY_ERROR, pos, "wasm32 does not link host libraries; extern functions are env imports");
         goto done;
     }
@@ -817,6 +834,23 @@ bool jog_cc_build(const JogCcRequest *request, CtDiag *diag) {
         goto done;
     }
 
+    if (request->extra_lib_dir_count > 0 && !request->extra_lib_dirs) {
+        ct_diag_emit(diag, CT_SEVERITY_ERROR, pos, "missing library search path list");
+        goto done;
+    }
+    for (size_t i = 0; i < request->extra_lib_dir_count; i++) {
+        const char *dir = request->extra_lib_dirs[i];
+        const char *flag = NULL;
+        if (!dir || dir[0] == '\0') {
+            ct_diag_emit(diag, CT_SEVERITY_ERROR, pos, "empty library search path");
+            goto done;
+        }
+        flag = libdir_flag(arena, dir);
+        if (!flag || !push_arg(&args, flag)) {
+            ct_diag_emit(diag, CT_SEVERITY_ERROR, pos, "out of memory");
+            goto done;
+        }
+    }
     if (request->extra_lib_count > 0 && !request->extra_libs) {
         ct_diag_emit(diag, CT_SEVERITY_ERROR, pos, "missing link library list");
         goto done;

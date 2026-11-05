@@ -1221,6 +1221,12 @@ static void expect_modules(CtArena *arena, CtDiag *diag, const char *jog, const 
                    "module 'lib' is required by jog.mod but was not given with --module; build with jog-build, or "
                    "pass --module lib=<dir>");
         expect_cli(arena, "modules bad flag", bad_flag, 2, "", "--module expects <name>=<dir>");
+        {
+            const char *bad_libdir[] = {jog, "check", app, "--module", lib_flag, "--libdir", NULL};
+            const char *ok_libdir[] = {jog, "check", app, "--module", lib_flag, "-L", ".", NULL};
+            expect_cli(arena, "modules bad --libdir", bad_libdir, 2, "", "--libdir expects a directory");
+            expect_cli(arena, "modules -L ok", ok_libdir, 0, "", NULL);
+        }
         expect_cli(arena, "modules check lib", check_lib, 0, "", NULL);
         expect_cli(arena, "modules build lib", build_lib, 1, "", "module 'lib' is a library; use jog check or jog test");
         expect_cli(arena, "modules noexport", noexport, 1, "", "package 'lib.internal' is not exported by module 'lib'");

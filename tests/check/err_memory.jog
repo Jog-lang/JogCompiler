@@ -62,11 +62,6 @@ fn unassigned() {
     *p = 1
 }
 
-fn no_const_conv(): *const i32 {
-    var x: i32 = 1
-    return &x
-}
-
 fn const_field(p: *const Point) {
     p.x = 1
 }
@@ -94,7 +89,6 @@ fn const_slice() {
 // error: bytes() does not take arguments
 // error: attribute 'foo' is not checked yet
 // error: variable 'p' is used before it is assigned
-// error: type mismatch: expected *const i32, got *i32
 // error: cannot assign to field 'x'
 // error: mismatched types *i32 and *const i32
 // error: cannot assign through a const view

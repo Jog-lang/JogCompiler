@@ -39,7 +39,8 @@ static void print_usage(FILE *out) {
     fprintf(out, "  %-70s %s\n", "jog version", "print the compiler version");
     fprintf(out, "  %-70s %s\n", "jog help", "show this message");
     fprintf(out, "\nbuild, run, test, check, emit-c, and emit-ir accept --module <name>=<dir>, repeatable,\n"
-                 "for each library module that jog.mod requires.\n");
+                 "for each library module that jog.mod requires, and --libdir <dir> / -L <dir> for C\n"
+                 "library search paths (emitted as -L before -l).\n");
 }
 
 int jog_cmd_not_implemented(const char *name, int milestone) {

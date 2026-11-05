@@ -323,6 +323,8 @@ static void check_basic(Harness *h, int with_tests) {
     CHECK(strcmp(h->program.module_name, "basic") == 0);
     CHECK(h->program.link_lib_count == 0);
     CHECK(h->program.link_libs == NULL);
+    CHECK(h->program.lib_dir_count == 0);
+    CHECK(h->program.lib_dirs == NULL);
     CHECK(path_ends(h->program.module_root, "tests/jog/loader/basic"));
     CHECK(ct_fs_is_file(ct_path_join(h->arena, h->program.module_root, "jog.mod")));
     CHECK(paths_are(&h->program, root_only, 1));
@@ -990,8 +992,8 @@ typedef struct BadManifest {
 
 static void test_manifest_v2(void) {
     static const BadManifest bad[] = {
-        {"module m\nlibdir lib\n", "jog.mod:2:1: error: jog.mod: 'libdir' is reserved for a later version"},
-        {"module m\nlibdir.windows lib\n", "jog.mod:2:1: error: jog.mod: 'libdir.windows' is reserved"},
+        {"module m\nlibdir.unknown lib\n",
+         "jog.mod:2:8: error: jog.mod: unknown target 'unknown'; expected windows, linux, or macos"},
         {"module m\nsource x\n", "jog.mod:2:1: error: jog.mod: 'source' is reserved"},
         {"module m\nreplace a ../a\n", "jog.mod:2:1: error: jog.mod: 'replace' is reserved"},
         {"module m\nconfig debug\n", "jog.mod:2:1: error: jog.mod: 'config' is reserved"},
@@ -1037,7 +1039,8 @@ static void test_manifest_v2(void) {
                         "# v2\r\nmodule m # name\r\nversion 1.2.3-rc.1\r\nkind library\r\njog 0.0.1-alpha.2\r\n"
                         "require a ../a\r\nrequire b 1.4.0\r\nrequire c C:/vendor/c\r\nrequire d /opt/d.jogz\r\n"
                         "export x\r\nexport x.y\r\nlink m\r\nlink.windows ws2_32\r\nlink.linux dl\r\n"
-                        "link.macos objc\r\n",
+                        "link.macos objc\r\nlibdir ./libs\r\nlibdir.windows ./libs/win\r\n"
+                        "libdir.linux ./libs/linux\r\nlibdir.macos ./libs/mac\r\n",
                         1));
     CHECK(h.program.module_name && strcmp(h.program.module_name, "m") == 0);
     CHECK(h.program.is_library);
@@ -1046,6 +1049,9 @@ static void test_manifest_v2(void) {
     CHECK(find_pkg(&h.program, "x.y") != NULL);
     CHECK(h.program.link_lib_count == 2);
     CHECK(h.program.link_lib_count > 0 && strcmp(h.program.link_libs[0], "m") == 0);
+    CHECK(h.program.lib_dir_count == 2);
+    CHECK(h.program.lib_dirs != NULL);
+    CHECK(strstr(h.program.lib_dirs[0], "libs") != NULL);
     close_harness(&h);
 
     /* A V1 file means version 0.0.0, an executable, no requires. */

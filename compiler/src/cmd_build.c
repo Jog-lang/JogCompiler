@@ -59,20 +59,22 @@ typedef struct CmdRequest {
     int saw_diag;
     const char **modules; /* --module values, "<name>=<dir>", in order; malloc */
     int module_count;
+    const char **lib_dirs; /* --libdir / -L values, in order; malloc */
+    int lib_dir_count;
 } CmdRequest;
 
 static const char *usage_line(PipelineStop stop) {
     switch (stop) {
     case STOP_BUILD:
-        return "usage: jog build [package] [-o file] [--release | --release-fast] [--keep-c] [--target wasm32] [--comptime-steps N] [--module name=dir ...]\n";
+        return "usage: jog build [package] [-o file] [--release | --release-fast] [--keep-c] [--target wasm32] [--comptime-steps N] [--module name=dir ...] [--libdir dir | -L dir ...]\n";
     case STOP_RUN:
-        return "usage: jog run [package] [--target wasm32] [--comptime-steps N] [--module name=dir ...] [-- args...]\n";
+        return "usage: jog run [package] [--target wasm32] [--comptime-steps N] [--module name=dir ...] [--libdir dir | -L dir ...] [-- args...]\n";
     case STOP_CHECK:
-        return "usage: jog check [package] [--diag=text|json] [--module name=dir ...]\n";
+        return "usage: jog check [package] [--diag=text|json] [--module name=dir ...] [--libdir dir | -L dir ...]\n";
     case STOP_C:
-        return "usage: jog emit-c [package] [--module name=dir ...]\n";
+        return "usage: jog emit-c [package] [--module name=dir ...] [--libdir dir | -L dir ...]\n";
     case STOP_IR:
-        return "usage: jog emit-ir [package] [--module name=dir ...]\n";
+        return "usage: jog emit-ir [package] [--module name=dir ...] [--libdir dir | -L dir ...]\n";
     }
     return "usage: jog <command> [arguments]\n";
 }
@@ -137,25 +139,65 @@ int jog_parse_module_flag(int argc, char **argv, int *i, const char **out) {
     return 0;
 }
 
+/* --libdir <dir>, --libdir=<dir>, -L <dir>, or -L<dir>. 1 when not a
+   libdir flag, 0 when consumed, 2 on bad usage. */
+int jog_parse_libdir_flag(int argc, char **argv, int *i, const char **out) {
+    const char *arg = argv[*i];
+    const char *value = NULL;
+    if (strcmp(arg, "--libdir") == 0 || strcmp(arg, "-L") == 0) {
+        if (*i + 1 >= argc) {
+            fputs("jog: --libdir expects a directory\n", stderr);
+            return 2;
+        }
+        value = argv[++*i];
+    } else if (strncmp(arg, "--libdir=", 9) == 0) {
+        value = arg + 9;
+    } else if (arg[0] == '-' && arg[1] == 'L' && arg[2] != '\0') {
+        value = arg + 2;
+    } else {
+        return 1;
+    }
+    if (!value || value[0] == '\0') {
+        fputs("jog: --libdir expects a directory\n", stderr);
+        return 2;
+    }
+    *out = value;
+    return 0;
+}
+
 static int parse_args(PipelineStop stop, int argc, char **argv, CmdRequest *req) {
     int i = 0;
     memset(req, 0, sizeof(*req));
     req->stop = stop;
     req->mode = JOG_BUILD_DEBUG;
     req->modules = malloc(((size_t)argc + 1) * sizeof(const char *));
-    if (!req->modules) {
+    req->lib_dirs = malloc(((size_t)argc + 1) * sizeof(const char *));
+    if (!req->modules || !req->lib_dirs) {
+        free((void *)req->modules);
+        free((void *)req->lib_dirs);
+        req->modules = NULL;
+        req->lib_dirs = NULL;
         fputs("jog: out of memory\n", stderr);
         return 1;
     }
     for (i = 0; i < argc; i++) {
         const char *arg = argv[i];
         const char *module = NULL;
+        const char *libdir = NULL;
         int flag = jog_parse_module_flag(argc, argv, &i, &module);
         if (flag == 2) {
             return 2;
         }
         if (flag == 0) {
             req->modules[req->module_count++] = module;
+            continue;
+        }
+        flag = jog_parse_libdir_flag(argc, argv, &i, &libdir);
+        if (flag == 2) {
+            return 2;
+        }
+        if (flag == 0) {
+            req->lib_dirs[req->lib_dir_count++] = libdir;
             continue;
         }
         if (strcmp(arg, "--") == 0) {
@@ -798,6 +840,8 @@ static int link_program(JogProgram *program, const CmdRequest *req, CtSb *c_text
     request.mode = req->mode;
     request.extra_libs = (const char *const *)program->link_libs;
     request.extra_lib_count = program->link_lib_count;
+    request.extra_lib_dirs = (const char *const *)program->lib_dirs;
+    request.extra_lib_dir_count = program->lib_dir_count;
     request.verbose = false;
     if (!jog_cc_build(&request, diag)) {
         return 0;
@@ -1144,6 +1188,10 @@ static int compile_pipeline(const CmdRequest *req) {
         program.module_args = args;
         program.module_arg_count = (size_t)req->module_count;
     }
+    if (req->lib_dir_count > 0) {
+        program.cli_lib_dirs = req->lib_dirs;
+        program.cli_lib_dir_count = (size_t)req->lib_dir_count;
+    }
 
     start = req->package ? req->package : ".";
     before = ct_diag_error_count(diag);
@@ -1289,7 +1337,8 @@ cleanup:
 
 /* jog test shares the build pipeline. commands.h stays unchanged.
    modules are --module values, "<name>=<dir>". */
-int jog_drive_test(const char *start, const char **modules, int module_count) {
+int jog_drive_test(const char *start, const char **modules, int module_count, const char **lib_dirs,
+                   int lib_dir_count) {
     CmdRequest req;
     memset(&req, 0, sizeof req);
     req.stop = STOP_RUN;
@@ -1299,6 +1348,8 @@ int jog_drive_test(const char *start, const char **modules, int module_count) {
     req.match_expects = 1;
     req.modules = modules;
     req.module_count = module_count;
+    req.lib_dirs = lib_dirs;
+    req.lib_dir_count = lib_dir_count;
     return compile_pipeline(&req);
 }
 
@@ -1309,6 +1360,7 @@ static int jog_command(PipelineStop stop, int argc, char **argv) {
         status = compile_pipeline(&req);
     }
     free((void *)req.modules);
+    free((void *)req.lib_dirs);
     return status;
 }
 

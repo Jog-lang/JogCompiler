@@ -92,6 +92,7 @@ typedef struct Module {
     CtDa requires; /* ModLine */
     CtDa exports;  /* ModLine */
     CtDa links;    /* const char *, the link lines for this target */
+    CtDa libdirs;  /* const char *, absolute or module-relative resolved paths */
     CtDa targets;  /* const char *, jog.mod `targets` names; empty when absent */
     bool has_targets;
     CtPos targets_pos;
@@ -536,9 +537,10 @@ static int word_in(const char *text, size_t len, const char *const *words, size_
     return 0;
 }
 
-static const char *const g_reserved_words[] = {"libdir",  "source",  "replace",  "config",
-                                               "include", "exclude", "provides", "needs"};
-static const char *const g_known_words[] = {"module", "version", "kind", "jog", "require", "export", "link", "targets"};
+static const char *const g_reserved_words[] = {"source",  "replace",  "config", "include",
+                                               "exclude", "provides", "needs"};
+static const char *const g_known_words[] = {"module", "version", "kind",    "jog",  "require",
+                                            "export", "link",    "libdir", "targets"};
 
 static int is_reserved_directive(Tok tok) {
     size_t base = 0;
@@ -716,6 +718,50 @@ static bool parse_manifest(Loader *loader, const CtFile *file, Module *mod) {
             } else if (keep) {
                 const char *lib = intern_tok(loader, toks[1]);
                 if (!lib || !ct_da_push(&mod->links, &lib)) {
+                    LOAD_ERROR(loader, pos, "out of memory");
+                    ok = 0;
+                }
+            }
+        } else if (tok_is(first, "libdir") || (first.len > 7 && memcmp(first.ptr, "libdir.", 7) == 0)) {
+            int keep = 1;
+            if (first.len > 6) {
+                Tok target;
+                target.ptr = first.ptr + 7;
+                target.len = first.len - 7;
+                target.column = first.column + 7;
+                if (!tok_is(target, "windows") && !tok_is(target, "linux") && !tok_is(target, "macos")) {
+                    LOAD_ERROR(loader, manifest_pos(file, line_no, target.column),
+                               "jog.mod: unknown target '%.*s'; expected windows, linux, or macos",
+                               (int)target.len, target.ptr);
+                    ok = 0;
+                    line_no++;
+                    continue;
+                }
+                keep = loader->program->options.ptr_size != 4 && tok_is(target, jog_host_os());
+            }
+            if (!one_word(loader, file, line_no, toks, n, "library search path")) {
+                ok = 0;
+            } else if (keep) {
+                const char *raw = intern_tok(loader, toks[1]);
+                const char *resolved = NULL;
+                if (!raw) {
+                    LOAD_ERROR(loader, pos, "out of memory");
+                    ok = 0;
+                } else if (raw[0] == '/' || raw[0] == '\\' ||
+                           (((raw[0] >= 'A' && raw[0] <= 'Z') || (raw[0] >= 'a' && raw[0] <= 'z')) &&
+                            raw[1] == ':')) {
+                    resolved = raw;
+                } else if (!mod->root) {
+                    LOAD_ERROR(loader, pos, "out of memory");
+                    ok = 0;
+                } else {
+                    resolved = ct_path_join(loader->program->arena, mod->root, raw);
+                    if (!resolved) {
+                        LOAD_ERROR(loader, pos, "out of memory");
+                        ok = 0;
+                    }
+                }
+                if (ok && resolved && !ct_da_push(&mod->libdirs, &resolved)) {
                     LOAD_ERROR(loader, pos, "out of memory");
                     ok = 0;
                 }
@@ -908,10 +954,12 @@ static bool parse_manifest(Loader *loader, const CtFile *file, Module *mod) {
 static bool module_init(Module *mod) {
     memset(mod, 0, sizeof *mod);
     if (!ct_da_init(&mod->requires, sizeof(ModLine)) || !ct_da_init(&mod->exports, sizeof(ModLine)) ||
-        !ct_da_init(&mod->links, sizeof(const char *)) || !ct_da_init(&mod->targets, sizeof(const char *))) {
+        !ct_da_init(&mod->links, sizeof(const char *)) || !ct_da_init(&mod->libdirs, sizeof(const char *)) ||
+        !ct_da_init(&mod->targets, sizeof(const char *))) {
         ct_da_free(&mod->requires);
         ct_da_free(&mod->exports);
         ct_da_free(&mod->links);
+        ct_da_free(&mod->libdirs);
         ct_da_free(&mod->targets);
         return false;
     }
@@ -922,6 +970,7 @@ static void module_free(Module *mod) {
     ct_da_free(&mod->requires);
     ct_da_free(&mod->exports);
     ct_da_free(&mod->links);
+    ct_da_free(&mod->libdirs);
     ct_da_free(&mod->targets);
 }
 
@@ -1399,6 +1448,80 @@ static bool merge_links(Loader *loader) {
             memcpy(copied, merged.data, merged.count * sizeof(const char *));
             loader->program->link_libs = copied;
             loader->program->link_lib_count = merged.count;
+        } else {
+            ok = false;
+        }
+    }
+    if (!ok) {
+        LOAD_ERROR(loader, loader->module_pos, "out of memory");
+    }
+    ct_da_free(&all);
+    ct_da_free(&merged);
+    return ok;
+}
+
+/* Root libdir lines, then each module, then CLI --libdir / -L. A path that
+   appears again keeps only its last position. */
+static bool merge_libdirs(Loader *loader) {
+    CtDa all;
+    CtDa merged;
+    size_t i = 0;
+    size_t j = 0;
+    bool ok = true;
+    if (!ct_da_init(&all, sizeof(const char *)) || !ct_da_init(&merged, sizeof(const char *))) {
+        ct_da_free(&all);
+        LOAD_ERROR(loader, loader->module_pos, "out of memory");
+        return false;
+    }
+    for (i = 0; ok && i <= loader->mods.count; i++) {
+        Module *mod = i == 0 ? &loader->root_mod : *(Module **)ct_da_at(&loader->mods, i - 1);
+        if (!mod || mod->bad) {
+            continue;
+        }
+        for (j = 0; ok && j < mod->libdirs.count; j++) {
+            ok = ct_da_push(&all, ct_da_at(&mod->libdirs, j));
+        }
+    }
+    for (i = 0; ok && i < loader->program->cli_lib_dir_count; i++) {
+        const char *dir = loader->program->cli_lib_dirs[i];
+        const char *abs = NULL;
+        if (!dir || dir[0] == '\0') {
+            LOAD_ERROR(loader, loader->module_pos, "empty --libdir path");
+            ok = false;
+            break;
+        }
+        abs = absolute_path(loader->program->arena, dir);
+        if (!abs) {
+            abs = ct_arena_strdup(loader->program->arena, dir);
+        }
+        if (!abs || !ct_da_push(&all, &abs)) {
+            LOAD_ERROR(loader, loader->module_pos, "out of memory");
+            ok = false;
+            break;
+        }
+    }
+    for (i = 0; ok && i < all.count; i++) {
+        const char *dir = *(const char **)ct_da_at(&all, i);
+        int later = 0;
+        for (j = i + 1; j < all.count; j++) {
+            if (strcmp(dir, *(const char **)ct_da_at(&all, j)) == 0) {
+                later = 1;
+                break;
+            }
+        }
+        if (!later) {
+            ok = ct_da_push(&merged, &dir);
+        }
+    }
+    loader->program->lib_dirs = NULL;
+    loader->program->lib_dir_count = 0;
+    if (ok && merged.count > 0) {
+        const char **copied = ct_arena_alloc(loader->program->arena, merged.count * sizeof(const char *),
+                                              _Alignof(const char *));
+        if (copied) {
+            memcpy(copied, merged.data, merged.count * sizeof(const char *));
+            loader->program->lib_dirs = copied;
+            loader->program->lib_dir_count = merged.count;
         } else {
             ok = false;
         }
@@ -2300,7 +2423,7 @@ bool jog_load(JogProgram *program, const char *start) {
         return false;
     }
     check_modules(&loader);
-    if (!merge_links(&loader)) {
+    if (!merge_links(&loader) || !merge_libdirs(&loader)) {
         loader_free(&loader);
         return false;
     }
