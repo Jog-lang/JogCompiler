@@ -89,8 +89,9 @@ typedef struct Module {
     bool is_library;
     bool required; /* a require line of some loaded jog.mod names it */
     bool bad;      /* a --module whose jog.mod failed; already reported */
-    CtDa requires; /* ModLine */
-    CtDa exports;  /* ModLine */
+    CtDa requires;      /* ModLine */
+    CtDa test_requires; /* ModLine — require.test; jog-build only, but needed for --module checks */
+    CtDa exports;       /* ModLine */
     CtDa links;    /* const char *, the link lines for this target */
     CtDa libdirs;  /* const char *, absolute or module-relative resolved paths */
     CtDa targets;  /* const char *, jog.mod `targets` names; empty when absent */
@@ -895,6 +896,41 @@ static bool parse_manifest(Loader *loader, const CtFile *file, Module *mod) {
             } else if (!push_line(loader, &mod->requires, toks[1], name_pos)) {
                 ok = 0;
             }
+        } else if (tok_is(first, "require.test")) {
+            /* Same rules as require; uniqueness is within test_requires only. */
+            CtPos name_pos = manifest_pos(file, line_no, n > 1 ? toks[1].column : first.column);
+            if (n < 2) {
+                LOAD_ERROR(loader, pos, "jog.mod: missing module name");
+                ok = 0;
+            } else if (!is_ident_token(toks[1])) {
+                LOAD_ERROR(loader, name_pos, "jog.mod: module name '%.*s' is not an identifier", (int)toks[1].len,
+                           toks[1].ptr);
+                ok = 0;
+            } else if (n < 3) {
+                LOAD_ERROR(loader, name_pos, "jog.mod: missing the path or version of module '%.*s'",
+                           (int)toks[1].len, toks[1].ptr);
+                ok = 0;
+            } else if (n > 3) {
+                LOAD_ERROR(loader, manifest_pos(file, line_no, toks[3].column),
+                           "jog.mod: extra tokens after the path or version");
+                ok = 0;
+            } else if (tok_is(toks[1], "std")) {
+                LOAD_ERROR(loader, name_pos, "jog.mod: std is built in and cannot be required");
+                ok = 0;
+            } else if (mod->name && tok_is(toks[1], mod->name)) {
+                LOAD_ERROR(loader, name_pos, "jog.mod: module '%s' cannot require itself", mod->name);
+                ok = 0;
+            } else if (find_line(&mod->test_requires, toks[1].ptr, toks[1].len)) {
+                LOAD_ERROR(loader, name_pos, "jog.mod: module '%.*s' is required twice", (int)toks[1].len,
+                           toks[1].ptr);
+                ok = 0;
+            } else if (!is_path_spec(toks[2]) && !semver_valid(toks[2].ptr, toks[2].len)) {
+                LOAD_ERROR(loader, manifest_pos(file, line_no, toks[2].column),
+                           "jog.mod: '%.*s' is neither a path nor a version", (int)toks[2].len, toks[2].ptr);
+                ok = 0;
+            } else if (!push_line(loader, &mod->test_requires, toks[1], name_pos)) {
+                ok = 0;
+            }
         } else if (tok_is(first, "export")) {
             CtPos path_pos = manifest_pos(file, line_no, n > 1 ? toks[1].column : first.column);
             if (!one_word(loader, file, line_no, toks, n, "package path")) {
@@ -953,10 +989,11 @@ static bool parse_manifest(Loader *loader, const CtFile *file, Module *mod) {
 
 static bool module_init(Module *mod) {
     memset(mod, 0, sizeof *mod);
-    if (!ct_da_init(&mod->requires, sizeof(ModLine)) || !ct_da_init(&mod->exports, sizeof(ModLine)) ||
-        !ct_da_init(&mod->links, sizeof(const char *)) || !ct_da_init(&mod->libdirs, sizeof(const char *)) ||
-        !ct_da_init(&mod->targets, sizeof(const char *))) {
+    if (!ct_da_init(&mod->requires, sizeof(ModLine)) || !ct_da_init(&mod->test_requires, sizeof(ModLine)) ||
+        !ct_da_init(&mod->exports, sizeof(ModLine)) || !ct_da_init(&mod->links, sizeof(const char *)) ||
+        !ct_da_init(&mod->libdirs, sizeof(const char *)) || !ct_da_init(&mod->targets, sizeof(const char *))) {
         ct_da_free(&mod->requires);
+        ct_da_free(&mod->test_requires);
         ct_da_free(&mod->exports);
         ct_da_free(&mod->links);
         ct_da_free(&mod->libdirs);
@@ -968,6 +1005,7 @@ static bool module_init(Module *mod) {
 
 static void module_free(Module *mod) {
     ct_da_free(&mod->requires);
+    ct_da_free(&mod->test_requires);
     ct_da_free(&mod->exports);
     ct_da_free(&mod->links);
     ct_da_free(&mod->libdirs);
@@ -1363,12 +1401,11 @@ static bool open_mapped(Loader *loader) {
     return true;
 }
 
-/* Every require names a module; a folder must not shadow it; and every
-   mapping must be required by some loaded jog.mod. */
-static void check_requires(Loader *loader, Module *mod) {
+/* Mark mapped modules named by lines as required; folder shadow check. */
+static void check_require_lines(Loader *loader, Module *mod, CtDa *lines) {
     size_t i = 0;
-    for (i = 0; i < mod->requires.count; i++) {
-        ModLine *line = ct_da_at(&mod->requires, i);
+    for (i = 0; i < lines->count; i++) {
+        ModLine *line = ct_da_at(lines, i);
         Module *dep = find_mapped(loader, line->text);
         const char *folder = ct_path_join(loader->program->arena, mod->root, line->text);
         if (dep) {
@@ -1382,6 +1419,13 @@ static void check_requires(Loader *loader, Module *mod) {
             LOAD_ERROR(loader, line->pos, "folder '%s' shadows module '%s'", line->text, line->text);
         }
     }
+}
+
+/* Every require / require.test names a module; a folder must not shadow it;
+   and every mapping must be required by some loaded jog.mod. */
+static void check_requires(Loader *loader, Module *mod) {
+    check_require_lines(loader, mod, &mod->requires);
+    check_require_lines(loader, mod, &mod->test_requires);
 }
 
 static void check_modules(Loader *loader) {
@@ -1723,7 +1767,9 @@ static void collect_imports(Loader *loader, PkgState *state) {
                 }
                 target = NULL;
                 idir = package_dir(loader, loader->program->std_root, segs, 1, count, pos);
-            } else if (state->mod && find_line(&state->mod->requires, segs[0], strlen(segs[0]))) {
+            } else if (state->mod &&
+                       (find_line(&state->mod->requires, segs[0], strlen(segs[0])) ||
+                        find_line(&state->mod->test_requires, segs[0], strlen(segs[0])))) {
                 const char *rest = dotted_path(loader, segs + 1, count - 1);
                 target = find_mapped(loader, segs[0]);
                 if (!target) {
