@@ -20,6 +20,8 @@ struct Program {
     is_library: bool
     // jog.mod `link` names for the root module.
     links: list.List<str>
+    // -L search paths: root libdir, then each --module, then CLI; last wins.
+    libdirs: list.List<str>
 }
 
 /**
@@ -35,5 +37,6 @@ fn empty_program(): Program with (a: mem.Allocator) {
     p.runtime_root = ""
     p.is_library = false
     p.links = list.empty<str>()
+    p.libdirs = list.empty<str>()
     return p
 }

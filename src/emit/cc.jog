@@ -292,7 +292,7 @@ private fn run_cc(args: list.List<str>, compiler: str): i32 with (a: mem.Allocat
     return 0
 }
 
-fn link_c(c_path: str, exe_path: str, runtime: str, mode: i32, libs: list.List<str>): i32 with (a: mem.Allocator) {
+fn link_c(c_path: str, exe_path: str, runtime: str, mode: i32, libs: list.List<str>, libdirs: list.List<str>): i32 with (a: mem.Allocator) {
     if c_path.len == 0 || exe_path.len == 0 || runtime.len == 0 {
         say("cannot invoke the C compiler: missing input, output, or runtime path")
         return 1
@@ -302,7 +302,7 @@ fn link_c(c_path: str, exe_path: str, runtime: str, mode: i32, libs: list.List<s
         return 1
     }
     val wasm = ends_with(exe_path, ".wasm")
-    if wasm && libs.len > 0 {
+    if wasm && (libs.len > 0 || libdirs.len > 0) {
         say("wasm32 does not link host libraries; extern functions are env imports")
         return 1
     }
@@ -377,6 +377,19 @@ fn link_c(c_path: str, exe_path: str, runtime: str, mode: i32, libs: list.List<s
     args.push("-o")
     args.push(exe_path)
     if !wasm {
+        var di: usize = 0
+        for di < libdirs.len {
+            val dir = libdirs.get(di)
+            if dir.len == 0 {
+                say("empty library search path")
+                return 1
+            }
+            var lflag = strbuilder.empty()
+            lflag.append("-L")
+            lflag.append(dir)
+            args.push(fs.copy_str(lflag.str()))
+            di = di + 1
+        }
         var li: usize = 0
         for li < libs.len {
             val lib = libs.get(li)

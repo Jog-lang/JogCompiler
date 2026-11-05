@@ -39,6 +39,46 @@ fn usage(to_err: bool) {
     say(to_err, "  jogc help                show this message")
 }
 
+/**
+ * --libdir <dir>, --libdir=<dir>, -L <dir>, or -L<dir>.
+ * ("", 1) not a flag, (value, 0) consumed, ("", 2) bad usage.
+ */
+fn take_libdir(arg: str, i: *i64): (str, i32) {
+    var value = ""
+    if arg == "--libdir" || arg == "-L" {
+        if i[0] + 1 >= os.argc() {
+            io.eprintln("jog: --libdir expects a directory")
+            return "", 2
+        }
+        i[0] = i[0] + 1
+        value = os.argv(i[0])
+    } else if arg.len >= 9 && texts.slice(arg, 0, 9) == "--libdir=" {
+        value = texts.slice(arg, 9, arg.len)
+    } else if arg.len > 2 && arg.ptr[0] == '-' as u8 && arg.ptr[1] == 'L' as u8 {
+        value = texts.slice(arg, 2, arg.len)
+    } else {
+        return "", 1
+    }
+    if value.len == 0 {
+        io.eprintln("jog: --libdir expects a directory")
+        return "", 2
+    }
+    return value, 0
+}
+
+fn apply_cli_libdirs(prog: load.Program, cli: list.List<str>): (load.Program, i32) with (a: mem.Allocator) {
+    if cli.len == 0 {
+        return prog, 0
+    }
+    val (merged, ok) = load.append_cli_libdirs(prog.libdirs, cli.items())
+    if !ok {
+        return prog, 1
+    }
+    var out = prog
+    out.libdirs = merged
+    return out, 0
+}
+
 fn dispatch(): i32 with (a: mem.Allocator) {
     if os.argc() < 2 {
         usage(true)
@@ -71,6 +111,7 @@ fn dispatch(): i32 with (a: mem.Allocator) {
         var start = "."
         var saw_start = false
         var module_flags = list.empty<str>()
+        var libdirs = list.empty<str>()
         var i: i64 = 2
         for i < os.argc() {
             val arg = os.argv(i)
@@ -99,14 +140,22 @@ fn dispatch(): i32 with (a: mem.Allocator) {
                     return 2
                 }
                 module_flags.push(value)
-            } else if !saw_start {
-                start = arg
-                saw_start = true
             } else {
-                io.eprint("jogc: unexpected argument '")
-                io.eprint(arg)
-                io.eprintln("'")
-                return 2
+                val (libdir, lflag) = take_libdir(arg, &i)
+                if lflag == 2 {
+                    return 2
+                }
+                if lflag == 0 {
+                    libdirs.push(libdir)
+                } else if !saw_start {
+                    start = arg
+                    saw_start = true
+                } else {
+                    io.eprint("jogc: unexpected argument '")
+                    io.eprint(arg)
+                    io.eprintln("'")
+                    return 2
+                }
             }
             i = i + 1
         }
@@ -114,13 +163,18 @@ fn dispatch(): i32 with (a: mem.Allocator) {
         if loaded != 0 {
             return loaded
         }
-        val (_, code) = check.run(prog)
+        val (with_libs, lcode) = apply_cli_libdirs(prog, libdirs)
+        if lcode != 0 {
+            return lcode
+        }
+        val (_, code) = check.run(with_libs)
         return code
     }
     if command == "emit-ir" {
         var start = "."
         var saw_start = false
         var module_flags = list.empty<str>()
+        var libdirs = list.empty<str>()
         var i: i64 = 2
         for i < os.argc() {
             val arg = os.argv(i)
@@ -149,14 +203,22 @@ fn dispatch(): i32 with (a: mem.Allocator) {
                     return 2
                 }
                 module_flags.push(value)
-            } else if !saw_start {
-                start = arg
-                saw_start = true
             } else {
-                io.eprint("jogc: unexpected argument '")
-                io.eprint(arg)
-                io.eprintln("'")
-                return 2
+                val (libdir, lflag) = take_libdir(arg, &i)
+                if lflag == 2 {
+                    return 2
+                }
+                if lflag == 0 {
+                    libdirs.push(libdir)
+                } else if !saw_start {
+                    start = arg
+                    saw_start = true
+                } else {
+                    io.eprint("jogc: unexpected argument '")
+                    io.eprint(arg)
+                    io.eprintln("'")
+                    return 2
+                }
             }
             i = i + 1
         }
@@ -164,7 +226,11 @@ fn dispatch(): i32 with (a: mem.Allocator) {
         if loaded != 0 {
             return loaded
         }
-        val (checked, code) = check.run(prog)
+        val (with_libs, lcode) = apply_cli_libdirs(prog, libdirs)
+        if lcode != 0 {
+            return lcode
+        }
+        val (checked, code) = check.run(with_libs)
         if code != 0 {
             return code
         }
@@ -176,12 +242,13 @@ fn dispatch(): i32 with (a: mem.Allocator) {
         var saw_steps = false
         var steps: u64 = 0
         var module_flags = list.empty<str>()
+        var libdirs = list.empty<str>()
         var i: i64 = 2
         for i < os.argc() {
             val arg = os.argv(i)
             if arg == "--comptime-steps" || (arg.len >= 17 && texts.slice(arg, 0, 17) == "--comptime-steps=") {
                 if saw_steps {
-                    io.eprintln("usage: jog emit-c [package] [--module name=dir ...]")
+                    io.eprintln("usage: jog emit-c [package] [--module name=dir ...] [--libdir dir | -L dir ...]")
                     return 2
                 }
                 var value = ""
@@ -227,14 +294,22 @@ fn dispatch(): i32 with (a: mem.Allocator) {
                     return 2
                 }
                 module_flags.push(value)
-            } else if !saw_start {
-                start = arg
-                saw_start = true
             } else {
-                io.eprint("jogc: unexpected argument '")
-                io.eprint(arg)
-                io.eprintln("'")
-                return 2
+                val (libdir, lflag) = take_libdir(arg, &i)
+                if lflag == 2 {
+                    return 2
+                }
+                if lflag == 0 {
+                    libdirs.push(libdir)
+                } else if !saw_start {
+                    start = arg
+                    saw_start = true
+                } else {
+                    io.eprint("jogc: unexpected argument '")
+                    io.eprint(arg)
+                    io.eprintln("'")
+                    return 2
+                }
             }
             i = i + 1
         }
@@ -242,7 +317,11 @@ fn dispatch(): i32 with (a: mem.Allocator) {
         if loaded != 0 {
             return loaded
         }
-        val (checked, code) = check.run(prog)
+        val (with_libs, lcode) = apply_cli_libdirs(prog, libdirs)
+        if lcode != 0 {
+            return lcode
+        }
+        val (checked, code) = check.run(with_libs)
         if code != 0 {
             return code
         }

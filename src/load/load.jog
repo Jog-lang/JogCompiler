@@ -774,6 +774,82 @@ private fn check_modules(root_man_path: str, root: Module, mods: *list.List<Modu
 }
 
 /**
+ * Keep only the last occurrence of each path (seed merge_libdirs).
+ */
+private fn dedupe_last(paths: list.List<str>): list.List<str> with (a: mem.Allocator) {
+    var merged = list.empty<str>()
+    var i: usize = 0
+    for i < paths.len {
+        val dir = paths.get(i)
+        var later = false
+        var j = i + 1
+        for j < paths.len {
+            if dir == paths.get(j) {
+                later = true
+            }
+            j = j + 1
+        }
+        if !later {
+            merged.push(dir)
+        }
+        i = i + 1
+    }
+    return merged
+}
+
+/**
+ * Root libdir lines, then each --module in order. Duplicate paths keep
+ * only their last position. CLI --libdir / -L are appended later.
+ */
+private fn merge_manifest_libdirs(root: Module, mods: list.List<Module>): list.List<str> with (a: mem.Allocator) {
+    var all = list.empty<str>()
+    for d in root.manifest.libdirs.items() {
+        all.push(d)
+    }
+    var i: usize = 0
+    for i < mods.len {
+        val m = mods.get(i)
+        if !m.bad {
+            for d in m.manifest.libdirs.items() {
+                all.push(d)
+            }
+        }
+        i = i + 1
+    }
+    return dedupe_last(all)
+}
+
+/**
+ * Append CLI --libdir / -L values (absolute when possible). Empty paths
+ * fail. Duplicate paths keep only their last position.
+ * @param existing paths already merged from jog.mod
+ * @param cli flag values in command-line order
+ * @return merged list, or empty and false on error
+ */
+fn append_cli_libdirs(existing: list.List<str>, cli: []str): (list.List<str>, bool) with (a: mem.Allocator) {
+    var all = list.empty<str>()
+    for d in existing.items() {
+        all.push(d)
+    }
+    var i: usize = 0
+    for i < cli.len {
+        val dir = cli[i]
+        if dir.len == 0 {
+            print_path_error(".", "empty --libdir path")
+            return list.empty<str>(), false
+        }
+        val (abs, ok) = make_abs(dir)
+        if ok {
+            all.push(abs)
+        } else {
+            all.push(fs.copy_str(dir))
+        }
+        i = i + 1
+    }
+    return dedupe_last(all), true
+}
+
+/**
  * Locate std/core, open the root module, apply --module mappings, and
  * check requires. module_flags are `name=dir` strings from the command
  * line. A loader error returns (empty, 1). A clean load returns the
@@ -862,6 +938,7 @@ fn run(start: str, module_flags: []str, include_tests: bool): (Program, i32) wit
             prog.runtime_root = fs.copy_str(roots.runtime_root)
             prog.is_library = root_mod.is_library
             prog.links = root_mod.manifest.links
+            prog.libdirs = merge_manifest_libdirs(root_mod, mods)
         }
     }
     fs.free_str(extra_dir)
