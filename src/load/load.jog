@@ -484,17 +484,12 @@ private fn mark_required(mods: *list.List<Module>, name: str) {
 }
 
 /**
- * Every require must not be shadowed by a same-named folder; mapped
- * dependencies are marked required.
- * @param man_path jog.mod path for diagnostics
- * @param mod the module whose requires are checked
- * @param mods --module modules
- * @context a allocator for joined paths
- * @return false when a shadow was reported
+ * One require / require.test list: no same-named folder shadow; mark
+ * mapped --module names required.
  */
-private fn check_requires(man_path: str, mod: Module, mods: *list.List<Module>): bool with (a: mem.Allocator) {
+private fn check_require_lines(man_path: str, mod: Module, lines: list.List<ModLine>, mods: *list.List<Module>): bool with (a: mem.Allocator) {
     var ok = true
-    for line in mod.manifest.requires.items() {
+    for line in lines.items() {
         mark_required(mods, line.text)
         val folder = fs.join(mod.root, line.text)
         if is_dir(folder) {
@@ -509,6 +504,23 @@ private fn check_requires(man_path: str, mod: Module, mods: *list.List<Module>):
             ok = false
         }
         fs.free_str(folder)
+    }
+    return ok
+}
+
+/**
+ * Every require / require.test must not be shadowed by a same-named
+ * folder; mapped dependencies are marked required.
+ * @param man_path jog.mod path for diagnostics
+ * @param mod the module whose requires are checked
+ * @param mods --module modules
+ * @context a allocator for joined paths
+ * @return false when a shadow was reported
+ */
+private fn check_requires(man_path: str, mod: Module, mods: *list.List<Module>): bool with (a: mem.Allocator) {
+    var ok = check_require_lines(man_path, mod, mod.manifest.requires, mods)
+    if !check_require_lines(man_path, mod, mod.manifest.test_requires, mods) {
+        ok = false
     }
     return ok
 }

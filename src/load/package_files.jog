@@ -470,6 +470,11 @@ private fn has_require(mod: Module, name: str): bool {
             return true
         }
     }
+    for line in mod.manifest.test_requires.items() {
+        if line.text == name {
+            return true
+        }
+    }
     return false
 }
 

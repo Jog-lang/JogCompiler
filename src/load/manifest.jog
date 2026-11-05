@@ -33,6 +33,8 @@ struct Manifest {
     name_line: i64
     name_column: i64
     requires: list.List<ModLine>
+    // require.test — jog-build test-only deps; needed so --module checks pass.
+    test_requires: list.List<ModLine>
     exports: list.List<ModLine>
     links: list.List<str>
     // Resolved against the module folder when relative (like seed ct_path_join).
@@ -65,6 +67,7 @@ fn empty_manifest(): Manifest with (a: mem.Allocator) {
     m.name_line = 0
     m.name_column = 0
     m.requires = list.empty<ModLine>()
+    m.test_requires = list.empty<ModLine>()
     m.exports = list.empty<ModLine>()
     m.links = list.empty<str>()
     m.libdirs = list.empty<str>()
@@ -761,7 +764,8 @@ fn parse_manifest(path: str, data: str): (Manifest, bool) with (a: mem.Allocator
                 }
             }
             saw_jog = true
-        } else if tok_is(first, "require") {
+        } else if tok_is(first, "require") || tok_is(first, "require.test") {
+            val test_only = tok_is(first, "require.test")
             var name_col = first.column
             if n > 1 {
                 name_col = toks[1].column
@@ -786,7 +790,10 @@ fn parse_manifest(path: str, data: str): (Manifest, bool) with (a: mem.Allocator
             } else if mod.name.len > 0 && tok_is(toks[1], mod.name) {
                 emit_fmt(path, line_no, name_col, "jog.mod: module '", mod.name, "' cannot require itself")
                 ok = false
-            } else if find_line(mod.requires, toks[1].text) {
+            } else if !test_only && find_line(mod.requires, toks[1].text) {
+                emit_fmt(path, line_no, name_col, "jog.mod: module '", toks[1].text, "' is required twice")
+                ok = false
+            } else if test_only && find_line(mod.test_requires, toks[1].text) {
                 emit_fmt(path, line_no, name_col, "jog.mod: module '", toks[1].text, "' is required twice")
                 ok = false
             } else if !is_path_spec(toks[2]) && !semver_valid(toks[2].text) {
@@ -798,7 +805,11 @@ fn parse_manifest(path: str, data: str): (Manifest, bool) with (a: mem.Allocator
                 line.text = copy_tok(toks[1])
                 line.line = line_no
                 line.column = name_col
-                mod.requires.push(line)
+                if test_only {
+                    mod.test_requires.push(line)
+                } else {
+                    mod.requires.push(line)
+                }
             }
         } else if tok_is(first, "export") {
             var path_col = first.column
