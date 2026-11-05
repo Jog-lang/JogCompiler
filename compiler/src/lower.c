@@ -1909,6 +1909,11 @@ static bool slice_to_const_view(const JogType *got, const JogType *want) {
            got->as.elem.elem && got->as.elem.elem == want->as.elem.elem;
 }
 
+static bool ptr_to_const_view(const JogType *got, const JogType *want) {
+    return got && want && got->kind == JOG_TY_PTR && want->kind == JOG_TY_PTR && !got->is_const && want->is_const &&
+           got->as.elem.elem && got->as.elem.elem == want->as.elem.elem;
+}
+
 static bool u8_slice_to_str_view(const JogType *got, const JogType *want) {
     const JogType *elem;
     if (!got || !want || got->kind != JOG_TY_SLICE || want->kind != JOG_TY_BYTES || !want->is_const) {
@@ -2619,7 +2624,7 @@ static JirOperand lower_expr_raw(Lower *L, JogNode *node) {
                 return value_none();
             }
             if (bytes_to_const_view(lhs.type, dest_ty) || slice_to_const_view(lhs.type, dest_ty) ||
-                u8_slice_to_str_view(lhs.type, dest_ty) ||
+                ptr_to_const_view(lhs.type, dest_ty) || u8_slice_to_str_view(lhs.type, dest_ty) ||
                 jog_type_converts_to_str(L->program->types, lhs.type, dest_ty) ||
                 bytes_n_reinterpret(lhs.type, dest_ty)) {
                 return bitcast_value(L, lhs, dest_ty, node->pos);
@@ -2713,8 +2718,8 @@ static JirOperand lower_expr(Lower *L, JogNode *node) {
     if (L->failed || !want) {
         return op;
     }
-    if (bytes_to_const_view(op.type, want) || slice_to_const_view(op.type, want) || u8_slice_to_str_view(op.type, want) ||
-        jog_type_converts_to_str(L->program->types, op.type, want)) {
+    if (bytes_to_const_view(op.type, want) || slice_to_const_view(op.type, want) || ptr_to_const_view(op.type, want) ||
+        u8_slice_to_str_view(op.type, want) || jog_type_converts_to_str(L->program->types, op.type, want)) {
         return bitcast_value(L, op, want, node->pos);
     }
     if (want->kind == JOG_TY_OPTION && op.type && want->as.elem.elem == op.type) {

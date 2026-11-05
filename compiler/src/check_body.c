@@ -173,6 +173,13 @@ static bool slice_to_const(const JogType *got, const JogType *want) {
            got->as.elem.elem && got->as.elem.elem == want->as.elem.elem;
 }
 
+/* *T converts to *const T when the element type matches. The reverse is
+   not implicit. Same idea as []T → []const T. */
+static bool ptr_to_const(const JogType *got, const JogType *want) {
+    return got && want && got->kind == JOG_TY_PTR && want->kind == JOG_TY_PTR && !got->is_const && want->is_const &&
+           got->as.elem.elem && got->as.elem.elem == want->as.elem.elem;
+}
+
 /* [N]byte as T, and T as [N]byte, when N is size(T). Unchecked reinterpret. */
 static bool bytes_n_reinterpret(const JogType *got, const JogType *want) {
     if (!got || !want || !got->has_layout || !want->has_layout || got->size == 0 || got->size != want->size) {
@@ -1289,8 +1296,8 @@ static JogType *expect_type(Env *env, JogNode *node, JogType *got, JogType *want
             return replaced;
         }
     }
-    if (bytes_to_const(got, want) || slice_to_const(got, want) || u8_slice_to_str(got, want) ||
-        jog_type_converts_to_str(env->ck->program->types, got, want)) {
+    if (bytes_to_const(got, want) || slice_to_const(got, want) || ptr_to_const(got, want) ||
+        u8_slice_to_str(got, want) || jog_type_converts_to_str(env->ck->program->types, got, want)) {
         node->type = want;
         return want;
     }
@@ -2101,8 +2108,9 @@ static JogType *check_cast(Env *env, JogNode *node) {
         node->type = dest;
         return dest;
     }
-    if (bytes_to_const(got, dest) || slice_to_const(got, dest) || u8_slice_to_str(got, dest) ||
-        jog_type_converts_to_str(env->ck->program->types, got, dest) || bytes_n_reinterpret(got, dest)) {
+    if (bytes_to_const(got, dest) || slice_to_const(got, dest) || ptr_to_const(got, dest) ||
+        u8_slice_to_str(got, dest) || jog_type_converts_to_str(env->ck->program->types, got, dest) ||
+        bytes_n_reinterpret(got, dest)) {
         node->type = dest;
         return dest;
     }
