@@ -205,6 +205,11 @@ private fn slice_to_const(got: *Type, want: *Type): bool {
         got.elem != null && want.elem != null && got.elem!! == want.elem!!
 }
 
+private fn ptr_to_const(got: *Type, want: *Type): bool {
+    return got.kind == TypeKind.PTR && want.kind == TypeKind.PTR && !got.is_const && want.is_const &&
+        got.elem != null && want.elem != null && got.elem!! == want.elem!!
+}
+
 private fn u8_slice_to_str(got: *Type, want: *Type): bool {
     if got.kind != TypeKind.SLICE || !is_str_type(want) {
         return false
@@ -270,8 +275,8 @@ fn expect_type(env: *Env, node: *parse.Node, got: *Type?, want: *Type?): *Type? 
     if iface_rc > 0 {
         return iface_out
     }
-    if bytes_to_const(got!!, want!!) || slice_to_const(got!!, want!!) || u8_slice_to_str(got!!, want!!) ||
-        converts_to_str(got!!, want!!) {
+    if bytes_to_const(got!!, want!!) || slice_to_const(got!!, want!!) || ptr_to_const(got!!, want!!) ||
+        u8_slice_to_str(got!!, want!!) || converts_to_str(got!!, want!!) {
         // C jog_check_expect sets node->type so lower can BITCAST the view.
         set_node_ty(node, want)
         return want
@@ -2282,9 +2287,9 @@ private fn check_cast(env: *Env, node: *parse.Node): *Type? with (a: mem.Allocat
     if iface > 0 {
         return iface_ty
     }
-    // bytes / []u8 / []byte → str (and const variants), matching C check_cast.
-    if bytes_to_const(got!!, dest!!) || slice_to_const(got!!, dest!!) || u8_slice_to_str(got!!, dest!!) ||
-        converts_to_str(got!!, dest!!) {
+    // bytes / []u8 / []byte → str (and const variants), *T → *const T, matching C check_cast.
+    if bytes_to_const(got!!, dest!!) || slice_to_const(got!!, dest!!) || ptr_to_const(got!!, dest!!) ||
+        u8_slice_to_str(got!!, dest!!) || converts_to_str(got!!, dest!!) {
         return dest
     }
     // [N]byte ↔ T when sizes match (C bytes_n_reinterpret).

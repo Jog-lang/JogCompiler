@@ -1431,6 +1431,10 @@ private fn want_view_bitcast(got: *check.Type?, want: *check.Type?): bool {
         g.elem!! == w.elem!! {
         return true
     }
+    if g.kind == tk.PTR && w.kind == tk.PTR && !g.is_const && w.is_const && g.elem != null && w.elem != null &&
+        g.elem!! == w.elem!! {
+        return true
+    }
     if g.kind == tk.SLICE && is_str_ty(w) && is_u8_elem(g.elem) {
         return true
     }
