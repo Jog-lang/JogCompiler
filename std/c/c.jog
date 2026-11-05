@@ -8,6 +8,11 @@
 // c.windows.jog uses the 32-bit LLP64 sizes, and c.posix.jog uses the
 // 64-bit LP64 sizes. The loader picks one of those files by its suffix.
 // *void is the language spelling of an untyped pointer.
+//
+// fromCStr views a C string as a Jog str until the C buffer is freed or
+// overwritten. copyCStr copies into the root error arena (same storage as
+// ErrorAllocator) so GetError-style text can outlive the next overwrite.
+// Dynamic Jog strings go through text.cstr; literals use c"...".
 
 type char = i8
 type short = i16
@@ -62,4 +67,41 @@ extern {
     fn jogrt_argv(i: int, len: *size_t): *const char?
     // Same bytes as jogrt_argv, without the length out-parameter.
     fn jogrt_arg_ptr(i: int): *const char?
+}
+
+/**
+ * View a NUL-terminated C string as a Jog str without copying.
+ * Valid only while the C buffer lives (and is not overwritten).
+ */
+fn fromCStr(p: *const char): str {
+    val n = strlen(p) as usize
+    var view = bytes()
+    if n == 0 {
+        return view
+    }
+    view.ptr = p as *u8
+    view.len = n
+    return view
+}
+
+/**
+ * Copy a C string into the root error arena so the text outlives the next
+ * GetError-style overwrite. Empty input returns "" without allocating.
+ * Does not import std.mem (cycle with this package); uses jogrt_error_alloc.
+ */
+fn copyCStr(p: *const char): str {
+    val n = strlen(p) as usize
+    if n == 0 {
+        return ""
+    }
+    val raw_ptr = jogrt_error_alloc(n, 1)
+    if raw_ptr == null {
+        panic("out of memory")
+    }
+    val dest = raw_ptr!!
+    memcpy(dest, p as *const void, n)
+    var out = bytes()
+    out.ptr = dest as *u8
+    out.len = n
+    return out
 }

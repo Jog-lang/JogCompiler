@@ -1,5 +1,6 @@
 // Package std.text. slice, starts_with, ends_with, and index_of are views:
 // they allocate nothing. clone copies into the Allocator context.
+// cstr copies a NUL-terminated buffer for C FFI; free_cstr releases it.
 // is_digit and is_hex_digit classify one ASCII byte and allocate nothing.
 // A range that does not fit the string panics. An empty needle is a match
 // at the start. index_of returns the byte offset and false when the needle
@@ -198,6 +199,46 @@ fn str.clone(): str with (a: mem.Allocator) {
 
 fn clone(s: str): str with (a: mem.Allocator) {
     return s.clone()
+}
+
+/**
+ * NUL-terminated copy for C FFI, from the Allocator context.
+ * Use c"..." for true literals; use cstr for a dynamic Jog str.
+ * Panics if self contains an embedded NUL. The caller frees the
+ * len + 1 block with free_cstr (same allocator).
+ * @return pointer valid until free_cstr
+ */
+fn str.cstr(): *const c.char with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < self.len {
+        if self.ptr[i] == 0 {
+            panic("cstr: embedded NUL")
+        }
+        i = i + 1
+    }
+    val (raw, err) = a.alloc(self.len + 1, align(u8))
+    if err != null {
+        panic("out of memory")
+    }
+    if self.len > 0 {
+        c.memcpy(raw.ptr as *void, self.ptr as *const void, self.len)
+    }
+    raw.ptr[self.len] = 0
+    return raw.ptr as *const c.char
+}
+
+fn cstr(s: str): *const c.char with (a: mem.Allocator) {
+    return s.cstr()
+}
+
+/**
+ * Frees a buffer returned by cstr. len is the original str.len (not counting NUL).
+ */
+fn free_cstr(p: *const c.char, len: usize) with (a: mem.Allocator) {
+    var b = bytes()
+    b.ptr = p as *u8
+    b.len = len + 1
+    a.free(b)
 }
 
 /**
