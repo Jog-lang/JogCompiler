@@ -3,6 +3,7 @@
 // is_digit and is_hex_digit classify one ASCII byte. contains, starts_with,
 // ends_with, and trim* are text extensions (core prelude rejects them).
 
+import std.c
 import std.mem
 import std.testing
 
@@ -53,6 +54,25 @@ fn viewsAndCopy() with (t: testing.Testing) {
         val owned = "hello".clone()
         t.expectEq(owned, "hello")
         drop(owned)
+    }
+}
+
+@test
+fn cstrRoundTrip() with (t: testing.Testing) {
+    with (mem.heap()) {
+        val p = "hi".cstr()
+        t.expect(c.strlen(p) == 2)
+        t.expectEq(c.fromCStr(p), "hi")
+        free_cstr(p, 2)
+
+        val empty = "".cstr()
+        t.expect(c.strlen(empty) == 0)
+        free_cstr(empty, 0)
+
+        val owned = c.copyCStr(c"err")
+        t.expectEq(owned, "err")
+        t.expect(c.fromCStr(c"").len == 0)
+        t.expect(c.copyCStr(c"").len == 0)
     }
 }
 
