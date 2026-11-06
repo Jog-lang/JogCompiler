@@ -188,6 +188,182 @@ static bool bytes_n_reinterpret(const JogType *got, const JogType *want) {
     return got->kind == JOG_TY_BYTES_N || want->kind == JOG_TY_BYTES_N;
 }
 
+/* Hold-open published unfinished struct: one sentinel field with null name/type. */
+static bool is_hold_open_struct(const JogType *type) {
+    return type && type->kind == JOG_TY_STRUCT && type->as.nominal.field_count == 1 && type->as.nominal.fields &&
+           type->as.nominal.fields[0].type == NULL && type->as.nominal.fields[0].name == NULL;
+}
+
+/* Universe void: empty incomplete struct named void with no layout. */
+static bool is_void_struct(const JogType *type) {
+    const char *name;
+    if (!type || type->kind != JOG_TY_STRUCT || type->has_layout) {
+        return false;
+    }
+    if (type->as.nominal.field_count != 0 || type->as.nominal.package != NULL || type->as.nominal.decl != NULL) {
+        return false;
+    }
+    name = type->as.nominal.name;
+    return name != NULL && strcmp(name, "void") == 0;
+}
+
+static bool refuse_struct_layout(const JogType *type) {
+    return !type || type->kind != JOG_TY_STRUCT || is_hold_open_struct(type) || is_void_struct(type);
+}
+
+static bool ensure_type_layout(JogTypes *types, JogType *type) {
+    if (!type) {
+        return false;
+    }
+    if (type->kind == JOG_TY_STRUCT && refuse_struct_layout(type)) {
+        return false;
+    }
+    if (type->has_layout) {
+        return true;
+    }
+    return jog_type_layout(types, type);
+}
+
+/* Recursive C-layout equality for plain structs (and nested field types). */
+static bool layouts_equal(JogTypes *types, JogType *a, JogType *b, int depth) {
+    size_t i;
+    if (!a || !b || depth > 64) {
+        return false;
+    }
+    a = jog_type_underlying(a);
+    b = jog_type_underlying(b);
+    if (!a || !b) {
+        return false;
+    }
+    if (a == b) {
+        return true;
+    }
+    if (!ensure_type_layout(types, a) || !ensure_type_layout(types, b)) {
+        return false;
+    }
+    if (a->size == 0 || a->size != b->size || a->align != b->align || a->kind != b->kind) {
+        return false;
+    }
+    switch (a->kind) {
+    case JOG_TY_BOOL:
+        return true;
+    case JOG_TY_INT:
+        return a->as.integer.bits == b->as.integer.bits && a->as.integer.is_signed == b->as.integer.is_signed &&
+               a->as.integer.is_size == b->as.integer.is_size;
+    case JOG_TY_FLOAT:
+        return a->as.flt.bits == b->as.flt.bits;
+    case JOG_TY_BYTES_N:
+        return a->as.bytes_n.n == b->as.bytes_n.n;
+    case JOG_TY_PTR:
+        return layouts_equal(types, a->as.elem.elem, b->as.elem.elem, depth + 1);
+    case JOG_TY_BYTES:
+        return true;
+    case JOG_TY_SLICE:
+        return layouts_equal(types, a->as.elem.elem, b->as.elem.elem, depth + 1);
+    case JOG_TY_ARRAY:
+        return a->as.array.len == b->as.array.len &&
+               layouts_equal(types, a->as.array.elem, b->as.array.elem, depth + 1);
+    case JOG_TY_TUPLE:
+        if (a->as.tuple.count != b->as.tuple.count || !a->as.tuple.elems || !b->as.tuple.elems ||
+            !a->as.tuple.offsets || !b->as.tuple.offsets) {
+            return false;
+        }
+        for (i = 0; i < a->as.tuple.count; i++) {
+            if (a->as.tuple.offsets[i] != b->as.tuple.offsets[i] ||
+                !layouts_equal(types, a->as.tuple.elems[i], b->as.tuple.elems[i], depth + 1)) {
+                return false;
+            }
+        }
+        return true;
+    case JOG_TY_STRUCT:
+        if (refuse_struct_layout(a) || refuse_struct_layout(b) || a->as.nominal.field_count != b->as.nominal.field_count ||
+            !a->as.nominal.fields || !b->as.nominal.fields) {
+            return false;
+        }
+        for (i = 0; i < a->as.nominal.field_count; i++) {
+            if (a->as.nominal.fields[i].offset != b->as.nominal.fields[i].offset ||
+                !layouts_equal(types, a->as.nominal.fields[i].type, b->as.nominal.fields[i].type, depth + 1)) {
+                return false;
+            }
+        }
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* S as T / *S as *T when both are plain C-layout structs with equal layouts. */
+static bool struct_layout_bitcast(JogTypes *types, const JogType *got, const JogType *want) {
+    JogType *g;
+    JogType *w;
+    if (!got || !want || !types) {
+        return false;
+    }
+    g = jog_type_underlying((JogType *)got);
+    w = jog_type_underlying((JogType *)want);
+    if (!g || !w) {
+        return false;
+    }
+    if (g->kind == JOG_TY_PTR && w->kind == JOG_TY_PTR) {
+        if (g->is_const && !w->is_const) {
+            return false;
+        }
+        g = jog_type_underlying(g->as.elem.elem);
+        w = jog_type_underlying(w->as.elem.elem);
+        if (!g || !w || g->kind != JOG_TY_STRUCT || w->kind != JOG_TY_STRUCT) {
+            return false;
+        }
+        return layouts_equal(types, g, w, 0);
+    }
+    if (g->kind != JOG_TY_STRUCT || w->kind != JOG_TY_STRUCT) {
+        return false;
+    }
+    return layouts_equal(types, g, w, 0);
+}
+
+/* *Outer → *Embedded when every embed along the unique path is at offset 0. */
+static bool embed_ptr_coerce(JogTypes *types, const JogType *got, const JogType *want) {
+    JogType *outer;
+    JogType *inner;
+    JogType *cur;
+    uint32_t path[JOG_STRUCT_PATH];
+    uint8_t len = 0;
+    uint8_t i;
+    if (!got || !want || !types || got->kind != JOG_TY_PTR || want->kind != JOG_TY_PTR) {
+        return false;
+    }
+    if (got->is_const && !want->is_const) {
+        return false;
+    }
+    outer = jog_type_underlying(got->as.elem.elem);
+    inner = jog_type_underlying(want->as.elem.elem);
+    if (!outer || !inner || outer->kind != JOG_TY_STRUCT || inner->kind != JOG_TY_STRUCT) {
+        return false;
+    }
+    if (!ensure_type_layout(types, outer) || !ensure_type_layout(types, inner)) {
+        return false;
+    }
+    if (!jog_struct_embed_path(outer, inner, path, &len) || len == 0) {
+        return false;
+    }
+    cur = outer;
+    for (i = 0; i < len; i++) {
+        JogField *field;
+        if (!ensure_type_layout(types, cur) || !cur->as.nominal.fields || path[i] >= cur->as.nominal.field_count) {
+            return false;
+        }
+        field = &cur->as.nominal.fields[path[i]];
+        if (!field->embedded || field->offset != 0 || !field->type) {
+            return false;
+        }
+        cur = jog_type_underlying(field->type);
+        if (!cur || cur->kind != JOG_TY_STRUCT) {
+            return false;
+        }
+    }
+    return cur == inner;
+}
+
 static bool is_arith_op(JogTokenKind op) {
     switch (op) {
     case JOG_TOK_PLUS:
@@ -1301,6 +1477,10 @@ static JogType *expect_type(Env *env, JogNode *node, JogType *got, JogType *want
         node->type = want;
         return want;
     }
+    if (embed_ptr_coerce(env->ck->program->types, got, want)) {
+        node->type = want;
+        return want;
+    }
     if (want->kind == JOG_TY_OPTION && want->as.elem.elem && same_type(got, want->as.elem.elem)) {
         node->type = want;
         return want;
@@ -2110,7 +2290,7 @@ static JogType *check_cast(Env *env, JogNode *node) {
     }
     if (bytes_to_const(got, dest) || slice_to_const(got, dest) || ptr_to_const(got, dest) ||
         u8_slice_to_str(got, dest) || jog_type_converts_to_str(env->ck->program->types, got, dest) ||
-        bytes_n_reinterpret(got, dest)) {
+        bytes_n_reinterpret(got, dest) || struct_layout_bitcast(env->ck->program->types, got, dest)) {
         node->type = dest;
         return dest;
     }
