@@ -28,6 +28,7 @@ struct Drive {
     steps: u64
     saw_steps: bool
     modules: list.List<str>
+    libdirs: list.List<str>
     run_args: list.List<str>
     include_tests: bool
 }
@@ -59,11 +60,11 @@ fn parse_steps(text: str): (u64, bool) {
 
 private fn usage_of(command: str): i32 {
     if command == "build" {
-        io.eprintln("usage: jog build [package] [-o file] [--release | --release-fast] [--keep-c] [--target wasm32] [--comptime-steps N] [--module name=dir ...]")
+        io.eprintln("usage: jog build [package] [-o file] [--release | --release-fast] [--keep-c] [--target wasm32] [--comptime-steps N] [--module name=dir ...] [--libdir dir | -L dir ...]")
     } else if command == "run" {
-        io.eprintln("usage: jog run [package] [--target wasm32] [--comptime-steps N] [--module name=dir ...] [-- args...]")
+        io.eprintln("usage: jog run [package] [--target wasm32] [--comptime-steps N] [--module name=dir ...] [--libdir dir | -L dir ...] [-- args...]")
     } else {
-        io.eprintln("usage: jog test [package | --all] [--module name=dir ...]")
+        io.eprintln("usage: jog test [package | --all] [--module name=dir ...] [--libdir dir | -L dir ...]")
     }
     return 2
 }
@@ -89,6 +90,33 @@ private fn take_module(arg: str, i: *i64): (str, i32) {
         buf.append(value)
         buf.append("'")
         io.eprintln(buf.str())
+        return "", 2
+    }
+    return value, 0
+}
+
+/**
+ * --libdir <dir>, --libdir=<dir>, -L <dir>, or -L<dir>.
+ * Returns ("", 1) when not a libdir flag, (value, 0) when consumed, ("", 2) on bad usage.
+ */
+private fn take_libdir(arg: str, i: *i64): (str, i32) {
+    var value = ""
+    if arg == "--libdir" || arg == "-L" {
+        if i[0] + 1 >= os.argc() {
+            io.eprintln("jog: --libdir expects a directory")
+            return "", 2
+        }
+        i[0] = i[0] + 1
+        value = os.argv(i[0])
+    } else if arg.len >= 9 && texts.slice(arg, 0, 9) == "--libdir=" {
+        value = texts.slice(arg, 9, arg.len)
+    } else if arg.len > 2 && arg.ptr[0] == '-' as u8 && arg.ptr[1] == 'L' as u8 {
+        value = texts.slice(arg, 2, arg.len)
+    } else {
+        return "", 1
+    }
+    if value.len == 0 {
+        io.eprintln("jog: --libdir expects a directory")
         return "", 2
     }
     return value, 0
@@ -132,6 +160,7 @@ private fn empty_drive(): Drive with (a: mem.Allocator) {
     d.steps = 0
     d.saw_steps = false
     d.modules = list.empty<str>()
+    d.libdirs = list.empty<str>()
     d.run_args = list.empty<str>()
     d.include_tests = false
     return d
@@ -150,6 +179,15 @@ private fn parse_test(): (Drive, i32) with (a: mem.Allocator) {
         }
         if flag == 0 {
             d.modules.push(mod)
+            i = i + 1
+            continue
+        }
+        val (libdir, lflag) = take_libdir(arg, &i)
+        if lflag == 2 {
+            return d, 2
+        }
+        if lflag == 0 {
+            d.libdirs.push(libdir)
             i = i + 1
             continue
         }
@@ -182,6 +220,15 @@ private fn parse_build(command: str): (Drive, i32) with (a: mem.Allocator) {
         }
         if flag == 0 {
             d.modules.push(mod)
+            i = i + 1
+            continue
+        }
+        val (libdir, lflag) = take_libdir(arg, &i)
+        if lflag == 2 {
+            return d, 2
+        }
+        if lflag == 0 {
+            d.libdirs.push(libdir)
             i = i + 1
             continue
         }
@@ -581,15 +628,23 @@ fn drive(command: str): i32 with (a: mem.Allocator) {
     if loaded != 0 {
         return loaded
     }
-    if prog.is_library && (command == "build" || (command == "run" && !parsed.include_tests)) {
+    var loaded_prog = prog
+    if parsed.libdirs.len > 0 {
+        val (merged, mok) = load.append_cli_libdirs(prog.libdirs, parsed.libdirs.items())
+        if !mok {
+            return 1
+        }
+        loaded_prog.libdirs = merged
+    }
+    if loaded_prog.is_library && (command == "build" || (command == "run" && !parsed.include_tests)) {
         var buf = strbuilder.empty()
         buf.append("module '")
-        buf.append(prog.root_module)
+        buf.append(loaded_prog.root_module)
         buf.append("' is a library; use jog check or jog test")
         io.eprintln(buf.str())
         return 1
     }
-    val (checked, ccode) = check.run(prog)
+    val (checked, ccode) = check.run(loaded_prog)
     if ccode != 0 {
         return ccode
     }
@@ -674,7 +729,7 @@ fn drive(command: str): i32 with (a: mem.Allocator) {
         io.eprintln(buf.str())
         return 1
     }
-    val linked = link_c(c_path, exe, checked.runtime_root, parsed.mode, checked.links)
+    val linked = link_c(c_path, exe, checked.runtime_root, parsed.mode, checked.links, checked.libdirs)
     if linked != 0 {
         return linked
     }
