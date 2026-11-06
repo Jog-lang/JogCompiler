@@ -65,8 +65,10 @@ typedef struct JogCcRequest {
     const char *exe_path;
     const char *runtime_root;
     JogBuildMode mode;
-    const char *const *extra_libs; /* from @link, e.g. "SDL3" */
+    const char *const *extra_libs; /* from jog.mod link, e.g. "SDL3" */
     size_t extra_lib_count;
+    const char *const *extra_lib_dirs; /* -L paths from libdir / --libdir */
+    size_t extra_lib_dir_count;
     bool verbose;                  /* print the command line */
 } JogCcRequest;
 
