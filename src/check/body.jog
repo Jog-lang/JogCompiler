@@ -241,6 +241,155 @@ private fn converts_to_str(got: *Type, want: *Type): bool {
     return is_u8_ty(elem)
 }
 
+private fn is_hold_open_struct(ty: *Type): bool {
+    return ty.kind == TypeKind.STRUCT && ty.field_names.len == 1 && ty.field_names.get(0).len == 0 &&
+        ty.field_types.len == 0
+}
+
+private fn is_void_struct(ty: *Type): bool {
+    return ty.kind == TypeKind.STRUCT && !ty.has_layout && ty.field_names.len == 0 && ty.name == "void" &&
+        ty.package.len == 0 && ty.decl == null
+}
+
+private fn refuse_struct_layout(ty: *Type): bool {
+    return ty.kind != TypeKind.STRUCT || is_hold_open_struct(ty) || is_void_struct(ty)
+}
+
+private fn ensure_type_layout(table: *TypeTable, ty: *Type): bool with (a: mem.Allocator) {
+    if ty.kind == TypeKind.STRUCT && (is_hold_open_struct(ty) || is_void_struct(ty)) {
+        return false
+    }
+    if ty.has_layout {
+        return true
+    }
+    return type_layout(table, ty)
+}
+
+private fn layouts_equal(table: *TypeTable, a0: *Type, b0: *Type, depth: i64): bool with (a: mem.Allocator) {
+    if depth > 64 {
+        return false
+    }
+    var a_ty = type_peel_distinct(a0)
+    var b_ty = type_peel_distinct(b0)
+    if a_ty == b_ty {
+        return true
+    }
+    if !ensure_type_layout(table, a_ty) || !ensure_type_layout(table, b_ty) {
+        return false
+    }
+    if a_ty.size == 0 || a_ty.size != b_ty.size || a_ty.align != b_ty.align || a_ty.kind != b_ty.kind {
+        return false
+    }
+    if a_ty.kind == TypeKind.BOOL {
+        return true
+    }
+    if a_ty.kind == TypeKind.INT {
+        return a_ty.int_bits == b_ty.int_bits && a_ty.int_signed == b_ty.int_signed &&
+            a_ty.int_is_size == b_ty.int_is_size
+    }
+    if a_ty.kind == TypeKind.FLOAT {
+        return a_ty.float_bits == b_ty.float_bits
+    }
+    if a_ty.kind == TypeKind.BYTES_N {
+        return a_ty.len == b_ty.len
+    }
+    if a_ty.kind == TypeKind.PTR {
+        if a_ty.elem == null || b_ty.elem == null {
+            return false
+        }
+        return layouts_equal(table, a_ty.elem!!, b_ty.elem!!, depth + 1)
+    }
+    if a_ty.kind == TypeKind.BYTES {
+        return true
+    }
+    if a_ty.kind == TypeKind.SLICE {
+        if a_ty.elem == null || b_ty.elem == null {
+            return false
+        }
+        return layouts_equal(table, a_ty.elem!!, b_ty.elem!!, depth + 1)
+    }
+    if a_ty.kind == TypeKind.ARRAY {
+        if a_ty.len != b_ty.len || a_ty.elem == null || b_ty.elem == null {
+            return false
+        }
+        return layouts_equal(table, a_ty.elem!!, b_ty.elem!!, depth + 1)
+    }
+    if a_ty.kind == TypeKind.TUPLE {
+        if a_ty.elems.len != b_ty.elems.len {
+            return false
+        }
+        var i: usize = 0
+        for i < a_ty.elems.len {
+            if !layouts_equal(table, a_ty.elems.get(i), b_ty.elems.get(i), depth + 1) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    if a_ty.kind == TypeKind.STRUCT {
+        if refuse_struct_layout(a_ty) || refuse_struct_layout(b_ty) ||
+            type_field_count(a_ty) != type_field_count(b_ty) {
+            return false
+        }
+        var i: usize = 0
+        for i < type_field_count(a_ty) {
+            val fa = type_field_at(a_ty, i)
+            val fb = type_field_at(b_ty, i)
+            if fa.offset != fb.offset || fa.field_type == null || fb.field_type == null {
+                return false
+            }
+            if !layouts_equal(table, fa.field_type!!, fb.field_type!!, depth + 1) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    return false
+}
+
+private fn struct_layout_bitcast(table: *TypeTable, got: *Type, want: *Type): bool with (a: mem.Allocator) {
+    var g = type_peel_distinct(got)
+    var w = type_peel_distinct(want)
+    if g.kind == TypeKind.PTR && w.kind == TypeKind.PTR {
+        if g.is_const && !w.is_const {
+            return false
+        }
+        if g.elem == null || w.elem == null {
+            return false
+        }
+        g = type_peel_distinct(g.elem!!)
+        w = type_peel_distinct(w.elem!!)
+        if g.kind != TypeKind.STRUCT || w.kind != TypeKind.STRUCT {
+            return false
+        }
+        return layouts_equal(table, g, w, 0)
+    }
+    if g.kind != TypeKind.STRUCT || w.kind != TypeKind.STRUCT {
+        return false
+    }
+    return layouts_equal(table, g, w, 0)
+}
+
+private fn embed_ptr_coerce(got: *Type, want: *Type): bool with (a: mem.Allocator) {
+    if got.kind != TypeKind.PTR || want.kind != TypeKind.PTR {
+        return false
+    }
+    if got.is_const && !want.is_const {
+        return false
+    }
+    if got.elem == null || want.elem == null {
+        return false
+    }
+    val outer = type_peel_distinct(got.elem!!)
+    val inner = type_peel_distinct(want.elem!!)
+    if outer.kind != TypeKind.STRUCT || inner.kind != TypeKind.STRUCT {
+        return false
+    }
+    return struct_embed_at_offset_zero(outer, inner)
+}
+
 fn expect_type(env: *Env, node: *parse.Node, got: *Type?, want: *Type?): *Type? with (a: mem.Allocator) {
     if got == null || env.ck.stop {
         return got
@@ -278,6 +427,10 @@ fn expect_type(env: *Env, node: *parse.Node, got: *Type?, want: *Type?): *Type? 
     if bytes_to_const(got!!, want!!) || slice_to_const(got!!, want!!) || ptr_to_const(got!!, want!!) ||
         u8_slice_to_str(got!!, want!!) || converts_to_str(got!!, want!!) {
         // C jog_check_expect sets node->type so lower can BITCAST the view.
+        set_node_ty(node, want)
+        return want
+    }
+    if embed_ptr_coerce(got!!, want!!) {
         set_node_ty(node, want)
         return want
     }
@@ -2295,6 +2448,9 @@ private fn check_cast(env: *Env, node: *parse.Node): *Type? with (a: mem.Allocat
     // [N]byte ↔ T when sizes match (C bytes_n_reinterpret).
     if got!!.has_layout && dest!!.has_layout && got!!.size > 0 && got!!.size == dest!!.size &&
         (got!!.kind == TypeKind.BYTES_N || dest!!.kind == TypeKind.BYTES_N) {
+        return dest
+    }
+    if struct_layout_bitcast(&env.ck.types, got!!, dest!!) {
         return dest
     }
     var b = strbuilder.empty()

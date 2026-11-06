@@ -1,0 +1,53 @@
+struct FRect {
+    x: f32
+    y: f32
+    w: f32
+    h: f32
+}
+
+struct SDL_FRect {
+    x: f32
+    y: f32
+    w: f32
+    h: f32
+}
+
+struct Entity {
+    id: i32
+}
+
+struct Player {
+    Entity
+    hp: i32
+}
+
+fn take_box(r: SDL_FRect): f32 {
+    return r.x + r.w
+}
+
+fn take_ptr(p: *const SDL_FRect): f32 {
+    return p.x
+}
+
+fn take_entity(e: *Entity): i32 {
+    return e.id
+}
+
+fn take_const_entity(e: *const Entity): i32 {
+    return e.id
+}
+
+fn main() {
+    var rect = FRect(x: 1.0, y: 2.0, w: 3.0, h: 4.0)
+    val box = rect as SDL_FRect
+    val _a = take_box(rect as SDL_FRect)
+    val _b = take_ptr(&rect as *const SDL_FRect)
+    val _c = take_ptr(&box)
+
+    var pl = Player(Entity: Entity(id: 7), hp: 3)
+    val _d = take_entity(&pl)
+    val _e = take_const_entity(&pl)
+    val back = &pl.Entity as *Player
+    val _f = back.hp + _d + _e
+    val _g = box.y + _a + _b + _c
+}

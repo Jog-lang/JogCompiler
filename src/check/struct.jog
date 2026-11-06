@@ -887,6 +887,79 @@ fn struct_embed_match(outer: *Type, inner: *Type): (i64, i64) {
     return count, best
 }
 
+private fn embed_path_collect(
+    ty: *Type,
+    inner: *Type,
+    prefix: *list.List<usize>,
+    count: *i64,
+    best: *list.List<usize>,
+) {
+    if ty.kind != TypeKind.STRUCT || prefix.len > 16 {
+        return
+    }
+    if ty == inner || same_generic_receiver(inner as *Type?, ty as *Type?) {
+        if count[0] == 0 {
+            best.clear()
+            var i: usize = 0
+            for i < prefix.len {
+                best.push(prefix.get(i))
+                i = i + 1
+            }
+        }
+        count[0] = count[0] + 1
+        return
+    }
+    var i: usize = 0
+    for i < type_field_count(ty) {
+        val f = type_field_at(ty, i)
+        if f.embedded && f.field_type != null && f.field_type!!.kind == TypeKind.STRUCT {
+            prefix.push(i)
+            embed_path_collect(f.field_type!!, inner, prefix, count, best)
+            val _ = prefix.pop()
+        }
+        i = i + 1
+    }
+}
+
+/**
+ * True when *Outer → *Embedded is allowed: unique embed path, every field at offset 0.
+ */
+fn struct_embed_at_offset_zero(outer: *Type, inner: *Type): bool with (a: mem.Allocator) {
+    if outer.kind != TypeKind.STRUCT || inner.kind != TypeKind.STRUCT || outer == inner {
+        return false
+    }
+    var prefix = list.empty<usize>()
+    var best = list.empty<usize>()
+    var count: i64 = 0
+    embed_path_collect(outer, inner, &prefix, &count, &best)
+    if count != 1 || best.len == 0 {
+        prefix.free()
+        best.free()
+        return false
+    }
+    var cur = outer
+    var i: usize = 0
+    for i < best.len {
+        val f = type_field_at(cur, best.get(i))
+        if !f.embedded || f.offset != 0 || f.field_type == null {
+            prefix.free()
+            best.free()
+            return false
+        }
+        cur = type_peel_distinct(f.field_type!!)
+        if cur.kind != TypeKind.STRUCT {
+            prefix.free()
+            best.free()
+            return false
+        }
+        i = i + 1
+    }
+    val ok = cur == inner || same_generic_receiver(inner as *Type?, cur as *Type?)
+    prefix.free()
+    best.free()
+    return ok
+}
+
 /**
  * Look up a method on a type (and embeds).
  * @return hit, ambiguous, waiting_failed
