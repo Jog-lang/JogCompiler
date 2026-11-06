@@ -1449,6 +1449,49 @@ private fn want_view_bitcast(got: *check.Type?, want: *check.Type?): bool {
     return false
 }
 
+/** Same-layout nominative structs (value form) for explicit `as`. */
+private fn want_struct_layout_bitcast(got: *check.Type?, want: *check.Type?): bool {
+    if got == null || want == null || got!! == want!! {
+        return false
+    }
+    var g = check.type_peel_distinct(got!!)
+    var w = check.type_peel_distinct(want!!)
+    val tk = check.type_kinds()
+    if g.kind == tk.PTR && w.kind == tk.PTR {
+        // Pointer `as` already covered by memory_ptr_cast_ok; keep value path here.
+        return false
+    }
+    if g.kind != tk.STRUCT || w.kind != tk.STRUCT || g == w {
+        return false
+    }
+    return g.has_layout && w.has_layout && g.size > 0 && g.size == w.size
+}
+
+/** Implicit *Outer → *Embedded at offset 0 (checker already accepted). */
+private fn want_embed_ptr_bitcast(got: *check.Type?, want: *check.Type?): bool {
+    if got == null || want == null || got!! == want!! {
+        return false
+    }
+    val g = check.type_peel_distinct(got!!)
+    val w = check.type_peel_distinct(want!!)
+    val tk = check.type_kinds()
+    if g.kind != tk.PTR || w.kind != tk.PTR {
+        return false
+    }
+    if g.is_const && !w.is_const {
+        return false
+    }
+    if g.elem == null || w.elem == null {
+        return false
+    }
+    val ge = check.type_peel_distinct(g.elem!!)
+    val we = check.type_peel_distinct(w.elem!!)
+    if ge == we || ge.kind != tk.STRUCT || we.kind != tk.STRUCT {
+        return false
+    }
+    return true
+}
+
 /** Explicit `as` bitcast cases: views + ptr_like package cast + bytes_n (C). */
 private fn want_cast_bitcast(got: *check.Type?, want: *check.Type?): bool {
     if want_view_bitcast(got, want) {
@@ -1467,6 +1510,9 @@ private fn want_cast_bitcast(got: *check.Type?, want: *check.Type?): bool {
     if g.has_layout && w.has_layout && g.size > 0 && g.size == w.size && (g.kind == tk.BYTES_N || w.kind == tk.BYTES_N) {
         return true
     }
+    if want_struct_layout_bitcast(got, want) {
+        return true
+    }
     return false
 }
 
@@ -1476,7 +1522,7 @@ fn lower_expr(L: *Lower, node: *parse.Node): ir.Operand with (a: mem.Allocator) 
         return op
     }
     val want = check.get_node_ty(node)
-    if want != null && op.ty != null && want_view_bitcast(op.ty, want) {
+    if want != null && op.ty != null && (want_view_bitcast(op.ty, want) || want_embed_ptr_bitcast(op.ty, want)) {
         return emit_bitcast(L, op, want, node_pos(L, node))
     }
     // T → T? (C wrap_option_some in lower_expr).

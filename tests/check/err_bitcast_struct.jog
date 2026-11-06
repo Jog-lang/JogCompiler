@@ -1,0 +1,44 @@
+struct A {
+    x: i32
+}
+
+struct B {
+    x: i64
+}
+
+struct C {
+    x: i32
+    y: i32
+}
+
+struct Entity {
+    id: i32
+}
+
+struct Mid {
+    n: i32
+    Entity
+}
+
+struct Outer {
+    Mid
+}
+
+fn take_entity(e: *Entity): i32 {
+    return e.id
+}
+
+fn main() {
+    var a = A(x: 1)
+    val bad = a as B
+    val also = a as C
+    var mid = Mid(n: 1, Entity: Entity(id: 2))
+    val n = take_entity(&mid)
+    var outer = Outer(Mid: Mid(n: 0, Entity: Entity(id: 0)))
+    val m = take_entity(&outer)
+}
+
+// error: cannot cast A to B
+// error: cannot cast A to C
+// error: expected *Entity, got *Mid
+// error: expected *Entity, got *Outer
