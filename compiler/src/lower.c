@@ -1934,6 +1934,61 @@ static bool bytes_n_reinterpret(const JogType *got, const JogType *want) {
     return got->kind == JOG_TY_BYTES_N || want->kind == JOG_TY_BYTES_N;
 }
 
+/* Explicit `as` between same-layout structs (value or pointer). */
+static bool struct_layout_bitcast_cast(const JogType *got, const JogType *want) {
+    const JogType *g;
+    const JogType *w;
+    if (!got || !want || got == want) {
+        return false;
+    }
+    g = jog_type_underlying((JogType *)got);
+    w = jog_type_underlying((JogType *)want);
+    if (!g || !w || g == w) {
+        return false;
+    }
+    if (g->kind == JOG_TY_PTR && w->kind == JOG_TY_PTR) {
+        const JogType *ge = g->as.elem.elem ? jog_type_underlying(g->as.elem.elem) : NULL;
+        const JogType *we = w->as.elem.elem ? jog_type_underlying(w->as.elem.elem) : NULL;
+        if (!ge || !we || ge->kind != JOG_TY_STRUCT || we->kind != JOG_TY_STRUCT) {
+            return false;
+        }
+        if (g->is_const && !w->is_const) {
+            return false;
+        }
+        return g->has_layout && w->has_layout && g->size > 0 && g->size == w->size;
+    }
+    if (g->kind != JOG_TY_STRUCT || w->kind != JOG_TY_STRUCT) {
+        return false;
+    }
+    return g->has_layout && w->has_layout && g->size > 0 && g->size == w->size;
+}
+
+/* Implicit *Outer → *Embedded (offset 0): pointer elems are different structs.
+   Value structs are never coerced here — only explicit `as` (CAST path). */
+static bool embed_ptr_bitcast_view(const JogType *got, const JogType *want) {
+    const JogType *g;
+    const JogType *w;
+    const JogType *ge;
+    const JogType *we;
+    if (!got || !want || got == want) {
+        return false;
+    }
+    g = jog_type_underlying((JogType *)got);
+    w = jog_type_underlying((JogType *)want);
+    if (!g || !w || g->kind != JOG_TY_PTR || w->kind != JOG_TY_PTR) {
+        return false;
+    }
+    if (g->is_const && !w->is_const) {
+        return false;
+    }
+    ge = g->as.elem.elem ? jog_type_underlying(g->as.elem.elem) : NULL;
+    we = w->as.elem.elem ? jog_type_underlying(w->as.elem.elem) : NULL;
+    if (!ge || !we || ge == we || ge->kind != JOG_TY_STRUCT || we->kind != JOG_TY_STRUCT) {
+        return false;
+    }
+    return true;
+}
+
 static JirOperand bitcast_value(Lower *L, JirOperand src, JogType *dest, JogPos pos) {
     uint32_t dst;
     JirInst *inst;
@@ -2626,7 +2681,7 @@ static JirOperand lower_expr_raw(Lower *L, JogNode *node) {
             if (bytes_to_const_view(lhs.type, dest_ty) || slice_to_const_view(lhs.type, dest_ty) ||
                 ptr_to_const_view(lhs.type, dest_ty) || u8_slice_to_str_view(lhs.type, dest_ty) ||
                 jog_type_converts_to_str(L->program->types, lhs.type, dest_ty) ||
-                bytes_n_reinterpret(lhs.type, dest_ty)) {
+                bytes_n_reinterpret(lhs.type, dest_ty) || struct_layout_bitcast_cast(lhs.type, dest_ty)) {
                 return bitcast_value(L, lhs, dest_ty, node->pos);
             }
         }
@@ -2719,7 +2774,8 @@ static JirOperand lower_expr(Lower *L, JogNode *node) {
         return op;
     }
     if (bytes_to_const_view(op.type, want) || slice_to_const_view(op.type, want) || ptr_to_const_view(op.type, want) ||
-        u8_slice_to_str_view(op.type, want) || jog_type_converts_to_str(L->program->types, op.type, want)) {
+        u8_slice_to_str_view(op.type, want) || jog_type_converts_to_str(L->program->types, op.type, want) ||
+        embed_ptr_bitcast_view(op.type, want)) {
         return bitcast_value(L, op, want, node->pos);
     }
     if (want->kind == JOG_TY_OPTION && op.type && want->as.elem.elem == op.type) {

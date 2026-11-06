@@ -1,0 +1,45 @@
+// expect: ok
+
+struct FRect {
+    x: f32
+    y: f32
+    w: f32
+    h: f32
+}
+
+struct SDL_FRect {
+    x: f32
+    y: f32
+    w: f32
+    h: f32
+}
+
+struct Entity {
+    id: i32
+}
+
+struct Player {
+    Entity
+    hp: i32
+}
+
+extern {
+    fn puts(s: *const i8): i32
+}
+
+fn take_box(r: SDL_FRect): f32 {
+    return r.x
+}
+
+fn take_entity(e: *Entity): i32 {
+    return e.id
+}
+
+fn main() {
+    var rect = FRect(x: 1.0, y: 2.0, w: 3.0, h: 4.0)
+    val box = rect as SDL_FRect
+    var pl = Player(Entity: Entity(id: 9), hp: 1)
+    if take_box(box) == 1.0 && take_entity(&pl) == 9 {
+        puts(c"ok")
+    }
+}
