@@ -1043,7 +1043,13 @@ fn run(start: str, module_flags: []str, include_tests: bool, ptr_size: u32, emsc
             prog.runtime_root = fs.copy_str(roots.runtime_root)
             prog.is_library = root_mod.is_library
             val from_mod = merge_manifest_links(root_mod, mods)
-            prog.links = merge_source_links(from_mod, prog.packages)
+            // @link → -l on native and wasm32-emscripten; freestanding wasm32
+            // uses @link only as import module names.
+            if ptr_size != 4 || emscripten {
+                prog.links = merge_source_links(from_mod, prog.packages)
+            } else {
+                prog.links = from_mod
+            }
             prog.libdirs = merge_manifest_libdirs(root_mod, mods)
             prog.ptr_size = ptr_size
             prog.emscripten = emscripten
