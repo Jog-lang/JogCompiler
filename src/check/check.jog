@@ -20,7 +20,11 @@ fn run(prog: load.Program): (load.Program, i32) with (a: mem.Allocator) {
         io.eprintln("jogc: check received no packages")
         return out, 1
     }
-    var ck = check_new(out, 8)
+    var psz = out.ptr_size
+    if psz != 4 && psz != 8 {
+        psz = 8
+    }
+    var ck = check_new(out, psz)
     if !collect_jobs(&ck) {
         return out, 1
     }

@@ -535,7 +535,7 @@ private fn check_requires(man_path: str, mod: Module, mods: *list.List<Module>):
  * @context a allocator
  * @return false when a mapping failed validation
  */
-private fn open_mapped(flags: []str, root_name: str, mods: *list.List<Module>): bool with (a: mem.Allocator) {
+private fn open_mapped(flags: []str, root_name: str, mods: *list.List<Module>, emscripten: bool, ptr_size: u32): bool with (a: mem.Allocator) {
     var ok = true
     var i: usize = 0
     for i < flags.len {
@@ -668,7 +668,7 @@ private fn open_mapped(flags: []str, root_name: str, mods: *list.List<Module>): 
             i = i + 1
             continue
         }
-        val (manifest, parsed) = parse_manifest(man_path, data as str)
+        val (manifest, parsed) = parse_manifest(man_path, data as str, emscripten, ptr_size)
         a.free(data)
         if !parsed {
             var bad = empty_module()
@@ -869,10 +869,12 @@ fn append_cli_libdirs(existing: list.List<str>, cli: []str): (list.List<str>, bo
  * @param start file or folder, as given on the command line; `.` when omitted
  * @param module_flags --module values without the flag name
  * @param include_tests keep *.test.jog in the root module (jog test)
+ * @param ptr_size 4 for wasm32 / wasm32-emscripten, else 8
+ * @param emscripten --target wasm32-emscripten (keeps link.emscripten)
  * @context a allocator for the walk and the file bytes
  * @return the program and 0, or an empty program and 1 on a loader error
  */
-fn run(start: str, module_flags: []str, include_tests: bool): (Program, i32) with (a: mem.Allocator) {
+fn run(start: str, module_flags: []str, include_tests: bool, ptr_size: u32, emscripten: bool): (Program, i32) with (a: mem.Allocator) {
     val (roots, roots_ok) = locate_roots()
     if !roots_ok {
         free_roots(roots)
@@ -908,7 +910,7 @@ fn run(start: str, module_flags: []str, include_tests: bool): (Program, i32) wit
         free_roots(roots)
         return empty_program(), 1
     }
-    val (manifest, ok) = parse_manifest(man_path, data as str)
+    val (manifest, ok) = parse_manifest(man_path, data as str, emscripten, ptr_size)
     a.free(data)
     if !ok || manifest.name.len == 0 {
         fs.free_str(man_path)
@@ -938,12 +940,12 @@ fn run(start: str, module_flags: []str, include_tests: bool): (Program, i32) wit
         }
     }
     var mods = list.empty<Module>()
-    val mapped_ok = open_mapped(module_flags, root_mod.name, &mods)
+    val mapped_ok = open_mapped(module_flags, root_mod.name, &mods, emscripten, ptr_size)
     val modules_ok = check_modules(man_path, root_mod, &mods)
     var prog = empty_program()
     var files_ok = true
     if shadows_ok && mapped_ok && modules_ok {
-        val (loaded, load_ok) = load_root_sources(root_mod, man_path, roots, mods, include_tests, extra_dir)
+        val (loaded, load_ok) = load_root_sources(root_mod, man_path, roots, mods, include_tests, extra_dir, ptr_size)
         prog = loaded
         files_ok = load_ok
         if load_ok {
@@ -951,6 +953,8 @@ fn run(start: str, module_flags: []str, include_tests: bool): (Program, i32) wit
             prog.is_library = root_mod.is_library
             prog.links = root_mod.manifest.links
             prog.libdirs = merge_manifest_libdirs(root_mod, mods)
+            prog.ptr_size = ptr_size
+            prog.emscripten = emscripten
         }
     }
     fs.free_str(extra_dir)

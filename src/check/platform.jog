@@ -539,7 +539,7 @@ private fn check_package_platform(ck: *Check, pkg: *load.Package) with (a: mem.A
     }
     var compared = list.empty<*parse.Node>()
     if pkg.targets.len == 0 {
-        val os = load.host_os()
+        val os = load.target_os(ck.prog.ptr_size)
         val files = sources_for_target(pkg, os)
         check_target(ck, os, files, expect_nodes, expect_files, &compared)
     } else {
