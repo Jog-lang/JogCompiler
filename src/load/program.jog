@@ -18,7 +18,7 @@ struct Program {
     // Runtime directory the loader found (JOG_ROOT/runtime, else next to std).
     runtime_root: str
     is_library: bool
-    // jog.mod `link` names for the root module.
+    // Link names: root jog.mod, then each --module, then @link from externs.
     links: list.List<str>
     // -L search paths: root libdir, then each --module, then CLI; last wins.
     libdirs: list.List<str>

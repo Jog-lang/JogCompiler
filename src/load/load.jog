@@ -17,6 +17,7 @@
 // Study note: JogDocs bootstrap/study/NameResolution. Manifest contract:
 // JogDocs design/Packages.md. Steps 1–9 done. Step 10 resolves bodies.
 
+import src.parse
 import std.fs
 import std.io
 import std.list
@@ -832,6 +833,96 @@ private fn merge_manifest_libdirs(root: Module, mods: list.List<Module>): list.L
 }
 
 /**
+ * Root jog.mod link lines, then each --module in order. Duplicate names
+ * keep only their last position (seed merge_links).
+ */
+private fn merge_manifest_links(root: Module, mods: list.List<Module>): list.List<str> with (a: mem.Allocator) {
+    var all = list.empty<str>()
+    for lib in root.manifest.links.items() {
+        all.push(lib)
+    }
+    var i: usize = 0
+    for i < mods.len {
+        val m = mods.get(i)
+        if !m.bad {
+            for lib in m.manifest.links.items() {
+                all.push(lib)
+            }
+        }
+        i = i + 1
+    }
+    return dedupe_last(all)
+}
+
+/** @link("name") string on a decl, or "" when absent / malformed. */
+private fn attr_link_lib(node: *parse.Node): str {
+    for kid in node.kids.items() {
+        if !parse.is_attribute(kid) || kid.name != "link" {
+            continue
+        }
+        if kid.kids.len != 1 {
+            continue
+        }
+        val arg = kid.kids.get(0)
+        if !parse.is_arg(arg) || arg.kids.len != 1 {
+            continue
+        }
+        val value = arg.kids.get(0)
+        if parse.is_string_lit(value) {
+            return value.text
+        }
+    }
+    return ""
+}
+
+/**
+ * Append @link("lib") names from loaded extern blocks after manifest
+ * links. Duplicate names keep their last position.
+ */
+private fn merge_source_links(existing: list.List<str>, packages: list.List<*Package>): list.List<str> with (a: mem.Allocator) {
+    var all = list.empty<str>()
+    for lib in existing.items() {
+        all.push(lib)
+    }
+    var pi: usize = 0
+    for pi < packages.len {
+        val pkg = packages.get(pi)
+        var fi: usize = 0
+        for fi < pkg.files.len {
+            val file = pkg.files.get(fi)
+            if file.ast != null {
+                val root = file.ast!!
+                var di: usize = 0
+                for di < root.kids.len {
+                    val decl = root.kids.get(di)
+                    if parse.is_extern_block(decl) {
+                        val block_lib = attr_link_lib(decl)
+                        if block_lib.len > 0 {
+                            all.push(block_lib)
+                        }
+                        var ki: usize = 0
+                        for ki < decl.kids.len {
+                            val kid = decl.kids.get(ki)
+                            if parse.is_fn(kid) {
+                                val fn_lib = attr_link_lib(kid)
+                                if fn_lib.len > 0 {
+                                    all.push(fn_lib)
+                                }
+                            }
+                            ki = ki + 1
+                        }
+                    }
+                    di = di + 1
+                }
+            }
+            fi = fi + 1
+        }
+        pi = pi + 1
+    }
+    return dedupe_last(all)
+}
+
+/**
  * Append CLI --libdir / -L values (absolute when possible). Empty paths
  * fail. Duplicate paths keep only their last position.
  * @param existing paths already merged from jog.mod
@@ -949,7 +1040,8 @@ fn run(start: str, module_flags: []str, include_tests: bool): (Program, i32) wit
         if load_ok {
             prog.runtime_root = fs.copy_str(roots.runtime_root)
             prog.is_library = root_mod.is_library
-            prog.links = root_mod.manifest.links
+            val from_mod = merge_manifest_links(root_mod, mods)
+            prog.links = merge_source_links(from_mod, prog.packages)
             prog.libdirs = merge_manifest_libdirs(root_mod, mods)
         }
     }
