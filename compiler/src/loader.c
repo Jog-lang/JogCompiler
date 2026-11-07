@@ -703,16 +703,24 @@ static bool parse_manifest(Loader *loader, const CtFile *file, Module *mod) {
                 target.ptr = first.ptr + 5;
                 target.len = first.len - 5;
                 target.column = first.column + 5;
-                if (!tok_is(target, "windows") && !tok_is(target, "linux") && !tok_is(target, "macos")) {
+                if (!tok_is(target, "windows") && !tok_is(target, "linux") && !tok_is(target, "macos") &&
+                    !tok_is(target, "emscripten")) {
                     LOAD_ERROR(loader, manifest_pos(file, line_no, target.column),
-                               "jog.mod: unknown target '%.*s'; expected windows, linux, or macos",
+                               "jog.mod: unknown target '%.*s'; expected windows, linux, macos, or emscripten",
                                (int)target.len, target.ptr);
                     ok = 0;
                     line_no++;
                     continue;
                 }
-                /* wasm32 links no C libraries of its own. */
-                keep = loader->program->options.ptr_size != 4 && tok_is(target, jog_host_os());
+                /* Freestanding wasm32 links no host libraries. Emscripten keeps
+                   link.emscripten only among targeted lines. */
+                if (loader->program->options.emscripten) {
+                    keep = tok_is(target, "emscripten");
+                } else if (loader->program->options.ptr_size == 4) {
+                    keep = 0;
+                } else {
+                    keep = tok_is(target, jog_host_os());
+                }
             }
             if (!one_word(loader, file, line_no, toks, n, "library name")) {
                 ok = 0;
@@ -730,15 +738,22 @@ static bool parse_manifest(Loader *loader, const CtFile *file, Module *mod) {
                 target.ptr = first.ptr + 7;
                 target.len = first.len - 7;
                 target.column = first.column + 7;
-                if (!tok_is(target, "windows") && !tok_is(target, "linux") && !tok_is(target, "macos")) {
+                if (!tok_is(target, "windows") && !tok_is(target, "linux") && !tok_is(target, "macos") &&
+                    !tok_is(target, "emscripten")) {
                     LOAD_ERROR(loader, manifest_pos(file, line_no, target.column),
-                               "jog.mod: unknown target '%.*s'; expected windows, linux, or macos",
+                               "jog.mod: unknown target '%.*s'; expected windows, linux, macos, or emscripten",
                                (int)target.len, target.ptr);
                     ok = 0;
                     line_no++;
                     continue;
                 }
-                keep = loader->program->options.ptr_size != 4 && tok_is(target, jog_host_os());
+                if (loader->program->options.emscripten) {
+                    keep = tok_is(target, "emscripten");
+                } else if (loader->program->options.ptr_size == 4) {
+                    keep = 0;
+                } else {
+                    keep = tok_is(target, jog_host_os());
+                }
             }
             if (!one_word(loader, file, line_no, toks, n, "library search path")) {
                 ok = 0;

@@ -22,11 +22,10 @@
    -Wno-incompatible-library-redeclaration. Every other compiler gets gcc's
    -Wno-builtin-declaration-mismatch.
 
-   An output path ending in .wasm is wasm32, not the host. JogCcRequest has
-   no target field, so the suffix is the signal. That link is clang
-   --target=wasm32-unknown-unknown plus runtime/wasm/jogrt_wasm.c and
-   wasm-ld. gcc cannot build it. The driver only uses the suffix for
-   --target wasm32. */
+   An output path ending in .wasm is freestanding wasm32. request->emscripten
+   (from --target wasm32-emscripten) drives emcc with the host-style runtime
+   plus runtime/emscripten/jogrt_switch.c and runtime/jogrt_mainloop.c, and
+   allows -l / -L. Freestanding wasm still rejects host libraries. */
 
 #if defined(_WIN32)
 #define CC_PATH_SEP ';'
@@ -83,7 +82,7 @@ static bool base_contains(const char *path, const char *needle) {
 }
 
 static const char *mismatch_flag(const char *compiler) {
-    if (base_contains(compiler, "clang")) {
+    if (base_contains(compiler, "clang") || base_contains(compiler, "emcc")) {
         return "-Wno-incompatible-library-redeclaration";
     }
     return "-Wno-builtin-declaration-mismatch";
@@ -102,7 +101,8 @@ static bool push_builtin_flags(CtDa *args, const char *compiler) {
     if (!push_arg(args, mismatch_flag(compiler))) {
         return false;
     }
-    if (base_contains(compiler, "clang") && !push_arg(args, "-Wno-builtin-requires-header")) {
+    if ((base_contains(compiler, "clang") || base_contains(compiler, "emcc")) &&
+        !push_arg(args, "-Wno-builtin-requires-header")) {
         return false;
     }
     return true;
@@ -752,8 +752,178 @@ static void print_command(const char *const *argv) {
     fflush(stderr);
 }
 
+static const char *find_emcc(CtArena *arena, const char **override_out, bool *oom) {
+    const char *override = ct_fs_getenv(arena, "EMCC");
+    if (override && override[0] != '\0') {
+        *override_out = override;
+        if (has_separator(override)) {
+            return file_in_dir(arena, "", override, oom);
+        }
+        return search_path(arena, override, oom);
+    }
+    override = ct_fs_getenv(arena, "JOG_CC");
+    if (override && override[0] != '\0' && base_contains(override, "emcc")) {
+        *override_out = override;
+        if (has_separator(override)) {
+            return file_in_dir(arena, "", override, oom);
+        }
+        return search_path(arena, override, oom);
+    }
+    *override_out = NULL;
+    return search_path(arena, "emcc", oom);
+}
+
+/* Emscripten: emcc + libc runtime (not freestanding jogrt_wasm). Host -l/-L
+   are allowed. Coroutine switch is the aborting emscripten stub. */
+static bool jog_cc_build_emscripten(const JogCcRequest *request, CtDiag *diag) {
+    CtPos pos = {0};
+    CtArena *arena = NULL;
+    CtDa args;
+    bool args_ready = ct_da_init(&args, sizeof(const char *));
+    bool ok = false;
+    bool oom = false;
+    const char *override = NULL;
+    const char *compiler = NULL;
+    const char *jogrt_c = NULL;
+    const char *jogrt_sched = NULL;
+    const char *jogrt_switch = NULL;
+    const char *jogrt_mainloop = NULL;
+    const char *jogrt_main = NULL;
+    const char *end = NULL;
+    int exit_code = 0;
+
+    if (!request) {
+        ct_diag_emit(diag, CT_SEVERITY_ERROR, pos, "cannot invoke emcc: missing request");
+        goto done;
+    }
+    pos.file = request->c_path;
+    if (!request->c_path || request->c_path[0] == '\0' || !request->exe_path || request->exe_path[0] == '\0' ||
+        !request->runtime_root || request->runtime_root[0] == '\0') {
+        ct_diag_emit(diag, CT_SEVERITY_ERROR, pos, "cannot invoke emcc: missing input, output, or runtime path");
+        goto done;
+    }
+    if (request->mode != JOG_BUILD_DEBUG && request->mode != JOG_BUILD_RELEASE &&
+        request->mode != JOG_BUILD_RELEASE_FAST) {
+        ct_diag_emit(diag, CT_SEVERITY_ERROR, pos, "cannot invoke emcc: unknown build mode");
+        goto done;
+    }
+
+    arena = ct_arena_create();
+    if (!arena || !args_ready) {
+        ct_diag_emit(diag, CT_SEVERITY_ERROR, pos, "out of memory");
+        goto done;
+    }
+
+    compiler = find_emcc(arena, &override, &oom);
+    if (oom) {
+        ct_diag_emit(diag, CT_SEVERITY_ERROR, pos, "out of memory");
+        goto done;
+    }
+    if (!compiler) {
+        if (override) {
+            ct_diag_emit(diag, CT_SEVERITY_ERROR, pos, "emcc '%s' from EMCC/JOG_CC was not found", override);
+        } else {
+            ct_diag_emit(diag, CT_SEVERITY_ERROR, pos,
+                         "emcc not found; install emsdk and put emcc on PATH (or set EMCC)");
+        }
+        goto done;
+    }
+
+    jogrt_c = ct_path_join(arena, request->runtime_root, "jogrt.c");
+    jogrt_sched = ct_path_join(arena, request->runtime_root, "jogrt_sched.c");
+    jogrt_switch = ct_path_join(arena, request->runtime_root, "emscripten/jogrt_switch.c");
+    jogrt_mainloop = ct_path_join(arena, request->runtime_root, "jogrt_mainloop.c");
+    jogrt_main = ct_path_join(arena, request->runtime_root, "jogrt_main.c");
+    if (!jogrt_c || !jogrt_sched || !jogrt_switch || !jogrt_mainloop || !jogrt_main) {
+        ct_diag_emit(diag, CT_SEVERITY_ERROR, pos, "out of memory");
+        goto done;
+    }
+    if (!ct_fs_is_file(request->c_path)) {
+        ct_diag_emit(diag, CT_SEVERITY_ERROR, pos, "C input '%s' was not found", request->c_path);
+        goto done;
+    }
+    if (!ct_fs_is_file(jogrt_c) || !ct_fs_is_file(jogrt_sched) || !ct_fs_is_file(jogrt_switch) ||
+        !ct_fs_is_file(jogrt_mainloop) || !ct_fs_is_file(jogrt_main)) {
+        ct_diag_emit(diag, CT_SEVERITY_ERROR, pos,
+                     "runtime '%s' is missing jogrt.c, jogrt_sched.c, emscripten/jogrt_switch.c, "
+                     "jogrt_mainloop.c, or jogrt_main.c",
+                     request->runtime_root);
+        goto done;
+    }
+
+    if (!push_arg(&args, compiler) || !push_arg(&args, "-std=gnu17") || !push_mode_flags(&args, request->mode) ||
+        !push_builtin_flags(&args, compiler) || !push_arg(&args, "-I") || !push_arg(&args, request->runtime_root) ||
+        !push_arg(&args, request->c_path) || !push_arg(&args, jogrt_c) || !push_arg(&args, jogrt_sched) ||
+        !push_arg(&args, jogrt_switch) || !push_arg(&args, jogrt_mainloop) || !push_arg(&args, jogrt_main) ||
+        !push_arg(&args, "-sALLOW_MEMORY_GROWTH=1") || !push_arg(&args, "-sFULL_ES2=1") ||
+        !push_arg(&args, "-o") || !push_arg(&args, request->exe_path)) {
+        ct_diag_emit(diag, CT_SEVERITY_ERROR, pos, "out of memory");
+        goto done;
+    }
+
+    if (request->extra_lib_dir_count > 0 && !request->extra_lib_dirs) {
+        ct_diag_emit(diag, CT_SEVERITY_ERROR, pos, "missing library search path list");
+        goto done;
+    }
+    for (size_t i = 0; i < request->extra_lib_dir_count; i++) {
+        const char *dir = request->extra_lib_dirs[i];
+        const char *flag = NULL;
+        if (!dir || dir[0] == '\0') {
+            ct_diag_emit(diag, CT_SEVERITY_ERROR, pos, "empty library search path");
+            goto done;
+        }
+        flag = libdir_flag(arena, dir);
+        if (!flag || !push_arg(&args, flag)) {
+            ct_diag_emit(diag, CT_SEVERITY_ERROR, pos, "out of memory");
+            goto done;
+        }
+    }
+    if (request->extra_lib_count > 0 && !request->extra_libs) {
+        ct_diag_emit(diag, CT_SEVERITY_ERROR, pos, "missing link library list");
+        goto done;
+    }
+    for (size_t i = 0; i < request->extra_lib_count; i++) {
+        const char *lib = request->extra_libs[i];
+        const char *flag = NULL;
+        if (!lib || lib[0] == '\0') {
+            ct_diag_emit(diag, CT_SEVERITY_ERROR, pos, "empty link library");
+            goto done;
+        }
+        flag = link_flag(arena, lib);
+        if (!flag || !push_arg(&args, flag)) {
+            ct_diag_emit(diag, CT_SEVERITY_ERROR, pos, "out of memory");
+            goto done;
+        }
+    }
+    if (!ct_da_push(&args, &end) || !args.data) {
+        ct_diag_emit(diag, CT_SEVERITY_ERROR, pos, "out of memory");
+        goto done;
+    }
+    if (request->verbose) {
+        print_command(args.data);
+    }
+    if (!ct_proc_run(args.data, NULL, NULL, &exit_code)) {
+        ct_diag_emit(diag, CT_SEVERITY_ERROR, pos, "cannot run emcc '%s'", compiler);
+        goto done;
+    }
+    if (exit_code != 0) {
+        ct_diag_emit(diag, CT_SEVERITY_ERROR, pos, "emcc exited with status %d", exit_code);
+        goto done;
+    }
+    ok = true;
+
+done:
+    ct_da_free(&args);
+    ct_arena_destroy(arena);
+    return ok;
+}
+
+
 bool jog_cc_build(const JogCcRequest *request, CtDiag *diag) {
     CtPos pos = {0};
+    if (request && request->emscripten) {
+        return jog_cc_build_emscripten(request, diag);
+    }
     if (request && path_ends_with(request->exe_path, ".wasm")) {
         return jog_cc_build_wasm(request, diag);
     }
@@ -767,6 +937,7 @@ bool jog_cc_build(const JogCcRequest *request, CtDiag *diag) {
     const char *jogrt_c = NULL;
     const char *jogrt_sched = NULL;
     const char *jogrt_switch = NULL;
+    const char *jogrt_mainloop = NULL;
     const char *jogrt_main = NULL;
     const char *end = NULL;
     int exit_code = 0;
@@ -810,8 +981,9 @@ bool jog_cc_build(const JogCcRequest *request, CtDiag *diag) {
     jogrt_c = ct_path_join(arena, request->runtime_root, "jogrt.c");
     jogrt_sched = ct_path_join(arena, request->runtime_root, "jogrt_sched.c");
     jogrt_switch = ct_path_join(arena, request->runtime_root, "jogrt_switch.c");
+    jogrt_mainloop = ct_path_join(arena, request->runtime_root, "jogrt_mainloop.c");
     jogrt_main = ct_path_join(arena, request->runtime_root, "jogrt_main.c");
-    if (!jogrt_c || !jogrt_sched || !jogrt_switch || !jogrt_main) {
+    if (!jogrt_c || !jogrt_sched || !jogrt_switch || !jogrt_mainloop || !jogrt_main) {
         ct_diag_emit(diag, CT_SEVERITY_ERROR, pos, "out of memory");
         goto done;
     }
@@ -819,8 +991,10 @@ bool jog_cc_build(const JogCcRequest *request, CtDiag *diag) {
         ct_diag_emit(diag, CT_SEVERITY_ERROR, pos, "C input '%s' was not found", request->c_path);
         goto done;
     }
-    if (!ct_fs_is_file(jogrt_c) || !ct_fs_is_file(jogrt_sched) || !ct_fs_is_file(jogrt_switch) || !ct_fs_is_file(jogrt_main)) {
-        ct_diag_emit(diag, CT_SEVERITY_ERROR, pos, "runtime '%s' is missing jogrt.c, jogrt_sched.c, jogrt_switch.c, or jogrt_main.c",
+    if (!ct_fs_is_file(jogrt_c) || !ct_fs_is_file(jogrt_sched) || !ct_fs_is_file(jogrt_switch) ||
+        !ct_fs_is_file(jogrt_mainloop) || !ct_fs_is_file(jogrt_main)) {
+        ct_diag_emit(diag, CT_SEVERITY_ERROR, pos,
+                     "runtime '%s' is missing jogrt.c, jogrt_sched.c, jogrt_switch.c, jogrt_mainloop.c, or jogrt_main.c",
                      request->runtime_root);
         goto done;
     }
@@ -828,7 +1002,7 @@ bool jog_cc_build(const JogCcRequest *request, CtDiag *diag) {
     if (!push_arg(&args, compiler) || !push_arg(&args, "-std=gnu17") || !push_mode_flags(&args, request->mode) ||
         !push_builtin_flags(&args, compiler) || !push_arg(&args, "-I") || !push_arg(&args, request->runtime_root) ||
         !push_arg(&args, request->c_path) || !push_arg(&args, jogrt_c) || !push_arg(&args, jogrt_sched) ||
-        !push_arg(&args, jogrt_switch) || !push_arg(&args, jogrt_main) ||
+        !push_arg(&args, jogrt_switch) || !push_arg(&args, jogrt_mainloop) || !push_arg(&args, jogrt_main) ||
         !push_arg(&args, "-o") || !push_arg(&args, request->exe_path)) {
         ct_diag_emit(diag, CT_SEVERITY_ERROR, pos, "out of memory");
         goto done;
