@@ -20,9 +20,9 @@ typedef struct Command {
 
 static const Command g_commands[] = {
     {"build", jog_cmd_build,
-     "jog build [package] [-o file] [--release | --release-fast] [--keep-c] [--target wasm32]",
+     "jog build [package] [-o file] [--release | --release-fast] [--keep-c] [--target wasm32|wasm32-emscripten]",
      "compile to an executable"},
-    {"run", jog_cmd_run, "jog run [package] [--target wasm32] [-- args...]", "build and run"},
+    {"run", jog_cmd_run, "jog run [package] [--target wasm32|wasm32-emscripten] [-- args...]", "build and run"},
     {"test", jog_cmd_test, "jog test [package | --all]", "run *.test.jog tests"},
     {"check", jog_cmd_check, "jog check [package]", "run the frontend only"},
     {"emit-c", jog_cmd_emit_c, "jog emit-c [package]", "print the generated C"},

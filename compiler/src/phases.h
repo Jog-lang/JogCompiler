@@ -69,6 +69,7 @@ typedef struct JogCcRequest {
     size_t extra_lib_count;
     const char *const *extra_lib_dirs; /* -L paths from libdir / --libdir */
     size_t extra_lib_dir_count;
+    bool emscripten;               /* drive emcc; allow -l / -L */
     bool verbose;                  /* print the command line */
 } JogCcRequest;
 

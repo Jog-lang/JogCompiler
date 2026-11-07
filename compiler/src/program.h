@@ -77,7 +77,8 @@ typedef enum JogBuildMode {
 typedef struct JogOptions {
     JogBuildMode mode;
     bool include_tests; /* load *.test.jog files */
-    uint32_t ptr_size;  /* 8 for x64, 4 for wasm32 */
+    uint32_t ptr_size;  /* 8 for x64, 4 for wasm32 / wasm32-emscripten */
+    bool emscripten;    /* --target wasm32-emscripten: emcc + host libs */
     bool start_package; /* also load the package that contains the start path (jog check) */
 } JogOptions;
 
