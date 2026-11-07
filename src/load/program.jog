@@ -18,10 +18,14 @@ struct Program {
     // Runtime directory the loader found (JOG_ROOT/runtime, else next to std).
     runtime_root: str
     is_library: bool
-    // jog.mod `link` names for the root module.
+    // Link names: root jog.mod, then each --module, then @link from externs.
     links: list.List<str>
     // -L search paths: root libdir, then each --module, then CLI; last wins.
     libdirs: list.List<str>
+    // 8 for native, 4 for wasm32 / wasm32-emscripten.
+    ptr_size: u32
+    // --target wasm32-emscripten: keep link.emscripten, drive emcc.
+    emscripten: bool
 }
 
 /**
@@ -38,5 +42,7 @@ fn empty_program(): Program with (a: mem.Allocator) {
     p.is_library = false
     p.links = list.empty<str>()
     p.libdirs = list.empty<str>()
+    p.ptr_size = 8
+    p.emscripten = false
     return p
 }

@@ -24,6 +24,7 @@ struct Drive {
     keep_c: bool
     saw_keep: bool
     wasm: bool
+    emscripten: bool
     saw_target: bool
     steps: u64
     saw_steps: bool
@@ -60,9 +61,9 @@ fn parse_steps(text: str): (u64, bool) {
 
 private fn usage_of(command: str): i32 {
     if command == "build" {
-        io.eprintln("usage: jog build [package] [-o file] [--release | --release-fast] [--keep-c] [--target wasm32] [--comptime-steps N] [--module name=dir ...] [--libdir dir | -L dir ...]")
+        io.eprintln("usage: jog build [package] [-o file] [--release | --release-fast] [--keep-c] [--target wasm32|wasm32-emscripten] [--comptime-steps N] [--module name=dir ...] [--libdir dir | -L dir ...]")
     } else if command == "run" {
-        io.eprintln("usage: jog run [package] [--target wasm32] [--comptime-steps N] [--module name=dir ...] [--libdir dir | -L dir ...] [-- args...]")
+        io.eprintln("usage: jog run [package] [--target wasm32|wasm32-emscripten] [--comptime-steps N] [--module name=dir ...] [--libdir dir | -L dir ...] [-- args...]")
     } else {
         io.eprintln("usage: jog test [package | --all] [--module name=dir ...] [--libdir dir | -L dir ...]")
     }
@@ -156,6 +157,7 @@ private fn empty_drive(): Drive with (a: mem.Allocator) {
     d.keep_c = false
     d.saw_keep = false
     d.wasm = false
+    d.emscripten = false
     d.saw_target = false
     d.steps = 0
     d.saw_steps = false
@@ -272,7 +274,7 @@ private fn parse_build(command: str): (Drive, i32) with (a: mem.Allocator) {
             } else {
                 value = texts.slice(arg, 9, arg.len)
             }
-            if value != "wasm32" {
+            if value != "wasm32" && value != "wasm32-emscripten" {
                 var buf = strbuilder.empty()
                 buf.append("jog: unknown target '")
                 buf.append(value)
@@ -281,7 +283,11 @@ private fn parse_build(command: str): (Drive, i32) with (a: mem.Allocator) {
                 return d, 2
             }
             d.saw_target = true
-            d.wasm = true
+            if value == "wasm32-emscripten" {
+                d.emscripten = true
+            } else {
+                d.wasm = true
+            }
             i = i + 1
             continue
         }
@@ -624,7 +630,11 @@ fn drive(command: str): i32 with (a: mem.Allocator) {
     if parsed.saw_start {
         start = parsed.start
     }
-    val (prog, loaded) = load.run(start, parsed.modules.items(), parsed.include_tests)
+    var ptr_size: u32 = 8
+    if parsed.wasm || parsed.emscripten {
+        ptr_size = 4
+    }
+    val (prog, loaded) = load.run(start, parsed.modules.items(), parsed.include_tests, ptr_size, parsed.emscripten)
     if loaded != 0 {
         return loaded
     }
@@ -689,7 +699,9 @@ fn drive(command: str): i32 with (a: mem.Allocator) {
         exe = parsed.output
     } else {
         var suffix = ".exe"
-        if parsed.wasm {
+        if parsed.emscripten {
+            suffix = ".html"
+        } else if parsed.wasm {
             suffix = ".wasm"
         }
         exe = fs.join(out_dir, with_suffix(name, suffix))
@@ -702,11 +714,27 @@ fn drive(command: str): i32 with (a: mem.Allocator) {
         io.eprintln(buf.str())
         return 1
     }
+    if parsed.emscripten && !ends_with(exe, ".html") && !ends_with(exe, ".js") {
+        var buf = strbuilder.empty()
+        buf.append("wasm32-emscripten output '")
+        buf.append(exe)
+        buf.append("' must end in .html or .js")
+        io.eprintln(buf.str())
+        return 1
+    }
     if !parsed.wasm && ends_with(exe, ".wasm") {
         var buf = strbuilder.empty()
         buf.append("output '")
         buf.append(exe)
         buf.append("' ends in .wasm; pass --target wasm32")
+        io.eprintln(buf.str())
+        return 1
+    }
+    if !parsed.emscripten && (ends_with(exe, ".html") || ends_with(exe, ".js")) {
+        var buf = strbuilder.empty()
+        buf.append("output '")
+        buf.append(exe)
+        buf.append("' looks like Emscripten output; pass --target wasm32-emscripten")
         io.eprintln(buf.str())
         return 1
     }
@@ -729,7 +757,7 @@ fn drive(command: str): i32 with (a: mem.Allocator) {
         io.eprintln(buf.str())
         return 1
     }
-    val linked = link_c(c_path, exe, checked.runtime_root, parsed.mode, checked.links, checked.libdirs)
+    val linked = link_c(c_path, exe, checked.runtime_root, parsed.mode, checked.links, checked.libdirs, parsed.emscripten)
     if linked != 0 {
         return linked
     }

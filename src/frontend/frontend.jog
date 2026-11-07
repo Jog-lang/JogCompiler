@@ -49,7 +49,7 @@ struct SymbolInfo {
  * @return 0 on success; non-zero on load or check failure
  */
 fn run(start: str, module_flags: []str): i32 with (a: mem.Allocator) {
-    val (prog, loaded) = load.run(start, module_flags, false)
+    val (prog, loaded) = load.run(start, module_flags, false, 8, false)
     if loaded != 0 {
         return loaded
     }
@@ -112,7 +112,7 @@ fn analyze(
     load.begin_collect()
     load.begin_overrides(override_paths, override_texts)
     load.set_soft_asts(true)
-    val (prog, loaded) = load.run(start, module_flags, false)
+    val (prog, loaded) = load.run(start, module_flags, false, 8, false)
     var code = loaded
     if loaded == 0 {
         val (_, c) = check.run(prog)

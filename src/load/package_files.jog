@@ -37,6 +37,8 @@ private struct Walk {
     order: list.List<*Package>
     failed: bool
     include_tests: bool
+    // 4 for wasm32 / wasm32-emscripten (platform OS is wasm).
+    ptr_size: u32
 }
 
 private fn has_suffix(name: str, suffix: str): bool {
@@ -258,8 +260,8 @@ private fn load_platform_source(full: str, is_test: bool, pkg: *Package, imports
  * @context a allocator
  * @return false on empty package, list failure, or lex/parse error
  */
-fn load_files(pkg: *Package, include_tests: bool, allow_empty: bool, err_path: str, err_line: i64, err_column: i64, imports: *list.List<ImportRef>): bool with (a: mem.Allocator) {
-    val target = host_os()
+fn load_files(pkg: *Package, include_tests: bool, allow_empty: bool, err_path: str, err_line: i64, err_column: i64, imports: *list.List<ImportRef>, ptr_size: u32): bool with (a: mem.Allocator) {
+    val target = target_os(ptr_size)
     var (names, listed) = fs.list(pkg.dir)
     if !listed {
         print_pos_error(err_path, err_line, err_column, "cannot list package folder")
@@ -709,7 +711,7 @@ private fn load_package(w: *Walk, has_mod: bool, mod: Module, path: str, name: s
     val include_tests = w.include_tests && has_mod && mod.is_root
     val allow_empty = has_mod && mod.is_library && mod.manifest.exports.len > 0 && dir == mod.root
     var refs = list.empty<ImportRef>()
-    var files_ok = load_files(pkg, include_tests, allow_empty, err_file, err_line, err_column, &refs)
+    var files_ok = load_files(pkg, include_tests, allow_empty, err_file, err_line, err_column, &refs, w.ptr_size)
     if files_ok && has_mod && mod.manifest.has_targets {
         if !attach_target_sources(pkg, include_tests, mod.manifest, err_file, err_line, err_column) {
             files_ok = false
@@ -818,7 +820,7 @@ fn package_path_under(root: str, dir: str): str with (a: mem.Allocator) {
  * @context a allocator
  * @return the program and true, or an empty program and false on error
  */
-fn load_root_sources(root_mod: Module, man_path: str, roots: Roots, mods: list.List<Module>, include_tests: bool, extra_dir: str): (Program, bool) with (a: mem.Allocator) {
+fn load_root_sources(root_mod: Module, man_path: str, roots: Roots, mods: list.List<Module>, include_tests: bool, extra_dir: str, ptr_size: u32): (Program, bool) with (a: mem.Allocator) {
     var w: Walk
     w.roots = roots
     w.root_mod = root_mod
@@ -829,6 +831,7 @@ fn load_root_sources(root_mod: Module, man_path: str, roots: Roots, mods: list.L
     w.order = list.empty<*Package>()
     w.failed = false
     w.include_tests = include_tests
+    w.ptr_size = ptr_size
 
     var back = false
     val root = load_package(&w, true, root_mod, "", root_mod.name, root_mod.root, man_path, root_mod.manifest.name_line, root_mod.manifest.name_column, &back)
@@ -853,9 +856,9 @@ fn load_root_sources(root_mod: Module, man_path: str, roots: Roots, mods: list.L
     var ok = !w.failed && root != null
     if ok {
         val universe = universe_scope()
-        if !bind_prelude(universe, roots.core_root) {
+        if !bind_prelude(universe, roots.core_root, ptr_size) {
             ok = false
-        } else if !resolve_packages(root_mod.name, w.order, universe) {
+        } else if !resolve_packages(root_mod.name, w.order, universe, ptr_size) {
             ok = false
         } else if !resolve_bodies(w.order) {
             ok = false

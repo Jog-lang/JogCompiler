@@ -151,7 +151,7 @@ private fn load_and_check(
 ): (load.Program, i32) with (a: mem.Allocator) {
     load.begin_overrides(override_paths, override_texts)
     load.set_soft_asts(true)
-    val (prog, loaded) = load.run(start, module_flags, false)
+    val (prog, loaded) = load.run(start, module_flags, false, 8, false)
     var code = loaded
     if loaded == 0 {
         val (checked, c) = check.run(prog)

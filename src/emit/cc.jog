@@ -268,7 +268,7 @@ private fn push_mode(args: *list.List<str>, mode: i32): bool {
 }
 
 private fn push_warnings(args: *list.List<str>, compiler: str) {
-    if base_has(compiler, "clang") {
+    if base_has(compiler, "clang") || base_has(compiler, "emcc") {
         args.push("-Wno-incompatible-library-redeclaration")
         args.push("-Wno-builtin-requires-header")
         return
@@ -292,7 +292,138 @@ private fn run_cc(args: list.List<str>, compiler: str): i32 with (a: mem.Allocat
     return 0
 }
 
-fn link_c(c_path: str, exe_path: str, runtime: str, mode: i32, libs: list.List<str>, libdirs: list.List<str>): i32 with (a: mem.Allocator) {
+private fn run_emcc(args: list.List<str>, compiler: str): i32 with (a: mem.Allocator) {
+    val (code, err) = proc.run_inherit(args.items())
+    if err != null {
+        say3("cannot run emcc '", compiler, "'")
+        return 1
+    }
+    if code != 0 {
+        var buf = strbuilder.empty()
+        buf.append("emcc exited with status ")
+        buf.append_int(code as i64, 10)
+        say(buf.str())
+        return 1
+    }
+    return 0
+}
+
+private fn push_link_libs(args: *list.List<str>, libs: list.List<str>, libdirs: list.List<str>): i32 with (a: mem.Allocator) {
+    var di: usize = 0
+    for di < libdirs.len {
+        val dir = libdirs.get(di)
+        if dir.len == 0 {
+            say("empty library search path")
+            return 1
+        }
+        var lflag = strbuilder.empty()
+        lflag.append("-L")
+        lflag.append(dir)
+        args.push(fs.copy_str(lflag.str()))
+        di = di + 1
+    }
+    var li: usize = 0
+    for li < libs.len {
+        val lib = libs.get(li)
+        if lib.len == 0 {
+            say("empty link library")
+            return 1
+        }
+        var flag = strbuilder.empty()
+        flag.append("-l")
+        flag.append(lib)
+        args.push(fs.copy_str(flag.str()))
+        li = li + 1
+    }
+    return 0
+}
+
+// EMCC, else JOG_CC when it names emcc, else emcc on PATH.
+private fn find_emcc(): (str, str) with (a: mem.Allocator) {
+    val (emcc_view, has_emcc) = os.env("EMCC")
+    if has_emcc && emcc_view.len > 0 {
+        val override = fs.copy_str(emcc_view)
+        if has_sep(override) {
+            return file_in_dir("", override), override
+        }
+        return search_path(override), override
+    }
+    val (cc_view, has_cc) = os.env("JOG_CC")
+    if has_cc && cc_view.len > 0 && base_has(cc_view, "emcc") {
+        val override = fs.copy_str(cc_view)
+        if has_sep(override) {
+            return file_in_dir("", override), override
+        }
+        return search_path(override), override
+    }
+    return search_path("emcc"), ""
+}
+
+/* Emscripten: emcc + libc runtime (not freestanding jogrt_wasm). Host -l/-L
+   are allowed. Coroutine switch is the aborting emscripten stub. */
+private fn link_emscripten(c_path: str, exe_path: str, runtime: str, mode: i32, libs: list.List<str>, libdirs: list.List<str>): i32 with (a: mem.Allocator) {
+    if c_path.len == 0 || exe_path.len == 0 || runtime.len == 0 {
+        say("cannot invoke emcc: missing input, output, or runtime path")
+        return 1
+    }
+    if mode != 0 && mode != 1 && mode != 2 {
+        say("cannot invoke emcc: unknown build mode")
+        return 1
+    }
+    val (compiler, override) = find_emcc()
+    if compiler.len == 0 {
+        if override.len > 0 {
+            say3("emcc '", override, "' from EMCC/JOG_CC was not found")
+        } else {
+            say("emcc not found; install emsdk and put emcc on PATH (or set EMCC)")
+        }
+        return 1
+    }
+    if !is_file(c_path) {
+        say3("C input '", c_path, "' was not found")
+        return 1
+    }
+    val jogrt_c = fs.join(runtime, "jogrt.c")
+    val jogrt_sched = fs.join(runtime, "jogrt_sched.c")
+    val jogrt_switch = fs.join(runtime, "emscripten/jogrt_switch.c")
+    val jogrt_mainloop = fs.join(runtime, "jogrt_mainloop.c")
+    val jogrt_main = fs.join(runtime, "jogrt_main.c")
+    if !is_file(jogrt_c) || !is_file(jogrt_sched) || !is_file(jogrt_switch) || !is_file(jogrt_mainloop) ||
+        !is_file(jogrt_main) {
+        say3("runtime '", runtime,
+            "' is missing jogrt.c, jogrt_sched.c, emscripten/jogrt_switch.c, jogrt_mainloop.c, or jogrt_main.c")
+        return 1
+    }
+    var args = list.empty<str>()
+    args.push(compiler)
+    args.push("-std=gnu17")
+    if !push_mode(&args, mode) {
+        say("cannot invoke emcc: unknown build mode")
+        return 1
+    }
+    push_warnings(&args, compiler)
+    args.push("-I")
+    args.push(runtime)
+    args.push(c_path)
+    args.push(jogrt_c)
+    args.push(jogrt_sched)
+    args.push(jogrt_switch)
+    args.push(jogrt_mainloop)
+    args.push(jogrt_main)
+    args.push("-sALLOW_MEMORY_GROWTH=1")
+    args.push("-sFULL_ES2=1")
+    args.push("-o")
+    args.push(exe_path)
+    if push_link_libs(&args, libs, libdirs) != 0 {
+        return 1
+    }
+    return run_emcc(args, compiler)
+}
+
+fn link_c(c_path: str, exe_path: str, runtime: str, mode: i32, libs: list.List<str>, libdirs: list.List<str>, emscripten: bool): i32 with (a: mem.Allocator) {
+    if emscripten {
+        return link_emscripten(c_path, exe_path, runtime, mode, libs, libdirs)
+    }
     if c_path.len == 0 || exe_path.len == 0 || runtime.len == 0 {
         say("cannot invoke the C compiler: missing input, output, or runtime path")
         return 1
@@ -364,44 +495,25 @@ fn link_c(c_path: str, exe_path: str, runtime: str, mode: i32, libs: list.List<s
         val jogrt_c = fs.join(runtime, "jogrt.c")
         val jogrt_sched = fs.join(runtime, "jogrt_sched.c")
         val jogrt_switch = fs.join(runtime, "jogrt_switch.c")
+        val jogrt_mainloop = fs.join(runtime, "jogrt_mainloop.c")
         val jogrt_main = fs.join(runtime, "jogrt_main.c")
-        if !is_file(jogrt_c) || !is_file(jogrt_sched) || !is_file(jogrt_switch) || !is_file(jogrt_main) {
-            say3("runtime '", runtime, "' is missing jogrt.c, jogrt_sched.c, jogrt_switch.c, or jogrt_main.c")
+        if !is_file(jogrt_c) || !is_file(jogrt_sched) || !is_file(jogrt_switch) || !is_file(jogrt_mainloop) ||
+            !is_file(jogrt_main) {
+            say3("runtime '", runtime,
+                "' is missing jogrt.c, jogrt_sched.c, jogrt_switch.c, jogrt_mainloop.c, or jogrt_main.c")
             return 1
         }
         args.push(jogrt_c)
         args.push(jogrt_sched)
         args.push(jogrt_switch)
+        args.push(jogrt_mainloop)
         args.push(jogrt_main)
     }
     args.push("-o")
     args.push(exe_path)
     if !wasm {
-        var di: usize = 0
-        for di < libdirs.len {
-            val dir = libdirs.get(di)
-            if dir.len == 0 {
-                say("empty library search path")
-                return 1
-            }
-            var lflag = strbuilder.empty()
-            lflag.append("-L")
-            lflag.append(dir)
-            args.push(fs.copy_str(lflag.str()))
-            di = di + 1
-        }
-        var li: usize = 0
-        for li < libs.len {
-            val lib = libs.get(li)
-            if lib.len == 0 {
-                say("empty link library")
-                return 1
-            }
-            var flag = strbuilder.empty()
-            flag.append("-l")
-            flag.append(lib)
-            args.push(fs.copy_str(flag.str()))
-            li = li + 1
+        if push_link_libs(&args, libs, libdirs) != 0 {
+            return 1
         }
     }
     return run_cc(args, compiler)

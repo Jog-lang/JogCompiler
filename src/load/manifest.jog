@@ -519,14 +519,31 @@ private fn copy_tok(tok: Tok): str with (a: mem.Allocator) {
 }
 
 /**
+ * Whether a link.<target> / libdir.<target> line is kept for this build.
+ * Emscripten keeps only emscripten; freestanding wasm32 drops all targeted
+ * lines; native keeps the host OS. Untargeted link/libdir always stay.
+ */
+private fn keep_link_target(target: str, emscripten: bool, ptr_size: u32): bool {
+    if emscripten {
+        return target == "emscripten"
+    }
+    if ptr_size == 4 {
+        return false
+    }
+    return target == host_os()
+}
+
+/**
  * Read jog.mod v2 into a Manifest. Matches parse_manifest in loader.c.
  * Diagnostics use path:line:column. A failed parse still fills what it can.
  * @param path absolute path of the jog.mod file, as printed in diagnostics
  * @param data file bytes
+ * @param emscripten --target wasm32-emscripten
+ * @param ptr_size 4 for wasm32 / wasm32-emscripten, else 8
  * @context a allocator for strings and lists
  * @return the manifest and true when the file is acceptable
  */
-fn parse_manifest(path: str, data: str): (Manifest, bool) with (a: mem.Allocator) {
+fn parse_manifest(path: str, data: str, emscripten: bool, ptr_size: u32): (Manifest, bool) with (a: mem.Allocator) {
     var mod = empty_manifest()
     var at: usize = 0
     var line_no: i64 = 1
@@ -539,7 +556,6 @@ fn parse_manifest(path: str, data: str): (Manifest, bool) with (a: mem.Allocator
     var any_export = false
     var first_export_line: i64 = 0
     var first_export_column: i64 = 0
-    val host = host_os()
     val mod_dir = mod_folder(path)
 
     for at < data.len {
@@ -642,14 +658,15 @@ fn parse_manifest(path: str, data: str): (Manifest, bool) with (a: mem.Allocator
                 var target: Tok
                 target.text = texts.slice(first.text, 5, first.text.len)
                 target.column = first.column + 5
-                if !tok_is(target, "windows") && !tok_is(target, "linux") && !tok_is(target, "macos") {
+                if !tok_is(target, "windows") && !tok_is(target, "linux") && !tok_is(target, "macos") &&
+                    !tok_is(target, "emscripten") {
                     emit_fmt(path, line_no, target.column, "jog.mod: unknown target '", target.text,
-                        "'; expected windows, linux, or macos")
+                        "'; expected windows, linux, macos, or emscripten")
                     ok = false
                     line_no = line_no + 1
                     continue
                 }
-                keep = tok_is(target, host)
+                keep = keep_link_target(target.text, emscripten, ptr_size)
             }
             if !one_word(path, line_no, pos_col, third_col, n, "library name") {
                 ok = false
@@ -663,16 +680,15 @@ fn parse_manifest(path: str, data: str): (Manifest, bool) with (a: mem.Allocator
                 var target: Tok
                 target.text = texts.slice(first.text, 7, first.text.len)
                 target.column = first.column + 7
-                if !tok_is(target, "windows") && !tok_is(target, "linux") && !tok_is(target, "macos") {
+                if !tok_is(target, "windows") && !tok_is(target, "linux") && !tok_is(target, "macos") &&
+                    !tok_is(target, "emscripten") {
                     emit_fmt(path, line_no, target.column, "jog.mod: unknown target '", target.text,
-                        "'; expected windows, linux, or macos")
+                        "'; expected windows, linux, macos, or emscripten")
                     ok = false
                     line_no = line_no + 1
                     continue
                 }
-                // Match develop's link.<target> filter (host OS). Seed also
-                // drops these for wasm32 (ptr_size 4); that skips at link.
-                keep = tok_is(target, host)
+                keep = keep_link_target(target.text, emscripten, ptr_size)
             }
             if !one_word(path, line_no, pos_col, third_col, n, "library search path") {
                 ok = false
@@ -858,12 +874,13 @@ fn parse_manifest(path: str, data: str): (Manifest, bool) with (a: mem.Allocator
         ok = false
     }
     if mod.has_targets && mod.targets.len > 0 && mod.name.len > 0 {
-        if !find_target(mod.targets, host) {
+        val os = target_os(ptr_size)
+        if !find_target(mod.targets, os) {
             var b = strbuilder.empty()
             b.append("module '")
             b.append(mod.name)
             b.append("' does not support target '")
-            b.append(host)
+            b.append(os)
             b.append("'")
             emit(path, mod.targets_line, mod.targets_column, b.str())
             b.free()

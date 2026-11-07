@@ -552,10 +552,11 @@ private fn bind_lang_items(scope: *PackageScope): bool with (a: mem.Allocator) {
  * Read core/scalar.jog into the universe scope, then bind language items.
  * @param scope universe from universe_scope
  * @param core_root path to the core folder, or empty when missing
+ * @param ptr_size 4 for wasm32 / wasm32-emscripten, else 8 (isize/usize)
  * @context a allocator for the file bytes and symbols
  * @return false when the prelude failed
  */
-fn bind_prelude(scope: *PackageScope, core_root: str): bool with (a: mem.Allocator) {
+fn bind_prelude(scope: *PackageScope, core_root: str, ptr_size: u32): bool with (a: mem.Allocator) {
     if core_root.len == 0 || !dir_is(core_root) {
         print_bare_error("core prelude was not found")
         return false
@@ -597,7 +598,7 @@ fn bind_prelude(scope: *PackageScope, core_root: str): bool with (a: mem.Allocat
         fs.free_str(path)
         return false
     }
-    var pre = Prelude(scope: scope, path: path, failed: false, ptr_size: size(*u8) as u64)
+    var pre = Prelude(scope: scope, path: path, failed: false, ptr_size: ptr_size as u64)
     var seen = list.empty<bool>()
     var i: usize = 0
     for i < scalar_count() {

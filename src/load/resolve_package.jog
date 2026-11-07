@@ -13,6 +13,7 @@ private struct Resolve {
     packages: list.List<*Package>
     universe: *PackageScope?
     failed: bool
+    ptr_size: u32
 }
 
 private fn is_discard(name: str): bool {
@@ -436,7 +437,7 @@ private fn core_file(source: SourceFile): bool {
 }
 
 private fn bind_platform(r: *Resolve, pkg: *Package) with (a: mem.Allocator) {
-    val target = host_os()
+    val target = target_os(r.ptr_size)
     var fi: usize = 0
     for fi < pkg.files.len {
         val source = pkg.files.get(fi)
@@ -524,15 +525,17 @@ private fn build_package(r: *Resolve, pkg: *Package) with (a: mem.Allocator) {
  * @param root_module name of the root module
  * @param packages dependency-ordered packages from the loader
  * @param universe builtin scope after the prelude
+ * @param ptr_size 4 for wasm32 / wasm32-emscripten (platform OS wasm)
  * @context a allocator for scopes and symbols
  * @return false when a resolve error was reported
  */
-fn resolve_packages(root_module: str, packages: list.List<*Package>, universe: *PackageScope): bool with (a: mem.Allocator) {
+fn resolve_packages(root_module: str, packages: list.List<*Package>, universe: *PackageScope, ptr_size: u32): bool with (a: mem.Allocator) {
     var r: Resolve
     r.root_module = root_module
     r.packages = packages
     r.universe = universe as *PackageScope?
     r.failed = false
+    r.ptr_size = ptr_size
     for pkg in packages.items() {
         build_package(&r, pkg)
     }

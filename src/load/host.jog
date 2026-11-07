@@ -1,8 +1,21 @@
 // The host OS name for link.<target> and targets checks. Matches
-// jog_host_os in compiler/src/os_suffix.h.
+// jog_host_os / jog_target_os in compiler/src/os_suffix.h.
 
 /**
  * The OS this compiler binary was built for: windows, linux, or macos.
  * @return the host target name
  */
 expect fn host_os(): str
+
+/**
+ * Platform-file OS for the build: wasm when ptr_size is 4 (wasm32 or
+ * wasm32-emscripten), otherwise the host. Matches jog_target_os.
+ * @param ptr_size 4 or 8
+ * @return "wasm", "windows", "linux", or "macos"
+ */
+fn target_os(ptr_size: u32): str {
+    if ptr_size == 4 {
+        return "wasm"
+    }
+    return host_os()
+}
