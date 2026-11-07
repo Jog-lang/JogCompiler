@@ -95,8 +95,9 @@ typedef struct JogProgram {
     JogPackage **packages;    /* dependency order: every package after the ones it imports */
     size_t package_count;
     JogPackage *root;
-    const char **link_libs; /* link names for this target: the root's, then each module's in
-                               --module order; a repeated name keeps its last position */
+    const char **link_libs; /* link names for this target: root jog.mod, then each --module,
+                               then @link("…") from loaded extern blocks; a repeated name
+                               keeps its last position */
     size_t link_lib_count;
     const char **lib_dirs; /* -L search paths: root libdir, then each module, then CLI; last wins */
     size_t lib_dir_count;
