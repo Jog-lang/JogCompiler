@@ -52,6 +52,7 @@ typedef struct CmdRequest {
     int include_tests; /* load *.test.jog */
     int match_expects; /* compare stdout with // expect: lines in test files */
     int target_wasm;   /* --target wasm32; output ends in .wasm */
+    int target_emscripten; /* --target wasm32-emscripten; output ends in .html */
     int saw_target;
     uint64_t comptime_steps; /* 0 when --comptime-steps was omitted */
     int saw_comptime;
@@ -66,9 +67,9 @@ typedef struct CmdRequest {
 static const char *usage_line(PipelineStop stop) {
     switch (stop) {
     case STOP_BUILD:
-        return "usage: jog build [package] [-o file] [--release | --release-fast] [--keep-c] [--target wasm32] [--comptime-steps N] [--module name=dir ...] [--libdir dir | -L dir ...]\n";
+        return "usage: jog build [package] [-o file] [--release | --release-fast] [--keep-c] [--target wasm32|wasm32-emscripten] [--comptime-steps N] [--module name=dir ...] [--libdir dir | -L dir ...]\n";
     case STOP_RUN:
-        return "usage: jog run [package] [--target wasm32] [--comptime-steps N] [--module name=dir ...] [--libdir dir | -L dir ...] [-- args...]\n";
+        return "usage: jog run [package] [--target wasm32|wasm32-emscripten] [--comptime-steps N] [--module name=dir ...] [--libdir dir | -L dir ...] [-- args...]\n";
     case STOP_CHECK:
         return "usage: jog check [package] [--diag=text|json] [--module name=dir ...] [--libdir dir | -L dir ...]\n";
     case STOP_C:
@@ -234,12 +235,16 @@ static int parse_args(PipelineStop stop, int argc, char **argv, CmdRequest *req)
                 }
                 value = argv[++i];
             }
-            if (!value || strcmp(value, "wasm32") != 0) {
+            if (!value || (strcmp(value, "wasm32") != 0 && strcmp(value, "wasm32-emscripten") != 0)) {
                 fprintf(stderr, "jog: unknown target '%s'\n", value ? value : "");
                 return 2;
             }
             req->saw_target = 1;
-            req->target_wasm = 1;
+            if (strcmp(value, "wasm32-emscripten") == 0) {
+                req->target_emscripten = 1;
+            } else {
+                req->target_wasm = 1;
+            }
             continue;
         }
         if (strcmp(arg, "--comptime-steps") == 0 || strncmp(arg, "--comptime-steps=", 17) == 0) {
@@ -609,9 +614,16 @@ static JogNode *list_at(JogList list, size_t index) {
     return list.items[index];
 }
 
-/* The module named by one @link("..."), or NULL when the node has none.
-   *bad is set when an @link is present and not one safe string literal. */
-static const char *attr_link_module(CtDiag *diag, JogNode *node, int *bad) {
+/* True for a host -l name or a Wasm import module token (letters, digits,
+   '_', '.', '-'; non-empty and shorter than 128). */
+static int link_lib_token(const char *text) {
+    return wasm_module_token(text);
+}
+
+/* The string named by one @link("..."), or NULL when the node has none.
+   *bad is set when an @link is present and not one safe string literal.
+   When require_wasm is set, the name must also be a Wasm import module. */
+static const char *attr_link_name(CtDiag *diag, JogNode *node, int *bad, int require_wasm) {
     size_t i;
     const char *found = NULL;
     if (!node || !bad) {
@@ -639,7 +651,15 @@ static const char *attr_link_module(CtDiag *diag, JogNode *node, int *bad) {
             *bad = 1;
             return NULL;
         }
-        if (!wasm_module_token(text)) {
+        if (!link_lib_token(text)) {
+            ct_diag_emit(diag, CT_SEVERITY_ERROR, pos_of(attr->pos),
+                         require_wasm ? "@link module '%s' is not a Wasm import name"
+                                      : "@link library '%s' is not a valid library name",
+                         text);
+            *bad = 1;
+            return NULL;
+        }
+        if (require_wasm && !wasm_module_token(text)) {
             ct_diag_emit(diag, CT_SEVERITY_ERROR, pos_of(attr->pos),
                          "@link module '%s' is not a Wasm import name", text);
             *bad = 1;
@@ -648,6 +668,12 @@ static const char *attr_link_module(CtDiag *diag, JogNode *node, int *bad) {
         found = text;
     }
     return found;
+}
+
+/* The module named by one @link("..."), or NULL when the node has none.
+   *bad is set when an @link is present and not one safe string literal. */
+static const char *attr_link_module(CtDiag *diag, JogNode *node, int *bad) {
+    return attr_link_name(diag, node, bad, 1);
 }
 
 static int note_import(CtDiag *diag, CtDa *notes, const char *symbol, const char *module, JogPos pos) {
@@ -786,6 +812,115 @@ static int prepend_wasm_imports(JogProgram *program, CtSb *c_text) {
     return 1;
 }
 
+/* Append @link("lib") names from every loaded extern block (and per-fn
+   overrides) after jog.mod link lines. A repeated name keeps its last
+   position — the same rule as merge_links. Native hosts pass these as -l;
+   Wasm uses @link only as import module names (prepend_wasm_imports). */
+static int merge_source_links(JogProgram *program) {
+    CtDa all;
+    CtDa merged;
+    size_t p;
+    size_t f;
+    size_t d;
+    size_t n;
+    size_t i;
+    size_t j;
+    int ok = 1;
+    CtPos pos = {0};
+    if (!program) {
+        return 0;
+    }
+    if (!ct_da_init(&all, sizeof(const char *)) || !ct_da_init(&merged, sizeof(const char *))) {
+        ct_da_free(&all);
+        ct_da_free(&merged);
+        ct_diag_emit(program->diag, CT_SEVERITY_ERROR, pos, "out of memory");
+        return 0;
+    }
+    for (i = 0; ok && i < program->link_lib_count; i++) {
+        const char *lib = program->link_libs[i];
+        ok = ct_da_push(&all, &lib);
+    }
+    for (p = 0; ok && p < program->package_count; p++) {
+        JogPackage *pkg = program->packages ? program->packages[p] : NULL;
+        if (!pkg) {
+            continue;
+        }
+        for (f = 0; ok && f < pkg->file_count; f++) {
+            JogSourceFile *file = pkg->files ? pkg->files[f] : NULL;
+            JogNode *root = file ? file->ast : NULL;
+            if (!root || root->kind != JOG_NODE_FILE) {
+                continue;
+            }
+            for (d = 0; ok && d < root->as.file.decls.count; d++) {
+                JogNode *decl = list_at(root->as.file.decls, d);
+                const char *block_lib;
+                int bad = 0;
+                if (!decl || decl->kind != JOG_NODE_EXTERN_BLOCK) {
+                    continue;
+                }
+                block_lib = attr_link_name(program->diag, decl, &bad, 0);
+                if (bad) {
+                    ok = 0;
+                    break;
+                }
+                if (block_lib) {
+                    ok = ct_da_push(&all, &block_lib);
+                }
+                for (n = 0; ok && n < decl->as.extern_block.fns.count; n++) {
+                    JogNode *fn = list_at(decl->as.extern_block.fns, n);
+                    const char *fn_lib;
+                    bad = 0;
+                    if (!fn || fn->kind != JOG_NODE_FN) {
+                        continue;
+                    }
+                    fn_lib = attr_link_name(program->diag, fn, &bad, 0);
+                    if (bad) {
+                        ok = 0;
+                        break;
+                    }
+                    if (fn_lib) {
+                        ok = ct_da_push(&all, &fn_lib);
+                    }
+                }
+            }
+        }
+    }
+    for (i = 0; ok && i < all.count; i++) {
+        const char *lib = *(const char **)ct_da_at(&all, i);
+        int later = 0;
+        for (j = i + 1; j < all.count; j++) {
+            if (strcmp(lib, *(const char **)ct_da_at(&all, j)) == 0) {
+                later = 1;
+                break;
+            }
+        }
+        if (!later) {
+            ok = ct_da_push(&merged, &lib);
+        }
+    }
+    if (ok) {
+        program->link_libs = NULL;
+        program->link_lib_count = 0;
+        if (merged.count > 0) {
+            const char **copied =
+                ct_arena_alloc(program->arena, merged.count * sizeof(const char *), _Alignof(const char *));
+            if (copied) {
+                memcpy(copied, merged.data, merged.count * sizeof(const char *));
+                program->link_libs = copied;
+                program->link_lib_count = merged.count;
+            } else {
+                ok = 0;
+            }
+        }
+    }
+    if (!ok) {
+        ct_diag_emit(program->diag, CT_SEVERITY_ERROR, pos, "out of memory");
+    }
+    ct_da_free(&all);
+    ct_da_free(&merged);
+    return ok;
+}
+
 static int link_program(JogProgram *program, const CmdRequest *req, CtSb *c_text, const char **exe_out) {
     CtArena *arena = program->arena;
     CtDiag *diag = program->diag;
@@ -806,7 +941,13 @@ static int link_program(JogProgram *program, const CmdRequest *req, CtSb *c_text
     if (req->output) {
         exe_path = req->output;
     } else {
-        exe_name = suffix_name(arena, program->module_name, req->target_wasm ? ".wasm" : JOG_EXE_SUFFIX);
+        if (req->target_emscripten) {
+            exe_name = suffix_name(arena, program->module_name, ".html");
+        } else if (req->target_wasm) {
+            exe_name = suffix_name(arena, program->module_name, ".wasm");
+        } else {
+            exe_name = suffix_name(arena, program->module_name, JOG_EXE_SUFFIX);
+        }
         exe_path = out_dir && exe_name ? ct_path_join(arena, out_dir, exe_name) : NULL;
     }
     if (!out_dir || !c_path || !exe_path) {
@@ -817,8 +958,18 @@ static int link_program(JogProgram *program, const CmdRequest *req, CtSb *c_text
         ct_diag_emit(diag, CT_SEVERITY_ERROR, pos, "wasm32 output '%s' must end in .wasm", exe_path);
         return 0;
     }
+    if (req->target_emscripten && !path_ends_with(exe_path, ".html") && !path_ends_with(exe_path, ".js")) {
+        ct_diag_emit(diag, CT_SEVERITY_ERROR, pos,
+                     "wasm32-emscripten output '%s' must end in .html or .js", exe_path);
+        return 0;
+    }
     if (!req->target_wasm && path_ends_with(exe_path, ".wasm")) {
         ct_diag_emit(diag, CT_SEVERITY_ERROR, pos, "output '%s' ends in .wasm; pass --target wasm32", exe_path);
+        return 0;
+    }
+    if (!req->target_emscripten && (path_ends_with(exe_path, ".html") || path_ends_with(exe_path, ".js"))) {
+        ct_diag_emit(diag, CT_SEVERITY_ERROR, pos,
+                     "output '%s' looks like Emscripten output; pass --target wasm32-emscripten", exe_path);
         return 0;
     }
     pos.file = c_path;
@@ -827,6 +978,9 @@ static int link_program(JogProgram *program, const CmdRequest *req, CtSb *c_text
         return 0;
     }
     if (req->target_wasm && !prepend_wasm_imports(program, c_text)) {
+        return 0;
+    }
+    if (!req->target_wasm && !merge_source_links(program)) {
         return 0;
     }
     if (!write_file(c_path, c_text->data ? c_text->data : "", c_text->len)) {
@@ -842,6 +996,7 @@ static int link_program(JogProgram *program, const CmdRequest *req, CtSb *c_text
     request.extra_lib_count = program->link_lib_count;
     request.extra_lib_dirs = (const char *const *)program->lib_dirs;
     request.extra_lib_dir_count = program->lib_dir_count;
+    request.emscripten = req->target_emscripten ? true : false;
     request.verbose = false;
     if (!jog_cc_build(&request, diag)) {
         return 0;
@@ -1160,7 +1315,8 @@ static int compile_pipeline(const CmdRequest *req) {
     program.intern = intern;
     program.options.mode = req->mode;
     program.options.include_tests = req->include_tests ? true : false;
-    program.options.ptr_size = req->target_wasm ? 4u : 8u;
+    program.options.ptr_size = (req->target_wasm || req->target_emscripten) ? 4u : 8u;
+    program.options.emscripten = req->target_emscripten ? true : false;
     program.options.start_package = req->stop == STOP_CHECK && req->package != NULL;
     program.types = jog_types_create(arena, program.options.ptr_size);
     if (!program.types) {

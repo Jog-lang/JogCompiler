@@ -177,4 +177,9 @@ int jogrt_wexitstatus(int status);
    const int8_t ** matches Jog *(*const c.char?)?. */
 const int8_t **jogrt_environ(void);
 
+/* Returning mainloop for Emscripten (and a plain while on desktop).
+   Calls the program's @export jog_app_iterate() until it returns 0.
+   Linked from runtime/jogrt_mainloop.c. */
+void jog_host_run_loop(void);
+
 #endif
