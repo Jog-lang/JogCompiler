@@ -159,7 +159,7 @@ fn dispatch(): i32 with (a: mem.Allocator) {
             }
             i = i + 1
         }
-        val (prog, loaded) = load.run(start, module_flags.items(), false)
+        val (prog, loaded) = load.run(start, module_flags.items(), false, 8, false)
         if loaded != 0 {
             return loaded
         }
@@ -222,7 +222,7 @@ fn dispatch(): i32 with (a: mem.Allocator) {
             }
             i = i + 1
         }
-        val (prog, loaded) = load.run(start, module_flags.items(), false)
+        val (prog, loaded) = load.run(start, module_flags.items(), false, 8, false)
         if loaded != 0 {
             return loaded
         }
@@ -313,7 +313,7 @@ fn dispatch(): i32 with (a: mem.Allocator) {
             }
             i = i + 1
         }
-        val (prog, loaded) = load.run(start, module_flags.items(), false)
+        val (prog, loaded) = load.run(start, module_flags.items(), false, 8, false)
         if loaded != 0 {
             return loaded
         }
