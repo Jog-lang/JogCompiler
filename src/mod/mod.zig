@@ -1,0 +1,176 @@
+const std = @import("std");
+
+pub const Error = error{
+    MissingJogMod,
+    MissingModule,
+    MissingRoot,
+    DuplicateModule,
+    DuplicateVersion,
+    DuplicateRoot,
+    EmptyDirective,
+    UnknownDirective,
+    OutOfMemory,
+};
+
+/// Minimal jog.mod: module, version, root, optional source lines.
+pub const Manifest = struct {
+    name: []const u8,
+    version: []const u8,
+    /// Paths relative to the module directory; root first, then source lines (deduped).
+    sources: []const []const u8,
+    /// Directory that contains jog.mod (as given / relative to cwd).
+    dir: []const u8,
+    arena: std.heap.ArenaAllocator,
+
+    pub fn deinit(self: *Manifest) void {
+        self.arena.deinit();
+    }
+};
+
+/// True when `path` is a directory or a `jog.mod` file.
+pub fn isModulePath(path: []const u8) bool {
+    if (std.mem.eql(u8, std.fs.path.basename(path), "jog.mod")) return true;
+    const st = std.fs.cwd().statFile(path) catch return false;
+    return st.kind == .directory;
+}
+
+/// Load and parse `dir/jog.mod` (or `path` when it is a jog.mod file).
+pub fn loadFromPath(parent: std.mem.Allocator, path: []const u8) Error!Manifest {
+    const st = std.fs.cwd().statFile(path) catch return error.MissingJogMod;
+
+    const dir: []const u8 = if (st.kind == .directory)
+        path
+    else if (std.mem.eql(u8, std.fs.path.basename(path), "jog.mod"))
+        (std.fs.path.dirname(path) orelse ".")
+    else
+        return error.MissingJogMod;
+
+    const mod_path = if (st.kind == .directory)
+        try std.fs.path.join(parent, &.{ path, "jog.mod" })
+    else
+        try parent.dupe(u8, path);
+    defer parent.free(mod_path);
+
+    const text = std.fs.cwd().readFileAlloc(parent, mod_path, 1024 * 1024) catch return error.MissingJogMod;
+    defer parent.free(text);
+
+    return parse(parent, text, dir);
+}
+
+pub fn parse(parent: std.mem.Allocator, text: []const u8, dir: []const u8) Error!Manifest {
+    var arena = std.heap.ArenaAllocator.init(parent);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+
+    var name: ?[]const u8 = null;
+    var version: ?[]const u8 = null;
+    var root: ?[]const u8 = null;
+    var extras: std.ArrayListUnmanaged([]const u8) = .{};
+
+    var line_it = std.mem.splitScalar(u8, text, '\n');
+    while (line_it.next()) |raw_line| {
+        const line = trimComment(std.mem.trim(u8, raw_line, " \t\r"));
+        if (line.len == 0) continue;
+
+        var tok_it = std.mem.tokenizeAny(u8, line, " \t");
+        const key = tok_it.next() orelse continue;
+        const value = std.mem.trim(u8, line[key.len..], " \t");
+        if (value.len == 0) return error.EmptyDirective;
+
+        if (std.mem.eql(u8, key, "module")) {
+            if (name != null) return error.DuplicateModule;
+            name = try a.dupe(u8, firstWord(value));
+        } else if (std.mem.eql(u8, key, "version")) {
+            if (version != null) return error.DuplicateVersion;
+            version = try a.dupe(u8, firstWord(value));
+        } else if (std.mem.eql(u8, key, "root")) {
+            if (root != null) return error.DuplicateRoot;
+            root = try a.dupe(u8, firstWord(value));
+        } else if (std.mem.eql(u8, key, "source")) {
+            try extras.append(a, try a.dupe(u8, firstWord(value)));
+        } else {
+            return error.UnknownDirective;
+        }
+    }
+
+    const mod_name = name orelse return error.MissingModule;
+    const mod_root = root orelse return error.MissingRoot;
+    const mod_version = version orelse try a.dupe(u8, "0.0.0");
+
+    var sources: std.ArrayListUnmanaged([]const u8) = .{};
+    try sources.append(a, mod_root);
+    for (extras.items) |s| {
+        if (containsPath(sources.items, s)) continue;
+        try sources.append(a, s);
+    }
+
+    return .{
+        .name = mod_name,
+        .version = mod_version,
+        .sources = try sources.toOwnedSlice(a),
+        .dir = try a.dupe(u8, dir),
+        .arena = arena,
+    };
+}
+
+/// Join module dir + relative sources. Caller frees each path and the slice.
+pub fn resolveSourcePaths(allocator: std.mem.Allocator, m: *const Manifest) Error![][]const u8 {
+    var out: std.ArrayListUnmanaged([]const u8) = .{};
+    errdefer {
+        for (out.items) |p| allocator.free(p);
+        out.deinit(allocator);
+    }
+    for (m.sources) |rel| {
+        const joined = try std.fs.path.join(allocator, &.{ m.dir, rel });
+        try out.append(allocator, joined);
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn containsPath(hay: []const []const u8, needle: []const u8) bool {
+    for (hay) |p| {
+        if (std.mem.eql(u8, p, needle)) return true;
+    }
+    return false;
+}
+
+fn firstWord(s: []const u8) []const u8 {
+    var it = std.mem.tokenizeAny(u8, s, " \t");
+    return it.next() orelse s;
+}
+
+fn trimComment(line: []const u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, line, '#')) |i| {
+        return std.mem.trim(u8, line[0..i], " \t");
+    }
+    return line;
+}
+
+test "parse minimal jog.mod" {
+    const text =
+        \\module demo
+        \\version 0.1.0
+        \\root main.jog
+        \\source util.jog
+        \\
+    ;
+    var m = try parse(std.testing.allocator, text, ".");
+    defer m.deinit();
+    try std.testing.expectEqualStrings("demo", m.name);
+    try std.testing.expectEqualStrings("0.1.0", m.version);
+    try std.testing.expectEqual(@as(usize, 2), m.sources.len);
+    try std.testing.expectEqualStrings("main.jog", m.sources[0]);
+    try std.testing.expectEqualStrings("util.jog", m.sources[1]);
+}
+
+test "root listed again in source is deduped" {
+    const text =
+        \\module demo
+        \\root main.jog
+        \\source main.jog
+        \\
+    ;
+    var m = try parse(std.testing.allocator, text, ".");
+    defer m.deinit();
+    try std.testing.expectEqual(@as(usize, 1), m.sources.len);
+}

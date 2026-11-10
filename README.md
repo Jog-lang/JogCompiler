@@ -15,10 +15,13 @@ zig build
 
 ```
 jog version
-jog parse <file.jog>
-jog check <file.jog>
-jog build <file.jog> -o <out>
+jog parse <path>
+jog check <path>
+jog build <path> -o <out>
+jog deps [path]
 ```
+
+`path` may be a `.jog` file, a directory with `jog.mod`, or a `jog.mod` file. Module sources listed in `jog.mod` (`root` + optional `source` lines) are parsed and typechecked together.
 
 ## Pipeline
 
@@ -41,6 +44,8 @@ zig build
 ./zig-out/bin/jog build examples/cast_narrow.jog -o out/cast && ./out/cast
 ./zig-out/bin/jog build examples/context_iface.jog -o out/ctx && ./out/ctx
 ./zig-out/bin/jog build examples/subset.jog -o out/subset && ./out/subset
+./zig-out/bin/jog build examples/mod_demo -o /tmp/mod_demo && /tmp/mod_demo
+./zig-out/bin/jog deps examples/mod_demo
 ```
 
-Language subset (milestone): structs/fields, pointers, `T?` + `?.`, widen/`as` narrow, `with` contexts, `interface struct` fat ptrs.
+Language subset (milestone): structs/fields, pointers, `T?` + `?.`, widen/`as` narrow, `with` contexts, `interface struct` fat ptrs. Minimal `jog.mod` module graph (`root` + `source`).

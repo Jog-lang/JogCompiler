@@ -1,13 +1,138 @@
 const std = @import("std");
+const ast = @import("../ast/ast.zig");
 const parse = @import("../parse/parse.zig");
 const check_mod = @import("../check/check.zig");
 const ir = @import("../ir/ir.zig");
 const link = @import("../codegen/link.zig");
+const mod = @import("../mod/mod.zig");
 
 pub const version_string = "jog 0.2.2-v2 (zig host, ir→asm→native)";
 
 pub fn cmdVersion(writer: anytype) !void {
     try writer.print("{s}\n", .{version_string});
+}
+
+/// Parsed Jog unit: one file or a merged module. Keeps source buffers alive
+/// because the parser stores string slices into them.
+pub const Unit = struct {
+    file: ast.File,
+    /// Owned source buffers (one per input file).
+    srcs: [][]u8,
+    /// Per-file ASTs when multi-file; empty for single-file.
+    parts: []ast.File,
+    /// Merged decls slice owned by `allocator` when parts.len > 0.
+    merged_decls: ?[]ast.Decl,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *Unit) void {
+        if (self.merged_decls) |d| self.allocator.free(d);
+        for (self.parts) |*p| p.deinit();
+        if (self.parts.len > 0) {
+            self.allocator.free(self.parts);
+            // file.arena was never used for nodes
+            self.file.arena.deinit();
+        } else {
+            self.file.deinit();
+        }
+        for (self.srcs) |s| self.allocator.free(s);
+        self.allocator.free(self.srcs);
+    }
+};
+
+fn loadSingle(allocator: std.mem.Allocator, path: []const u8) !Unit {
+    const src = try std.fs.cwd().readFileAlloc(allocator, path, 16 * 1024 * 1024);
+    errdefer allocator.free(src);
+    var file = try parse.Parser.parseFile(allocator, src);
+    errdefer file.deinit();
+    const srcs = try allocator.alloc([]u8, 1);
+    srcs[0] = src;
+    return .{
+        .file = file,
+        .srcs = srcs,
+        .parts = &[_]ast.File{},
+        .merged_decls = null,
+        .allocator = allocator,
+    };
+}
+
+fn loadModule(allocator: std.mem.Allocator, path: []const u8, writer: anytype) !Unit {
+    var manifest = mod.loadFromPath(allocator, path) catch |err| {
+        try writer.print("jog.mod error: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer manifest.deinit();
+
+    const paths = mod.resolveSourcePaths(allocator, &manifest) catch |err| {
+        try writer.print("jog.mod error: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer {
+        for (paths) |p| allocator.free(p);
+        allocator.free(paths);
+    }
+
+    if (paths.len == 0) {
+        try writer.writeAll("jog.mod error: no sources\n");
+        std.process.exit(1);
+    }
+    if (paths.len == 1) {
+        return loadSingle(allocator, paths[0]) catch |err| {
+            try writer.print("parse error ({s}): {s}\n", .{ paths[0], @errorName(err) });
+            std.process.exit(1);
+        };
+    }
+
+    var srcs: std.ArrayListUnmanaged([]u8) = .{};
+    errdefer {
+        for (srcs.items) |s| allocator.free(s);
+        srcs.deinit(allocator);
+    }
+    var parts: std.ArrayListUnmanaged(ast.File) = .{};
+    errdefer {
+        for (parts.items) |*p| p.deinit();
+        parts.deinit(allocator);
+    }
+    var decls: std.ArrayListUnmanaged(ast.Decl) = .{};
+    errdefer decls.deinit(allocator);
+
+    for (paths) |p| {
+        const src = std.fs.cwd().readFileAlloc(allocator, p, 16 * 1024 * 1024) catch |err| {
+            try writer.print("read error ({s}): {s}\n", .{ p, @errorName(err) });
+            std.process.exit(1);
+        };
+        try srcs.append(allocator, src);
+        const file = parse.Parser.parseFile(allocator, src) catch |err| {
+            try writer.print("parse error ({s}): {s}\n", .{ p, @errorName(err) });
+            std.process.exit(1);
+        };
+        try decls.appendSlice(allocator, file.decls);
+        try parts.append(allocator, file);
+    }
+
+    const merged = try decls.toOwnedSlice(allocator);
+    const parts_slice = try parts.toOwnedSlice(allocator);
+    const srcs_slice = try srcs.toOwnedSlice(allocator);
+
+    return .{
+        .file = .{
+            .decls = merged,
+            .arena = std.heap.ArenaAllocator.init(allocator),
+        },
+        .srcs = srcs_slice,
+        .parts = parts_slice,
+        .merged_decls = merged,
+        .allocator = allocator,
+    };
+}
+
+pub fn loadPath(allocator: std.mem.Allocator, path: []const u8, writer: anytype) !Unit {
+    if (mod.isModulePath(path)) {
+        return loadModule(allocator, path, writer);
+    }
+    return loadSingle(allocator, path) catch |err| {
+        try writer.print("parse error: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
 }
 
 /// One JSON object per line (v1 LSP contract).
@@ -26,15 +151,10 @@ fn writeDiag(allocator: std.mem.Allocator, writer: anytype, file: []const u8, li
 }
 
 pub fn cmdParse(allocator: std.mem.Allocator, path: []const u8, writer: anytype) !void {
-    const src = try std.fs.cwd().readFileAlloc(allocator, path, 16 * 1024 * 1024);
-    defer allocator.free(src);
-    var file = parse.Parser.parseFile(allocator, src) catch |err| {
-        try writer.print("parse error: {s}\n", .{@errorName(err)});
-        std.process.exit(1);
-    };
-    defer file.deinit();
-    try writer.print("ok: {d} declaration(s)\n", .{file.decls.len});
-    for (file.decls) |d| {
+    var unit = try loadPath(allocator, path, writer);
+    defer unit.deinit();
+    try writer.print("ok: {d} declaration(s)\n", .{unit.file.decls.len});
+    for (unit.file.decls) |d| {
         switch (d) {
             .type_alias => |t| try writer.print("  type {s}\n", .{t.name}),
             .struct_decl => |s| try writer.print("  struct {s}\n", .{s.name}),
@@ -50,18 +170,9 @@ pub fn cmdParse(allocator: std.mem.Allocator, path: []const u8, writer: anytype)
 }
 
 pub fn cmdCheck(allocator: std.mem.Allocator, path: []const u8, diag_json: bool, writer: anytype) !void {
-    const src = try std.fs.cwd().readFileAlloc(allocator, path, 16 * 1024 * 1024);
-    defer allocator.free(src);
-    var file = parse.Parser.parseFile(allocator, src) catch |err| {
-        if (diag_json) {
-            try writeDiag(allocator, writer, path, 1, 1, "error", try std.fmt.allocPrint(allocator, "parse error: {s}", .{@errorName(err)}));
-        } else {
-            try writer.print("parse error: {s}\n", .{@errorName(err)});
-        }
-        std.process.exit(1);
-    };
-    defer file.deinit();
-    var result = try check_mod.check(allocator, &file);
+    var unit = try loadPath(allocator, path, writer);
+    defer unit.deinit();
+    var result = try check_mod.check(allocator, &unit.file);
     defer result.deinit();
     if (!result.ok) {
         for (result.diagnostics) |d| {
@@ -79,14 +190,9 @@ pub fn cmdCheck(allocator: std.mem.Allocator, path: []const u8, diag_json: bool,
 }
 
 pub fn cmdBuild(allocator: std.mem.Allocator, path: []const u8, out_path: []const u8, keep_asm: bool, writer: anytype) !void {
-    const src = try std.fs.cwd().readFileAlloc(allocator, path, 16 * 1024 * 1024);
-    defer allocator.free(src);
-    var file = parse.Parser.parseFile(allocator, src) catch |err| {
-        try writer.print("parse error: {s}\n", .{@errorName(err)});
-        std.process.exit(1);
-    };
-    defer file.deinit();
-    var result = try check_mod.check(allocator, &file);
+    var unit = try loadPath(allocator, path, writer);
+    defer unit.deinit();
+    var result = try check_mod.check(allocator, &unit.file);
     defer result.deinit();
     if (!result.ok) {
         for (result.diagnostics) |d| {
@@ -99,7 +205,7 @@ pub fn cmdBuild(allocator: std.mem.Allocator, path: []const u8, out_path: []cons
         std.process.exit(1);
     }
 
-    var program = ir.lower(allocator, &file, &result) catch |err| {
+    var program = ir.lower(allocator, &unit.file, &result) catch |err| {
         try writer.print("lower error: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
@@ -112,18 +218,38 @@ pub fn cmdBuild(allocator: std.mem.Allocator, path: []const u8, out_path: []cons
     try link.buildExecutable(allocator, &program, out_path, keep_asm, writer);
 }
 
+pub fn cmdDeps(allocator: std.mem.Allocator, path: []const u8, writer: anytype) !void {
+    var manifest = mod.loadFromPath(allocator, path) catch |err| {
+        try writer.print("deps: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer manifest.deinit();
+
+    const paths = try mod.resolveSourcePaths(allocator, &manifest);
+    defer {
+        for (paths) |p| allocator.free(p);
+        allocator.free(paths);
+    }
+    for (paths) |p| {
+        try writer.print("{s}\n", .{p});
+    }
+}
+
 pub fn usage(writer: anytype) !void {
     try writer.writeAll(
         \\usage: jog <command> [args]
         \\
         \\commands:
         \\  version                 print version
-        \\  parse <file>            parse and list declarations
-        \\  check [--diag=json] <file>
+        \\  parse <path>            parse and list declarations
+        \\  check [--diag=json] <path>
         \\                          typecheck subset (JSON diags for LSP)
-        \\  build <file> -o OUT [--keep-asm]
+        \\  build <path> -o OUT [--keep-asm]
         \\                          IR → asm → native link (no C intermediate)
+        \\  deps [path]             print module source paths (jog.mod)
         \\  help                    this message
+        \\
+        \\path may be a .jog file, a directory with jog.mod, or a jog.mod file.
         \\
     );
 }

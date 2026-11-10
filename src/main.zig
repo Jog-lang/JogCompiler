@@ -84,6 +84,11 @@ pub fn main() !void {
         }, out_path orelse "a.out", keep_asm, stdout);
         return;
     }
+    if (std.mem.eql(u8, cmd, "deps")) {
+        const path = args.next() orelse ".";
+        try driver.cmdDeps(allocator, path, stdout);
+        return;
+    }
 
     try stderr.print("unknown command: {s}\n", .{cmd});
     try driver.usage(stderr);
@@ -94,4 +99,5 @@ test {
     _ = @import("lex/lex.zig");
     _ = @import("check/check.zig");
     _ = @import("codegen/asm.zig");
+    _ = @import("mod/mod.zig");
 }

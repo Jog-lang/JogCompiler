@@ -1,0 +1,4 @@
+fn ok_msg(): i64 {
+    print("mod ok\n")
+    return 0
+}
