@@ -1,7 +1,6 @@
 // C compiler driver. Checked against compiler/src/cc.c (jog_cc_build).
 // std.proc does not search PATH, so find_compiler resolves the binary first.
-// std.fs has no mkdir or remove; directory and delete go through host APIs
-// in cc.windows.jog / cc.posix.jog (Friction: std.fs.mkdir / remove).
+// Directories and deletes use std.fs.mkdir / std.fs.remove.
 
 import std.fs
 import std.io
@@ -14,8 +13,6 @@ import std.text as texts
 
 expect fn is_dir(path: str): bool
 expect fn is_file(path: str): bool
-expect fn ensure_dir(path: str): bool
-expect fn remove_file(path: str)
 expect fn path_sep(): u8
 expect fn exe_suffix(): str
 
@@ -37,30 +34,11 @@ private fn is_sep(b: u8): bool {
 
 // Create path and any missing parents.
 fn mkdir_p(path: str): bool {
-    if path.len == 0 {
-        return false
-    }
-    if is_dir(path) {
-        return true
-    }
-    var i: usize = 0
-    if path.len >= 2 && path.ptr[1] == ':' as u8 {
-        i = 2
-    }
-    for i < path.len && is_sep(path.ptr[i]) {
-        i = i + 1
-    }
-    var k = i
-    for k < path.len {
-        if is_sep(path.ptr[k]) && k > 0 {
-            val prefix = texts.slice(path, 0, k)
-            if prefix.len > 0 && !ensure_dir(prefix) {
-                return false
-            }
-        }
-        k = k + 1
-    }
-    return ensure_dir(path)
+    return fs.mkdir(path) == null
+}
+
+fn remove_file(path: str) {
+    _ = fs.remove(path)
 }
 
 fn write_text(path: str, text: str): bool with (a: mem.Allocator) {
@@ -308,7 +286,7 @@ private fn run_emcc(args: list.List<str>, compiler: str): i32 with (a: mem.Alloc
     return 0
 }
 
-private fn push_link_libs(args: *list.List<str>, libs: list.List<str>, libdirs: list.List<str>): i32 with (a: mem.Allocator) {
+private fn push_link_libs(args: *list.List<str>, libs: list.List<str>, libdirs: list.List<str>, with_rpath: bool): i32 with (a: mem.Allocator) {
     var di: usize = 0
     for di < libdirs.len {
         val dir = libdirs.get(di)
@@ -320,6 +298,14 @@ private fn push_link_libs(args: *list.List<str>, libs: list.List<str>, libdirs: 
         lflag.append("-L")
         lflag.append(dir)
         args.push(fs.copy_str(lflag.str()))
+        // Embed rpath so the dynamic loader finds non-system libs without
+        // LD_LIBRARY_PATH (native ELF/Mach-O only).
+        if with_rpath {
+            var rflag = strbuilder.empty()
+            rflag.append("-Wl,-rpath,")
+            rflag.append(dir)
+            args.push(fs.copy_str(rflag.str()))
+        }
         di = di + 1
     }
     var li: usize = 0
@@ -414,7 +400,7 @@ private fn link_emscripten(c_path: str, exe_path: str, runtime: str, mode: i32, 
     args.push("-sFULL_ES2=1")
     args.push("-o")
     args.push(exe_path)
-    if push_link_libs(&args, libs, libdirs) != 0 {
+    if push_link_libs(&args, libs, libdirs, false) != 0 {
         return 1
     }
     return run_emcc(args, compiler)
@@ -512,7 +498,7 @@ fn link_c(c_path: str, exe_path: str, runtime: str, mode: i32, libs: list.List<s
     args.push("-o")
     args.push(exe_path)
     if !wasm {
-        if push_link_libs(&args, libs, libdirs) != 0 {
+        if push_link_libs(&args, libs, libdirs, true) != 0 {
             return 1
         }
     }

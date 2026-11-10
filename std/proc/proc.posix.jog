@@ -109,7 +109,7 @@ private fn cleanup_temps(out_path: *u8, err_path: *u8) {
     unlink_made(err_path, true)
 }
 
-private fn spawn(args: []str): (Output, error?) with (a: mem.Allocator) {
+private fn spawn(args: []str, cwd: str): (Output, error?) with (a: mem.Allocator) {
     var out_path: [64]u8
     var err_path: [64]u8
     val out_fd = make_temp("jpo", out_path[..].ptr, 64)
@@ -146,6 +146,27 @@ private fn spawn(args: []str): (Output, error?) with (a: mem.Allocator) {
         close_fd(err_fd)
         cleanup_temps(out_path[..].ptr, err_path[..].ptr)
         return Output(), errors.ErrIO
+    }
+    if cwd.len > 0 {
+        var cwd_buf: [4096]u8
+        if cwd.len >= 4096 {
+            c.jogrt_spawn_actions_free(actions)
+            close_fd(nul_fd)
+            close_fd(out_fd)
+            close_fd(err_fd)
+            cleanup_temps(out_path[..].ptr, err_path[..].ptr)
+            return Output(), errors.ErrIO
+        }
+        c.memcpy(cwd_buf[..].ptr as *void, cwd.ptr as *const void, cwd.len)
+        cwd_buf[cwd.len] = 0
+        if c.jogrt_spawn_actions_addchdir(actions!!, cwd_buf[..].ptr as *const c.char) != 0 {
+            c.jogrt_spawn_actions_free(actions)
+            close_fd(nul_fd)
+            close_fd(out_fd)
+            close_fd(err_fd)
+            cleanup_temps(out_path[..].ptr, err_path[..].ptr)
+            return Output(), errors.ErrIO
+        }
     }
     var (argv, argv_err) = build_argv(args)
     if argv_err != null {
@@ -190,33 +211,54 @@ private fn spawn(args: []str): (Output, error?) with (a: mem.Allocator) {
 
 // args[0] is the program. The call waits. A null error means the process
 // ran and Output.code is its exit code.
-actual fn run(args: []str): (Output, error?) with (a: mem.Allocator) {
+actual fn run(args: []str, cwd: str = ""): (Output, error?) with (a: mem.Allocator) {
     if args.len == 0 {
         return Output(), errors.ErrIO
     }
     if !args_ok(args) {
         return Output(), errors.ErrIO
     }
-    return spawn(args)
+    return spawn(args, cwd)
 }
 
-// Same start and wait as run, with no file actions, so the child keeps
-// the parent's stdout and stderr. The i32 is the exit code when the
-// error is null. There are no captured bytes.
-actual fn run_inherit(args: []str): (i32, error?) with (a: mem.Allocator) {
+// Same start and wait as run, with no capture file actions, so the child
+// keeps the parent's stdout and stderr. The i32 is the exit code when
+// the error is null. There are no captured bytes.
+actual fn run_inherit(args: []str, cwd: str = ""): (i32, error?) with (a: mem.Allocator) {
     if args.len == 0 {
         return 0, errors.ErrIO
     }
     if !args_ok(args) {
         return 0, errors.ErrIO
+    }
+    var actions_ptr: *void? = null
+    if cwd.len > 0 {
+        val actions = c.jogrt_spawn_actions_new()
+        if actions == null {
+            return 0, errors.ErrIO
+        }
+        var cwd_buf: [4096]u8
+        if cwd.len >= 4096 {
+            c.jogrt_spawn_actions_free(actions)
+            return 0, errors.ErrIO
+        }
+        c.memcpy(cwd_buf[..].ptr as *void, cwd.ptr as *const void, cwd.len)
+        cwd_buf[cwd.len] = 0
+        if c.jogrt_spawn_actions_addchdir(actions!!, cwd_buf[..].ptr as *const c.char) != 0 {
+            c.jogrt_spawn_actions_free(actions)
+            return 0, errors.ErrIO
+        }
+        actions_ptr = actions
     }
     var (argv, argv_err) = build_argv(args)
     if argv_err != null {
+        c.jogrt_spawn_actions_free(actions_ptr)
         return 0, argv_err
     }
     var pid: c.int = 0
     val slots = argv.vector.ptr as *(*const c.char?)
-    val spawned = c.posix_spawnp(&pid, slots[0]!!, null, null, slots, c.jogrt_environ())
+    val spawned = c.posix_spawnp(&pid, slots[0]!!, actions_ptr as *const void?, null, slots, c.jogrt_environ())
+    c.jogrt_spawn_actions_free(actions_ptr)
     if spawned != 0 {
         free_argv(&argv)
         if spawned == 2 {

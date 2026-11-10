@@ -9,11 +9,6 @@
 // Optional source overrides let the loader lex/parse open editor buffers
 // instead of disk.
 //
-// Do not add `with (a: mem.Allocator)` to print_path_error / print_bare_error:
-// that signature change currently breaks lowering of programs that also have
- // package-level vars ("global values are not lowered yet"). Collect from
-// those two with an inner `with (mem.heap())` instead. See Friction.
-
 import std.fs
 import std.io
 import std.list
@@ -202,10 +197,8 @@ private fn push_collected(path: str, line: i64, column: i64, severity: str, mess
  * @param path path as given on the command line, or a jog.mod path
  * @param message text after `error: `
  */
-fn print_path_error(path: str, message: str) {
-    with (mem.heap()) {
-        push_collected(path, 1, 1, "error", message)
-    }
+fn print_path_error(path: str, message: str) with (a: mem.Allocator) {
+    push_collected(path, 1, 1, "error", message)
     io.eprint(path)
     io.eprint(": error: ")
     io.eprintln(message)
@@ -216,10 +209,8 @@ fn print_path_error(path: str, message: str) {
  * (for example `core prelude was not found`).
  * @param message text after `error: `
  */
-fn print_bare_error(message: str) {
-    with (mem.heap()) {
-        push_collected("", 1, 1, "error", message)
-    }
+fn print_bare_error(message: str) with (a: mem.Allocator) {
+    push_collected("", 1, 1, "error", message)
     io.eprint("error: ")
     io.eprintln(message)
 }

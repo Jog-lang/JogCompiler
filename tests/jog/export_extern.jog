@@ -1,0 +1,21 @@
+// expect: ok
+
+extern {
+    fn puts(s: *const i8): i32
+}
+
+@export
+fn tick_frame(): i32 {
+    return 7
+}
+
+fn apply(tick: extern () -> i32): i32 {
+    return tick()
+}
+
+fn main() {
+    val n = apply(tick_frame)
+    if n == 7 {
+        puts(c"ok")
+    }
+}
