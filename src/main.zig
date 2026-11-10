@@ -35,11 +35,25 @@ pub fn main() !void {
         return;
     }
     if (std.mem.eql(u8, cmd, "check")) {
-        const path = args.next() orelse {
+        var path: ?[]const u8 = null;
+        var diag_json = false;
+        while (args.next()) |a| {
+            if (std.mem.eql(u8, a, "--diag=json")) {
+                diag_json = true;
+            } else if (std.mem.startsWith(u8, a, "-")) {
+                try stderr.print("check: unknown flag {s}\n", .{a});
+                std.process.exit(2);
+            } else if (path == null) {
+                path = a;
+            } else {
+                try stderr.print("check: unexpected arg {s}\n", .{a});
+                std.process.exit(2);
+            }
+        }
+        try driver.cmdCheck(allocator, path orelse {
             try stderr.writeAll("check: missing file\n");
             std.process.exit(2);
-        };
-        try driver.cmdCheck(allocator, path, stdout);
+        }, diag_json, stdout);
         return;
     }
     if (std.mem.eql(u8, cmd, "build")) {
