@@ -326,6 +326,12 @@ private fn semver_cmp(a: str, b: str): i64 {
 }
 
 private fn is_path_spec(tok: Tok): bool {
+    if tok.text.len == 1 && tok.text.ptr[0] == '.' as u8 {
+        return true
+    }
+    if tok.text.len == 2 && tok.text.ptr[0] == '.' as u8 && tok.text.ptr[1] == '.' as u8 {
+        return true
+    }
     if tok.text.len >= 1 && (tok.text.ptr[0] == '/' as u8 || tok.text.ptr[0] == '\\' as u8) {
         return true
     }

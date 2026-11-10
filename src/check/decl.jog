@@ -1355,7 +1355,16 @@ fn check_fn(ck: *Check, job: *CheckJob): *Type? with (a: mem.Allocator) {
         }
         return err_ty(ck)
     }
-    val is_extern = parse.flag_has_word(node.flag, "extern")
+    var is_extern = parse.flag_has_word(node.flag, "extern")
+    // @export uses the C calling convention; its value type is extern (…) -> R.
+    if !is_extern {
+        for kid in node.kids.items() {
+            if parse.is_attribute(kid) && kid.name == "export" {
+                is_extern = true
+                break
+            }
+        }
+    }
     val variadic = parse.flag_has_word(node.flag, "variadic")
     return type_fn(&ck.types, params, ret, contexts, variadic, false, is_extern)
 }

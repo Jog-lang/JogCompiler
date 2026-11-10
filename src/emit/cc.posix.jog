@@ -1,5 +1,4 @@
 // POSIX bodies for emit.cc. Loaded for linux and macos.
-// mkdir goes through jogrt_mkdir because mode_t differs between the two.
 
 import std.c
 
@@ -39,31 +38,6 @@ actual fn is_file(path: str): bool {
     }
     c.close(fd)
     return true
-}
-
-actual fn ensure_dir(path: str): bool {
-    if path.len == 0 {
-        return false
-    }
-    if is_dir(path) {
-        return true
-    }
-    var buf: [4096]u8
-    if !fill(path, buf[..].ptr) {
-        return false
-    }
-    if c.jogrt_mkdir(buf[..].ptr as *const c.char) == 0 {
-        return true
-    }
-    return is_dir(path)
-}
-
-actual fn remove_file(path: str) {
-    var buf: [4096]u8
-    if !fill(path, buf[..].ptr) {
-        return
-    }
-    c.unlink(buf[..].ptr as *const c.char)
 }
 
 actual fn path_sep(): u8 {
