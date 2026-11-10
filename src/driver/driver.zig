@@ -2,9 +2,9 @@ const std = @import("std");
 const parse = @import("../parse/parse.zig");
 const check_mod = @import("../check/check.zig");
 const ir = @import("../ir/ir.zig");
-const elf = @import("../codegen/elf.zig");
+const link = @import("../codegen/link.zig");
 
-pub const version_string = "jog 0.2.0-v2 (zig host, linux-x64 native)";
+pub const version_string = "jog 0.2.1-v2 (zig host, ir→asm→native)";
 
 pub fn cmdVersion(writer: anytype) !void {
     try writer.print("{s}\n", .{version_string});
@@ -35,15 +35,17 @@ pub fn cmdParse(allocator: std.mem.Allocator, path: []const u8, writer: anytype)
     defer file.deinit();
     try writer.print("ok: {d} declaration(s)\n", .{file.decls.len});
     for (file.decls) |d| {
-        const name = switch (d) {
-            .type_alias => |t| t.name,
-            .struct_decl => |s| s.name,
-            .interface_fn => |i| i.name,
-            .interface_struct => |i| i.name,
-            .fn_decl => |f| f.name,
-            .method => |m| m.name,
-        };
-        try writer.print("  {s}\n", .{name});
+        switch (d) {
+            .type_alias => |t| try writer.print("  type {s}\n", .{t.name}),
+            .struct_decl => |s| try writer.print("  struct {s}\n", .{s.name}),
+            .interface_fn => |i| try writer.print("  interface fn {s}\n", .{i.name}),
+            .interface_struct => |i| try writer.print("  interface struct {s}\n", .{i.name}),
+            .fn_decl => |f| try writer.print("  fn {s}\n", .{f.name}),
+            .method => |m| try writer.print("  method {s}.{s}\n", .{ m.type_name, m.name }),
+            .extern_block => |eb| {
+                for (eb.fns) |ef| try writer.print("  extern fn {s}\n", .{ef.name});
+            },
+        }
     }
 }
 
@@ -76,7 +78,7 @@ pub fn cmdCheck(allocator: std.mem.Allocator, path: []const u8, diag_json: bool,
     }
 }
 
-pub fn cmdBuild(allocator: std.mem.Allocator, path: []const u8, out_path: []const u8, writer: anytype) !void {
+pub fn cmdBuild(allocator: std.mem.Allocator, path: []const u8, out_path: []const u8, keep_asm: bool, writer: anytype) !void {
     const src = try std.fs.cwd().readFileAlloc(allocator, path, 16 * 1024 * 1024);
     defer allocator.free(src);
     var file = parse.Parser.parseFile(allocator, src) catch |err| {
@@ -97,18 +99,17 @@ pub fn cmdBuild(allocator: std.mem.Allocator, path: []const u8, out_path: []cons
         std.process.exit(1);
     }
 
-    var program = try ir.lower(allocator, &file, &result);
+    var program = ir.lower(allocator, &file, &result) catch |err| {
+        try writer.print("lower error: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
     defer program.deinit();
 
     if (std.fs.path.dirname(out_path)) |dir| {
         std.fs.cwd().makePath(dir) catch {};
     }
 
-    const out_file = try std.fs.cwd().createFile(out_path, .{ .mode = 0o755 });
-    defer out_file.close();
-
-    try elf.emitLinuxX64(allocator, &program, out_file.writer());
-    try writer.print("wrote {s} (native ELF, no C intermediate)\n", .{out_path});
+    try link.buildExecutable(allocator, &program, out_path, keep_asm, writer);
 }
 
 pub fn usage(writer: anytype) !void {
@@ -120,7 +121,8 @@ pub fn usage(writer: anytype) !void {
         \\  parse <file>            parse and list declarations
         \\  check [--diag=json] <file>
         \\                          typecheck subset (JSON diags for LSP)
-        \\  build <file> -o OUT     emit linux x64 ELF
+        \\  build <file> -o OUT [--keep-asm]
+        \\                          IR → asm → native link (no C intermediate)
         \\  help                    this message
         \\
     );

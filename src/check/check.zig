@@ -124,6 +124,23 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
                 const key = try std.fmt.allocPrint(a, "{s}.{s}", .{ md.type_name, md.name });
                 try methods.put(a, key, md);
             },
+            .extern_block => |eb| {
+                for (eb.fns) |ef| {
+                    // Treat as known fn name for calls
+                    const stub = try a.create(ast.FnDecl);
+                    stub.* = .{
+                        .name = ef.name,
+                        .params = ef.params,
+                        .contexts = &[_]ast.ContextParam{},
+                        .ret = ef.ret,
+                        .body = null,
+                        .exported = false,
+                    };
+                    try fns.put(a, ef.name, stub);
+                    for (ef.params) |p| _ = try resolveTypeExpr(a, &types, p.ty, &diags);
+                    if (ef.ret) |r| _ = try resolveTypeExpr(a, &types, r, &diags);
+                }
+            },
         }
     }
 
@@ -475,6 +492,10 @@ fn checkExpr(
             const ti = try a.create(TypeInfo);
             ti.* = .{ .kind = .optional, .name = "opt_result", .pointee = try voidType(a) };
             return ti;
+        },
+        .panic_call => |p| {
+            _ = try checkExpr(a, types, fns, scope, p.message, diags);
+            return try voidType(a);
         },
         .struct_lit => |sl| {
             if (types.get(sl.type_name)) |t| {

@@ -20,11 +20,21 @@ jog check <file.jog>
 jog build <file.jog> -o <out>
 ```
 
+## Pipeline
+
+```
+.jog → lex → parse → check → IR → GAS asm → zig cc + runtime/*.s → ELF
+```
+
+No C source is generated from Jog. Freestanding programs use `runtime/linux_x64_start.s`; `extern` pulls in libc. ABI notes: `docs/abi.md`.
+
 ## Examples
 
 ```
 zig build
 ./zig-out/bin/jog build examples/hello.jog -o out/hello
 ./out/hello
+./zig-out/bin/jog build examples/arith.jog -o out/arith && ./out/arith
+./zig-out/bin/jog build examples/extern_puts.jog -o out/puts && ./out/puts
 ./zig-out/bin/jog check examples/subset.jog
 ```

@@ -1,0 +1,7 @@
+fn main(): i64 {
+    val n = 1
+    if (n == 1) {
+        panic("intentional panic\n")
+    }
+    return 0
+}

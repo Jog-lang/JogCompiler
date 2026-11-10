@@ -31,6 +31,18 @@ pub const Decl = union(enum) {
     interface_struct: InterfaceStruct,
     fn_decl: FnDecl,
     method: MethodDecl,
+    extern_block: ExternBlock,
+};
+
+pub const ExternBlock = struct {
+    /// C ABI SysV (linux x64) for now.
+    fns: []ExternFn,
+};
+
+pub const ExternFn = struct {
+    name: []const u8,
+    params: []Param,
+    ret: ?*TypeExpr,
 };
 
 pub const TypeAlias = struct {
@@ -73,6 +85,8 @@ pub const FnDecl = struct {
     contexts: []ContextParam,
     ret: ?*TypeExpr,
     body: ?*Block,
+    /// C-callable export (SysV). Jog callers still use the Jog path; export adds .globl for C.
+    exported: bool = false,
 };
 
 pub const MethodDecl = struct {
@@ -134,6 +148,11 @@ pub const Expr = union(enum) {
     cast: Cast,
     optional_call: OptionalCall,
     struct_lit: StructLit,
+    panic_call: PanicCall,
+};
+
+pub const PanicCall = struct {
+    message: *Expr,
 };
 
 pub const Binary = struct {

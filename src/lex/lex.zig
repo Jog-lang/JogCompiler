@@ -20,6 +20,11 @@ pub const TokenKind = enum {
     kw_as,
     kw_true,
     kw_false,
+    kw_extern,
+    kw_export,
+    kw_expect,
+    kw_actual,
+    kw_panic,
     // punct
     lparen,
     rparen,
@@ -200,6 +205,11 @@ fn keyword(text: []const u8) TokenKind {
         .{ "as", TokenKind.kw_as },
         .{ "true", TokenKind.kw_true },
         .{ "false", TokenKind.kw_false },
+        .{ "extern", TokenKind.kw_extern },
+        .{ "export", TokenKind.kw_export },
+        .{ "expect", TokenKind.kw_expect },
+        .{ "actual", TokenKind.kw_actual },
+        .{ "panic", TokenKind.kw_panic },
     };
     inline for (map) |e| {
         if (std.mem.eql(u8, text, e[0])) return e[1];

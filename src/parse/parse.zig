@@ -58,6 +58,13 @@ pub const Parser = struct {
             .kw_type => return .{ .type_alias = try self.parseTypeAlias() },
             .kw_struct => return .{ .struct_decl = try self.parseStruct() },
             .kw_interface => return try self.parseInterface(),
+            .kw_extern => return .{ .extern_block = try self.parseExternBlock() },
+            .kw_export => {
+                self.advance();
+                var fd = try self.parseFn();
+                fd.exported = true;
+                return .{ .fn_decl = fd };
+            },
             .kw_fn => {
                 // method: fn *Type.name or fn Type.name
                 const save_i = self.lx.i;
@@ -87,6 +94,27 @@ pub const Parser = struct {
             },
             else => return error.UnexpectedToken,
         }
+    }
+
+    fn parseExternBlock(self: *Parser) ParseError!ast.ExternBlock {
+        try self.expect(.kw_extern);
+        try self.expect(.lbrace);
+        var fns: std.ArrayListUnmanaged(ast.ExternFn) = .{};
+        while (self.tok.kind != .rbrace and self.tok.kind != .eof) {
+            try self.expect(.kw_fn);
+            if (self.tok.kind != .ident) return error.UnexpectedToken;
+            const name = self.tok.text;
+            self.advance();
+            const params = try self.parseParamList();
+            var ret: ?*ast.TypeExpr = null;
+            if (self.tok.kind == .colon) {
+                self.advance();
+                ret = try self.parseTypeExpr();
+            }
+            try fns.append(self.allocator, .{ .name = name, .params = params, .ret = ret });
+        }
+        try self.expect(.rbrace);
+        return .{ .fns = try fns.toOwnedSlice(self.allocator) };
     }
 
     fn parseTypeAlias(self: *Parser) ParseError!ast.TypeAlias {
@@ -197,6 +225,7 @@ pub const Parser = struct {
             .contexts = contexts,
             .ret = ret,
             .body = body,
+            .exported = false,
         };
     }
 
@@ -357,6 +386,15 @@ pub const Parser = struct {
                 self.advance();
                 if (self.tok.kind == .rbrace) return .{ .return_stmt = null };
                 return .{ .return_stmt = try self.parseExpr() };
+            },
+            .kw_panic => {
+                self.advance();
+                try self.expect(.lparen);
+                const msg = try self.parseExpr();
+                try self.expect(.rparen);
+                const e = try self.allocator.create(ast.Expr);
+                e.* = .{ .panic_call = .{ .message = msg } };
+                return .{ .expr = e };
             },
             .kw_if => {
                 self.advance();
@@ -620,6 +658,7 @@ fn unescape(allocator: std.mem.Allocator, s: []const u8) ParseError![]const u8 {
                 'n' => '\n',
                 't' => '\t',
                 'r' => '\r',
+                '0' => 0,
                 '\\' => '\\',
                 '"' => '"',
                 else => s[i],

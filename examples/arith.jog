@@ -1,0 +1,12 @@
+fn add(a: i64, b: i64): i64 {
+    return a + b
+}
+
+fn main(): i64 {
+    val x = add(40, 2)
+    if (x != 42) {
+        panic("arith failed\n")
+    }
+    print("arith ok\n")
+    return 0
+}

@@ -57,23 +57,31 @@ pub fn main() !void {
         return;
     }
     if (std.mem.eql(u8, cmd, "build")) {
-        const path = args.next() orelse {
-            try stderr.writeAll("build: missing file\n");
-            std.process.exit(2);
-        };
+        var path: ?[]const u8 = null;
         var out_path: ?[]const u8 = null;
+        var keep_asm = false;
         while (args.next()) |a| {
             if (std.mem.eql(u8, a, "-o")) {
                 out_path = args.next() orelse {
                     try stderr.writeAll("build: -o needs a path\n");
                     std.process.exit(2);
                 };
-            } else {
+            } else if (std.mem.eql(u8, a, "--keep-asm")) {
+                keep_asm = true;
+            } else if (std.mem.startsWith(u8, a, "-")) {
                 try stderr.print("build: unknown arg {s}\n", .{a});
+                std.process.exit(2);
+            } else if (path == null) {
+                path = a;
+            } else {
+                try stderr.print("build: unexpected arg {s}\n", .{a});
                 std.process.exit(2);
             }
         }
-        try driver.cmdBuild(allocator, path, out_path orelse "a.out", stdout);
+        try driver.cmdBuild(allocator, path orelse {
+            try stderr.writeAll("build: missing file\n");
+            std.process.exit(2);
+        }, out_path orelse "a.out", keep_asm, stdout);
         return;
     }
 
@@ -85,5 +93,5 @@ pub fn main() !void {
 test {
     _ = @import("lex/lex.zig");
     _ = @import("check/check.zig");
-    _ = @import("codegen/elf.zig");
+    _ = @import("codegen/asm.zig");
 }
