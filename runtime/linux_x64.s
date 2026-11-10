@@ -64,6 +64,16 @@ jogrt_alloc:
 jogrt_dispatcher_stub:
   ret
 
+# Synchronous "spawn": call fn(arg) on this thread (freestanding Dispatcher).
+# rdi = function pointer, rsi = arg
+.globl jogrt_spawn
+.type jogrt_spawn, @function
+jogrt_spawn:
+  mov rax, rdi
+  mov rdi, rsi
+  call rax
+  ret
+
 .section .rodata
 jogrt_oom_msg:
   .ascii "jogrt: out of memory\n"

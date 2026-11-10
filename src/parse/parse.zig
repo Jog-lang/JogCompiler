@@ -59,6 +59,24 @@ pub const Parser = struct {
             .kw_struct => return .{ .struct_decl = try self.parseStruct() },
             .kw_interface => return try self.parseInterface(),
             .kw_extern => return .{ .extern_block = try self.parseExternBlock() },
+            .kw_expect => {
+                self.advance();
+                try self.expect(.kw_fn);
+                if (self.tok.kind != .ident) return error.UnexpectedToken;
+                const name = self.tok.text;
+                self.advance();
+                const params = try self.parseParamList();
+                var ret: ?*ast.TypeExpr = null;
+                if (self.tok.kind == .colon) {
+                    self.advance();
+                    ret = try self.parseTypeExpr();
+                }
+                return .{ .expect_fn = .{ .name = name, .params = params, .ret = ret } };
+            },
+            .kw_actual => {
+                self.advance();
+                return .{ .actual_fn = try self.parseFn() };
+            },
             .kw_export => {
                 self.advance();
                 var fd = try self.parseFn();

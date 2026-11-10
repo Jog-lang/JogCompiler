@@ -32,6 +32,8 @@ pub const Decl = union(enum) {
     fn_decl: FnDecl,
     method: MethodDecl,
     extern_block: ExternBlock,
+    expect_fn: ExternFn,
+    actual_fn: FnDecl,
 };
 
 pub const ExternBlock = struct {

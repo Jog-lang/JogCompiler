@@ -20,10 +20,16 @@ pub const Op = enum {
     narrow,
     call,
     icall,
+    vtaddr,
     ret,
     jmp,
     jz,
     panic,
+};
+
+pub const VTable = struct {
+    symbol: []const u8,
+    methods: [][]const u8,
 };
 
 pub const none: u32 = std.math.maxInt(u32);
@@ -57,6 +63,7 @@ pub const Program = struct {
     strings: [][]const u8,
     callees: []Callee,
     funcs: []Func,
+    vtables: []VTable,
     needs_libc: bool,
     arena: std.heap.ArenaAllocator,
 
@@ -110,6 +117,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
         .strings = &[_][]const u8{},
         .callees = &[_]Callee{},
         .funcs = &[_]Func{},
+        .vtables = &[_]VTable{},
         .needs_libc = false,
         .arena = std.heap.ArenaAllocator.init(parent),
     };
@@ -123,10 +131,14 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
     var methods: std.StringHashMapUnmanaged(MethodInfo) = .{}; // "Type.method"
     var ifaces: std.StringHashMapUnmanaged(IfaceInfo) = .{};
     var fn_infos: std.StringHashMapUnmanaged(FnInfo) = .{};
+    var vtables: std.ArrayListUnmanaged(VTable) = .{};
+    var vtable_map: std.StringHashMapUnmanaged(u32) = .{};
 
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_print" });
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_panic" });
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_alloc" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_spawn" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_dispatcher_stub" });
 
     for (file.decls) |d| {
         switch (d) {
@@ -144,7 +156,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                     program.needs_libc = true;
                 }
             },
-            .fn_decl => |fd| {
+            .fn_decl, .actual_fn => |fd| {
                 if (fd.body != null) {
                     try internCallee(a, &callees, &callee_map, .{ .kind = .jog_fn, .name = fd.name });
                     try fn_infos.put(a, fd.name, .{
@@ -152,6 +164,19 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                         .nparams = @intCast(fd.params.len),
                         .contexts = fd.contexts,
                         .exported = fd.exported or std.mem.eql(u8, fd.name, "main"),
+                    });
+                }
+            },
+            .expect_fn => |ef| {
+                // Placeholder until an actual_fn / runtime symbol is seen; do not pull libc yet.
+                if (!callee_map.contains(ef.name)) {
+                    const kind: CalleeKind = if (std.mem.startsWith(u8, ef.name, "jogrt_")) .runtime else .jog_fn;
+                    try internCallee(a, &callees, &callee_map, .{ .kind = kind, .name = ef.name });
+                    try fn_infos.put(a, ef.name, .{
+                        .mangled = ef.name,
+                        .nparams = @intCast(ef.params.len),
+                        .contexts = &[_]ast.ContextParam{},
+                        .exported = false,
                     });
                 }
             },
@@ -177,8 +202,13 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
 
     var funcs: std.ArrayListUnmanaged(Func) = .{};
     for (file.decls) |d| {
-        if (d == .fn_decl and d.fn_decl.body != null) {
-            const fd = d.fn_decl;
+        const maybe_fd: ?ast.FnDecl = switch (d) {
+            .fn_decl => |fd| if (fd.body != null) fd else null,
+            .actual_fn => |fd| if (fd.body != null) fd else null,
+            else => null,
+        };
+        if (maybe_fd) |fd| {
+            try internCallee(a, &callees, &callee_map, .{ .kind = .jog_fn, .name = fd.name });
             const f = try lowerFn(a, .{
                 .name = fd.name,
                 .params = fd.params,
@@ -187,7 +217,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                 .exported = fd.exported or std.mem.eql(u8, fd.name, "main"),
                 .self_type = null,
                 .pointer_recv = false,
-            }, &strings, &callee_map, &structs, &methods, &ifaces, &fn_infos);
+            }, &strings, &callee_map, &structs, &methods, &ifaces, &fn_infos, &vtables, &vtable_map);
             try funcs.append(a, f);
         } else if (d == .method and d.method.body != null) {
             const md = d.method;
@@ -200,7 +230,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                 .exported = true,
                 .self_type = md.type_name,
                 .pointer_recv = md.pointer_recv,
-            }, &strings, &callee_map, &structs, &methods, &ifaces, &fn_infos);
+            }, &strings, &callee_map, &structs, &methods, &ifaces, &fn_infos, &vtables, &vtable_map);
             try funcs.append(a, f);
         }
     }
@@ -208,6 +238,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
     program.strings = try strings.toOwnedSlice(a);
     program.callees = try callees.toOwnedSlice(a);
     program.funcs = try funcs.toOwnedSlice(a);
+    program.vtables = try vtables.toOwnedSlice(a);
     return program;
 }
 
@@ -235,6 +266,8 @@ const Ctx = struct {
     methods: *std.StringHashMapUnmanaged(MethodInfo),
     ifaces: *std.StringHashMapUnmanaged(IfaceInfo),
     fn_infos: *std.StringHashMapUnmanaged(FnInfo),
+    vtables: *std.ArrayListUnmanaged(VTable),
+    vtable_map: *std.StringHashMapUnmanaged(u32),
     slots: *std.StringHashMapUnmanaged(u32),
     meta: *std.StringHashMapUnmanaged(SlotMeta),
     next_slot: *u32,
@@ -260,6 +293,8 @@ fn lowerFn(
     methods: *std.StringHashMapUnmanaged(MethodInfo),
     ifaces: *std.StringHashMapUnmanaged(IfaceInfo),
     fn_infos: *std.StringHashMapUnmanaged(FnInfo),
+    vtables: *std.ArrayListUnmanaged(VTable),
+    vtable_map: *std.StringHashMapUnmanaged(u32),
 ) !Func {
     var slots: std.StringHashMapUnmanaged(u32) = .{};
     var meta: std.StringHashMapUnmanaged(SlotMeta) = .{};
@@ -303,6 +338,8 @@ fn lowerFn(
         .methods = methods,
         .ifaces = ifaces,
         .fn_infos = fn_infos,
+        .vtables = vtables,
+        .vtable_map = vtable_map,
         .slots = &slots,
         .meta = &meta,
         .next_slot = &next_slot,
@@ -479,7 +516,16 @@ fn fieldOffset(ctx: *Ctx, base_expr: *ast.Expr, field: []const u8) LowerError!i6
 
 fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
     switch (e.*) {
-        .ident => |name| return ctx.slots.get(name) orelse error.UnknownName,
+        .ident => |name| {
+            if (ctx.slots.get(name)) |s| return s;
+            // function address
+            if (ctx.callee_map.get(name)) |cid| {
+                const d = try ctx.fresh();
+                try ctx.emit(.{ .op = .saddr, .dst = d, .aux = -1 - @as(i64, @intCast(cid)) });
+                return d;
+            }
+            return error.UnknownName;
+        },
         .int => |n| {
             const d = try ctx.fresh();
             try ctx.emit(.{ .op = .iconst, .dst = d, .aux = n });
@@ -651,6 +697,19 @@ fn lowerCall(ctx: *Ctx, c: ast.Call) LowerError!u32 {
             try ctx.emit(inst);
             return d;
         }
+        if (std.mem.eql(u8, name, "spawn")) {
+            if (c.args.len != 2) return error.TooManyArgs;
+            const fp = try lowerExpr(ctx, c.args[0]);
+            const arg = try lowerExpr(ctx, c.args[1]);
+            const cid = ctx.callee_map.get("jogrt_spawn").?;
+            var inst = Inst{ .op = .call, .dst = none, .aux = cid, .arity = 2 };
+            inst.args[0] = fp;
+            inst.args[1] = arg;
+            try ctx.emit(inst);
+            const d = try ctx.fresh();
+            try ctx.emit(.{ .op = .iconst, .dst = d, .aux = 0 });
+            return d;
+        }
         if (ctx.fn_infos.get(name)) |fi| {
             return try lowerFnCall(ctx, fi, c.args, c.with_args);
         }
@@ -737,11 +796,24 @@ fn maybeCoerceCtx(ctx: *Ctx, slot: u32, concrete: []const u8, want: []const u8) 
 fn coerceToIface(ctx: *Ctx, data_slot: u32, concrete: []const u8, iface_name: []const u8) LowerError!u32 {
     const iface = ctx.ifaces.get(iface_name) orelse return error.UnknownName;
     if (iface.methods.len == 0) return data_slot;
-    // fat ptr { data, method0 } — one-method v0; multi uses first method only for calls by name match
-    const ms = iface.methods[0];
-    const key = try std.fmt.allocPrint(ctx.a, "{s}.{s}", .{ concrete, ms.name });
-    const mi = ctx.methods.get(key) orelse return error.UnknownName;
-    const cid = ctx.callee_map.get(mi.mangled) orelse return error.UnknownName;
+
+    const map_key = try std.fmt.allocPrint(ctx.a, "{s}>{s}", .{ concrete, iface_name });
+    const vt_index: u32 = blk: {
+        if (ctx.vtable_map.get(map_key)) |i| break :blk i;
+        var mnames: std.ArrayListUnmanaged([]const u8) = .{};
+        for (iface.methods) |ms| {
+            const key = try std.fmt.allocPrint(ctx.a, "{s}.{s}", .{ concrete, ms.name });
+            const mi = ctx.methods.get(key) orelse return error.UnknownName;
+            try mnames.append(ctx.a, mi.mangled);
+        }
+        const idx: u32 = @intCast(ctx.vtables.items.len);
+        try ctx.vtables.append(ctx.a, .{
+            .symbol = try std.fmt.allocPrint(ctx.a, "jog_vt_{d}", .{idx}),
+            .methods = try mnames.toOwnedSlice(ctx.a),
+        });
+        try ctx.vtable_map.put(ctx.a, map_key, idx);
+        break :blk idx;
+    };
 
     const sz = try ctx.fresh();
     try ctx.emit(.{ .op = .iconst, .dst = sz, .aux = 16 });
@@ -751,15 +823,14 @@ fn coerceToIface(ctx: *Ctx, data_slot: u32, concrete: []const u8, iface_name: []
     allo.args[0] = sz;
     try ctx.emit(allo);
 
-    // store data at fat+0; fn address at fat+8 (aux = -1 - callee_index → lea in asm)
     try ctx.emit(.{ .op = .store, .src0 = fat, .src1 = data_slot });
-    const fn_s = try ctx.fresh();
-    try ctx.emit(.{ .op = .saddr, .dst = fn_s, .aux = -1 - @as(i64, @intCast(cid)) });
+    const vt = try ctx.fresh();
+    try ctx.emit(.{ .op = .vtaddr, .dst = vt, .aux = vt_index });
     const eight = try ctx.fresh();
     try ctx.emit(.{ .op = .iconst, .dst = eight, .aux = 8 });
     const slot1 = try ctx.fresh();
     try ctx.emit(.{ .op = .add, .dst = slot1, .src0 = fat, .src1 = eight });
-    try ctx.emit(.{ .op = .store, .src0 = slot1, .src1 = fn_s });
+    try ctx.emit(.{ .op = .store, .src0 = slot1, .src1 = vt });
     return fat;
 }
 
@@ -819,13 +890,31 @@ fn lowerMethodOrIfaceCall(
 }
 
 fn lowerIfaceMethod(ctx: *Ctx, fat: u32, method: []const u8, args: []*ast.Expr) LowerError!u32 {
-    _ = method; // v0: single-method fat, always call slot+8
+    var method_index: i64 = -1;
+    var it = ctx.ifaces.iterator();
+    while (it.next()) |e| {
+        for (e.value_ptr.methods, 0..) |ms, i| {
+            if (std.mem.eql(u8, ms.name, method)) {
+                method_index = @intCast(i);
+                break;
+            }
+        }
+        if (method_index >= 0) break;
+    }
+    if (method_index < 0) return error.UnknownName;
+
     const data = try ctx.fresh();
     try ctx.emit(.{ .op = .load, .dst = data, .src0 = fat });
     const eight = try ctx.fresh();
     try ctx.emit(.{ .op = .iconst, .dst = eight, .aux = 8 });
+    const vt_slot = try ctx.fresh();
+    try ctx.emit(.{ .op = .add, .dst = vt_slot, .src0 = fat, .src1 = eight });
+    const vt = try ctx.fresh();
+    try ctx.emit(.{ .op = .load, .dst = vt, .src0 = vt_slot });
+    const off = try ctx.fresh();
+    try ctx.emit(.{ .op = .iconst, .dst = off, .aux = method_index * 8 });
     const fpp = try ctx.fresh();
-    try ctx.emit(.{ .op = .add, .dst = fpp, .src0 = fat, .src1 = eight });
+    try ctx.emit(.{ .op = .add, .dst = fpp, .src0 = vt, .src1 = off });
     const fnptr = try ctx.fresh();
     try ctx.emit(.{ .op = .load, .dst = fnptr, .src0 = fpp });
 

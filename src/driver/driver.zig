@@ -6,7 +6,7 @@ const ir = @import("../ir/ir.zig");
 const link = @import("../codegen/link.zig");
 const mod = @import("../mod/mod.zig");
 
-pub const version_string = "jog 0.2.2-v2 (zig host, ir→asm→native)";
+pub const version_string = "jog 0.2.3-v2 (zig host, ir→asm→native)";
 
 pub fn cmdVersion(writer: anytype) !void {
     try writer.print("{s}\n", .{version_string});
@@ -165,6 +165,8 @@ pub fn cmdParse(allocator: std.mem.Allocator, path: []const u8, writer: anytype)
             .extern_block => |eb| {
                 for (eb.fns) |ef| try writer.print("  extern fn {s}\n", .{ef.name});
             },
+            .expect_fn => |e| try writer.print("  expect fn {s}\n", .{e.name}),
+            .actual_fn => |f| try writer.print("  actual fn {s}\n", .{f.name}),
         }
     }
 }

@@ -1,0 +1,15 @@
+// expect/actual: platform hook with Jog body.
+
+expect fn platform_id(): i64
+
+actual fn platform_id(): i64 {
+    return 42
+}
+
+fn main() {
+    if (platform_id() == 42) {
+        print("expect actual ok\n")
+    } else {
+        panic("expect actual fail\n")
+    }
+}

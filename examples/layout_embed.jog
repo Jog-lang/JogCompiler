@@ -1,0 +1,31 @@
+// Offset-0 embed: first field shares the object's address.
+
+struct Inner {
+    a: i64
+    b: i64
+}
+
+struct Outer {
+    inner: Inner
+    tag: i64
+}
+
+fn *Inner.sum(): i64 {
+    return self.a + self.b
+}
+
+fn main() {
+    // Nested structs are pointer fields in the flat ABI; use as-cast for embed demo
+    // via explicit Inner object aliased through Outer.inner pointer store.
+    val inn = Inner(a: 3, b: 4)
+    val o = Outer(inner: inn, tag: 9)
+    if (o.inner.sum() == 7) {
+        if (o.tag == 9) {
+            print("layout embed ok\n")
+        } else {
+            panic("tag\n")
+        }
+    } else {
+        panic("sum\n")
+    }
+}

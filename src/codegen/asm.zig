@@ -49,8 +49,15 @@ pub fn emit(allocator: std.mem.Allocator, program: *const ir.Program, writer: an
         try writer.writeAll("\n");
     }
 
-    // rodata strings
     try writer.writeAll(".section .rodata\n");
+    try writer.writeAll(".align 8\n");
+    for (program.vtables, 0..) |vt, i| {
+        _ = vt.symbol;
+        try writer.print("jog_vt_{d}:\n", .{i});
+        for (vt.methods) |m| {
+            try writer.print("  .quad {s}\n", .{m});
+        }
+    }
     try writer.writeAll("jog_narrow_msg:\n");
     try writer.writeAll("  .ascii \"panic: narrow cast overflow\\n\"\n");
     try writer.writeAll("jog_narrow_msg_len = . - jog_narrow_msg\n");
@@ -194,6 +201,10 @@ fn emitInst(writer: anytype, prog: *const ir.Program, fname: []const u8, ninst: 
             if (inst.dst != ir.none) {
                 try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{slot(inst.dst)});
             }
+        },
+        .vtaddr => {
+            try writer.print("  lea rax, [rip + jog_vt_{d}]\n", .{inst.aux});
+            try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{slot(inst.dst)});
         },
         .ret => {
             if (inst.src0 != ir.none) {

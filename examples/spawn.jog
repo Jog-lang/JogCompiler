@@ -1,0 +1,10 @@
+// Dispatcher-style sync spawn via runtime jogrt_spawn (builtin).
+
+fn worker(arg: *byte) {
+    print("spawned\n")
+}
+
+fn main() {
+    spawn(worker, null)
+    print("spawn ok\n")
+}

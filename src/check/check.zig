@@ -117,8 +117,22 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
                 ti.* = .{ .kind = .iface_struct, .name = ins.name };
                 try types.put(a, ins.name, ti);
             },
-            .fn_decl => |*fd| {
+            .fn_decl, .actual_fn => |*fd| {
                 try fns.put(a, fd.name, fd);
+            },
+            .expect_fn => |ef| {
+                const stub = try a.create(ast.FnDecl);
+                stub.* = .{
+                    .name = ef.name,
+                    .params = ef.params,
+                    .contexts = &[_]ast.ContextParam{},
+                    .ret = ef.ret,
+                    .body = null,
+                    .exported = false,
+                };
+                try fns.put(a, ef.name, stub);
+                for (ef.params) |p| _ = try resolveTypeExpr(a, &types, p.ty, &diags);
+                if (ef.ret) |r| _ = try resolveTypeExpr(a, &types, r, &diags);
             },
             .method => |*md| {
                 const key = try std.fmt.allocPrint(a, "{s}.{s}", .{ md.type_name, md.name });
@@ -484,6 +498,10 @@ fn checkExpr(
                 const ti = try a.create(TypeInfo);
                 ti.* = .{ .kind = .pointer, .name = "ptr", .pointee = types.get("byte") };
                 return ti;
+            }
+            if (c.callee.* == .ident and std.mem.eql(u8, c.callee.ident, "spawn")) {
+                for (c.args) |arg| _ = try checkExpr(a, types, fns, scope, arg, diags);
+                return try voidType(a);
             }
             if (c.callee.* == .ident) {
                 if (fns.get(c.callee.ident)) |fd| {
