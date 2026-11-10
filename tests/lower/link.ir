@@ -3,11 +3,11 @@ init none
 
 fn f0 extern printf "app.printf": extern (...) -> i32  ; link.jog:4:5
 
-fn f1 export start "app.start": () -> i32  ; link.jog:8:1
+fn f1 export start "app.start": extern () -> i32  ; link.jog:8:1
 b0 entry:
   ret i32 1  ; link.jog:9:5
 
-fn f2 export c_entry "app.entry": () -> i32  ; link.jog:13:1
+fn f2 export c_entry "app.entry": extern () -> i32  ; link.jog:13:1
 b0 entry:
   ret i32 2  ; link.jog:14:5
 

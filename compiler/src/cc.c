@@ -222,6 +222,25 @@ static const char *libdir_flag(CtArena *arena, const char *dir) {
     return flag;
 }
 
+/* -Wl,-rpath,<dir> so the dynamic loader finds libs from the same
+   search paths without LD_LIBRARY_PATH. Native ELF/Mach-O only. */
+static const char *rpath_flag(CtArena *arena, const char *dir) {
+    size_t n;
+    char *flag;
+    static const char prefix[] = "-Wl,-rpath,";
+    if (!arena || !dir) {
+        return NULL;
+    }
+    n = strlen(dir);
+    flag = ct_arena_alloc(arena, sizeof(prefix) - 1 + n + 1, 1);
+    if (!flag) {
+        return NULL;
+    }
+    memcpy(flag, prefix, sizeof(prefix) - 1);
+    memcpy(flag + sizeof(prefix) - 1, dir, n + 1);
+    return flag;
+}
+
 static const char *link_flag(CtArena *arena, const char *lib) {
     size_t len = strlen(lib);
     char *flag = ct_arena_alloc(arena, len + 3, 1);
@@ -1015,12 +1034,14 @@ bool jog_cc_build(const JogCcRequest *request, CtDiag *diag) {
     for (size_t i = 0; i < request->extra_lib_dir_count; i++) {
         const char *dir = request->extra_lib_dirs[i];
         const char *flag = NULL;
+        const char *rflag = NULL;
         if (!dir || dir[0] == '\0') {
             ct_diag_emit(diag, CT_SEVERITY_ERROR, pos, "empty library search path");
             goto done;
         }
         flag = libdir_flag(arena, dir);
-        if (!flag || !push_arg(&args, flag)) {
+        rflag = rpath_flag(arena, dir);
+        if (!flag || !rflag || !push_arg(&args, flag) || !push_arg(&args, rflag)) {
             ct_diag_emit(diag, CT_SEVERITY_ERROR, pos, "out of memory");
             goto done;
         }

@@ -1,0 +1,25 @@
+// expect: ok
+
+extern {
+    fn puts(s: *const i8): i32
+}
+
+var sink: *i32? = null
+var flag: i32 = 0
+
+fn set_sink(p: *i32) {
+    sink = p
+}
+
+fn main() {
+    var n: i32 = 3
+    set_sink(&n)
+    if sink != null {
+        if *sink!! == 3 {
+            flag = 1
+        }
+    }
+    if flag == 1 {
+        puts(c"ok")
+    }
+}

@@ -4,11 +4,11 @@
 #include <emscripten.h>
 #endif
 
-/* Apps that use the returning mainloop @export jog_app_iterate(): i32
-   (return 0 to stop). Passing a Jog fn as extern () -> i32 is not wired
-   yet (Friction); a fixed export keeps one binary on desktop + Emscripten.
+/* Returning mainloop: the app passes an @export tick that returns 0 to
+   stop. Desktop runs a while loop; Emscripten drives requestAnimationFrame.
 
-   A weak stub lets programs that never call jog_host_run_loop still link. */
+   A weak jog_app_iterate stub remains so binaries that never call
+   jog_host_run_loop still link if an older object references the symbol. */
 
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((weak))
@@ -18,18 +18,24 @@ int jog_app_iterate(void) {
 }
 
 #ifdef __EMSCRIPTEN__
+static jog_host_tick_fn jog_host_tick;
+
 static void jog_host_frame_trampoline(void) {
-    if (!jog_app_iterate()) {
+    if (!jog_host_tick || !jog_host_tick()) {
         emscripten_cancel_main_loop();
     }
 }
 
-void jog_host_run_loop(void) {
+void jog_host_run_loop(jog_host_tick_fn tick) {
+    jog_host_tick = tick;
     emscripten_set_main_loop(jog_host_frame_trampoline, 0, 1);
 }
 #else
-void jog_host_run_loop(void) {
-    while (jog_app_iterate()) {
+void jog_host_run_loop(jog_host_tick_fn tick) {
+    if (!tick) {
+        return;
+    }
+    while (tick()) {
     }
 }
 #endif

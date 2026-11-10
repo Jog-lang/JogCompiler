@@ -1246,8 +1246,10 @@ static JogType *check_fn(Check *ck, CheckJob *job) {
     if (bad || ck->stop) {
         return ck->stop ? NULL : error_type(ck);
     }
+    /* @export uses the C calling convention, so its value type is an
+       extern function type (passable where extern (…) -> R is expected). */
     built = jog_type_fn(ck->program->types, params, param_count, ret, contexts, context_count, fn->as.fn.variadic, false,
-                        fn->as.fn.is_extern);
+                        fn->as.fn.is_extern || fn_has_attr(fn, "export"));
     if (!built) {
         oom(ck);
         return NULL;

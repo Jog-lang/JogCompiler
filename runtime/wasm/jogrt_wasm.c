@@ -489,6 +489,12 @@ int jogrt_spawn_actions_adddup2(void *actions, int fd, int newfd) {
     return -1;
 }
 
+int jogrt_spawn_actions_addchdir(void *actions, const int8_t *path) {
+    (void)actions;
+    (void)path;
+    return -1;
+}
+
 void jogrt_spawn_actions_free(void *actions) {
     (void)actions;
 }

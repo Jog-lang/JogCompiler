@@ -497,6 +497,12 @@ static int semver_cmp(const char *a, const char *b) {
 
 /* A require spec that starts with ./ ../ / \ or a drive letter is a path. */
 static int is_path_spec(Tok tok) {
+    if (tok.len == 1 && tok.ptr[0] == '.') {
+        return 1;
+    }
+    if (tok.len == 2 && tok.ptr[0] == '.' && tok.ptr[1] == '.') {
+        return 1;
+    }
     if (tok.len >= 1 && (tok.ptr[0] == '/' || tok.ptr[0] == '\\')) {
         return 1;
     }

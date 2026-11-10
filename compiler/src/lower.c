@@ -4394,7 +4394,9 @@ static const char *global_gap(const JogType *type) {
         return NULL;
     case JOG_TY_ERROR:
     case JOG_TY_OPTION:
-        return "errors";
+        /* Niche null / error? globals zero-init; tagged options use the
+           same layout as locals. Friction: package-level T? = null. */
+        return NULL;
     case JOG_TY_TYPE_PARAM:
     case JOG_TY_INTERFACE:
         return "generics";

@@ -168,6 +168,8 @@ int jogrt_mkdir(const int8_t *path);
 void *jogrt_spawn_actions_new(void);
 /* 0 on success, -1 when actions is NULL or adddup2 fails. */
 int jogrt_spawn_actions_adddup2(void *actions, int fd, int newfd);
+/* Child working directory for posix_spawn (addchdir_np). 0 on success. */
+int jogrt_spawn_actions_addchdir(void *actions, const int8_t *path);
 void jogrt_spawn_actions_free(void *actions);
 
 /* WEXITSTATUS when the child exited normally, otherwise -1. */
@@ -178,8 +180,9 @@ int jogrt_wexitstatus(int status);
 const int8_t **jogrt_environ(void);
 
 /* Returning mainloop for Emscripten (and a plain while on desktop).
-   Calls the program's @export jog_app_iterate() until it returns 0.
-   Linked from runtime/jogrt_mainloop.c. */
-void jog_host_run_loop(void);
+   Calls tick until it returns 0. tick is typically an @export Jog fn
+   passed as an extern () -> i32 value. Linked from runtime/jogrt_mainloop.c. */
+typedef int (*jog_host_tick_fn)(void);
+void jog_host_run_loop(jog_host_tick_fn tick);
 
 #endif
