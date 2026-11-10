@@ -1,0 +1,16 @@
+// Structs + field load/store (pointers under the hood).
+
+struct Point {
+    x: i64
+    y: i64
+}
+
+fn main() {
+    val p = Point(x: 3, y: 4)
+    p.x = 10
+    if (p.x + p.y == 14) {
+        print("structs ok\n")
+    } else {
+        panic("structs fail\n")
+    }
+}

@@ -4,7 +4,7 @@ const check_mod = @import("../check/check.zig");
 const ir = @import("../ir/ir.zig");
 const link = @import("../codegen/link.zig");
 
-pub const version_string = "jog 0.2.1-v2 (zig host, ir→asm→native)";
+pub const version_string = "jog 0.2.2-v2 (zig host, ir→asm→native)";
 
 pub fn cmdVersion(writer: anytype) !void {
     try writer.print("{s}\n", .{version_string});

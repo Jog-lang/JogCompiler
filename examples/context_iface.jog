@@ -1,0 +1,27 @@
+// Contexts + interface struct (Allocator fat ptr) + method.
+
+interface struct Allocator {
+    fn alloc(size: usize): *byte
+}
+
+struct Arena {
+    pad: i64
+}
+
+fn *Arena.alloc(size: usize): *byte {
+    return alloc(size)
+}
+
+fn take(n: usize) with (a: Allocator): *byte {
+    return a.alloc(n)
+}
+
+fn main() {
+    val arena = Arena(pad: 0)
+    val p = take(16) with (arena)
+    if (p != null) {
+        print("context iface ok\n")
+    } else {
+        panic("alloc failed\n")
+    }
+}

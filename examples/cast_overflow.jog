@@ -1,0 +1,10 @@
+// Narrow that must panic.
+
+fn main() {
+    val x: u32 = 70000
+    val y: u16 = x as u16
+    print("unreachable\n")
+    if (y == 0) {
+        print("?\n")
+    }
+}

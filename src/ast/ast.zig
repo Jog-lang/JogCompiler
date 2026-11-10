@@ -120,8 +120,15 @@ pub const VarDecl = struct {
 };
 
 pub const Assign = struct {
+    /// Simple `name = value`, or field store when `field` is set (`base.name = value`).
     name: []const u8,
     value: *Expr,
+    field: ?FieldAssign = null,
+};
+
+pub const FieldAssign = struct {
+    base: *Expr,
+    name: []const u8,
 };
 
 pub const IfStmt = struct {
@@ -173,6 +180,8 @@ pub const UnaryOp = enum { neg, not, addr, deref };
 pub const Call = struct {
     callee: *Expr,
     args: []*Expr,
+    /// Call-site contexts: `f(args) with (e1, e2)`.
+    with_args: []*Expr = &.{},
 };
 
 pub const FieldAccess = struct {

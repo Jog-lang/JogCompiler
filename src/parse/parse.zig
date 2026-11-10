@@ -439,10 +439,19 @@ pub const Parser = struct {
             else => {
                 const e = try self.parseExpr();
                 if (self.tok.kind == .eq) {
-                    if (e.* != .ident) return error.UnexpectedToken;
                     self.advance();
                     const v = try self.parseExpr();
-                    return .{ .assign = .{ .name = e.ident, .value = v } };
+                    if (e.* == .ident) {
+                        return .{ .assign = .{ .name = e.ident, .value = v } };
+                    }
+                    if (e.* == .field) {
+                        return .{ .assign = .{
+                            .name = e.field.name,
+                            .value = v,
+                            .field = .{ .base = e.field.base, .name = e.field.name },
+                        } };
+                    }
+                    return error.UnexpectedToken;
                 }
                 return .{ .expr = e };
             },
@@ -514,8 +523,28 @@ pub const Parser = struct {
                     }
                 }
                 try self.expect(.rparen);
+                var with_args: []*ast.Expr = &.{};
+                if (self.tok.kind == .kw_with) {
+                    self.advance();
+                    try self.expect(.lparen);
+                    var wargs: std.ArrayListUnmanaged(*ast.Expr) = .{};
+                    while (true) {
+                        try wargs.append(self.allocator, try self.parseExpr());
+                        if (self.tok.kind == .comma) {
+                            self.advance();
+                            continue;
+                        }
+                        break;
+                    }
+                    try self.expect(.rparen);
+                    with_args = try wargs.toOwnedSlice(self.allocator);
+                }
                 const call = try self.allocator.create(ast.Expr);
-                call.* = .{ .call = .{ .callee = e, .args = try args.toOwnedSlice(self.allocator) } };
+                call.* = .{ .call = .{
+                    .callee = e,
+                    .args = try args.toOwnedSlice(self.allocator),
+                    .with_args = with_args,
+                } };
                 e = call;
                 continue;
             }

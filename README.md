@@ -36,5 +36,11 @@ zig build
 ./out/hello
 ./zig-out/bin/jog build examples/arith.jog -o out/arith && ./out/arith
 ./zig-out/bin/jog build examples/extern_puts.jog -o out/puts && ./out/puts
-./zig-out/bin/jog check examples/subset.jog
+./zig-out/bin/jog build examples/structs.jog -o out/structs && ./out/structs
+./zig-out/bin/jog build examples/null_flow.jog -o out/null_flow && ./out/null_flow
+./zig-out/bin/jog build examples/cast_narrow.jog -o out/cast && ./out/cast
+./zig-out/bin/jog build examples/context_iface.jog -o out/ctx && ./out/ctx
+./zig-out/bin/jog build examples/subset.jog -o out/subset && ./out/subset
 ```
+
+Language subset (milestone): structs/fields, pointers, `T?` + `?.`, widen/`as` narrow, `with` contexts, `interface struct` fat ptrs.

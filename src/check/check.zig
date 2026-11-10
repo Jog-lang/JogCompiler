@@ -178,8 +178,22 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
             try diags.append(a, .{ .message = try std.fmt.allocPrint(a, "method on unknown type '{s}'", .{md.type_name}) });
         }
         for (md.contexts) |ctx| _ = try resolveTypeExpr(a, &types, ctx.ty, &diags);
+        if (md.ret) |r| _ = try resolveTypeExpr(a, &types, r, &diags);
+        for (md.params) |p| _ = try resolveTypeExpr(a, &types, p.ty, &diags);
         if (md.body) |body| {
-            try checkFunctionBody(a, &types, &fns, md.params, md.contexts, body, &diags);
+            // synthesize self param for receiver
+            var params_with_self: std.ArrayListUnmanaged(ast.Param) = .{};
+            const self_ty = try a.create(ast.TypeExpr);
+            if (md.pointer_recv) {
+                const inner = try a.create(ast.TypeExpr);
+                inner.* = .{ .name = md.type_name };
+                self_ty.* = .{ .pointer = inner };
+            } else {
+                self_ty.* = .{ .name = md.type_name };
+            }
+            try params_with_self.append(a, .{ .name = "self", .ty = self_ty });
+            for (md.params) |p| try params_with_self.append(a, p);
+            try checkFunctionBody(a, &types, &fns, try params_with_self.toOwnedSlice(a), md.contexts, body, &diags);
         }
     }
 
@@ -340,13 +354,18 @@ fn checkStmt(
             }
         },
         .assign => |as| {
-            const v = lookupVar(scope, as.name) orelse {
-                try diags.append(a, .{ .message = try std.fmt.allocPrint(a, "unknown name '{s}'", .{as.name}) });
-                return;
-            };
-            const rt = try checkExpr(a, types, fns, scope, as.value, diags);
-            if (!canAssign(rt, v.ty)) {
-                try diags.append(a, .{ .message = "assignment type mismatch" });
+            if (as.field) |fa| {
+                _ = try checkExpr(a, types, fns, scope, fa.base, diags);
+                _ = try checkExpr(a, types, fns, scope, as.value, diags);
+            } else {
+                const v = lookupVar(scope, as.name) orelse {
+                    try diags.append(a, .{ .message = try std.fmt.allocPrint(a, "unknown name '{s}'", .{as.name}) });
+                    return;
+                };
+                const rt = try checkExpr(a, types, fns, scope, as.value, diags);
+                if (!canAssign(rt, v.ty)) {
+                    try diags.append(a, .{ .message = "assignment type mismatch" });
+                }
             }
         },
         .expr => |e| _ = try checkExpr(a, types, fns, scope, e, diags),
@@ -455,18 +474,46 @@ fn checkExpr(
             return t;
         },
         .call => |c| {
-            // builtins
             if (c.callee.* == .ident and std.mem.eql(u8, c.callee.ident, "print")) {
                 for (c.args) |arg| _ = try checkExpr(a, types, fns, scope, arg, diags);
+                for (c.with_args) |w| _ = try checkExpr(a, types, fns, scope, w, diags);
                 return try voidType(a);
+            }
+            if (c.callee.* == .ident and std.mem.eql(u8, c.callee.ident, "alloc")) {
+                for (c.args) |arg| _ = try checkExpr(a, types, fns, scope, arg, diags);
+                const ti = try a.create(TypeInfo);
+                ti.* = .{ .kind = .pointer, .name = "ptr", .pointee = types.get("byte") };
+                return ti;
+            }
+            if (c.callee.* == .ident) {
+                if (fns.get(c.callee.ident)) |fd| {
+                    for (c.args) |arg| _ = try checkExpr(a, types, fns, scope, arg, diags);
+                    for (c.with_args) |w| _ = try checkExpr(a, types, fns, scope, w, diags);
+                    if (fd.ret) |r| return try resolveTypeExpr(a, types, r, diags);
+                    return try voidType(a);
+                }
+            }
+            if (c.callee.* == .field) {
+                _ = try checkExpr(a, types, fns, scope, c.callee.field.base, diags);
+                for (c.args) |arg| _ = try checkExpr(a, types, fns, scope, arg, diags);
+                for (c.with_args) |w| _ = try checkExpr(a, types, fns, scope, w, diags);
+                // method return unknown without full resolution — pointer-ish default
+                const ti = try a.create(TypeInfo);
+                ti.* = .{ .kind = .pointer, .name = "ptr", .pointee = types.get("byte") };
+                return ti;
             }
             _ = try checkExpr(a, types, fns, scope, c.callee, diags);
             for (c.args) |arg| _ = try checkExpr(a, types, fns, scope, arg, diags);
+            for (c.with_args) |w| _ = try checkExpr(a, types, fns, scope, w, diags);
             return try voidType(a);
         },
         .field => |f| {
-            _ = try checkExpr(a, types, fns, scope, f.base, diags);
-            return try voidType(a);
+            const base = try checkExpr(a, types, fns, scope, f.base, diags);
+            _ = base;
+            // field type resolution deferred to IR layout; treat as i64/ptr-sized
+            const ti = try a.create(TypeInfo);
+            ti.* = .{ .kind = .i64_ty, .name = "i64", .bits = 64, .unsigned = false };
+            return ti;
         },
         .cast => |c| {
             const from = try checkExpr(a, types, fns, scope, c.expr, diags);
@@ -484,10 +531,7 @@ fn checkExpr(
             return to;
         },
         .optional_call => |oc| {
-            const base = try checkExpr(a, types, fns, scope, oc.base, diags);
-            if (base.kind != .optional and base.kind != .pointer) {
-                // allow; ?. on optional
-            }
+            _ = try checkExpr(a, types, fns, scope, oc.base, diags);
             for (oc.args) |arg| _ = try checkExpr(a, types, fns, scope, arg, diags);
             const ti = try a.create(TypeInfo);
             ti.* = .{ .kind = .optional, .name = "opt_result", .pointee = try voidType(a) };
@@ -518,11 +562,18 @@ fn voidType(a: std.mem.Allocator) !*TypeInfo {
 fn canAssign(from: *TypeInfo, to: *TypeInfo) bool {
     if (from.kind == to.kind and std.mem.eql(u8, from.name, to.name)) return true;
     if (to.kind == .optional) {
-        if (to.pointee) |p| return canAssign(from, p) or from.kind == .optional;
+        if (from.kind == .optional) return true;
+        if (from.kind == .pointer or from.kind == .struct_ty) return true;
+        if (to.pointee) |p| return canAssign(from, p) or from.kind == .pointer;
+        return false;
     }
-    // widen
+    // untyped int literal (i64) → any integer
+    if (from.kind == .i64_ty and to.bits > 0) return true;
+    // widen unsigned
     if (from.bits > 0 and to.bits > 0 and from.unsigned and to.unsigned and from.bits <= to.bits) return true;
-    // interface / named struct same name
+    // pointer to optional pointer / raw
+    if (from.kind == .pointer and to.kind == .pointer) return true;
+    // interface / named struct
     if (from.kind == .struct_ty and to.kind == .iface_struct) return true;
     if (from.kind == .pointer and to.kind == .iface_struct) return true;
     return false;

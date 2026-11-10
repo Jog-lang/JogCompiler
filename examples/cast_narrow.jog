@@ -1,0 +1,11 @@
+// Widen is implicit; narrow uses `as` (runtime panic if high bits set).
+
+fn main() {
+    val x: u32 = 40
+    val y: u16 = x as u16
+    if (y == 40) {
+        print("cast ok\n")
+    } else {
+        panic("cast fail\n")
+    }
+}

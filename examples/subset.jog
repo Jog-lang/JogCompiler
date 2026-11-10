@@ -1,4 +1,4 @@
-// v2 language subset: bytes-first buffers, interfaces, contexts, casting, null flow.
+// v2 language subset smoke: bytes-first buffers, interfaces, contexts, casting, null flow.
 
 type Handle = u64
 
@@ -14,8 +14,8 @@ struct Buf {
     cap: usize
 }
 
-fn *Buf.alloc(size: usize) with Allocator: *byte {
-    return null
+fn *Buf.alloc(size: usize): *byte {
+    return alloc(size)
 }
 
 struct Arena {
@@ -25,7 +25,7 @@ struct Arena {
 }
 
 fn *Arena.alloc(size: usize): *byte {
-    return null
+    return alloc(size)
 }
 
 fn widen(x: u16): u32 {
@@ -36,8 +36,8 @@ fn narrow(x: u32): u16 {
     return x as u16
 }
 
-fn useBoth() with (a: Allocator): u16 {
-    return 1
+fn useBoth(n: usize) with (a: Allocator): *byte {
+    return a.alloc(n)
 }
 
 fn maybe(p: *byte?): usize {
@@ -53,5 +53,21 @@ fn optCall(p: *Buf?): usize {
 }
 
 fn main() {
+    val arena = Arena(ptr: null, len: 0, cap: 0)
+    val p = useBoth(8) with (arena)
+    if (maybe(p) != 1) {
+        panic("subset alloc\n")
+    }
+    val b = Buf(ptr: p, len: 8, cap: 8)
+    val q: *Buf? = b
+    if (optCall(q) != 0) {
+        panic("subset opt\n")
+    }
+    if (optCall(null) != 0) {
+        panic("subset null opt\n")
+    }
+    if (narrow(widen(7)) != 7) {
+        panic("subset cast\n")
+    }
     print("subset ok\n")
 }
