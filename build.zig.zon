@@ -1,0 +1,16 @@
+.{
+    .name = .jog,
+    .version = "0.2.0",
+    .fingerprint = 0x8bb214778c534f92,
+    .minimum_zig_version = "0.14.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "examples",
+        "README.md",
+        "LICENSE",
+        "AGENTS.md",
+    },
+}

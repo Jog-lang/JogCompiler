@@ -1,0 +1,4 @@
+// Minimal v2 program: print via builtin, lowered to write+exit syscalls.
+fn main() {
+    print("Hello, Jog v2!\n")
+}
