@@ -36,12 +36,13 @@ struct Output {
 
 // Starts args[0] and waits. The error is null when the process ran.
 // Output.code is then the exit code. See the package comment for which
-// sentinel a failed start returns.
-expect fn run(args: []str): (Output, error?) with (a: mem.Allocator)
+// sentinel a failed start returns. An empty cwd keeps the parent's
+// working directory; a non-empty cwd is the child's.
+expect fn run(args: []str, cwd: str = ""): (Output, error?) with (a: mem.Allocator)
 
 // Same start and wait as run, without captured bytes. The i32 is the
 // exit code when the error is null.
-expect fn run_inherit(args: []str): (i32, error?) with (a: mem.Allocator)
+expect fn run_inherit(args: []str, cwd: str = ""): (i32, error?) with (a: mem.Allocator)
 
 // Releases both captured blocks. An empty block frees nothing.
 fn free_output(out: Output) with (a: mem.Allocator) {

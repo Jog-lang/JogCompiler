@@ -17,6 +17,7 @@
 // reading is returned. The std heap panics instead of reporting one.
 
 import std.c
+import std.error as errors
 import std.io
 import std.list as lists
 import std.mem
@@ -30,6 +31,41 @@ expect fn rename(from: str, to: str): error?
 
 expect fn exists(path: str): bool
 expect fn cwd(): (str, bool) with (a: mem.Allocator)
+
+// Creates one directory. ErrIO when the path does not fit or the OS
+// refuses. Succeeds when the directory already exists.
+expect fn mkdir_one(path: str): error?
+
+// Removes a file or an empty directory. ErrNotFound when missing.
+expect fn remove(path: str): error?
+
+// Creates path and any missing parents (mkdir -p). ErrIO on failure.
+fn mkdir(path: str): error? {
+    if path.len == 0 {
+        return errors.ErrIO
+    }
+    var i: usize = 0
+    if path.len >= 2 && path.ptr[1] == ':' as u8 {
+        i = 2
+    }
+    for i < path.len && is_sep(path.ptr[i]) {
+        i = i + 1
+    }
+    var k = i
+    for k < path.len {
+        if is_sep(path.ptr[k]) && k > 0 {
+            val prefix = text.slice(path, 0, k)
+            if prefix.len > 0 {
+                val err = mkdir_one(prefix)
+                if err != null {
+                    return err
+                }
+            }
+        }
+        k = k + 1
+    }
+    return mkdir_one(path)
+}
 
 // The whole file, from io.read_all. ErrNotFound means the path is missing.
 // ErrIO means another read failed. The bytes come from the Allocator

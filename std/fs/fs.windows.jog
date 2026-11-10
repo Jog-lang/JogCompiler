@@ -131,3 +131,35 @@ actual fn cwd(): (str, bool) with (a: mem.Allocator) {
     view.len = nbytes
     return copy_str(view), true
 }
+
+actual fn mkdir_one(path: str): error? {
+    var wide: [4096]u16
+    if !wide_path(path, wide[..].ptr, 4096) {
+        return errors.ErrIO
+    }
+    if c.CreateDirectoryW(wide[..].ptr, 0) != 0 {
+        return null
+    }
+    if exists(path) {
+        return null
+    }
+    return errors.ErrIO
+}
+
+actual fn remove(path: str): error? {
+    var wide: [4096]u16
+    if !wide_path(path, wide[..].ptr, 4096) {
+        return errors.ErrIO
+    }
+    if c.DeleteFileW(wide[..].ptr) != 0 {
+        return null
+    }
+    if c.RemoveDirectoryW(wide[..].ptr) != 0 {
+        return null
+    }
+    val code = c.GetLastError()
+    if code == 2 || code == 3 {
+        return errors.ErrNotFound
+    }
+    return errors.ErrIO
+}

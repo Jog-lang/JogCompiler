@@ -225,7 +225,7 @@ private fn fill_nul(dest: *u16) {
     dest[3] = 0
 }
 
-private fn spawn(app: *u16, command: *u16, capture: bool): (Output, error?) with (a: mem.Allocator) {
+private fn spawn(app: *u16, command: *u16, capture: bool, cwd_wide: *u16?): (Output, error?) with (a: mem.Allocator) {
     var out_path: [260]u16
     var err_path: [260]u16
     var startup: Startup
@@ -259,7 +259,7 @@ private fn spawn(app: *u16, command: *u16, capture: bool): (Output, error?) with
         startup.stdin_h = nul_h
         startup.stdout_h = out_h
         startup.stderr_h = err_h
-        val created = CreateProcessW(app, command, null, null, 1, 0, null, null, &startup, &info)
+        val created = CreateProcessW(app, command, null, null, 1, 0, null, cwd_wide, &startup, &info)
         var code: c.unsigned_long = 0
         if created == 0 {
             code = c.GetLastError()
@@ -276,7 +276,7 @@ private fn spawn(app: *u16, command: *u16, capture: bool): (Output, error?) with
             return Output(), errors.ErrIO
         }
     } else {
-        val created = CreateProcessW(app, command, null, null, 0, 0, null, null, &startup, &info)
+        val created = CreateProcessW(app, command, null, null, 0, 0, null, cwd_wide, &startup, &info)
         if created == 0 {
             val code = c.GetLastError()
             if code == 2 || code == 3 {
@@ -317,7 +317,7 @@ private fn spawn(app: *u16, command: *u16, capture: bool): (Output, error?) with
     return out, err
 }
 
-private fn start(args: []str, capture: bool): (Output, error?) with (a: mem.Allocator) {
+private fn start(args: []str, capture: bool, cwd: str): (Output, error?) with (a: mem.Allocator) {
     if args.len == 0 {
         return Output(), errors.ErrIO
     }
@@ -343,7 +343,17 @@ private fn start(args: []str, capture: bool): (Output, error?) with (a: mem.Allo
         a.free(wide)
         return Output(), errors.ErrIO
     }
-    val (out, spawn_err) = spawn(wide_app[..].ptr, wide.ptr as *u16, capture)
+    var cwd_buf: [4096]u16
+    var cwd_ptr: *u16? = null
+    if cwd.len > 0 {
+        if !c.utf8_to_wide(cwd, cwd_buf[..].ptr, 4096) {
+            command.free()
+            a.free(wide)
+            return Output(), errors.ErrIO
+        }
+        cwd_ptr = cwd_buf[..].ptr
+    }
+    val (out, spawn_err) = spawn(wide_app[..].ptr, wide.ptr as *u16, capture, cwd_ptr)
     command.free()
     a.free(wide)
     return out, spawn_err
@@ -351,14 +361,14 @@ private fn start(args: []str, capture: bool): (Output, error?) with (a: mem.Allo
 
 // args[0] is the program. The call waits. A null error means the process
 // ran and Output.code is its exit code.
-actual fn run(args: []str): (Output, error?) with (a: mem.Allocator) {
-    return start(args, true)
+actual fn run(args: []str, cwd: str = ""): (Output, error?) with (a: mem.Allocator) {
+    return start(args, true, cwd)
 }
 
 // Same start and wait as run. The child keeps the parent's stdout and
 // stderr, so its writes show up as it makes them. The i32 is the exit
 // code when the error is null. There are no captured bytes.
-actual fn run_inherit(args: []str): (i32, error?) with (a: mem.Allocator) {
-    val (out, err) = start(args, false)
+actual fn run_inherit(args: []str, cwd: str = ""): (i32, error?) with (a: mem.Allocator) {
+    val (out, err) = start(args, false, cwd)
     return out.code, err
 }

@@ -21,6 +21,7 @@ extern {
     fn GetFileAttributesW(path: *u16): unsigned_long
     fn GetCurrentDirectoryW(cap: unsigned_long, buffer: *u16): unsigned_long
     fn GetEnvironmentVariableW(name: *u16, buf: *u16, cap: unsigned_long): unsigned_long
+    fn SetEnvironmentVariableW(name: *u16, value: *u16?): int
     fn MultiByteToWideChar(
         code_page: unsigned_int,
         flags: unsigned_long,

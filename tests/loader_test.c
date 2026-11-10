@@ -993,7 +993,7 @@ typedef struct BadManifest {
 static void test_manifest_v2(void) {
     static const BadManifest bad[] = {
         {"module m\nlibdir.unknown lib\n",
-         "jog.mod:2:8: error: jog.mod: unknown target 'unknown'; expected windows, linux, or macos"},
+         "jog.mod:2:8: error: jog.mod: unknown target 'unknown'; expected windows, linux, macos, or emscripten"},
         {"module m\nsource x\n", "jog.mod:2:1: error: jog.mod: 'source' is reserved"},
         {"module m\nreplace a ../a\n", "jog.mod:2:1: error: jog.mod: 'replace' is reserved"},
         {"module m\nconfig debug\n", "jog.mod:2:1: error: jog.mod: 'config' is reserved"},
@@ -1038,6 +1038,7 @@ static void test_manifest_v2(void) {
     CHECK(load_manifest(&h, 0,
                         "# v2\r\nmodule m # name\r\nversion 1.2.3-rc.1\r\nkind library\r\njog 0.0.1-alpha.2\r\n"
                         "require a ../a\r\nrequire b 1.4.0\r\nrequire c C:/vendor/c\r\nrequire d /opt/d.jogz\r\n"
+                        "require e ..\r\nrequire f .\r\n"
                         "export x\r\nexport x.y\r\nlink m\r\nlink.windows ws2_32\r\nlink.linux dl\r\n"
                         "link.macos objc\r\nlibdir ./libs\r\nlibdir.windows ./libs/win\r\n"
                         "libdir.linux ./libs/linux\r\nlibdir.macos ./libs/mac\r\n",

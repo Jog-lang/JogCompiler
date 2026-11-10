@@ -1,5 +1,5 @@
-#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
-#define _POSIX_C_SOURCE 200809L
+#if !defined(_WIN32) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
 #endif
 
 #include "jogrt.h"
@@ -632,6 +632,19 @@ int jogrt_spawn_actions_adddup2(void *actions, int fd, int newfd) {
         return -1;
     }
     return posix_spawn_file_actions_adddup2(actions, fd, newfd);
+#endif
+}
+
+int jogrt_spawn_actions_addchdir(void *actions, const int8_t *path) {
+#if defined(_WIN32)
+    (void)actions;
+    (void)path;
+    return -1;
+#else
+    if (!actions || !path) {
+        return -1;
+    }
+    return posix_spawn_file_actions_addchdir_np(actions, (const char *)path);
 #endif
 }
 

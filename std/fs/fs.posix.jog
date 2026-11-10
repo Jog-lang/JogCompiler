@@ -87,6 +87,38 @@ actual fn cwd(): (str, bool) with (a: mem.Allocator) {
     return copy_str(path_view_local(buf[..].ptr)), true
 }
 
+actual fn mkdir_one(path: str): error? {
+    var buf: [4096]u8
+    if !fill_path(buf[..].ptr, 4096, path) {
+        return errors.ErrIO
+    }
+    if c.jogrt_mkdir(buf[..].ptr as *const c.char) == 0 {
+        return null
+    }
+    // EEXIST — treat as success when the path is already a directory.
+    if exists(path) {
+        return null
+    }
+    return errors.ErrIO
+}
+
+actual fn remove(path: str): error? {
+    var buf: [4096]u8
+    if !fill_path(buf[..].ptr, 4096, path) {
+        return errors.ErrIO
+    }
+    if c.unlink(buf[..].ptr as *const c.char) == 0 {
+        return null
+    }
+    if c.rmdir(buf[..].ptr as *const c.char) == 0 {
+        return null
+    }
+    if c.jogrt_errno() == 2 {
+        return errors.ErrNotFound
+    }
+    return errors.ErrIO
+}
+
 private fn path_view_local(path: *u8): str {
     var n: usize = 0
     for n < 4096 {
