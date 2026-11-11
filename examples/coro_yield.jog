@@ -1,0 +1,26 @@
+// Gate step 1: stackful cooperative yield on one OS thread.
+// go(fn, arg) enqueues; yield() round-robins; coro_drain() runs until only main remains.
+// Expected: a1 b1 a2 b2 a3 b3 done (interleaved), not a1 a2 a3 b1 b2 b3.
+
+fn a(arg: *byte) {
+    print("a1\n")
+    yield()
+    print("a2\n")
+    yield()
+    print("a3\n")
+}
+
+fn b(arg: *byte) {
+    print("b1\n")
+    yield()
+    print("b2\n")
+    yield()
+    print("b3\n")
+}
+
+fn main() {
+    go(a, null)
+    go(b, null)
+    coro_drain()
+    print("done\n")
+}

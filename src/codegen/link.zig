@@ -22,12 +22,14 @@ pub fn buildExecutable(
     defer allocator.free(rt);
     const rt_main = try std.fs.path.join(allocator, &.{ rt, "linux_x64.s" });
     defer allocator.free(rt_main);
+    const rt_coro = try std.fs.path.join(allocator, &.{ rt, "linux_x64_coro.s" });
+    defer allocator.free(rt_coro);
     const rt_start = try std.fs.path.join(allocator, &.{ rt, "linux_x64_start.s" });
     defer allocator.free(rt_start);
 
     var argv: std.ArrayListUnmanaged([]const u8) = .{};
     defer argv.deinit(allocator);
-    try argv.appendSlice(allocator, &.{ "zig", "cc", "-no-pie", "-o", out_path, asm_path, rt_main });
+    try argv.appendSlice(allocator, &.{ "zig", "cc", "-no-pie", "-o", out_path, asm_path, rt_main, rt_coro });
     if (!program.needs_libc) {
         try argv.appendSlice(allocator, &.{ rt_start, "-nostdlib", "-fno-stack-protector" });
     }

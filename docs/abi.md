@@ -28,5 +28,7 @@ Marks a Jog function `.globl` so C can call it under SysV. `main` is always expo
 | `jogrt_panic` | `write(2, …)` + `exit(1)` |
 | `jogrt_alloc` | bump allocator (Allocator stub) |
 | `jogrt_dispatcher_stub` | Dispatcher stub |
+| `jogrt_spawn` | Sync call `fn(arg)` on this thread |
+| `jogrt_go` / `jogrt_yield` / `jogrt_coro_*` | Stackful single-thread scheduler (`linux_x64_coro.s`) |
 
-These are the linux **actuals** for process entry / syscalls; other OS runtimes will live beside them.
+Coroutines: see `docs/coroutines.md`. These are the linux **actuals** for process entry / syscalls; other OS runtimes will live beside them.

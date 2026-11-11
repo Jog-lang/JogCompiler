@@ -46,6 +46,8 @@ zig build
 ./zig-out/bin/jog build examples/subset.jog -o out/subset && ./out/subset
 ./zig-out/bin/jog build examples/mod_demo -o /tmp/mod_demo && /tmp/mod_demo
 ./zig-out/bin/jog deps examples/mod_demo
+./zig-out/bin/jog build examples/coro_yield.jog -o out/coro_yield && ./out/coro_yield
+./zig-out/bin/jog build examples/spawn.jog -o out/spawn && ./out/spawn
 ```
 
-Language subset (milestone): structs/fields, pointers, `T?` + `?.`, widen/`as` narrow, `with` contexts, `interface struct` fat ptrs. Minimal `jog.mod` module graph (`root` + `source`).
+Language subset (milestone): structs/fields, pointers, `T?` + `?.`, widen/`as` narrow, `with` contexts, `interface struct` fat ptrs. Minimal `jog.mod` module graph (`root` + `source`). Stackful `go`/`yield` on one OS thread: `docs/coroutines.md`.

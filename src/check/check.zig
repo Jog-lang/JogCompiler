@@ -503,6 +503,27 @@ fn checkExpr(
                 for (c.args) |arg| _ = try checkExpr(a, types, fns, scope, arg, diags);
                 return try voidType(a);
             }
+            if (c.callee.* == .ident and std.mem.eql(u8, c.callee.ident, "go")) {
+                for (c.args) |arg| _ = try checkExpr(a, types, fns, scope, arg, diags);
+                return try voidType(a);
+            }
+            if (c.callee.* == .ident and (std.mem.eql(u8, c.callee.ident, "yield") or
+                std.mem.eql(u8, c.callee.ident, "coro_drain") or
+                std.mem.eql(u8, c.callee.ident, "coro_park")))
+            {
+                return try voidType(a);
+            }
+            if (c.callee.* == .ident and (std.mem.eql(u8, c.callee.ident, "coro_alive") or
+                std.mem.eql(u8, c.callee.ident, "coro_id")))
+            {
+                const ti = try a.create(TypeInfo);
+                ti.* = .{ .kind = .i64_ty, .name = "i64", .bits = 64, .unsigned = false };
+                return ti;
+            }
+            if (c.callee.* == .ident and std.mem.eql(u8, c.callee.ident, "coro_unpark")) {
+                for (c.args) |arg| _ = try checkExpr(a, types, fns, scope, arg, diags);
+                return try voidType(a);
+            }
             if (c.callee.* == .ident) {
                 if (fns.get(c.callee.ident)) |fd| {
                     for (c.args) |arg| _ = try checkExpr(a, types, fns, scope, arg, diags);

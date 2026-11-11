@@ -64,7 +64,8 @@ jogrt_alloc:
 jogrt_dispatcher_stub:
   ret
 
-# Synchronous "spawn": call fn(arg) on this thread (freestanding Dispatcher).
+# Synchronous "spawn": call fn(arg) on this thread (Dispatcher stub).
+# For cooperative stackful launch use jogrt_go (linux_x64_coro.s).
 # rdi = function pointer, rsi = arg
 .globl jogrt_spawn
 .type jogrt_spawn, @function

@@ -139,6 +139,13 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_alloc" });
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_spawn" });
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_dispatcher_stub" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_go" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_yield" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_coro_drain" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_coro_alive" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_coro_id" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_coro_park" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_coro_unpark" });
 
     for (file.decls) |d| {
         switch (d) {
@@ -705,6 +712,69 @@ fn lowerCall(ctx: *Ctx, c: ast.Call) LowerError!u32 {
             var inst = Inst{ .op = .call, .dst = none, .aux = cid, .arity = 2 };
             inst.args[0] = fp;
             inst.args[1] = arg;
+            try ctx.emit(inst);
+            const d = try ctx.fresh();
+            try ctx.emit(.{ .op = .iconst, .dst = d, .aux = 0 });
+            return d;
+        }
+        // Stackful coro (gate step 1): go enqueues; yield round-robins on one OS thread.
+        if (std.mem.eql(u8, name, "go")) {
+            if (c.args.len != 2) return error.TooManyArgs;
+            const fp = try lowerExpr(ctx, c.args[0]);
+            const arg = try lowerExpr(ctx, c.args[1]);
+            const cid = ctx.callee_map.get("jogrt_go").?;
+            var inst = Inst{ .op = .call, .dst = none, .aux = cid, .arity = 2 };
+            inst.args[0] = fp;
+            inst.args[1] = arg;
+            try ctx.emit(inst);
+            const d = try ctx.fresh();
+            try ctx.emit(.{ .op = .iconst, .dst = d, .aux = 0 });
+            return d;
+        }
+        if (std.mem.eql(u8, name, "yield")) {
+            if (c.args.len != 0) return error.TooManyArgs;
+            const cid = ctx.callee_map.get("jogrt_yield").?;
+            try ctx.emit(.{ .op = .call, .dst = none, .aux = cid, .arity = 0 });
+            const d = try ctx.fresh();
+            try ctx.emit(.{ .op = .iconst, .dst = d, .aux = 0 });
+            return d;
+        }
+        if (std.mem.eql(u8, name, "coro_drain")) {
+            if (c.args.len != 0) return error.TooManyArgs;
+            const cid = ctx.callee_map.get("jogrt_coro_drain").?;
+            try ctx.emit(.{ .op = .call, .dst = none, .aux = cid, .arity = 0 });
+            const d = try ctx.fresh();
+            try ctx.emit(.{ .op = .iconst, .dst = d, .aux = 0 });
+            return d;
+        }
+        if (std.mem.eql(u8, name, "coro_alive")) {
+            if (c.args.len != 0) return error.TooManyArgs;
+            const cid = ctx.callee_map.get("jogrt_coro_alive").?;
+            const d = try ctx.fresh();
+            try ctx.emit(.{ .op = .call, .dst = d, .aux = cid, .arity = 0 });
+            return d;
+        }
+        if (std.mem.eql(u8, name, "coro_id")) {
+            if (c.args.len != 0) return error.TooManyArgs;
+            const cid = ctx.callee_map.get("jogrt_coro_id").?;
+            const d = try ctx.fresh();
+            try ctx.emit(.{ .op = .call, .dst = d, .aux = cid, .arity = 0 });
+            return d;
+        }
+        if (std.mem.eql(u8, name, "coro_park")) {
+            if (c.args.len != 0) return error.TooManyArgs;
+            const cid = ctx.callee_map.get("jogrt_coro_park").?;
+            try ctx.emit(.{ .op = .call, .dst = none, .aux = cid, .arity = 0 });
+            const d = try ctx.fresh();
+            try ctx.emit(.{ .op = .iconst, .dst = d, .aux = 0 });
+            return d;
+        }
+        if (std.mem.eql(u8, name, "coro_unpark")) {
+            if (c.args.len != 1) return error.TooManyArgs;
+            const idx = try lowerExpr(ctx, c.args[0]);
+            const cid = ctx.callee_map.get("jogrt_coro_unpark").?;
+            var inst = Inst{ .op = .call, .dst = none, .aux = cid, .arity = 1 };
+            inst.args[0] = idx;
             try ctx.emit(inst);
             const d = try ctx.fresh();
             try ctx.emit(.{ .op = .iconst, .dst = d, .aux = 0 });
