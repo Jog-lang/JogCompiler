@@ -1,4 +1,5 @@
-// Gate step 1: stackful cooperative yield on one OS thread.
+// Gate step 1 proof (still valid): stackful cooperative yield on one OS thread.
+// Use dispatcher_single so interleaving stays deterministic under the pool runtime.
 // go(fn, arg) enqueues; yield() round-robins; coro_drain() runs until only main remains.
 // Expected: a1 b1 a2 b2 a3 b3 done (interleaved), not a1 a2 a3 b1 b2 b3.
 
@@ -19,6 +20,7 @@ fn b(arg: *byte) {
 }
 
 fn main() {
+    dispatcher_single()
     go(a, null)
     go(b, null)
     coro_drain()

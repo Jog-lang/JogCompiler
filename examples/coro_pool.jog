@@ -1,0 +1,25 @@
+// Gate step 2: multi-worker pool + steal. Ambient Dispatcher is the pool.
+// print_tid uses gettid(2); distinct tid= lines prove multiple OS threads.
+// yield requeues onto the next worker so resume often hops threads.
+
+fn work(arg: *byte) {
+    print_tid()
+    yield()
+    print_tid()
+    yield()
+    print_tid()
+}
+
+fn main() {
+    dispatcher_pool(4)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    coro_drain()
+    print("pool done\n")
+}

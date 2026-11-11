@@ -509,12 +509,20 @@ fn checkExpr(
             }
             if (c.callee.* == .ident and (std.mem.eql(u8, c.callee.ident, "yield") or
                 std.mem.eql(u8, c.callee.ident, "coro_drain") or
-                std.mem.eql(u8, c.callee.ident, "coro_park")))
+                std.mem.eql(u8, c.callee.ident, "coro_park") or
+                std.mem.eql(u8, c.callee.ident, "dispatcher_single") or
+                std.mem.eql(u8, c.callee.ident, "print_tid")))
             {
                 return try voidType(a);
             }
+            if (c.callee.* == .ident and std.mem.eql(u8, c.callee.ident, "dispatcher_pool")) {
+                for (c.args) |arg| _ = try checkExpr(a, types, fns, scope, arg, diags);
+                return try voidType(a);
+            }
             if (c.callee.* == .ident and (std.mem.eql(u8, c.callee.ident, "coro_alive") or
-                std.mem.eql(u8, c.callee.ident, "coro_id")))
+                std.mem.eql(u8, c.callee.ident, "coro_id") or
+                std.mem.eql(u8, c.callee.ident, "worker_id") or
+                std.mem.eql(u8, c.callee.ident, "gettid")))
             {
                 const ti = try a.create(TypeInfo);
                 ti.* = .{ .kind = .i64_ty, .name = "i64", .bits = 64, .unsigned = false };

@@ -31,7 +31,7 @@ jogrt_panic:
   mov eax, 1
   syscall
   mov edi, 1
-  mov eax, 60
+  mov eax, 231
   syscall
 
 .globl jogrt_alloc

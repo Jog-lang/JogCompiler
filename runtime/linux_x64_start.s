@@ -8,5 +8,6 @@ _start:
   and rsp, -16
   call main
   mov rdi, rax
-  mov eax, 60
+  # exit_group (231): CLONE_THREAD workers survive plain exit(60)
+  mov eax, 231
   syscall
