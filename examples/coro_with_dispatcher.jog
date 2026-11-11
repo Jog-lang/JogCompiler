@@ -1,0 +1,32 @@
+// Gate step 3: with (Dispatcher) migrates a stackful coro across pools.
+// Primary pool workers 0-1; secondary (dispatcher_new) workers 2-3.
+// Proof: same cid before/inside/after; inside wid must be 2 or 3; outside 0 or 1.
+
+fn work(arg: *byte) {
+    print("before\n")
+    print_tid()
+    val io = dispatcher_get(1)
+    with (io) {
+        print("inside\n")
+        print_tid()
+        yield()
+        print_tid()
+    }
+    print("after\n")
+    print_tid()
+}
+
+fn main() {
+    val primary = dispatcher_pool(2)
+    val secondary = dispatcher_new(2)
+    if (primary != 0) {
+        panic("primary id\n")
+    }
+    if (secondary != 1) {
+        panic("secondary id\n")
+    }
+    go(work, null)
+    go(work, null)
+    coro_drain()
+    print("with done\n")
+}

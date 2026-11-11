@@ -148,6 +148,10 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_coro_unpark" });
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_dispatcher_single" });
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_dispatcher_pool" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_dispatcher_new" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_dispatcher_get" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_dispatcher_enter" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_dispatcher_leave" });
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_print_tid" });
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_worker_id" });
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_gettid" });
@@ -403,7 +407,7 @@ fn metaForTypeExpr(te: *ast.TypeExpr, ifaces: *std.StringHashMapUnmanaged(IfaceI
 }
 
 fn isBuiltinScalar(name: []const u8) bool {
-    const builtins = [_][]const u8{ "byte", "bool", "u16", "u32", "u64", "i32", "i64", "usize", "str", "bytes", "void" };
+    const builtins = [_][]const u8{ "byte", "bool", "u16", "u32", "u64", "i32", "i64", "usize", "str", "bytes", "void", "Dispatcher" };
     for (builtins) |b| if (std.mem.eql(u8, name, b)) return true;
     return false;
 }
@@ -474,12 +478,26 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
         },
         .with_stmt => |ws| {
             const mark = ctx.ambient.items.len;
+            var n_disp_enter: u32 = 0;
             for (ws.values) |v| {
                 const slot = try lowerExpr(ctx, v);
                 const tn = inferTypeNameFromExpr(ctx, v) orelse "";
                 try ctx.ambient.append(ctx.a, .{ .slot = slot, .type_name = tn });
+                // Gate 3: Dispatcher with → park/resume onto that pool (Kotlin withContext shape).
+                if (std.mem.eql(u8, tn, "Dispatcher")) {
+                    const cid = ctx.callee_map.get("jogrt_dispatcher_enter").?;
+                    var inst = Inst{ .op = .call, .dst = none, .aux = cid, .arity = 1 };
+                    inst.args[0] = slot;
+                    try ctx.emit(inst);
+                    n_disp_enter += 1;
+                }
             }
             try lowerBlock(ctx, ws.body);
+            var i: u32 = 0;
+            while (i < n_disp_enter) : (i += 1) {
+                const cid = ctx.callee_map.get("jogrt_dispatcher_leave").?;
+                try ctx.emit(.{ .op = .call, .dst = none, .aux = cid, .arity = 0 });
+            }
             ctx.ambient.shrinkRetainingCapacity(mark);
         },
     }
@@ -497,6 +515,11 @@ fn inferMetaFromExpr(ctx: *Ctx, e: *ast.Expr) ?SlotMeta {
         .call => |c| {
             if (c.callee.* == .ident and std.mem.eql(u8, c.callee.ident, "alloc"))
                 return .{ .kind = .raw_ptr, .type_name = "byte" };
+            if (c.callee.* == .ident and (std.mem.eql(u8, c.callee.ident, "dispatcher_pool") or
+                std.mem.eql(u8, c.callee.ident, "dispatcher_single") or
+                std.mem.eql(u8, c.callee.ident, "dispatcher_new") or
+                std.mem.eql(u8, c.callee.ident, "dispatcher_get")))
+                return .{ .kind = .scalar, .type_name = "Dispatcher" };
             return .{ .kind = .raw_ptr };
         },
         .cast => |c| return metaForTypeExpr(c.ty, ctx.ifaces),
@@ -788,27 +811,52 @@ fn lowerCall(ctx: *Ctx, c: ast.Call) LowerError!u32 {
         if (std.mem.eql(u8, name, "dispatcher_single")) {
             if (c.args.len != 0) return error.TooManyArgs;
             const cid = ctx.callee_map.get("jogrt_dispatcher_single").?;
-            try ctx.emit(.{ .op = .call, .dst = none, .aux = cid, .arity = 0 });
             const d = try ctx.fresh();
-            try ctx.emit(.{ .op = .iconst, .dst = d, .aux = 0 });
+            try ctx.emit(.{ .op = .call, .dst = d, .aux = cid, .arity = 0 });
             return d;
         }
         if (std.mem.eql(u8, name, "dispatcher_pool")) {
             const cid = ctx.callee_map.get("jogrt_dispatcher_pool").?;
+            const d = try ctx.fresh();
             if (c.args.len == 0) {
                 const z = try ctx.fresh();
                 try ctx.emit(.{ .op = .iconst, .dst = z, .aux = 0 });
-                var inst = Inst{ .op = .call, .dst = none, .aux = cid, .arity = 1 };
+                var inst = Inst{ .op = .call, .dst = d, .aux = cid, .arity = 1 };
                 inst.args[0] = z;
                 try ctx.emit(inst);
             } else if (c.args.len == 1) {
                 const n = try lowerExpr(ctx, c.args[0]);
-                var inst = Inst{ .op = .call, .dst = none, .aux = cid, .arity = 1 };
+                var inst = Inst{ .op = .call, .dst = d, .aux = cid, .arity = 1 };
                 inst.args[0] = n;
                 try ctx.emit(inst);
             } else return error.TooManyArgs;
+            return d;
+        }
+        if (std.mem.eql(u8, name, "dispatcher_new")) {
+            const cid = ctx.callee_map.get("jogrt_dispatcher_new").?;
             const d = try ctx.fresh();
-            try ctx.emit(.{ .op = .iconst, .dst = d, .aux = 0 });
+            if (c.args.len == 0) {
+                const z = try ctx.fresh();
+                try ctx.emit(.{ .op = .iconst, .dst = z, .aux = 0 });
+                var inst = Inst{ .op = .call, .dst = d, .aux = cid, .arity = 1 };
+                inst.args[0] = z;
+                try ctx.emit(inst);
+            } else if (c.args.len == 1) {
+                const n = try lowerExpr(ctx, c.args[0]);
+                var inst = Inst{ .op = .call, .dst = d, .aux = cid, .arity = 1 };
+                inst.args[0] = n;
+                try ctx.emit(inst);
+            } else return error.TooManyArgs;
+            return d;
+        }
+        if (std.mem.eql(u8, name, "dispatcher_get")) {
+            if (c.args.len != 1) return error.TooManyArgs;
+            const id = try lowerExpr(ctx, c.args[0]);
+            const cid = ctx.callee_map.get("jogrt_dispatcher_get").?;
+            const d = try ctx.fresh();
+            var inst = Inst{ .op = .call, .dst = d, .aux = cid, .arity = 1 };
+            inst.args[0] = id;
+            try ctx.emit(inst);
             return d;
         }
         if (std.mem.eql(u8, name, "print_tid")) {

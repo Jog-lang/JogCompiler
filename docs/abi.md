@@ -28,7 +28,9 @@ Marks a Jog function `.globl` so C can call it under SysV. `main` is always expo
 | `jogrt_panic` | `write(2, …)` + `exit(1)` |
 | `jogrt_alloc` | bump allocator (Allocator stub) |
 | `jogrt_dispatcher_stub` | No-op stub (pool is `jogrt_dispatcher_pool`) |
-| `jogrt_dispatcher_single` / `jogrt_dispatcher_pool` | Ambient Dispatcher (1 thread vs N-worker pool) |
+| `jogrt_dispatcher_single` / `jogrt_dispatcher_pool` | Primary Dispatcher handle (1 thread vs N-worker pool) |
+| `jogrt_dispatcher_new` / `jogrt_dispatcher_get` | Extra pools / handle lookup |
+| `jogrt_dispatcher_enter` / `jogrt_dispatcher_leave` | `with (Dispatcher)` cross-pool park/resume |
 | `jogrt_spawn` | Sync call `fn(arg)` on this thread |
 | `jogrt_go` / `jogrt_yield` / `jogrt_coro_*` | Stackful M:N scheduler + steal (`linux_x64_coro.s`) |
 | `jogrt_print_tid` / `jogrt_gettid` / `jogrt_worker_id` | Multi-thread proof helpers |

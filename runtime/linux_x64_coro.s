@@ -1,21 +1,24 @@
 # Jog v2 stackful coroutine scheduler (linux x86_64 SysV).
+# Gate step 3: with (Dispatcher) cross-pool hop (park + rsp swap onto target pool).
 # Gate step 2: multi-worker pool + work-steal; ambient Dispatcher.
 # Gate step 1 (rsp swap, park stubs) preserved; single-thread via dispatcher_single.
 # Stability: futex wake_all on enqueue; YRQ published before rsp swap; drain join
 # wakes idle workers; finish uses EXITING+YRQ retire (never yield-requeue after
 # clear) so go() cannot reuse a winding-down stack; steal start = rdtsc % n.
+# Steal and yield requeue stay within the coro’s current Dispatcher pool.
 #
 # Slot layout (128 bytes):
 #   0x00 rbx  0x08 rbp  0x10 r12  0x18 rsp
 #   0x20 r13  0x28 r14  0x30 r15  0x38 rip
 #   0x40 rdi  0x48 rsi  0x50 fn   0x58 arg
 #   0x60 flags (bit0=alive, bit1=parked)  0x68 stack_base
+#   0x70 current Dispatcher pool id
 #
 # TLS (FS base → jogrt_tls[wid], 32 bytes):
 #   0x00 wid  0x08 current (0=home/sched)  0x10 home_ctx*  0x18 yield_requeue
 # yield always hops to home first; home requeues after the rsp save (no dual-run race).
 #
-# Per-worker locked FIFO queues; steal starts at (wid+1)%n after local pop.
+# Per-worker locked FIFO queues; steal only within the same Dispatcher pool.
 
 .intel_syntax noprefix
 
@@ -27,6 +30,8 @@
 
 .set JOGRT_MAX_WORKERS, 8
 .set JOGRT_DEFAULT_WORKERS, 4
+.set JOGRT_MAX_POOLS, 4
+.set JOGRT_DISP_NEST, 4
 .set JOGRT_QUEUE_CAP, 64
 .set JOGRT_WORKER_STACK, 131072
 .set JOGRT_TLS_SIZE, 32
@@ -39,6 +44,7 @@
 .set CORO_OFF_ARG, 0x58
 .set CORO_OFF_FLAGS, 0x60
 .set CORO_OFF_STACK, 0x68
+.set CORO_OFF_DISP, 0x70
 
 .set CORO_ALIVE, 1
 .set CORO_PARKED, 2
@@ -83,11 +89,29 @@ jogrt_print_lock:
 jogrt_disp_mode:
   .zero 8          # 0=unset(default pool), 1=single, 2=pool
 jogrt_nworkers:
-  .zero 8
+  .zero 8          # total OS workers across all Dispatcher pools
 jogrt_pool_started:
   .zero 8
 jogrt_rr:
+  .zero 8          # legacy; pool-local RR lives in jogrt_pool_rr
+jogrt_npools:
   .zero 8
+jogrt_ambient_disp:
+  .zero 8          # Dispatcher for main / go when cid==0
+
+.align 16
+jogrt_pool_base:
+  .zero JOGRT_MAX_POOLS * 8
+jogrt_pool_nw:
+  .zero JOGRT_MAX_POOLS * 8
+jogrt_pool_rr:
+  .zero JOGRT_MAX_POOLS * 8
+jogrt_wid_pool:
+  .zero JOGRT_MAX_WORKERS * 8
+jogrt_disp_depth:
+  .zero JOGRT_CORO_MAX * 8
+jogrt_disp_stack:
+  .zero JOGRT_CORO_MAX * JOGRT_DISP_NEST * 8
 
 .align 16
 jogrt_tls:
@@ -257,6 +281,15 @@ jogrt_coro_init:
   jbe .Lcoro_init_nw_ok
   mov qword ptr [rip + jogrt_nworkers], JOGRT_MAX_WORKERS
 .Lcoro_init_nw_ok:
+  # Ensure primary Dispatcher pool 0 covers [0, nworkers)
+  cmp qword ptr [rip + jogrt_npools], 0
+  jne .Lcoro_init_pool_ok
+  mov rax, qword ptr [rip + jogrt_nworkers]
+  mov rdi, 0
+  mov rsi, 0
+  mov rdx, rax
+  call jogrt_pool_register
+.Lcoro_init_pool_ok:
   # install worker 0 TLS (main). Slot 0 is main; home_ctx[0] mirrors sched saves.
   xor edi, edi
   call jogrt_tls_install
@@ -270,14 +303,109 @@ jogrt_coro_init:
 .Lcoro_init_done:
   ret
 
+# rdi=pool_id, rsi=base_wid, rdx=nworkers — record pool tables (no spawn).
+.type jogrt_pool_register, @function
+jogrt_pool_register:
+  push rbx
+  push r12
+  push r13
+  push r14
+  mov rbx, rdi
+  mov r12, rsi
+  mov r13, rdx
+  lea rax, [rip + jogrt_pool_base]
+  mov qword ptr [rax + rbx * 8], r12
+  lea rax, [rip + jogrt_pool_nw]
+  mov qword ptr [rax + rbx * 8], r13
+  lea rax, [rip + jogrt_pool_rr]
+  mov qword ptr [rax + rbx * 8], 0
+  xor r14d, r14d
+.Lpreg_wid:
+  cmp r14, r13
+  jae .Lpreg_done
+  mov rax, r12
+  add rax, r14
+  lea rcx, [rip + jogrt_wid_pool]
+  mov qword ptr [rcx + rax * 8], rbx
+  inc r14
+  jmp .Lpreg_wid
+.Lpreg_done:
+  mov rax, rbx
+  inc rax
+  cmp qword ptr [rip + jogrt_npools], rax
+  jae .Lpreg_np
+  mov qword ptr [rip + jogrt_npools], rax
+.Lpreg_np:
+  pop r14
+  pop r13
+  pop r12
+  pop rbx
+  ret
+
+# rdi = pool id, rsi = coro index — RR enqueue onto that pool + wake.
+.type jogrt_pool_enqueue, @function
+jogrt_pool_enqueue:
+  push rbx
+  push r12
+  push r13
+  mov rbx, rdi
+  mov r12, rsi
+  cmp rbx, JOGRT_MAX_POOLS
+  jae .Lpenq_bad
+  lea rax, [rip + jogrt_pool_nw]
+  mov r13, qword ptr [rax + rbx * 8]
+  test r13, r13
+  jz .Lpenq_bad
+  lea rax, [rip + jogrt_pool_rr]
+  mov rcx, qword ptr [rax + rbx * 8]
+  mov rdx, rcx
+  inc rdx
+  mov qword ptr [rax + rbx * 8], rdx
+  xor edx, edx
+  mov rax, rcx
+  div r13
+  # rdx = offset within pool
+  lea rax, [rip + jogrt_pool_base]
+  add rdx, qword ptr [rax + rbx * 8]
+  mov rdi, rdx
+  mov rsi, r12
+  call jogrt_wq_push
+  call jogrt_wake_one
+  pop r13
+  pop r12
+  pop rbx
+  ret
+.Lpenq_bad:
+  lea rdi, [rip + jogrt_disp_bad_msg]
+  mov esi, jogrt_disp_bad_msg_len
+  call jogrt_panic
+
+# → rax = current Dispatcher id (ambient if home/main)
+.type jogrt_current_disp, @function
+jogrt_current_disp:
+  mov rax, qword ptr fs:[TLS_OFF_CUR]
+  test rax, rax
+  jz .Lcurdisp_amb
+  imul rax, rax, JOGRT_CORO_SLOT
+  lea rcx, [rip + jogrt_coro_slots]
+  mov rax, qword ptr [rcx + rax + CORO_OFF_DISP]
+  ret
+.Lcurdisp_amb:
+  mov rax, qword ptr [rip + jogrt_ambient_disp]
+  ret
+
 # dispatcher_single(): ambient single-thread (tests / deterministic yield demos)
+# → rax = Dispatcher handle 0
 .globl jogrt_dispatcher_single
 .type jogrt_dispatcher_single, @function
 jogrt_dispatcher_single:
   cmp qword ptr [rip + jogrt_pool_started], 0
   jne .Ldisp_single_late
+  cmp qword ptr [rip + jogrt_npools], 0
+  jne .Ldisp_single_late
   mov qword ptr [rip + jogrt_disp_mode], 1
   mov qword ptr [rip + jogrt_nworkers], 1
+  mov qword ptr [rip + jogrt_ambient_disp], 0
   call jogrt_coro_init
   xor eax, eax
   ret
@@ -286,13 +414,16 @@ jogrt_dispatcher_single:
   mov esi, jogrt_disp_late_msg_len
   call jogrt_panic
 
-# dispatcher_pool(n): n==0 → default; ambient multi-worker
+# dispatcher_pool(n): n==0 → default; ambient multi-worker primary pool.
+# → rax = Dispatcher handle 0
 .globl jogrt_dispatcher_pool
 .type jogrt_dispatcher_pool, @function
 jogrt_dispatcher_pool:
   push rbx
   mov rbx, rdi
   cmp qword ptr [rip + jogrt_pool_started], 0
+  jne .Ldisp_pool_late
+  cmp qword ptr [rip + jogrt_npools], 0
   jne .Ldisp_pool_late
   mov qword ptr [rip + jogrt_disp_mode], 2
   test rbx, rbx
@@ -308,6 +439,7 @@ jogrt_dispatcher_pool:
   mov rbx, JOGRT_MAX_WORKERS
 .Ldisp_pool_set:
   mov qword ptr [rip + jogrt_nworkers], rbx
+  mov qword ptr [rip + jogrt_ambient_disp], 0
   call jogrt_coro_init
   xor eax, eax
   pop rbx
@@ -315,6 +447,222 @@ jogrt_dispatcher_pool:
 .Ldisp_pool_late:
   lea rdi, [rip + jogrt_disp_late_msg]
   mov esi, jogrt_disp_late_msg_len
+  call jogrt_panic
+
+# dispatcher_new(n): create another Dispatcher pool (cross-pool with hops).
+# → rax = new Dispatcher handle (pool id)
+.globl jogrt_dispatcher_new
+.type jogrt_dispatcher_new, @function
+jogrt_dispatcher_new:
+  push rbx
+  push r12
+  push r13
+  push r14
+  mov rbx, rdi
+  call jogrt_coro_init
+  test rbx, rbx
+  jnz .Ldisp_new_n
+  mov rbx, JOGRT_DEFAULT_WORKERS
+.Ldisp_new_n:
+  cmp rbx, 1
+  jae .Ldisp_new_ge1
+  mov rbx, 1
+.Ldisp_new_ge1:
+  mov r12, qword ptr [rip + jogrt_npools]
+  cmp r12, JOGRT_MAX_POOLS
+  jae .Ldisp_new_fail
+  mov r13, qword ptr [rip + jogrt_nworkers]
+  mov rax, r13
+  add rax, rbx
+  cmp rax, JOGRT_MAX_WORKERS
+  ja .Ldisp_new_fail
+  # register pool at [r13, r13+rbx)
+  mov rdi, r12
+  mov rsi, r13
+  mov rdx, rbx
+  call jogrt_pool_register
+  add qword ptr [rip + jogrt_nworkers], rbx
+  mov r14, r12                            # new pool id
+  # If workers already running, spawn the new range; else pool_ensure will.
+  cmp qword ptr [rip + jogrt_pool_started], 0
+  je .Ldisp_new_ret
+  cmp qword ptr [rip + jogrt_disp_mode], 1
+  je .Ldisp_new_ret
+  mov rdi, r13
+  mov rsi, qword ptr [rip + jogrt_nworkers]
+  call jogrt_spawn_workers
+.Ldisp_new_ret:
+  mov rax, r14
+  pop r14
+  pop r13
+  pop r12
+  pop rbx
+  ret
+.Ldisp_new_fail:
+  lea rdi, [rip + jogrt_disp_new_fail_msg]
+  mov esi, jogrt_disp_new_fail_msg_len
+  call jogrt_panic
+
+# dispatcher_get(id): validate and return Dispatcher handle
+.globl jogrt_dispatcher_get
+.type jogrt_dispatcher_get, @function
+jogrt_dispatcher_get:
+  push rbx
+  mov rbx, rdi
+  call jogrt_coro_init
+  cmp rbx, qword ptr [rip + jogrt_npools]
+  jae .Ldisp_get_bad
+  lea rax, [rip + jogrt_pool_nw]
+  cmp qword ptr [rax + rbx * 8], 0
+  je .Ldisp_get_bad
+  mov rax, rbx
+  pop rbx
+  ret
+.Ldisp_get_bad:
+  lea rdi, [rip + jogrt_disp_bad_msg]
+  mov esi, jogrt_disp_bad_msg_len
+  call jogrt_panic
+
+# Enter Dispatcher context: nest + migrate if pool differs (Kotlin withContext shape).
+.globl jogrt_dispatcher_enter
+.type jogrt_dispatcher_enter, @function
+jogrt_dispatcher_enter:
+  push rbx
+  push r12
+  push r13
+  mov rbx, rdi                              # target disp
+  call jogrt_coro_init
+  cmp rbx, qword ptr [rip + jogrt_npools]
+  jae .Ldisp_enter_bad
+  lea rax, [rip + jogrt_pool_nw]
+  cmp qword ptr [rax + rbx * 8], 0
+  je .Ldisp_enter_bad
+  mov r12, qword ptr fs:[TLS_OFF_CUR]
+  test r12, r12
+  jnz .Ldisp_enter_coro
+  # main/home: ambient only (OS stack of worker 0 is not migratable)
+  mov r13, qword ptr [rip + jogrt_ambient_disp]
+  mov rax, qword ptr [rip + jogrt_disp_depth]
+  cmp rax, JOGRT_DISP_NEST
+  jae .Ldisp_enter_nest
+  lea rcx, [rip + jogrt_disp_stack]
+  mov qword ptr [rcx + rax * 8], r13
+  inc rax
+  mov qword ptr [rip + jogrt_disp_depth], rax
+  mov qword ptr [rip + jogrt_ambient_disp], rbx
+  xor eax, eax
+  pop r13
+  pop r12
+  pop rbx
+  ret
+.Ldisp_enter_coro:
+  lea rax, [rip + jogrt_disp_depth]
+  mov r13, qword ptr [rax + r12 * 8]
+  cmp r13, JOGRT_DISP_NEST
+  jae .Ldisp_enter_nest
+  # stack[cid][depth] = old; use (cid*NEST + depth)
+  mov rax, r12
+  imul rax, rax, JOGRT_DISP_NEST
+  add rax, r13
+  lea rcx, [rip + jogrt_disp_stack]
+  mov rdx, r12
+  imul rdx, rdx, JOGRT_CORO_SLOT
+  lea rsi, [rip + jogrt_coro_slots]
+  mov rsi, qword ptr [rsi + rdx + CORO_OFF_DISP]
+  mov qword ptr [rcx + rax * 8], rsi        # save old
+  # depth++
+  inc r13
+  lea rax, [rip + jogrt_disp_depth]
+  mov qword ptr [rax + r12 * 8], r13
+  mov rax, r12
+  imul rax, rax, JOGRT_CORO_SLOT
+  lea rcx, [rip + jogrt_coro_slots]
+  add rcx, rax
+  mov rax, qword ptr [rcx + CORO_OFF_DISP]
+  mov qword ptr [rcx + CORO_OFF_DISP], rbx
+  cmp rax, rbx
+  je .Ldisp_enter_same
+  # migrate: publish YRQ then switch home (requeue onto new pool)
+  mov qword ptr fs:[TLS_OFF_YRQ], r12
+  mfence
+  pop r13
+  pop r12
+  pop rbx
+  jmp jogrt_switch_to_home
+.Ldisp_enter_same:
+  xor eax, eax
+  pop r13
+  pop r12
+  pop rbx
+  ret
+.Ldisp_enter_bad:
+  lea rdi, [rip + jogrt_disp_bad_msg]
+  mov esi, jogrt_disp_bad_msg_len
+  call jogrt_panic
+.Ldisp_enter_nest:
+  lea rdi, [rip + jogrt_disp_nest_msg]
+  mov esi, jogrt_disp_nest_msg_len
+  call jogrt_panic
+
+# Leave innermost Dispatcher with-block.
+.globl jogrt_dispatcher_leave
+.type jogrt_dispatcher_leave, @function
+jogrt_dispatcher_leave:
+  push rbx
+  push r12
+  push r13
+  call jogrt_coro_init
+  mov r12, qword ptr fs:[TLS_OFF_CUR]
+  test r12, r12
+  jnz .Ldisp_leave_coro
+  mov rax, qword ptr [rip + jogrt_disp_depth]
+  test rax, rax
+  jz .Ldisp_leave_under
+  dec rax
+  mov qword ptr [rip + jogrt_disp_depth], rax
+  lea rcx, [rip + jogrt_disp_stack]
+  mov rbx, qword ptr [rcx + rax * 8]
+  mov qword ptr [rip + jogrt_ambient_disp], rbx
+  xor eax, eax
+  pop r13
+  pop r12
+  pop rbx
+  ret
+.Ldisp_leave_coro:
+  lea rax, [rip + jogrt_disp_depth]
+  mov r13, qword ptr [rax + r12 * 8]
+  test r13, r13
+  jz .Ldisp_leave_under
+  dec r13
+  mov qword ptr [rax + r12 * 8], r13
+  mov rax, r12
+  imul rax, rax, JOGRT_DISP_NEST
+  add rax, r13
+  lea rcx, [rip + jogrt_disp_stack]
+  mov rbx, qword ptr [rcx + rax * 8]       # previous disp
+  mov rax, r12
+  imul rax, rax, JOGRT_CORO_SLOT
+  lea rcx, [rip + jogrt_coro_slots]
+  add rcx, rax
+  mov rax, qword ptr [rcx + CORO_OFF_DISP]
+  mov qword ptr [rcx + CORO_OFF_DISP], rbx
+  cmp rax, rbx
+  je .Ldisp_leave_same
+  mov qword ptr fs:[TLS_OFF_YRQ], r12
+  mfence
+  pop r13
+  pop r12
+  pop rbx
+  jmp jogrt_switch_to_home
+.Ldisp_leave_same:
+  xor eax, eax
+  pop r13
+  pop r12
+  pop rbx
+  ret
+.Ldisp_leave_under:
+  lea rdi, [rip + jogrt_disp_under_msg]
+  mov esi, jogrt_disp_under_msg_len
   call jogrt_panic
 
 # ---------------------------------------------------------------------------
@@ -489,25 +837,33 @@ jogrt_wq_steal:
 
 .type jogrt_take_work, @function
 # → rax = coro index or -1
-# Prefer local queue, then steal starting at a randomized victim (rdtsc).
+# Prefer local queue, then steal within the same Dispatcher pool only.
 jogrt_take_work:
   push rbx
   push r12
   push r13
   push r14
+  push r15
+  push rbp
   mov rbx, qword ptr fs:[TLS_OFF_WID]
   mov rdi, rbx
   call jogrt_wq_pop
   cmp rax, -1
   jne .Ltake_done
-  mov r12, qword ptr [rip + jogrt_nworkers]
+  lea rax, [rip + jogrt_wid_pool]
+  mov r15, qword ptr [rax + rbx * 8]       # my pool
+  lea rax, [rip + jogrt_pool_nw]
+  mov r12, qword ptr [rax + r15 * 8]
   test r12, r12
   jz .Ltake_none
-  # Optional steal randomization: start victim = rdtsc % nworkers.
+  lea rax, [rip + jogrt_pool_base]
+  mov rbp, qword ptr [rax + r15 * 8]       # base (callee-saved)
+  # start = base + (rdtsc % nw)
   rdtsc
   xor edx, edx
   div r12
   mov r13, rdx
+  add r13, rbp
   xor r14d, r14d
 .Ltake_steal_loop:
   cmp r14, r12
@@ -521,14 +877,18 @@ jogrt_take_work:
 .Ltake_steal_next:
   inc r13
   mov rax, r13
+  sub rax, rbp
   xor edx, edx
   div r12
   mov r13, rdx
+  add r13, rbp
   inc r14
   jmp .Ltake_steal_loop
 .Ltake_none:
   mov rax, -1
 .Ltake_done:
+  pop rbp
+  pop r15
   pop r14
   pop r13
   pop r12
@@ -698,10 +1058,12 @@ jogrt_handle_requeue:
   lea rdi, [rip + jogrt_slots_lock]
   call jogrt_unlock
   pop rsi
-  # Requeue locally; steal + RR go() provide cross-thread hops under load.
-  mov rdi, qword ptr fs:[TLS_OFF_WID]
-  call jogrt_wq_push
-  call jogrt_wake_one
+  # Requeue onto the coro’s current Dispatcher pool (cross-pool migrate + yield).
+  mov rax, rsi
+  imul rax, rax, JOGRT_CORO_SLOT
+  lea rcx, [rip + jogrt_coro_slots]
+  mov rdi, qword ptr [rcx + rax + CORO_OFF_DISP]
+  call jogrt_pool_enqueue
   ret
 .Lhrq_retire:
   # Stack quiescent after rsp save — slot may be reused by go().
@@ -732,25 +1094,19 @@ jogrt_worker_entry:
   call jogrt_switch_to_coro
   jmp .Lworker_loop
 
-.type jogrt_pool_ensure, @function
-jogrt_pool_ensure:
-  mov rax, qword ptr [rip + jogrt_pool_started]
-  test rax, rax
-  jnz .Lpool_ens_done
-  cmp qword ptr [rip + jogrt_disp_mode], 1
-  je .Lpool_ens_single
+# rdi=start_wid, rsi=end_wid — clone workers in [start, end)
+.type jogrt_spawn_workers, @function
+jogrt_spawn_workers:
   push rbx
   push r12
   push r13
   push r14
   push r15
-  mov qword ptr [rip + jogrt_pool_started], 1
-  mov r13, qword ptr [rip + jogrt_nworkers]
-  mov r12, 1
-.Lpool_spawn:
+  mov r12, rdi
+  mov r13, rsi
+.Lspawn_loop:
   cmp r12, r13
-  jae .Lpool_spawn_done
-  # mmap worker stack
+  jae .Lspawn_done
   mov eax, SYS_MMAP
   xor edi, edi
   mov esi, JOGRT_WORKER_STACK
@@ -760,15 +1116,13 @@ jogrt_pool_ensure:
   xor r9d, r9d
   syscall
   cmp rax, -4095
-  jae .Lpool_spawn_fail
+  jae .Lspawn_fail
   mov r14, rax
   mov rax, r12
   lea rcx, [rip + jogrt_worker_stack_ptr]
   mov qword ptr [rcx + rax * 8], r14
-  # stack top
   lea r15, [r14 + JOGRT_WORKER_STACK]
   and r15, -16
-  # clone
   mov eax, SYS_CLONE
   mov edi, CLONE_FLAGS
   mov rsi, r15
@@ -777,28 +1131,39 @@ jogrt_pool_ensure:
   xor r8d, r8d
   syscall
   test rax, rax
-  jz .Lpool_child
-  # parent: next
+  jz .Lspawn_child
   inc r12
-  jmp .Lpool_spawn
-.Lpool_child:
-  # child: r12 still holds wid
+  jmp .Lspawn_loop
+.Lspawn_child:
   jmp jogrt_worker_entry
-.Lpool_spawn_done:
+.Lspawn_done:
   pop r15
   pop r14
   pop r13
   pop r12
   pop rbx
   ret
+.Lspawn_fail:
+  lea rdi, [rip + jogrt_pool_fail_msg]
+  mov esi, jogrt_pool_fail_msg_len
+  call jogrt_panic
+
+.type jogrt_pool_ensure, @function
+jogrt_pool_ensure:
+  mov rax, qword ptr [rip + jogrt_pool_started]
+  test rax, rax
+  jnz .Lpool_ens_done
+  cmp qword ptr [rip + jogrt_disp_mode], 1
+  je .Lpool_ens_single
+  mov qword ptr [rip + jogrt_pool_started], 1
+  mov rdi, 1
+  mov rsi, qword ptr [rip + jogrt_nworkers]
+  call jogrt_spawn_workers
+  ret
 .Lpool_ens_single:
   mov qword ptr [rip + jogrt_pool_started], 1
 .Lpool_ens_done:
   ret
-.Lpool_spawn_fail:
-  lea rdi, [rip + jogrt_pool_fail_msg]
-  mov esi, jogrt_pool_fail_msg_len
-  call jogrt_panic
 
 # ---------------------------------------------------------------------------
 # go / yield / park / unpark / drain
@@ -854,20 +1219,18 @@ jogrt_go:
   call jogrt_coro_arm
   mov r14, rbx
 .Lcoro_go_enqueue:
+  # Inherit ambient / current Dispatcher before unlock+enqueue.
+  call jogrt_current_disp
+  mov rcx, r14
+  imul rcx, rcx, JOGRT_CORO_SLOT
+  lea rdx, [rip + jogrt_coro_slots]
+  mov qword ptr [rdx + rcx + CORO_OFF_DISP], rax
+  mov r12, rax                              # pool id for enqueue
   lea rdi, [rip + jogrt_slots_lock]
   call jogrt_unlock
-  # enqueue onto ambient dispatcher: RR across workers
-  mov rax, qword ptr [rip + jogrt_rr]
-  mov rcx, rax
-  inc rax
-  mov qword ptr [rip + jogrt_rr], rax
-  xor edx, edx
-  div qword ptr [rip + jogrt_nworkers]
-  # rdx = target wid
-  mov rdi, rdx
+  mov rdi, r12
   mov rsi, r14
-  call jogrt_wq_push
-  call jogrt_wake_one
+  call jogrt_pool_enqueue
   xor eax, eax
   pop r14
   pop r13
@@ -971,19 +1334,13 @@ jogrt_coro_unpark:
   jz .Lunpark_unlock
   and rax, ~CORO_PARKED
   mov qword ptr [rcx + CORO_OFF_FLAGS], rax
+  mov rax, qword ptr [rcx + CORO_OFF_DISP]
   lea rdi, [rip + jogrt_slots_lock]
   call jogrt_unlock
-  # enqueue RR
-  mov rax, qword ptr [rip + jogrt_rr]
-  mov rcx, rax
-  inc rax
-  mov qword ptr [rip + jogrt_rr], rax
-  xor edx, edx
-  div qword ptr [rip + jogrt_nworkers]
-  mov rdi, rdx
+  # enqueue onto the coro’s Dispatcher pool
+  mov rdi, rax
   mov rsi, rbx
-  call jogrt_wq_push
-  call jogrt_wake_one
+  call jogrt_pool_enqueue
   pop rbx
   ret
 .Lunpark_unlock:
@@ -1245,6 +1602,18 @@ jogrt_pool_fail_msg_len = . - jogrt_pool_fail_msg
 jogrt_disp_late_msg:
   .ascii "jogrt: dispatcher change after pool start\n"
 jogrt_disp_late_msg_len = . - jogrt_disp_late_msg
+jogrt_disp_bad_msg:
+  .ascii "jogrt: bad Dispatcher handle\n"
+jogrt_disp_bad_msg_len = . - jogrt_disp_bad_msg
+jogrt_disp_new_fail_msg:
+  .ascii "jogrt: dispatcher_new failed (pools/workers exhausted)\n"
+jogrt_disp_new_fail_msg_len = . - jogrt_disp_new_fail_msg
+jogrt_disp_nest_msg:
+  .ascii "jogrt: Dispatcher with nest too deep\n"
+jogrt_disp_nest_msg_len = . - jogrt_disp_nest_msg
+jogrt_disp_under_msg:
+  .ascii "jogrt: Dispatcher leave underflow\n"
+jogrt_disp_under_msg_len = . - jogrt_disp_under_msg
 jogrt_wq_full_msg:
   .ascii "jogrt: worker run queue full\n"
 jogrt_wq_full_msg_len = . - jogrt_wq_full_msg

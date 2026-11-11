@@ -91,6 +91,8 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
     try defineBuiltin(a, &types, "str", .{ .kind = .string_ty, .name = "str" });
     try defineBuiltin(a, &types, "bytes", .{ .kind = .bytes_ty, .name = "bytes" });
     try defineBuiltin(a, &types, "void", .{ .kind = .void_ty, .name = "void" });
+    // Opaque pool handle (i64-sized); with (Dispatcher) migrates stackful coros (gate 3).
+    try defineBuiltin(a, &types, "Dispatcher", .{ .kind = .i64_ty, .name = "Dispatcher", .bits = 64, .unsigned = false });
 
     // collect decls
     for (file.decls) |*d| {
@@ -510,14 +512,19 @@ fn checkExpr(
             if (c.callee.* == .ident and (std.mem.eql(u8, c.callee.ident, "yield") or
                 std.mem.eql(u8, c.callee.ident, "coro_drain") or
                 std.mem.eql(u8, c.callee.ident, "coro_park") or
-                std.mem.eql(u8, c.callee.ident, "dispatcher_single") or
                 std.mem.eql(u8, c.callee.ident, "print_tid")))
             {
                 return try voidType(a);
             }
-            if (c.callee.* == .ident and std.mem.eql(u8, c.callee.ident, "dispatcher_pool")) {
+            if (c.callee.* == .ident and (std.mem.eql(u8, c.callee.ident, "dispatcher_single") or
+                std.mem.eql(u8, c.callee.ident, "dispatcher_pool") or
+                std.mem.eql(u8, c.callee.ident, "dispatcher_new") or
+                std.mem.eql(u8, c.callee.ident, "dispatcher_get")))
+            {
                 for (c.args) |arg| _ = try checkExpr(a, types, fns, scope, arg, diags);
-                return try voidType(a);
+                const ti = try a.create(TypeInfo);
+                ti.* = .{ .kind = .i64_ty, .name = "Dispatcher", .bits = 64, .unsigned = false };
+                return ti;
             }
             if (c.callee.* == .ident and (std.mem.eql(u8, c.callee.ident, "coro_alive") or
                 std.mem.eql(u8, c.callee.ident, "coro_id") or
