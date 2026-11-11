@@ -34,8 +34,13 @@ zig build
 # a1 b1 a2 b2 a3 b3 done  (dispatcher_single)
 
 ./zig-out/bin/jog build examples/coro_pool.jog -o out/coro_pool && ./out/coro_pool
-# multiple tid= lines; unique tids > 1; often same cid on different tids
+# multiple tid= lines; unique tids often > 1; often same cid on different tids
+
+./zig-out/bin/jog build examples/coro_pool_stress.jog -o out/coro_pool_stress && ./out/coro_pool_stress
+# N>>workers + yields; multi-tid expected under load (scripts/coro_stress.sh)
 ```
+
+Rare single-`tid` under light load is valid (work can collapse onto main before other workers run). Treat hangs / lost wakeups as failures; do not require multi-tid on every light run.
 
 ## Limits (not in this step)
 

@@ -1,0 +1,36 @@
+// Heavier pool stress: N >> workers + forced yields so hops are expected.
+// Under high load, unique tid= should usually be > 1. Rare single-tid under
+// light/racy scheduling is not treated as failure by the gate.
+
+fn work(arg: *byte) {
+    print_tid()
+    yield()
+    print_tid()
+    yield()
+    print_tid()
+    yield()
+    print_tid()
+}
+
+fn main() {
+    dispatcher_pool(4)
+    // 16 coros >> 4 workers (slot cap 32; leave headroom for main).
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    coro_drain()
+    print("stress done\n")
+}

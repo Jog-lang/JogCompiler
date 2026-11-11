@@ -1,6 +1,9 @@
 # Jog v2 stackful coroutine scheduler (linux x86_64 SysV).
 # Gate step 2: multi-worker pool + work-steal; ambient Dispatcher.
 # Gate step 1 (rsp swap, park stubs) preserved; single-thread via dispatcher_single.
+# Stability: futex wake_all on enqueue; YRQ published before rsp swap; drain join
+# wakes idle workers; finish uses EXITING+YRQ retire (never yield-requeue after
+# clear) so go() cannot reuse a winding-down stack; steal start = rdtsc % n.
 #
 # Slot layout (128 bytes):
 #   0x00 rbx  0x08 rbp  0x10 r12  0x18 rsp
@@ -12,7 +15,7 @@
 #   0x00 wid  0x08 current (0=home/sched)  0x10 home_ctx*  0x18 yield_requeue
 # yield always hops to home first; home requeues after the rsp save (no dual-run race).
 #
-# Per-worker locked FIFO queues; steal = take from another worker's head.
+# Per-worker locked FIFO queues; steal starts at (wid+1)%n after local pop.
 
 .intel_syntax noprefix
 
@@ -39,6 +42,8 @@
 
 .set CORO_ALIVE, 1
 .set CORO_PARKED, 2
+.set CORO_RUNNING, 4
+.set CORO_EXITING, 8
 
 .set TLS_OFF_WID, 0
 .set TLS_OFF_CUR, 8
@@ -177,19 +182,24 @@ jogrt_coro_trampoline:
   mov rax, qword ptr [rcx + CORO_OFF_FN]
   mov rdi, qword ptr [rcx + CORO_OFF_ARG]
   call rax
-  # finished: clear alive under lock
+  # finished: mark EXITING (not ALIVE) under lock, then hop home with YRQ=cid
+  # so home can retire the slot only after rsp is saved — never go through
+  # jogrt_yield (that re-reads flags and can requeue a reused slot).
   lea rdi, [rip + jogrt_slots_lock]
   call jogrt_lock
-  mov rax, qword ptr fs:[TLS_OFF_CUR]
+  mov rsi, qword ptr fs:[TLS_OFF_CUR]
+  mov rax, rsi
   imul rax, rax, JOGRT_CORO_SLOT
   lea rcx, [rip + jogrt_coro_slots]
   add rcx, rax
-  mov qword ptr [rcx + CORO_OFF_FLAGS], 0
+  mov qword ptr [rcx + CORO_OFF_FLAGS], CORO_EXITING
   lea rdi, [rip + jogrt_slots_lock]
   call jogrt_unlock
-.Lcoro_tramp_yield:
-  call jogrt_yield
-  jmp .Lcoro_tramp_yield
+  mov qword ptr fs:[TLS_OFF_YRQ], rsi
+  mfence
+  jmp jogrt_switch_to_home
+.Lcoro_tramp_dead:
+  jmp .Lcoro_tramp_dead
 
 # ---------------------------------------------------------------------------
 # Init / TLS / ambient Dispatcher
@@ -479,62 +489,79 @@ jogrt_wq_steal:
 
 .type jogrt_take_work, @function
 # → rax = coro index or -1
+# Prefer local queue, then steal starting at a randomized victim (rdtsc).
 jogrt_take_work:
   push rbx
   push r12
+  push r13
+  push r14
   mov rbx, qword ptr fs:[TLS_OFF_WID]
   mov rdi, rbx
   call jogrt_wq_pop
   cmp rax, -1
   jne .Ltake_done
-  # steal from others
   mov r12, qword ptr [rip + jogrt_nworkers]
-  xor ebx, ebx
+  test r12, r12
+  jz .Ltake_none
+  # Optional steal randomization: start victim = rdtsc % nworkers.
+  rdtsc
+  xor edx, edx
+  div r12
+  mov r13, rdx
+  xor r14d, r14d
 .Ltake_steal_loop:
-  cmp rbx, r12
+  cmp r14, r12
   jae .Ltake_none
-  cmp rbx, qword ptr fs:[TLS_OFF_WID]
+  mov rdi, r13
+  cmp rdi, rbx
   je .Ltake_steal_next
-  mov rdi, rbx
   call jogrt_wq_steal
   cmp rax, -1
   jne .Ltake_done
 .Ltake_steal_next:
-  inc rbx
+  inc r13
+  mov rax, r13
+  xor edx, edx
+  div r12
+  mov r13, rdx
+  inc r14
   jmp .Ltake_steal_loop
 .Ltake_none:
   mov rax, -1
 .Ltake_done:
+  pop r14
+  pop r13
   pop r12
   pop rbx
   ret
 
+# Wake every parked worker (xchg+futex). n<=8; avoids waking the wrong idle.
 .type jogrt_wake_one, @function
 jogrt_wake_one:
   push rbx
-  mov rbx, qword ptr [rip + jogrt_nworkers]
-  xor ecx, ecx
-.Lwake_scan:
-  cmp rcx, rbx
-  jae .Lwake_done
+  push r12
+  mov r12, qword ptr [rip + jogrt_nworkers]
+  xor ebx, ebx
+.Lwake_all_loop:
+  cmp rbx, r12
+  jae .Lwake_all_done
   lea rdx, [rip + jogrt_wq_park]
-  cmp dword ptr [rdx + rcx * 8], 1
-  jne .Lwake_next
-  mov dword ptr [rdx + rcx * 8], 0
-  # futex wake
-  push rcx
-  lea rdi, [rdx + rcx * 8]
+  lea r8, [rdx + rbx * 8]
+  xor eax, eax
+  xchg eax, dword ptr [r8]
+  cmp eax, 1
+  jne .Lwake_all_next
+  mov rdi, r8
   mov eax, SYS_FUTEX
   mov esi, FUTEX_WAKE
   mov edx, 1
   xor r10d, r10d
   syscall
-  pop rcx
-  jmp .Lwake_done
-.Lwake_next:
-  inc rcx
-  jmp .Lwake_scan
-.Lwake_done:
+.Lwake_all_next:
+  inc rbx
+  jmp .Lwake_all_loop
+.Lwake_all_done:
+  pop r12
   pop rbx
   ret
 
@@ -543,6 +570,7 @@ jogrt_park_self:
   mov rcx, qword ptr fs:[TLS_OFF_WID]
   lea rdx, [rip + jogrt_wq_park]
   mov dword ptr [rdx + rcx * 8], 1
+  mfence
   # recheck work before sleep
   push rcx
   call jogrt_take_work
@@ -592,6 +620,22 @@ jogrt_save_ctx_ptr:
 jogrt_switch_to_coro:
   push rbx
   mov rbx, rdi
+  # Claim RUNNING under slots_lock to prevent dual-run of one stack.
+  lea rdi, [rip + jogrt_slots_lock]
+  call jogrt_lock
+  mov rax, rbx
+  imul rax, rax, JOGRT_CORO_SLOT
+  lea rcx, [rip + jogrt_coro_slots]
+  add rcx, rax
+  mov rax, qword ptr [rcx + CORO_OFF_FLAGS]
+  test rax, CORO_ALIVE
+  jz .Lsw_coro_skip
+  test rax, CORO_RUNNING
+  jnz .Lsw_coro_skip
+  or rax, CORO_RUNNING
+  mov qword ptr [rcx + CORO_OFF_FLAGS], rax
+  lea rdi, [rip + jogrt_slots_lock]
+  call jogrt_unlock
   call jogrt_save_ctx_ptr
   mov r8, rax                            # save ctx
   mov qword ptr fs:[TLS_OFF_CUR], rbx
@@ -602,6 +646,12 @@ jogrt_switch_to_coro:
   mov rsi, rax
   pop rbx
   jmp jogrt_coro_switch
+.Lsw_coro_skip:
+  # Dead or already running: drop this queue entry (do not requeue).
+  lea rdi, [rip + jogrt_slots_lock]
+  call jogrt_unlock
+  pop rbx
+  ret
 
 .type jogrt_switch_to_home, @function
 jogrt_switch_to_home:
@@ -625,14 +675,41 @@ jogrt_handle_requeue:
   test rsi, rsi
   jz .Lhrq_done
   mov qword ptr fs:[TLS_OFF_YRQ], 0
-  # push onto next worker to encourage OS-thread hop when nworkers>1
-  mov rax, qword ptr fs:[TLS_OFF_WID]
-  inc rax
-  xor edx, edx
-  div qword ptr [rip + jogrt_nworkers]
-  mov rdi, rdx
+  # rsp already saved on home. Under lock: retire EXITING, or clear RUNNING
+  # then push (never push while RUNNING / EXITING).
+  push rsi
+  lea rdi, [rip + jogrt_slots_lock]
+  call jogrt_lock
+  pop rsi
+  push rsi
+  mov rax, rsi
+  imul rax, rax, JOGRT_CORO_SLOT
+  lea rcx, [rip + jogrt_coro_slots]
+  add rcx, rax
+  mov rax, qword ptr [rcx + CORO_OFF_FLAGS]
+  test rax, CORO_EXITING
+  jnz .Lhrq_retire
+  test rax, CORO_ALIVE
+  jz .Lhrq_drop
+  test rax, CORO_PARKED
+  jnz .Lhrq_drop
+  and rax, ~CORO_RUNNING
+  mov qword ptr [rcx + CORO_OFF_FLAGS], rax
+  lea rdi, [rip + jogrt_slots_lock]
+  call jogrt_unlock
+  pop rsi
+  # Requeue locally; steal + RR go() provide cross-thread hops under load.
+  mov rdi, qword ptr fs:[TLS_OFF_WID]
   call jogrt_wq_push
   call jogrt_wake_one
+  ret
+.Lhrq_retire:
+  # Stack quiescent after rsp save — slot may be reused by go().
+  mov qword ptr [rcx + CORO_OFF_FLAGS], 0
+.Lhrq_drop:
+  lea rdi, [rip + jogrt_slots_lock]
+  call jogrt_unlock
+  pop rsi
 .Lhrq_done:
   ret
 
@@ -751,7 +828,8 @@ jogrt_go:
   lea rdi, [rip + jogrt_coro_slots]
   add rdi, rax
   mov rax, qword ptr [rdi + CORO_OFF_FLAGS]
-  test rax, CORO_ALIVE
+  # Any non-zero flags: ALIVE, EXITING (stack still winding down), etc.
+  test rax, rax
   jnz .Lcoro_go_scan_next
   mov rsi, r12
   mov rdx, r13
@@ -812,19 +890,34 @@ jogrt_yield:
   # already home: try to run someone else, else no-op
   test rax, rax
   jz .Lyield_from_home
-  # mark requeue only if still runnable; home pushes AFTER rsp save
+  # Decide requeue under slots_lock so flags cannot race with finish/reuse.
   mov rsi, rax
+  mov qword ptr fs:[TLS_OFF_YRQ], 0
+  push rsi
+  lea rdi, [rip + jogrt_slots_lock]
+  call jogrt_lock
+  pop rsi
+  mov rax, rsi
   imul rax, rax, JOGRT_CORO_SLOT
   lea rcx, [rip + jogrt_coro_slots]
   add rcx, rax
   mov rax, qword ptr [rcx + CORO_OFF_FLAGS]
-  mov qword ptr fs:[TLS_OFF_YRQ], 0
   test rax, CORO_ALIVE
-  jz .Lyield_to_home
+  jz .Lyield_clear_run
   test rax, CORO_PARKED
-  jnz .Lyield_to_home
+  jnz .Lyield_clear_run
+  # Publish YRQ before rsp save/swap — RUNNING stays until home requeues.
   mov qword ptr fs:[TLS_OFF_YRQ], rsi
-.Lyield_to_home:
+  lea rdi, [rip + jogrt_slots_lock]
+  call jogrt_unlock
+  mfence
+  jmp jogrt_switch_to_home
+.Lyield_clear_run:
+  # Dead/parked/exiting: not requeued — clear RUNNING if still set.
+  and rax, ~CORO_RUNNING
+  mov qword ptr [rcx + CORO_OFF_FLAGS], rax
+  lea rdi, [rip + jogrt_slots_lock]
+  call jogrt_unlock
   jmp jogrt_switch_to_home
 .Lyield_from_home:
   call jogrt_handle_requeue
@@ -1109,18 +1202,29 @@ jogrt_coro_drain:
   call jogrt_switch_to_coro
   jmp .Ldrain_loop
 .Ldrain_idle:
+  # Join barrier: wake parked workers, try steal once more, then yield.
+  call jogrt_wake_one
   call jogrt_coro_alive
   cmp rax, 1
   jbe .Ldrain_check_q
+  call jogrt_take_work
+  cmp rax, -1
+  je .Ldrain_idle_yield
+  mov rdi, rax
+  call jogrt_switch_to_coro
+  jmp .Ldrain_loop
+.Ldrain_idle_yield:
   mov eax, SYS_SCHED_YIELD
   syscall
   jmp .Ldrain_loop
 .Ldrain_check_q:
   call jogrt_queues_empty
   test eax, eax
-  jnz .Ldrain_done
-  jmp .Ldrain_loop
+  jz .Ldrain_work
+  cmp qword ptr fs:[TLS_OFF_YRQ], 0
+  jne .Ldrain_work
 .Ldrain_done:
+  call jogrt_wake_one
   pop r12
   pop rbx
   ret
