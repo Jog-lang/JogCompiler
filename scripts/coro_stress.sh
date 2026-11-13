@@ -30,6 +30,7 @@ echo "== build =="
 build coro_yield.jog coro_yield
 build coro_pool.jog coro_pool
 build coro_pool_stress.jog coro_pool_stress
+build coro_steal_stress.jog coro_steal_stress
 build coro_with_dispatcher.jog coro_with
 build coro_io_dispatcher.jog coro_io
 
@@ -121,6 +122,22 @@ echo "stress multi_tid=$stress_multi single_tid=$stress_single"
 
 if [[ "$stress_multi" -lt 1 ]]; then
   echo "FAIL: expected at least one multi-tid stress run under N>>workers load"
+  exit 1
+fi
+
+echo "== coro_steal_stress (Chase-Lev) x$ROUNDS =="
+steal_multi=0
+steal_single=0
+for i in $(seq 1 "$ROUNDS"); do
+  out="$(run_bounded coro_steal_stress)" || { echo "HANG/FAIL steal round $i"; exit 1; }
+  echo "$out" | tail -n1 | grep -q 'steal done' || { echo "FAIL steal round $i"; echo "$out"; exit 1; }
+  nt="$(echo "$out" | count_unique_tids)"
+  if [[ "$nt" -gt 1 ]]; then steal_multi=$((steal_multi+1)); else steal_single=$((steal_single+1)); fi
+done
+echo "steal multi_tid=$steal_multi single_tid=$steal_single"
+
+if [[ "$steal_multi" -lt 1 ]]; then
+  echo "FAIL: expected at least one multi-tid steal-stress run"
   exit 1
 fi
 

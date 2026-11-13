@@ -1,6 +1,6 @@
-# Coroutines (v2 gate step 4)
+# Coroutines (v2 / JOG-78)
 
-Stackful coroutines with `rsp` swap. Gate 1: single-thread yield. Gate 2: multi-worker pool + steal. Gate 3: `with (Dispatcher)` cross-pool migration. Gate 4: elastic blocking/IO Dispatcher pool.
+Stackful coroutines with `rsp` swap. Gate 1: single-thread yield. Gate 2: multi-worker pool + steal. Gate 3: `with (Dispatcher)` cross-pool migration. Gate 4: elastic blocking/IO Dispatcher pool. JOG-78: Chase-Lev lock-free work-stealing deques.
 
 ## Builtins
 
@@ -28,8 +28,8 @@ Main’s OS stack (cid 0) is **not** migratable: `with` on main only updates amb
 ## Runtime shape
 
 - N OS workers via `clone` (`CLONE_THREAD|…`); worker 0 is main. Cap 16 workers / 4 Dispatcher pools.
-- Multiple **Dispatcher pools** partition workers; each has its own RR enqueue + in-pool steal.
-- Per-worker locked FIFO run queues; idle workers **steal only within their pool**.
+- Multiple **Dispatcher pools** partition workers; steal stays in-pool.
+- Per-worker **Chase-Lev** deques (owner push/pop bottom; thieves CAS-steal top). In-pool `go`/yield push locally; cross-pool submits use a locked per-pool inbox. Idle workers take: local pop → inbox → steal.
 - TLS via `arch_prctl(ARCH_SET_FS)` (wid, current coro, home CCB, yield-requeue).
 - Yield / Dispatcher enter-leave hop through the worker home so a coro is never runnable on two threads.
 - **IO elastic pool:** `dispatcher_io()` marks a pool elastic; enqueue may `clone` an extra worker when backlog ≥ live count (up to `pool_max`). Once grown, workers stay for the process (shrink deferred).
@@ -48,6 +48,9 @@ zig build
 ./zig-out/bin/jog build examples/coro_pool_stress.jog -o out/coro_pool_stress && ./out/coro_pool_stress
 # N>>workers + yields; multi-tid expected under load (scripts/coro_stress.sh)
 
+./zig-out/bin/jog build examples/coro_steal_stress.jog -o out/coro_steal_stress && ./out/coro_steal_stress
+# 8 workers × many yields; exercises Chase-Lev steal under contention
+
 ./zig-out/bin/jog build examples/coro_with_dispatcher.jog -o out/coro_with && ./out/coro_with
 # before wid∈{0,1}; inside wid∈{2,3}; after wid∈{0,1}; same cid
 
@@ -61,6 +64,6 @@ Rare single-`tid` under light load on gate-2 pool demos is valid. Treat hangs / 
 
 - No `go { }` blocks / captures, no `Scope`, no `Task` / join.
 - Fixed max 32 coro slots, 16 workers, 4 Dispatcher pools; stacks via `mmap` (not charged to `alloc`).
-- Queues are locked FIFOs (not lock-free Chase-Lev); fine for the gate.
+- Chase-Lev arrays are fixed-capacity (no grow); full queue panics.
 - IO pool shrink-beyond-min is deferred (grow only for now).
 - Freestanding linux x64 only.
