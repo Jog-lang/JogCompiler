@@ -2,13 +2,22 @@ const std = @import("std");
 
 pub const TypeExpr = union(enum) {
     name: []const u8,
+    /// Applied generics: `Box<i64>` / `id` type args live on Call separately.
+    named_app: NamedApp,
     pointer: *TypeExpr,
     pointer_const: *TypeExpr,
     optional: *TypeExpr,
     /// Fixed array `[N]T` (elements stored as 8-byte slots for now).
     array: ArrayType,
+    /// Product type `(T, U, …)` — lowered as synthetic `__TupN` struct.
+    tuple: []*TypeExpr,
     iface_fn: *IfaceFnType,
     bad,
+};
+
+pub const NamedApp = struct {
+    name: []const u8,
+    args: []*TypeExpr,
 };
 
 pub const ArrayType = struct {
@@ -85,6 +94,8 @@ pub const Field = struct {
 
 pub const StructDecl = struct {
     name: []const u8,
+    /// Generic params e.g. `struct Box<T>`.
+    type_params: [][]const u8 = &.{},
     fields: []Field,
 };
 
@@ -109,6 +120,8 @@ pub const MethodSig = struct {
 
 pub const FnDecl = struct {
     name: []const u8,
+    /// Generic params e.g. `fn id<T>(…)`.
+    type_params: [][]const u8 = &.{},
     params: []Param,
     contexts: []ContextParam,
     ret: ?*TypeExpr,
@@ -133,6 +146,7 @@ pub const Block = struct {
 
 pub const Stmt = union(enum) {
     var_decl: VarDecl,
+    destructure: Destructure,
     assign: Assign,
     expr: *Expr,
     return_stmt: ?*Expr,
@@ -159,6 +173,13 @@ pub const VarDecl = struct {
     name: []const u8,
     ty: ?*TypeExpr,
     init: ?*Expr,
+};
+
+/// `val (a, b) = expr` — bind tuple fields by index.
+pub const Destructure = struct {
+    mutable: bool,
+    names: [][]const u8,
+    init: *Expr,
 };
 
 pub const Assign = struct {
@@ -207,6 +228,8 @@ pub const Expr = union(enum) {
     struct_lit: StructLit,
     panic_call: PanicCall,
     when_expr: WhenExpr,
+    /// `(a, b, …)` product value.
+    tuple: []*Expr,
 };
 
 pub const WhenExpr = struct {
@@ -268,6 +291,8 @@ pub const Call = struct {
     args: []*Expr,
     /// Call-site contexts: `f(args) with (e1, e2)`.
     with_args: []*Expr = &.{},
+    /// Explicit generic args: `id<i64>(x)`.
+    type_args: []*TypeExpr = &.{},
 };
 
 pub const FieldAccess = struct {
@@ -288,6 +313,8 @@ pub const OptionalCall = struct {
 
 pub const StructLit = struct {
     type_name: []const u8,
+    /// `Box<i64>(…)` concrete args; empty for non-generic.
+    type_args: []*TypeExpr = &.{},
     fields: []StructLitField,
 };
 

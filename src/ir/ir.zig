@@ -206,9 +206,18 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_worker_id" });
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_gettid" });
 
+    var generic_fns: std.StringHashMapUnmanaged(ast.FnDecl) = .{};
+    var generic_structs: std.StringHashMapUnmanaged(ast.StructDecl) = .{};
+
     for (file.decls) |d| {
         switch (d) {
-            .struct_decl => |sd| try structs.put(a, sd.name, .{ .fields = sd.fields }),
+            .struct_decl => |sd| {
+                if (sd.type_params.len > 0) {
+                    try generic_structs.put(a, sd.name, sd);
+                } else {
+                    try structs.put(a, sd.name, .{ .fields = sd.fields });
+                }
+            },
             .enum_decl => |ed| {
                 var variants: std.ArrayListUnmanaged(EnumVariantVal) = .{};
                 var next: i64 = 0;
@@ -234,7 +243,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                 for (eb.fns) |ef| {
                     try internCallee(a, &callees, &callee_map, .{ .kind = .extern_c, .name = ef.name });
                     var ret_name: []const u8 = "";
-                    if (ef.ret) |r| ret_name = typeExprName(r);
+                    if (ef.ret) |r| ret_name = try resolveRetName(a, &structs, r);
                     try fn_infos.put(a, ef.name, .{
                         .mangled = ef.name,
                         .nparams = @intCast(ef.params.len),
@@ -246,10 +255,12 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                 }
             },
             .fn_decl, .actual_fn => |fd| {
-                if (fd.body != null) {
+                if (fd.body != null and fd.type_params.len > 0) {
+                    try generic_fns.put(a, fd.name, fd);
+                } else if (fd.body != null) {
                     try internCallee(a, &callees, &callee_map, .{ .kind = .jog_fn, .name = fd.name });
                     var ret_name: []const u8 = "";
-                    if (fd.ret) |r| ret_name = typeExprName(r);
+                    if (fd.ret) |r| ret_name = try resolveRetName(a, &structs, r);
                     try fn_infos.put(a, fd.name, .{
                         .mangled = fd.name,
                         .nparams = @intCast(fd.params.len),
@@ -265,7 +276,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                     const kind: CalleeKind = if (std.mem.startsWith(u8, ef.name, "jogrt_")) .runtime else .jog_fn;
                     try internCallee(a, &callees, &callee_map, .{ .kind = kind, .name = ef.name });
                     var ret_name: []const u8 = "";
-                    if (ef.ret) |r| ret_name = typeExprName(r);
+                    if (ef.ret) |r| ret_name = try resolveRetName(a, &structs, r);
                     try fn_infos.put(a, ef.name, .{
                         .mangled = ef.name,
                         .nparams = @intCast(ef.params.len),
@@ -277,11 +288,12 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
             },
             .method => |md| {
                 if (md.body != null) {
-                    const mangled = try std.fmt.allocPrint(a, "{s}_{s}", .{ md.type_name, md.name });
+                    const sym = try opMethodSymbol(a, md.name);
+                    const mangled = try std.fmt.allocPrint(a, "{s}_{s}", .{ md.type_name, sym });
                     const key = try std.fmt.allocPrint(a, "{s}.{s}", .{ md.type_name, md.name });
                     try internCallee(a, &callees, &callee_map, .{ .kind = .jog_fn, .name = mangled });
                     var mret: []const u8 = "";
-                    if (md.ret) |r| mret = typeExprName(r);
+                    if (md.ret) |r| mret = try resolveRetName(a, &structs, r);
                     try methods.put(a, key, .{
                         .mangled = mangled,
                         .pointer_recv = md.pointer_recv,
@@ -298,11 +310,15 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
         }
     }
 
+    // Instantiate generics referenced from the program (calls / struct lits / types).
+    var specialized: std.ArrayListUnmanaged(ast.FnDecl) = .{};
+    try instantiateGenerics(a, file, &generic_fns, &generic_structs, &structs, &fn_infos, &callees, &callee_map, &specialized);
+
     var funcs: std.ArrayListUnmanaged(Func) = .{};
     for (file.decls) |d| {
         const maybe_fd: ?ast.FnDecl = switch (d) {
-            .fn_decl => |fd| if (fd.body != null) fd else null,
-            .actual_fn => |fd| if (fd.body != null) fd else null,
+            .fn_decl => |fd| if (fd.body != null and fd.type_params.len == 0) fd else null,
+            .actual_fn => |fd| if (fd.body != null and fd.type_params.len == 0) fd else null,
             else => null,
         };
         if (maybe_fd) |fd| {
@@ -319,7 +335,8 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
             try funcs.append(a, f);
         } else if (d == .method and d.method.body != null) {
             const md = d.method;
-            const mangled = try std.fmt.allocPrint(a, "{s}_{s}", .{ md.type_name, md.name });
+            const sym = try opMethodSymbol(a, md.name);
+            const mangled = try std.fmt.allocPrint(a, "{s}_{s}", .{ md.type_name, sym });
             const f = try lowerFn(a, .{
                 .name = mangled,
                 .params = md.params,
@@ -331,6 +348,18 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
             }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map);
             try funcs.append(a, f);
         }
+    }
+    for (specialized.items) |fd| {
+        const f = try lowerFn(a, .{
+            .name = fd.name,
+            .params = fd.params,
+            .contexts = fd.contexts,
+            .body = fd.body.?,
+            .exported = false,
+            .self_type = null,
+            .pointer_recv = false,
+        }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map);
+        try funcs.append(a, f);
     }
 
     program.strings = try strings.toOwnedSlice(a);
@@ -345,6 +374,288 @@ fn internCallee(a: std.mem.Allocator, list: *std.ArrayListUnmanaged(Callee), map
     if (map.contains(c.name)) return;
     try list.append(a, c);
     try map.put(a, c.name, @intCast(list.items.len - 1));
+}
+
+fn resolveRetName(a: std.mem.Allocator, structs: *std.StringHashMapUnmanaged(StructInfo), te: *ast.TypeExpr) ![]const u8 {
+    return switch (te.*) {
+        .name => |n| n,
+        .named_app => |na| try mangleNamedApp(a, na.name, na.args),
+        .tuple => |elems| try ensureTupleStruct(a, structs, elems.len),
+        .optional => |inner| try resolveRetName(a, structs, inner),
+        .pointer, .pointer_const => |inner| try resolveRetName(a, structs, inner),
+        .array => |arr| try resolveRetName(a, structs, arr.elem),
+        else => "",
+    };
+}
+
+fn substTypeExpr(a: std.mem.Allocator, te: *ast.TypeExpr, params: [][]const u8, args: []*ast.TypeExpr) !*ast.TypeExpr {
+    switch (te.*) {
+        .name => |n| {
+            for (params, 0..) |p, i| {
+                if (std.mem.eql(u8, p, n) and i < args.len) {
+                    return try cloneTypeExpr(a, args[i]);
+                }
+            }
+            return try cloneTypeExpr(a, te);
+        },
+        .named_app => |na| {
+            var nargs: std.ArrayListUnmanaged(*ast.TypeExpr) = .{};
+            for (na.args) |arg| try nargs.append(a, try substTypeExpr(a, arg, params, args));
+            const out = try a.create(ast.TypeExpr);
+            out.* = .{ .named_app = .{ .name = na.name, .args = try nargs.toOwnedSlice(a) } };
+            return out;
+        },
+        .tuple => |elems| {
+            var ne: std.ArrayListUnmanaged(*ast.TypeExpr) = .{};
+            for (elems) |el| try ne.append(a, try substTypeExpr(a, el, params, args));
+            const out = try a.create(ast.TypeExpr);
+            out.* = .{ .tuple = try ne.toOwnedSlice(a) };
+            return out;
+        },
+        .optional => |inner| {
+            const out = try a.create(ast.TypeExpr);
+            out.* = .{ .optional = try substTypeExpr(a, inner, params, args) };
+            return out;
+        },
+        .pointer => |inner| {
+            const out = try a.create(ast.TypeExpr);
+            out.* = .{ .pointer = try substTypeExpr(a, inner, params, args) };
+            return out;
+        },
+        .pointer_const => |inner| {
+            const out = try a.create(ast.TypeExpr);
+            out.* = .{ .pointer_const = try substTypeExpr(a, inner, params, args) };
+            return out;
+        },
+        .array => |arr| {
+            const out = try a.create(ast.TypeExpr);
+            out.* = .{ .array = .{ .len = arr.len, .elem = try substTypeExpr(a, arr.elem, params, args) } };
+            return out;
+        },
+        else => return try cloneTypeExpr(a, te),
+    }
+}
+
+fn cloneTypeExpr(a: std.mem.Allocator, te: *ast.TypeExpr) !*ast.TypeExpr {
+    const out = try a.create(ast.TypeExpr);
+    out.* = te.*;
+    return out;
+}
+
+fn ensureGenericStruct(
+    a: std.mem.Allocator,
+    generic_structs: *std.StringHashMapUnmanaged(ast.StructDecl),
+    structs: *std.StringHashMapUnmanaged(StructInfo),
+    name: []const u8,
+    args: []*ast.TypeExpr,
+) ![]const u8 {
+    const mangled = try mangleNamedApp(a, name, args);
+    if (structs.contains(mangled)) return mangled;
+    const tmpl = generic_structs.get(name) orelse return mangled;
+    if (args.len != tmpl.type_params.len) return mangled;
+    var fields: std.ArrayListUnmanaged(ast.Field) = .{};
+    for (tmpl.fields) |f| {
+        try fields.append(a, .{
+            .name = f.name,
+            .ty = try substTypeExpr(a, f.ty, tmpl.type_params, args),
+        });
+    }
+    try structs.put(a, mangled, .{ .fields = try fields.toOwnedSlice(a) });
+    return mangled;
+}
+
+fn ensureGenericFn(
+    a: std.mem.Allocator,
+    generic_fns: *std.StringHashMapUnmanaged(ast.FnDecl),
+    structs: *std.StringHashMapUnmanaged(StructInfo),
+    fn_infos: *std.StringHashMapUnmanaged(FnInfo),
+    callees: *std.ArrayListUnmanaged(Callee),
+    callee_map: *std.StringHashMapUnmanaged(u32),
+    specialized: *std.ArrayListUnmanaged(ast.FnDecl),
+    name: []const u8,
+    args: []*ast.TypeExpr,
+) !void {
+    const mangled = try mangleNamedApp(a, name, args);
+    if (fn_infos.contains(mangled)) return;
+    const tmpl = generic_fns.get(name) orelse return;
+    if (args.len != tmpl.type_params.len) return;
+    var params: std.ArrayListUnmanaged(ast.Param) = .{};
+    for (tmpl.params) |p| {
+        try params.append(a, .{
+            .name = p.name,
+            .ty = try substTypeExpr(a, p.ty, tmpl.type_params, args),
+        });
+    }
+    var ret: ?*ast.TypeExpr = null;
+    if (tmpl.ret) |r| ret = try substTypeExpr(a, r, tmpl.type_params, args);
+    const fd = ast.FnDecl{
+        .name = mangled,
+        .type_params = &.{},
+        .params = try params.toOwnedSlice(a),
+        .contexts = tmpl.contexts,
+        .ret = ret,
+        .body = tmpl.body,
+        .exported = false,
+    };
+    try specialized.append(a, fd);
+    try internCallee(a, callees, callee_map, .{ .kind = .jog_fn, .name = mangled });
+    var ret_name: []const u8 = "";
+    if (ret) |r| ret_name = try resolveRetName(a, structs, r);
+    try fn_infos.put(a, mangled, .{
+        .mangled = mangled,
+        .nparams = @intCast(fd.params.len),
+        .contexts = fd.contexts,
+        .exported = false,
+        .ret_name = ret_name,
+    });
+    // Also alias under call lookup: lowerCall will mangle at site.
+}
+
+fn walkExprInstantiate(
+    a: std.mem.Allocator,
+    e: *ast.Expr,
+    generic_fns: *std.StringHashMapUnmanaged(ast.FnDecl),
+    generic_structs: *std.StringHashMapUnmanaged(ast.StructDecl),
+    structs: *std.StringHashMapUnmanaged(StructInfo),
+    fn_infos: *std.StringHashMapUnmanaged(FnInfo),
+    callees: *std.ArrayListUnmanaged(Callee),
+    callee_map: *std.StringHashMapUnmanaged(u32),
+    specialized: *std.ArrayListUnmanaged(ast.FnDecl),
+) !void {
+    switch (e.*) {
+        .call => |c| {
+            if (c.type_args.len > 0 and c.callee.* == .ident) {
+                try ensureGenericFn(a, generic_fns, structs, fn_infos, callees, callee_map, specialized, c.callee.ident, c.type_args);
+            }
+            for (c.args) |arg| try walkExprInstantiate(a, arg, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+            for (c.with_args) |w| try walkExprInstantiate(a, w, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+            try walkExprInstantiate(a, c.callee, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+        },
+        .struct_lit => |sl| {
+            if (sl.type_args.len > 0) {
+                _ = try ensureGenericStruct(a, generic_structs, structs, sl.type_name, sl.type_args);
+            }
+            for (sl.fields) |f| try walkExprInstantiate(a, f.value, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+        },
+        .tuple => |elems| {
+            _ = try ensureTupleStruct(a, structs, elems.len);
+            for (elems) |el| try walkExprInstantiate(a, el, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+        },
+        .binary => |b| {
+            try walkExprInstantiate(a, b.left, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+            try walkExprInstantiate(a, b.right, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+        },
+        .unary => |u| try walkExprInstantiate(a, u.expr, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized),
+        .field => |f| try walkExprInstantiate(a, f.base, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized),
+        .index => |ix| {
+            try walkExprInstantiate(a, ix.base, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+            try walkExprInstantiate(a, ix.index, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+        },
+        .cast => |c| {
+            try walkTypeInstantiate(a, c.ty, generic_structs, structs);
+            try walkExprInstantiate(a, c.expr, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+        },
+        .when_expr => |w| {
+            try walkExprInstantiate(a, w.scrutinee, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+            for (w.arms) |arm| try walkExprInstantiate(a, arm.body, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+            if (w.else_body) |eb| try walkExprInstantiate(a, eb, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+        },
+        .optional_call => |oc| {
+            try walkExprInstantiate(a, oc.base, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+            for (oc.args) |arg| try walkExprInstantiate(a, arg, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+        },
+        .panic_call => |p| try walkExprInstantiate(a, p.message, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized),
+        else => {},
+    }
+}
+
+fn walkTypeInstantiate(a: std.mem.Allocator, te: *ast.TypeExpr, generic_structs: *std.StringHashMapUnmanaged(ast.StructDecl), structs: *std.StringHashMapUnmanaged(StructInfo)) !void {
+    switch (te.*) {
+        .named_app => |na| _ = try ensureGenericStruct(a, generic_structs, structs, na.name, na.args),
+        .tuple => |elems| _ = try ensureTupleStruct(a, structs, elems.len),
+        .optional, .pointer, .pointer_const => |inner| try walkTypeInstantiate(a, inner, generic_structs, structs),
+        .array => |arr| try walkTypeInstantiate(a, arr.elem, generic_structs, structs),
+        else => {},
+    }
+}
+
+fn walkStmtInstantiate(
+    a: std.mem.Allocator,
+    stmt: ast.Stmt,
+    generic_fns: *std.StringHashMapUnmanaged(ast.FnDecl),
+    generic_structs: *std.StringHashMapUnmanaged(ast.StructDecl),
+    structs: *std.StringHashMapUnmanaged(StructInfo),
+    fn_infos: *std.StringHashMapUnmanaged(FnInfo),
+    callees: *std.ArrayListUnmanaged(Callee),
+    callee_map: *std.StringHashMapUnmanaged(u32),
+    specialized: *std.ArrayListUnmanaged(ast.FnDecl),
+) !void {
+    switch (stmt) {
+        .var_decl => |vd| {
+            if (vd.ty) |t| try walkTypeInstantiate(a, t, generic_structs, structs);
+            if (vd.init) |init| try walkExprInstantiate(a, init, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+        },
+        .destructure => |ds| try walkExprInstantiate(a, ds.init, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized),
+        .assign => |as| {
+            try walkExprInstantiate(a, as.value, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+            if (as.field) |fa| try walkExprInstantiate(a, fa.base, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+            if (as.index) |ix| {
+                try walkExprInstantiate(a, ix.base, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+                try walkExprInstantiate(a, ix.index, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+            }
+        },
+        .expr => |e| try walkExprInstantiate(a, e, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized),
+        .return_stmt => |re| if (re) |e| try walkExprInstantiate(a, e, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized),
+        .if_stmt => |ifs| {
+            try walkExprInstantiate(a, ifs.cond, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+            for (ifs.then_block.stmts) |s| try walkStmtInstantiate(a, s, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+            if (ifs.else_block) |eb| for (eb.stmts) |s| try walkStmtInstantiate(a, s, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+        },
+        .while_stmt => |ws| {
+            try walkExprInstantiate(a, ws.cond, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+            for (ws.body.stmts) |s| try walkStmtInstantiate(a, s, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+        },
+        .with_stmt => |ws| {
+            for (ws.values) |v| try walkExprInstantiate(a, v, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+            for (ws.body.stmts) |s| try walkStmtInstantiate(a, s, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+        },
+        .defer_stmt => |ds| switch (ds) {
+            .expr => |ex| try walkExprInstantiate(a, ex, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized),
+            .block => |b| for (b.stmts) |s| try walkStmtInstantiate(a, s, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized),
+        },
+        else => {},
+    }
+}
+
+fn instantiateGenerics(
+    a: std.mem.Allocator,
+    file: *const ast.File,
+    generic_fns: *std.StringHashMapUnmanaged(ast.FnDecl),
+    generic_structs: *std.StringHashMapUnmanaged(ast.StructDecl),
+    structs: *std.StringHashMapUnmanaged(StructInfo),
+    fn_infos: *std.StringHashMapUnmanaged(FnInfo),
+    callees: *std.ArrayListUnmanaged(Callee),
+    callee_map: *std.StringHashMapUnmanaged(u32),
+    specialized: *std.ArrayListUnmanaged(ast.FnDecl),
+) !void {
+    for (file.decls) |d| {
+        switch (d) {
+            .fn_decl, .actual_fn => |fd| {
+                if (fd.ret) |r| try walkTypeInstantiate(a, r, generic_structs, structs);
+                for (fd.params) |p| try walkTypeInstantiate(a, p.ty, generic_structs, structs);
+                if (fd.body) |body| {
+                    for (body.stmts) |s| try walkStmtInstantiate(a, s, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+                }
+            },
+            .method => |md| {
+                if (md.ret) |r| try walkTypeInstantiate(a, r, generic_structs, structs);
+                if (md.body) |body| {
+                    for (body.stmts) |s| try walkStmtInstantiate(a, s, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+                }
+            },
+            else => {},
+        }
+    }
 }
 
 const FnLower = struct {
@@ -431,7 +742,7 @@ fn lowerFn(
         const slot = next_slot;
         next_slot += 1;
         try slots.put(a, p.name, slot);
-        try meta.put(a, p.name, metaForTypeExpr(p.ty, ifaces));
+        try meta.put(a, p.name, try metaForTypeExpr(a, p.ty, structs, ifaces));
     }
     const nparams = next_slot;
 
@@ -476,9 +787,120 @@ fn lowerFn(
 fn typeExprName(te: *ast.TypeExpr) []const u8 {
     return switch (te.*) {
         .name => |n| n,
+        .named_app => |na| na.name, // caller should prefer mangleNamedApp
         .pointer, .pointer_const, .optional => |inner| typeExprName(inner),
         .array => |arr| typeExprName(arr.elem),
+        .tuple => "__Tup",
         else => "",
+    };
+}
+
+fn mangleTypeArgName(te: *ast.TypeExpr) []const u8 {
+    return switch (te.*) {
+        .name => |n| n,
+        .named_app => |na| na.name,
+        .tuple => |elems| blk: {
+            _ = elems;
+            break :blk "tup";
+        },
+        .optional => |inner| mangleTypeArgName(inner),
+        .pointer, .pointer_const => |inner| mangleTypeArgName(inner),
+        .array => |arr| mangleTypeArgName(arr.elem),
+        else => "X",
+    };
+}
+
+fn mangleNamedApp(a: std.mem.Allocator, name: []const u8, args: []*ast.TypeExpr) ![]const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    try buf.appendSlice(a, name);
+    for (args) |arg| {
+        try buf.appendSlice(a, "__");
+        try buf.appendSlice(a, mangleTypeArgName(arg));
+    }
+    return try buf.toOwnedSlice(a);
+}
+
+fn tupleStructName(a: std.mem.Allocator, n: usize) ![]const u8 {
+    return try std.fmt.allocPrint(a, "__Tup{d}", .{n});
+}
+
+fn ensureTupleStruct(a: std.mem.Allocator, structs: *std.StringHashMapUnmanaged(StructInfo), n: usize) ![]const u8 {
+    const name = try tupleStructName(a, n);
+    if (structs.contains(name)) return name;
+    var fields: std.ArrayListUnmanaged(ast.Field) = .{};
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const fname = try std.fmt.allocPrint(a, "_{d}", .{i});
+        const ty = try a.create(ast.TypeExpr);
+        ty.* = .{ .name = "i64" };
+        try fields.append(a, .{ .name = fname, .ty = ty });
+    }
+    try structs.put(a, name, .{ .fields = try fields.toOwnedSlice(a) });
+    return name;
+}
+
+fn opMethodSymbol(a: std.mem.Allocator, name: []const u8) ![]const u8 {
+    // `op+` → `op_add` for ELF-safe symbols; method lookup key stays `Type.op+`.
+    if (!std.mem.startsWith(u8, name, "op") or name.len < 3) return name;
+    const rest = name[2..];
+    const tag: []const u8 = if (std.mem.eql(u8, rest, "+"))
+        "add"
+    else if (std.mem.eql(u8, rest, "-"))
+        "sub"
+    else if (std.mem.eql(u8, rest, "*"))
+        "mul"
+    else if (std.mem.eql(u8, rest, "/"))
+        "div"
+    else if (std.mem.eql(u8, rest, "%"))
+        "rem"
+    else if (std.mem.eql(u8, rest, "=="))
+        "eq"
+    else if (std.mem.eql(u8, rest, "!="))
+        "ne"
+    else if (std.mem.eql(u8, rest, "<"))
+        "lt"
+    else if (std.mem.eql(u8, rest, ">"))
+        "gt"
+    else if (std.mem.eql(u8, rest, "<="))
+        "le"
+    else if (std.mem.eql(u8, rest, ">="))
+        "ge"
+    else if (std.mem.eql(u8, rest, "&"))
+        "band"
+    else if (std.mem.eql(u8, rest, "|"))
+        "bor"
+    else if (std.mem.eql(u8, rest, "^"))
+        "bxor"
+    else if (std.mem.eql(u8, rest, "<<"))
+        "shl"
+    else if (std.mem.eql(u8, rest, ">>"))
+        "shr"
+    else if (std.mem.eql(u8, rest, "~"))
+        "bnot"
+    else
+        return try std.fmt.allocPrint(a, "op_{s}", .{rest});
+    return try std.fmt.allocPrint(a, "op_{s}", .{tag});
+}
+
+fn binOpMethodName(op: ast.BinaryOp) ?[]const u8 {
+    return switch (op) {
+        .add => "op+",
+        .sub => "op-",
+        .mul => "op*",
+        .div => "op/",
+        .rem => "op%",
+        .eq => "op==",
+        .neq => "op!=",
+        .lt => "op<",
+        .gt => "op>",
+        .lte => "op<=",
+        .gte => "op>=",
+        .bit_and => "op&",
+        .bit_or => "op|",
+        .bit_xor => "op^",
+        .shl => "op<<",
+        .shr => "op>>",
+        else => null,
     };
 }
 
@@ -490,7 +912,7 @@ fn metaForTypeName(name: []const u8, ifaces: *std.StringHashMapUnmanaged(IfaceIn
     return .{ .kind = .struct_ptr, .type_name = name };
 }
 
-fn metaForTypeExpr(te: *ast.TypeExpr, ifaces: *std.StringHashMapUnmanaged(IfaceInfo)) SlotMeta {
+fn metaForTypeExpr(a: std.mem.Allocator, te: *ast.TypeExpr, structs: *std.StringHashMapUnmanaged(StructInfo), ifaces: *std.StringHashMapUnmanaged(IfaceInfo)) !SlotMeta {
     switch (te.*) {
         .optional => return .{ .kind = .opt_ptr, .type_name = typeExprName(te) },
         .pointer, .pointer_const => {
@@ -511,6 +933,14 @@ fn metaForTypeExpr(te: *ast.TypeExpr, ifaces: *std.StringHashMapUnmanaged(IfaceI
             };
         },
         .name => |n| return metaForTypeName(n, ifaces),
+        .named_app => |na| {
+            const mangled = try mangleNamedApp(a, na.name, na.args);
+            return metaForTypeName(mangled, ifaces);
+        },
+        .tuple => |elems| {
+            const name = try ensureTupleStruct(a, structs, elems.len);
+            return .{ .kind = .struct_ptr, .type_name = name };
+        },
         else => return .{ .kind = .scalar },
     }
 }
@@ -562,9 +992,30 @@ fn emitAllDefers(ctx: *Ctx) LowerError!void {
 
 fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
     switch (stmt) {
+        .destructure => |ds| {
+            const tup = try lowerExpr(ctx, ds.init);
+            const tn = blk: {
+                if (inferMetaFromExpr(ctx, ds.init)) |m| break :blk m.type_name;
+                break :blk try ensureTupleStruct(ctx.a, ctx.structs, ds.names.len);
+            };
+            _ = try ensureTupleStruct(ctx.a, ctx.structs, ds.names.len);
+            const sd = ctx.structs.get(tn) orelse return error.UnknownName;
+            for (ds.names, 0..) |n, i| {
+                if (i >= sd.fields.len) return error.TypeError;
+                const off: i64 = @intCast(i * 8);
+                const addr = try ctx.fresh();
+                const off_s = try ctx.fresh();
+                try ctx.emit(.{ .op = .iconst, .dst = off_s, .aux = off });
+                try ctx.emit(.{ .op = .add, .dst = addr, .src0 = tup, .src1 = off_s });
+                const slot = try ctx.fresh();
+                try ctx.emit(.{ .op = .load, .dst = slot, .src0 = addr });
+                try ctx.slots.put(ctx.a, n, slot);
+                try ctx.meta.put(ctx.a, n, .{ .kind = .scalar, .type_name = "i64" });
+            }
+        },
         .var_decl => |vd| {
             var sm: SlotMeta = .{ .kind = .scalar };
-            if (vd.ty) |t| sm = metaForTypeExpr(t, ctx.ifaces);
+            if (vd.ty) |t| sm = try metaForTypeExpr(ctx.a, t, ctx.structs, ctx.ifaces);
             if (sm.kind == .array_ptr and sm.array_len > 0) {
                 // One stack slot per element (8-byte frame slots). Byte/u8 still
                 // use load8/store8; index scale stays 8 so elements sit in consecutive slots.
@@ -720,9 +1171,32 @@ fn slotNameOf(_: *Ctx, _: u32) []const u8 {
 
 fn inferMetaFromExpr(ctx: *Ctx, e: *ast.Expr) ?SlotMeta {
     switch (e.*) {
-        .struct_lit => |sl| return .{ .kind = .struct_ptr, .type_name = sl.type_name },
+        .struct_lit => |sl| {
+            if (sl.type_args.len > 0) {
+                const mangled = mangleNamedApp(ctx.a, sl.type_name, sl.type_args) catch return .{ .kind = .struct_ptr, .type_name = sl.type_name };
+                return .{ .kind = .struct_ptr, .type_name = mangled };
+            }
+            return .{ .kind = .struct_ptr, .type_name = sl.type_name };
+        },
         .null_lit => return .{ .kind = .opt_ptr },
         .ident => |n| return ctx.meta.get(n),
+        .binary => |b| {
+            if (binOpMethodName(b.op)) |opm| {
+                if (inferTypeNameFromExpr(ctx, b.left)) |tn| {
+                    if (!isBuiltinScalar(tn) and ctx.structs.contains(tn)) {
+                        const key = std.fmt.allocPrint(ctx.a, "{s}.{s}", .{ tn, opm }) catch return null;
+                        if (ctx.methods.get(key)) |mi| {
+                            if (mi.ret_name.len > 0) {
+                                if (ctx.structs.contains(mi.ret_name))
+                                    return .{ .kind = .struct_ptr, .type_name = mi.ret_name };
+                                return .{ .kind = .scalar, .type_name = mi.ret_name };
+                            }
+                        }
+                    }
+                }
+            }
+            return null;
+        },
         .call => |c| {
             if (c.callee.* == .ident and std.mem.eql(u8, c.callee.ident, "alloc"))
                 return .{ .kind = .raw_ptr, .type_name = "byte" };
@@ -733,6 +1207,18 @@ fn inferMetaFromExpr(ctx: *Ctx, e: *ast.Expr) ?SlotMeta {
                 std.mem.eql(u8, c.callee.ident, "dispatcher_io")))
                 return .{ .kind = .scalar, .type_name = "Dispatcher" };
             if (c.callee.* == .ident) {
+                if (c.type_args.len > 0) {
+                    const mangled = mangleNamedApp(ctx.a, c.callee.ident, c.type_args) catch "";
+                    if (mangled.len > 0) {
+                        if (ctx.fn_infos.get(mangled)) |fi| {
+                            if (fi.ret_name.len > 0) {
+                                if (ctx.structs.contains(fi.ret_name))
+                                    return .{ .kind = .struct_ptr, .type_name = fi.ret_name };
+                                return .{ .kind = .scalar, .type_name = fi.ret_name };
+                            }
+                        }
+                    }
+                }
                 if (ctx.fn_infos.get(c.callee.ident)) |fi| {
                     if (fi.ret_name.len > 0) {
                         if (ctx.structs.contains(fi.ret_name))
@@ -754,7 +1240,8 @@ fn inferMetaFromExpr(ctx: *Ctx, e: *ast.Expr) ?SlotMeta {
             }
             return .{ .kind = .raw_ptr };
         },
-        .cast => |c| return metaForTypeExpr(c.ty, ctx.ifaces),
+        .cast => |c| return metaForTypeExpr(ctx.a, c.ty, ctx.structs, ctx.ifaces) catch null,
+        .tuple => |elems| return .{ .kind = .struct_ptr, .type_name = ensureTupleStruct(ctx.a, ctx.structs, elems.len) catch return null },
         else => return null,
     }
 }
@@ -826,7 +1313,20 @@ fn isFloatish(ctx: *Ctx, e: *ast.Expr) bool {
             }
             break :blk false;
         },
-        .binary => |b| isFloatish(ctx, b.left) or isFloatish(ctx, b.right),
+        .binary => |b| blk: {
+            if (binOpMethodName(b.op)) |opm| {
+                if (inferTypeNameFromExpr(ctx, b.left)) |tn| {
+                    if (!isBuiltinScalar(tn) and ctx.structs.contains(tn)) {
+                        const key = std.fmt.allocPrint(ctx.a, "{s}.{s}", .{ tn, opm }) catch break :blk false;
+                        if (ctx.methods.get(key)) |mi| {
+                            if (mi.ret_name.len > 0 and (std.mem.eql(u8, mi.ret_name, "f64") or std.mem.eql(u8, mi.ret_name, "f32")))
+                                break :blk true;
+                        }
+                    }
+                }
+            }
+            break :blk isFloatish(ctx, b.left) or isFloatish(ctx, b.right);
+        },
         .unary => |u| isFloatish(ctx, u.expr),
         .cast => |c| blk: {
             const tn = typeExprName(c.ty);
@@ -903,6 +1403,20 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
                 ctx.insts.items[jmp_true].aux = end_pos;
                 return d;
             }
+            // Operator methods: `a + b` → `Type.op+(b)` when left is a named struct with that method.
+            if (binOpMethodName(b.op)) |opm| {
+                if (inferTypeNameFromExpr(ctx, b.left)) |tn| {
+                    if (!isBuiltinScalar(tn) and ctx.structs.contains(tn)) {
+                        const key = try std.fmt.allocPrint(ctx.a, "{s}.{s}", .{ tn, opm });
+                        if (ctx.methods.get(key)) |_| {
+                            const base = try lowerExpr(ctx, b.left);
+                            var args = try ctx.a.alloc(*ast.Expr, 1);
+                            args[0] = b.right;
+                            return try lowerMethodOrIfaceCall(ctx, b.left, base, opm, args, &.{});
+                        }
+                    }
+                }
+            }
             const l = try lowerExpr(ctx, b.left);
             const r = try lowerExpr(ctx, b.right);
             const d = try ctx.fresh();
@@ -968,7 +1482,7 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
         .call => |c| return try lowerCall(ctx, c),
         .cast => |c| {
             const v = try lowerExpr(ctx, c.expr);
-            const to = metaForTypeExpr(c.ty, ctx.ifaces);
+            const to = try metaForTypeExpr(ctx.a, c.ty, ctx.structs, ctx.ifaces);
             // narrow ints via `as` when target bits known
             const bits = scalarBits(typeExprName(c.ty));
             if (bits > 0 and bits < 64) {
@@ -1092,8 +1606,33 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
             ctx.insts.items[jmp_i].aux = end_pos;
             return result;
         },
+        .tuple => |elems| {
+            const tname = try ensureTupleStruct(ctx.a, ctx.structs, elems.len);
+            const sd = ctx.structs.get(tname) orelse return error.UnknownName;
+            const size: i64 = @intCast(sd.fields.len * 8);
+            const sz = try ctx.fresh();
+            try ctx.emit(.{ .op = .iconst, .dst = sz, .aux = if (size == 0) 8 else size });
+            const cid = ctx.callee_map.get("jogrt_alloc").?;
+            const ptr = try ctx.fresh();
+            var allo = Inst{ .op = .call, .dst = ptr, .aux = cid, .arity = 1 };
+            allo.args[0] = sz;
+            try ctx.emit(allo);
+            for (elems, 0..) |el, i| {
+                const val = try lowerExpr(ctx, el);
+                const addr = try ctx.fresh();
+                const off_s = try ctx.fresh();
+                try ctx.emit(.{ .op = .iconst, .dst = off_s, .aux = @intCast(i * 8) });
+                try ctx.emit(.{ .op = .add, .dst = addr, .src0 = ptr, .src1 = off_s });
+                try ctx.emit(.{ .op = .store, .src0 = addr, .src1 = val });
+            }
+            return ptr;
+        },
         .struct_lit => |sl| {
-            const sd = ctx.structs.get(sl.type_name) orelse return error.UnknownName;
+            const tname = if (sl.type_args.len > 0)
+                try mangleNamedApp(ctx.a, sl.type_name, sl.type_args)
+            else
+                sl.type_name;
+            const sd = ctx.structs.get(tname) orelse return error.UnknownName;
             const size: i64 = @intCast(sd.fields.len * 8);
             if (size == 0) {
                 // empty-ish: still alloc 8
@@ -1319,6 +1858,12 @@ fn lowerCall(ctx: *Ctx, c: ast.Call) LowerError!u32 {
             const d = try ctx.fresh();
             try ctx.emit(.{ .op = .call, .dst = d, .aux = cid, .arity = 0 });
             return d;
+        }
+        if (c.type_args.len > 0) {
+            const mangled = try mangleNamedApp(ctx.a, name, c.type_args);
+            if (ctx.fn_infos.get(mangled)) |fi| {
+                return try lowerFnCall(ctx, fi, c.args, c.with_args);
+            }
         }
         if (ctx.fn_infos.get(name)) |fi| {
             return try lowerFnCall(ctx, fi, c.args, c.with_args);

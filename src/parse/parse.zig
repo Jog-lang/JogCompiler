@@ -227,6 +227,7 @@ pub const Parser = struct {
         if (self.tok.kind != .ident) return error.UnexpectedToken;
         const name = self.tok.text;
         self.advance();
+        const type_params = try self.parseTypeParamList();
         try self.expect(.lbrace);
         var fields: std.ArrayListUnmanaged(ast.Field) = .{};
         while (self.tok.kind != .rbrace and self.tok.kind != .eof) {
@@ -238,7 +239,7 @@ pub const Parser = struct {
             try fields.append(self.allocator, .{ .name = fname, .ty = ty });
         }
         try self.expect(.rbrace);
-        return .{ .name = name, .fields = try fields.toOwnedSlice(self.allocator) };
+        return .{ .name = name, .type_params = type_params, .fields = try fields.toOwnedSlice(self.allocator) };
     }
 
     fn parseInterface(self: *Parser) ParseError!ast.Decl {
@@ -303,6 +304,7 @@ pub const Parser = struct {
         if (self.tok.kind != .ident) return error.UnexpectedToken;
         const name = self.tok.text;
         self.advance();
+        const type_params = try self.parseTypeParamList();
         const params = try self.parseParamList();
         const contexts = try self.parseContextClause();
         var ret: ?*ast.TypeExpr = null;
@@ -316,6 +318,7 @@ pub const Parser = struct {
         }
         return .{
             .name = name,
+            .type_params = type_params,
             .params = params,
             .contexts = contexts,
             .ret = ret,
@@ -325,9 +328,7 @@ pub const Parser = struct {
     }
 
     fn parseMethodRest(self: *Parser, pointer_recv: bool, type_name: []const u8) ParseError!ast.MethodDecl {
-        if (self.tok.kind != .ident) return error.UnexpectedToken;
-        const name = self.tok.text;
-        self.advance();
+        const name = try self.parseMethodName();
         const params = try self.parseParamList();
         const contexts = try self.parseContextClause();
         var ret: ?*ast.TypeExpr = null;
@@ -348,6 +349,73 @@ pub const Parser = struct {
             .ret = ret,
             .body = body,
         };
+    }
+
+    /// Method name: ident, or `op` + operator (`op+`, `op==`, …).
+    fn parseMethodName(self: *Parser) ParseError![]const u8 {
+        if (self.tok.kind == .ident and std.mem.eql(u8, self.tok.text, "op")) {
+            self.advance();
+            const op_text: []const u8 = switch (self.tok.kind) {
+                .plus => "+",
+                .minus => "-",
+                .star => "*",
+                .slash => "/",
+                .percent => "%",
+                .eqeq => "==",
+                .neq => "!=",
+                .lt => "<",
+                .gt => ">",
+                .lte => "<=",
+                .gte => ">=",
+                .amp => "&",
+                .pipe => "|",
+                .caret => "^",
+                .shl => "<<",
+                .shr => ">>",
+                .tilde => "~",
+                else => return error.UnexpectedToken,
+            };
+            self.advance();
+            return try std.fmt.allocPrint(self.allocator, "op{s}", .{op_text});
+        }
+        if (self.tok.kind != .ident) return error.UnexpectedToken;
+        const name = self.tok.text;
+        self.advance();
+        return name;
+    }
+
+    fn parseTypeParamList(self: *Parser) ParseError![][]const u8 {
+        if (self.tok.kind != .lt) return &.{};
+        self.advance();
+        var params: std.ArrayListUnmanaged([]const u8) = .{};
+        while (true) {
+            if (self.tok.kind != .ident) return error.UnexpectedToken;
+            try params.append(self.allocator, self.tok.text);
+            self.advance();
+            if (self.tok.kind == .comma) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        try self.expect(.gt);
+        return try params.toOwnedSlice(self.allocator);
+    }
+
+    fn parseTypeArgList(self: *Parser) ParseError![]*ast.TypeExpr {
+        if (self.tok.kind != .lt) return &.{};
+        self.advance();
+        var args: std.ArrayListUnmanaged(*ast.TypeExpr) = .{};
+        while (true) {
+            try args.append(self.allocator, try self.parseTypeExpr());
+            if (self.tok.kind == .comma) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        try self.expect(.gt);
+        return try args.toOwnedSlice(self.allocator);
     }
 
     fn parseParamList(self: *Parser) ParseError![]ast.Param {
@@ -448,11 +516,34 @@ pub const Parser = struct {
             // inline interface fn type: interface fn (params): Ret — rare; skip for subset
             return error.UnexpectedToken;
         }
+        if (self.tok.kind == .lparen) {
+            self.advance();
+            var elems: std.ArrayListUnmanaged(*ast.TypeExpr) = .{};
+            try elems.append(self.allocator, try self.parseTypeExpr());
+            if (self.tok.kind != .comma) {
+                // Single `(T)` is just grouping.
+                try self.expect(.rparen);
+                return elems.items[0];
+            }
+            while (self.tok.kind == .comma) {
+                self.advance();
+                try elems.append(self.allocator, try self.parseTypeExpr());
+            }
+            try self.expect(.rparen);
+            const ty = try self.allocator.create(ast.TypeExpr);
+            ty.* = .{ .tuple = try elems.toOwnedSlice(self.allocator) };
+            return ty;
+        }
         if (self.tok.kind != .ident) return error.UnexpectedToken;
         const name = self.tok.text;
         self.advance();
+        const targs = try self.parseTypeArgList();
         const ty = try self.allocator.create(ast.TypeExpr);
-        ty.* = .{ .name = name };
+        if (targs.len == 0) {
+            ty.* = .{ .name = name };
+        } else {
+            ty.* = .{ .named_app = .{ .name = name, .args = targs } };
+        }
         return ty;
     }
 
@@ -473,6 +564,27 @@ pub const Parser = struct {
             .kw_val, .kw_var => {
                 const mutable = self.tok.kind == .kw_var;
                 self.advance();
+                if (self.tok.kind == .lparen) {
+                    self.advance();
+                    var names: std.ArrayListUnmanaged([]const u8) = .{};
+                    while (true) {
+                        if (self.tok.kind != .ident) return error.UnexpectedToken;
+                        try names.append(self.allocator, self.tok.text);
+                        self.advance();
+                        if (self.tok.kind == .comma) {
+                            self.advance();
+                            continue;
+                        }
+                        break;
+                    }
+                    try self.expect(.rparen);
+                    try self.expect(.eq);
+                    return .{ .destructure = .{
+                        .mutable = mutable,
+                        .names = try names.toOwnedSlice(self.allocator),
+                        .init = try self.parseExpr(),
+                    } };
+                }
                 if (self.tok.kind != .ident) return error.UnexpectedToken;
                 const name = self.tok.text;
                 self.advance();
@@ -769,6 +881,20 @@ pub const Parser = struct {
     fn parsePostfix(self: *Parser) ParseError!*ast.Expr {
         var e = try self.parsePrimary();
         while (true) {
+            // Generic call: `id<i64>(…)` — `<` after ident before `(`.
+            var pending_targs: []*ast.TypeExpr = &.{};
+            if (e.* == .ident and self.tok.kind == .lt) {
+                const save = self.snapshot();
+                const targs = self.parseTypeArgList() catch {
+                    self.restore(save);
+                    break;
+                };
+                if (self.tok.kind != .lparen) {
+                    self.restore(save);
+                    break;
+                }
+                pending_targs = targs;
+            }
             if (self.tok.kind == .lparen) {
                 self.advance();
                 var args: std.ArrayListUnmanaged(*ast.Expr) = .{};
@@ -817,10 +943,12 @@ pub const Parser = struct {
                     .callee = e,
                     .args = try args.toOwnedSlice(self.allocator),
                     .with_args = with_args,
+                    .type_args = pending_targs,
                 } };
                 e = call;
                 continue;
             }
+            if (pending_targs.len != 0) return error.UnexpectedToken;
             if (self.tok.kind == .lbracket) {
                 self.advance();
                 const idx = try self.parseExpr();
@@ -910,7 +1038,19 @@ pub const Parser = struct {
             .ident => {
                 const name = self.tok.text;
                 self.advance();
-                // StructLit: Name(field: expr, ...)
+                // Optional type args before struct lit / call: Name<…>(…)
+                var type_args: []*ast.TypeExpr = &.{};
+                if (self.tok.kind == .lt) {
+                    const save_ta = self.snapshot();
+                    if (self.parseTypeArgList()) |ta| {
+                        type_args = ta;
+                    } else |_| {
+                        self.restore(save_ta);
+                        type_args = &.{};
+                    }
+                }
+                // StructLit: Name(field: expr, ...) or Name<T>(field: …)
+                // Or generic call: Name<T>(args) — build call here so type_args are kept.
                 if (self.tok.kind == .lparen) {
                     // Could be call or struct lit — treat as call at expression level;
                     // struct lit uses Name(field: val) with named fields.
@@ -934,11 +1074,42 @@ pub const Parser = struct {
                                 try fields.append(self.allocator, .{ .name = n, .value = try self.parseExpr() });
                             }
                             try self.expect(.rparen);
-                            e.* = .{ .struct_lit = .{ .type_name = name, .fields = try fields.toOwnedSlice(self.allocator) } };
+                            e.* = .{ .struct_lit = .{
+                                .type_name = name,
+                                .type_args = type_args,
+                                .fields = try fields.toOwnedSlice(self.allocator),
+                            } };
                             return e;
                         }
                     }
                     self.restore(save);
+                    if (type_args.len != 0) {
+                        // Generic call Name<T>(…) — parse args now (parsePostfix would drop type_args).
+                        self.advance(); // (
+                        var args: std.ArrayListUnmanaged(*ast.Expr) = .{};
+                        if (self.tok.kind != .rparen) {
+                            while (true) {
+                                try args.append(self.allocator, try self.parseExpr());
+                                if (self.tok.kind == .comma) {
+                                    self.advance();
+                                    continue;
+                                }
+                                break;
+                            }
+                        }
+                        try self.expect(.rparen);
+                        const callee = try self.allocator.create(ast.Expr);
+                        callee.* = .{ .ident = name };
+                        e.* = .{ .call = .{
+                            .callee = callee,
+                            .args = try args.toOwnedSlice(self.allocator),
+                            .type_args = type_args,
+                        } };
+                        return e;
+                    }
+                } else if (type_args.len != 0) {
+                    // Bare Name<T> is not a value expr.
+                    return error.UnexpectedToken;
                 }
                 e.* = .{ .ident = name };
                 return e;
@@ -980,9 +1151,26 @@ pub const Parser = struct {
             },
             .lparen => {
                 self.advance();
-                const inner = try self.parseExpr();
+                if (self.tok.kind == .rparen) {
+                    self.advance();
+                    e.* = .{ .tuple = &[_]*ast.Expr{} };
+                    return e;
+                }
+                const first = try self.parseExpr();
+                if (self.tok.kind != .comma) {
+                    try self.expect(.rparen);
+                    return first;
+                }
+                var elems: std.ArrayListUnmanaged(*ast.Expr) = .{};
+                try elems.append(self.allocator, first);
+                while (self.tok.kind == .comma) {
+                    self.advance();
+                    if (self.tok.kind == .rparen) break; // trailing comma
+                    try elems.append(self.allocator, try self.parseExpr());
+                }
                 try self.expect(.rparen);
-                return inner;
+                e.* = .{ .tuple = try elems.toOwnedSlice(self.allocator) };
+                return e;
             },
             else => return error.UnexpectedToken,
         }

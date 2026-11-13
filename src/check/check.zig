@@ -116,6 +116,14 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
                 const ti = try a.create(TypeInfo);
                 ti.* = .{ .kind = .struct_ty, .name = sd.name };
                 try types.put(a, sd.name, ti);
+                // Type params are placeholders; field types referencing them resolve when used.
+                for (sd.type_params) |tp| {
+                    if (!types.contains(tp)) {
+                        const tpi = try a.create(TypeInfo);
+                        tpi.* = .{ .kind = .named, .name = tp };
+                        try types.put(a, tp, tpi);
+                    }
+                }
             },
             .enum_decl => |ed| {
                 const ti = try a.create(TypeInfo);
@@ -184,6 +192,16 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
     var it = fns.iterator();
     while (it.next()) |e| {
         const fd = e.value_ptr.*;
+        // Bind generic type params as opaque named types for the duration of this check.
+        var bound: std.ArrayListUnmanaged([]const u8) = .{};
+        for (fd.type_params) |tp| {
+            if (!types.contains(tp)) {
+                const ti = try a.create(TypeInfo);
+                ti.* = .{ .kind = .named, .name = tp };
+                try types.put(a, tp, ti);
+                try bound.append(a, tp);
+            }
+        }
         // contexts: with before return — already parsed; ensure types resolve
         for (fd.contexts) |ctx| {
             _ = try resolveTypeExpr(a, &types, ctx.ty, &diags);
@@ -200,6 +218,7 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
         if (fd.body) |body| {
             try checkFunctionBody(a, &types, &fns, fd.params, fd.contexts, body, &diags);
         }
+        for (bound.items) |tp| _ = types.remove(tp);
     }
 
     // methods: structural interface satisfaction (basic)
@@ -300,6 +319,32 @@ fn resolveTypeExpr(
             };
             return ti;
         },
+        .named_app => |na| {
+            // Surface accept: resolve args; treat as named struct of mangled form.
+            var buf: std.ArrayListUnmanaged(u8) = .{};
+            try buf.appendSlice(a, na.name);
+            for (na.args) |arg| {
+                const at = try resolveTypeExpr(a, types, arg, diags);
+                try buf.appendSlice(a, "__");
+                try buf.appendSlice(a, at.name);
+            }
+            const mangled = try buf.toOwnedSlice(a);
+            if (types.get(mangled)) |t| return t;
+            if (types.get(na.name)) |t| return t;
+            const ti = try a.create(TypeInfo);
+            ti.* = .{ .kind = .struct_ty, .name = mangled };
+            try types.put(a, mangled, ti);
+            return ti;
+        },
+        .tuple => |elems| {
+            for (elems) |el| _ = try resolveTypeExpr(a, types, el, diags);
+            const ti = try a.create(TypeInfo);
+            ti.* = .{
+                .kind = .struct_ty,
+                .name = try std.fmt.allocPrint(a, "__Tup{d}", .{elems.len}),
+            };
+            return ti;
+        },
         .iface_fn => {
             const ti = try a.create(TypeInfo);
             ti.* = .{ .kind = .iface_fn, .name = "iface_fn" };
@@ -394,6 +439,14 @@ fn checkStmt(
             }
             if (ty) |t| {
                 try scope.vars.put(a, vd.name, .{ .ty = t, .mutable = vd.mutable });
+            }
+        },
+        .destructure => |ds| {
+            const it = try checkExpr(a, types, fns, scope, ds.init, diags);
+            _ = it;
+            const i64t = types.get("i64").?;
+            for (ds.names) |n| {
+                try scope.vars.put(a, n, .{ .ty = i64t, .mutable = ds.mutable });
             }
         },
         .assign => |as| {
@@ -595,6 +648,22 @@ fn checkExpr(
                 if (fns.get(c.callee.ident)) |fd| {
                     for (c.args) |arg| _ = try checkExpr(a, types, fns, scope, arg, diags);
                     for (c.with_args) |w| _ = try checkExpr(a, types, fns, scope, w, diags);
+                    for (c.type_args) |ta| _ = try resolveTypeExpr(a, types, ta, diags);
+                    if (fd.type_params.len > 0 and c.type_args.len == fd.type_params.len) {
+                        // Temporarily bind T → concrete for return-type resolve.
+                        var saved: std.ArrayListUnmanaged(struct { []const u8, ?*TypeInfo }) = .{};
+                        for (fd.type_params, 0..) |tp, i| {
+                            const prev = types.get(tp);
+                            try saved.append(a, .{ tp, prev });
+                            const concrete = try resolveTypeExpr(a, types, c.type_args[i], diags);
+                            try types.put(a, tp, concrete);
+                        }
+                        const result = if (fd.ret) |r| try resolveTypeExpr(a, types, r, diags) else try voidType(a);
+                        for (saved.items) |s| {
+                            if (s[1]) |p| try types.put(a, s[0], p) else _ = types.remove(s[0]);
+                        }
+                        return result;
+                    }
                     if (fd.ret) |r| return try resolveTypeExpr(a, types, r, diags);
                     return try voidType(a);
                 }
@@ -681,12 +750,24 @@ fn checkExpr(
             return try voidType(a);
         },
         .struct_lit => |sl| {
-            if (types.get(sl.type_name)) |t| {
-                for (sl.fields) |f| _ = try checkExpr(a, types, fns, scope, f.value, diags);
-                return t;
+            for (sl.fields) |f| _ = try checkExpr(a, types, fns, scope, f.value, diags);
+            if (sl.type_args.len > 0) {
+                const te = try a.create(ast.TypeExpr);
+                te.* = .{ .named_app = .{ .name = sl.type_name, .args = sl.type_args } };
+                return try resolveTypeExpr(a, types, te, diags);
             }
+            if (types.get(sl.type_name)) |t| return t;
             try diags.append(a, .{ .message = try std.fmt.allocPrint(a, "unknown struct '{s}'", .{sl.type_name}) });
             return try voidType(a);
+        },
+        .tuple => |elems| {
+            for (elems) |el| _ = try checkExpr(a, types, fns, scope, el, diags);
+            const ti = try a.create(TypeInfo);
+            ti.* = .{
+                .kind = .struct_ty,
+                .name = try std.fmt.allocPrint(a, "__Tup{d}", .{elems.len}),
+            };
+            return ti;
         },
     }
 }

@@ -1,0 +1,19 @@
+// Multi-return tuples + destructure (JOG-87 P1).
+
+fn pair(a: i64, b: i64): (i64, i64) {
+    return (a, b)
+}
+
+fn main() {
+    val (x, y) = pair(3, 4)
+    if (x + y == 7) {
+        val t = (10, 20)
+        if (t._0 + t._1 == 30) {
+            print("tuples ok\n")
+        } else {
+            panic("fields\n")
+        }
+    } else {
+        panic("destructure\n")
+    }
+}
