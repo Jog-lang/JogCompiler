@@ -1,0 +1,57 @@
+// Gate step 4: elastic blocking/IO Dispatcher pool (stackful).
+// Primary pool workers 0-1 stay responsive while blockers sleep on the IO pool.
+// Four concurrent sleep_ms jobs force the IO pool to grow beyond its min (1).
+
+fn cpu_work(arg: *byte) {
+    print("cpu\n")
+    print_tid()
+    yield()
+    print("cpu\n")
+    print_tid()
+    yield()
+    print("cpu\n")
+    print_tid()
+    yield()
+    print("cpu\n")
+    print_tid()
+    yield()
+    print("cpu\n")
+    print_tid()
+    yield()
+    print("cpu\n")
+    print_tid()
+    yield()
+    print("cpu\n")
+    print_tid()
+    yield()
+    print("cpu\n")
+    print_tid()
+}
+
+fn blocker(arg: *byte) {
+    print("block-enter\n")
+    print_tid()
+    sleep_ms(40)
+    print("block-leave\n")
+    print_tid()
+}
+
+fn main() {
+    val primary = dispatcher_pool(2)
+    val io = dispatcher_io()
+    if (primary != 0) {
+        panic("primary id\n")
+    }
+    if (io != 1) {
+        panic("io id\n")
+    }
+    with (io) {
+        go(blocker, null)
+        go(blocker, null)
+        go(blocker, null)
+        go(blocker, null)
+    }
+    go(cpu_work, null)
+    coro_drain()
+    print("io done\n")
+}
