@@ -512,14 +512,17 @@ fn checkExpr(
             if (c.callee.* == .ident and (std.mem.eql(u8, c.callee.ident, "yield") or
                 std.mem.eql(u8, c.callee.ident, "coro_drain") or
                 std.mem.eql(u8, c.callee.ident, "coro_park") or
-                std.mem.eql(u8, c.callee.ident, "print_tid")))
+                std.mem.eql(u8, c.callee.ident, "print_tid") or
+                std.mem.eql(u8, c.callee.ident, "sleep_ms")))
             {
+                for (c.args) |arg| _ = try checkExpr(a, types, fns, scope, arg, diags);
                 return try voidType(a);
             }
             if (c.callee.* == .ident and (std.mem.eql(u8, c.callee.ident, "dispatcher_single") or
                 std.mem.eql(u8, c.callee.ident, "dispatcher_pool") or
                 std.mem.eql(u8, c.callee.ident, "dispatcher_new") or
-                std.mem.eql(u8, c.callee.ident, "dispatcher_get")))
+                std.mem.eql(u8, c.callee.ident, "dispatcher_get") or
+                std.mem.eql(u8, c.callee.ident, "dispatcher_io")))
             {
                 for (c.args) |arg| _ = try checkExpr(a, types, fns, scope, arg, diags);
                 const ti = try a.create(TypeInfo);

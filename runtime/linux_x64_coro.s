@@ -1,4 +1,5 @@
 # Jog v2 stackful coroutine scheduler (linux x86_64 SysV).
+# Gate step 4: blocking/IO elastic Dispatcher pool (stackful; grow under load).
 # Gate step 3: with (Dispatcher) cross-pool hop (park + rsp swap onto target pool).
 # Gate step 2: multi-worker pool + work-steal; ambient Dispatcher.
 # Gate step 1 (rsp swap, park stubs) preserved; single-thread via dispatcher_single.
@@ -6,6 +7,8 @@
 # wakes idle workers; finish uses EXITING+YRQ retire (never yield-requeue after
 # clear) so go() cannot reuse a winding-down stack; steal start = rdtsc % n.
 # Steal and yield requeue stay within the coro’s current Dispatcher pool.
+# IO pool: dispatcher_io() singleton; grows live workers toward pool_max when
+# queued work >= live workers; shrink-beyond-min deferred (workers stay once grown).
 #
 # Slot layout (128 bytes):
 #   0x00 rbx  0x08 rbp  0x10 r12  0x18 rsp
@@ -28,7 +31,7 @@
 .set JOGRT_CORO_PAGE, 4096
 .set JOGRT_CORO_MAP, (JOGRT_CORO_PAGE + JOGRT_CORO_STACK)
 
-.set JOGRT_MAX_WORKERS, 8
+.set JOGRT_MAX_WORKERS, 16
 .set JOGRT_DEFAULT_WORKERS, 4
 .set JOGRT_MAX_POOLS, 4
 .set JOGRT_DISP_NEST, 4
@@ -36,6 +39,8 @@
 .set JOGRT_WORKER_STACK, 131072
 .set JOGRT_TLS_SIZE, 32
 .set JOGRT_HOME_SIZE, 128
+.set JOGRT_IO_DEFAULT_MIN, 1
+.set JOGRT_IO_DEFAULT_MAX, 4
 
 .set CORO_OFF_RSP, 0x18
 .set CORO_OFF_RIP, 0x38
@@ -59,6 +64,7 @@
 .set SYS_WRITE, 1
 .set SYS_MMAP, 9
 .set SYS_MPROTECT, 10
+.set SYS_NANOSLEEP, 35
 .set SYS_CLONE, 56
 .set SYS_EXIT, 60
 .set SYS_FUTEX, 202
@@ -104,6 +110,12 @@ jogrt_pool_base:
   .zero JOGRT_MAX_POOLS * 8
 jogrt_pool_nw:
   .zero JOGRT_MAX_POOLS * 8
+jogrt_pool_min:
+  .zero JOGRT_MAX_POOLS * 8
+jogrt_pool_max:
+  .zero JOGRT_MAX_POOLS * 8
+jogrt_pool_elastic:
+  .zero JOGRT_MAX_POOLS * 8   # 1 = blocking/IO elastic pool
 jogrt_pool_rr:
   .zero JOGRT_MAX_POOLS * 8
 jogrt_wid_pool:
@@ -112,6 +124,10 @@ jogrt_disp_depth:
   .zero JOGRT_CORO_MAX * 8
 jogrt_disp_stack:
   .zero JOGRT_CORO_MAX * JOGRT_DISP_NEST * 8
+jogrt_io_disp:
+  .zero 8                     # 0 = unset; else pool id + 1 (so id 0 is representable)
+jogrt_elastic_lock:
+  .zero 8
 
 .align 16
 jogrt_tls:
@@ -304,6 +320,7 @@ jogrt_coro_init:
   ret
 
 # rdi=pool_id, rsi=base_wid, rdx=nworkers — record pool tables (no spawn).
+# Fixed pools: min=max=nw, elastic=0. Caller may overwrite min/max/elastic after.
 .type jogrt_pool_register, @function
 jogrt_pool_register:
   push rbx
@@ -317,6 +334,12 @@ jogrt_pool_register:
   mov qword ptr [rax + rbx * 8], r12
   lea rax, [rip + jogrt_pool_nw]
   mov qword ptr [rax + rbx * 8], r13
+  lea rax, [rip + jogrt_pool_min]
+  mov qword ptr [rax + rbx * 8], r13
+  lea rax, [rip + jogrt_pool_max]
+  mov qword ptr [rax + rbx * 8], r13
+  lea rax, [rip + jogrt_pool_elastic]
+  mov qword ptr [rax + rbx * 8], 0
   lea rax, [rip + jogrt_pool_rr]
   mov qword ptr [rax + rbx * 8], 0
   xor r14d, r14d
@@ -343,6 +366,7 @@ jogrt_pool_register:
   ret
 
 # rdi = pool id, rsi = coro index — RR enqueue onto that pool + wake.
+# Elastic pools may grow a worker when queued work pressure is high.
 .type jogrt_pool_enqueue, @function
 jogrt_pool_enqueue:
   push rbx
@@ -371,6 +395,13 @@ jogrt_pool_enqueue:
   mov rsi, r12
   call jogrt_wq_push
   call jogrt_wake_one
+  # Grow elastic IO pool under backlog (queued >= live workers).
+  lea rax, [rip + jogrt_pool_elastic]
+  cmp qword ptr [rax + rbx * 8], 0
+  je .Lpenq_done
+  mov rdi, rbx
+  call jogrt_elastic_maybe_grow
+.Lpenq_done:
   pop r13
   pop r12
   pop rbx
@@ -522,6 +553,213 @@ jogrt_dispatcher_get:
   lea rdi, [rip + jogrt_disp_bad_msg]
   mov esi, jogrt_disp_bad_msg_len
   call jogrt_panic
+
+# dispatcher_io(): singleton elastic blocking/IO Dispatcher (Kotlin IO analogue).
+# Starts with JOGRT_IO_DEFAULT_MIN workers; grows toward min(DEFAULT_MAX, remaining
+# worker budget) when enqueue backlog >= live workers. Shrink deferred.
+# → rax = Dispatcher handle (pool id)
+.globl jogrt_dispatcher_io
+.type jogrt_dispatcher_io, @function
+jogrt_dispatcher_io:
+  push rbx
+  push r12
+  push r13
+  push r14
+  push r15
+  call jogrt_coro_init
+  mov rax, qword ptr [rip + jogrt_io_disp]
+  test rax, rax
+  jz .Lio_create
+  dec rax
+  pop r15
+  pop r14
+  pop r13
+  pop r12
+  pop rbx
+  ret
+.Lio_create:
+  mov r12, qword ptr [rip + jogrt_npools]
+  cmp r12, JOGRT_MAX_POOLS
+  jae .Lio_fail
+  mov r13, qword ptr [rip + jogrt_nworkers]
+  mov rax, JOGRT_MAX_WORKERS
+  sub rax, r13
+  cmp rax, JOGRT_IO_DEFAULT_MIN
+  jb .Lio_fail
+  mov r14, JOGRT_IO_DEFAULT_MAX
+  cmp r14, rax
+  jbe .Lio_max_ok
+  mov r14, rax                              # r14 = actual max
+.Lio_max_ok:
+  mov r15, JOGRT_IO_DEFAULT_MIN             # r15 = min / initial live
+  cmp r15, r14
+  jbe .Lio_min_ok
+  mov r15, r14
+.Lio_min_ok:
+  # register pool at [r13, r13+r15) live; max may grow within budget
+  mov rdi, r12
+  mov rsi, r13
+  mov rdx, r15
+  call jogrt_pool_register
+  lea rax, [rip + jogrt_pool_min]
+  mov qword ptr [rax + r12 * 8], r15
+  lea rax, [rip + jogrt_pool_max]
+  mov qword ptr [rax + r12 * 8], r14
+  lea rax, [rip + jogrt_pool_elastic]
+  mov qword ptr [rax + r12 * 8], 1
+  # Pre-bind wid→pool for the full elastic range so grow only spawns.
+  xor ebx, ebx
+.Lio_bind:
+  cmp rbx, r14
+  jae .Lio_bind_done
+  mov rax, r13
+  add rax, rbx
+  lea rcx, [rip + jogrt_wid_pool]
+  mov qword ptr [rcx + rax * 8], r12
+  inc rbx
+  jmp .Lio_bind
+.Lio_bind_done:
+  add qword ptr [rip + jogrt_nworkers], r15
+  mov rax, r12
+  inc rax
+  mov qword ptr [rip + jogrt_io_disp], rax  # store id+1
+  # If workers already running, spawn the initial IO range; else pool_ensure will.
+  cmp qword ptr [rip + jogrt_pool_started], 0
+  je .Lio_ret
+  cmp qword ptr [rip + jogrt_disp_mode], 1
+  je .Lio_ret
+  mov rdi, r13
+  mov rsi, qword ptr [rip + jogrt_nworkers]
+  call jogrt_spawn_workers
+.Lio_ret:
+  mov rax, r12
+  pop r15
+  pop r14
+  pop r13
+  pop r12
+  pop rbx
+  ret
+.Lio_fail:
+  lea rdi, [rip + jogrt_disp_io_fail_msg]
+  mov esi, jogrt_disp_io_fail_msg_len
+  call jogrt_panic
+
+# rdi = pool id — grow one worker if elastic backlog warrants it.
+.type jogrt_elastic_maybe_grow, @function
+jogrt_elastic_maybe_grow:
+  push rbx
+  push r12
+  push r13
+  push r14
+  push r15
+  mov rbx, rdi
+  lea rax, [rip + jogrt_pool_elastic]
+  cmp qword ptr [rax + rbx * 8], 0
+  je .Lel_done
+  lea rdi, [rip + jogrt_elastic_lock]
+  call jogrt_lock
+  lea rax, [rip + jogrt_pool_nw]
+  mov r12, qword ptr [rax + rbx * 8]       # live
+  lea rax, [rip + jogrt_pool_max]
+  mov r13, qword ptr [rax + rbx * 8]       # max
+  cmp r12, r13
+  jae .Lel_unlock
+  cmp qword ptr [rip + jogrt_nworkers], JOGRT_MAX_WORKERS
+  jae .Lel_unlock
+  # Count queued items across live workers in this pool.
+  lea rax, [rip + jogrt_pool_base]
+  mov r14, qword ptr [rax + rbx * 8]       # base
+  xor r15d, r15d                           # queued
+  xor ecx, ecx
+.Lel_qloop:
+  cmp rcx, r12
+  jae .Lel_qdone
+  mov rdx, r14
+  add rdx, rcx
+  mov rax, rdx
+  imul rax, rax, 8
+  lea rsi, [rip + jogrt_wq_tail]
+  mov r8, qword ptr [rsi + rax]
+  lea rsi, [rip + jogrt_wq_head]
+  mov r9, qword ptr [rsi + rax]
+  sub r8, r9
+  add r15, r8
+  inc rcx
+  jmp .Lel_qloop
+.Lel_qdone:
+  # Grow when backlog >= live workers (need another OS thread for blocking work).
+  cmp r15, r12
+  jb .Lel_unlock
+  # Append one worker at base+live (must equal current nworkers for contiguous wids).
+  mov r8, r14
+  add r8, r12                              # new wid
+  cmp r8, qword ptr [rip + jogrt_nworkers]
+  jne .Lel_unlock                          # only grow at end of global wid space
+  lea rax, [rip + jogrt_pool_nw]
+  inc qword ptr [rax + rbx * 8]
+  inc qword ptr [rip + jogrt_nworkers]
+  lea rcx, [rip + jogrt_wid_pool]
+  mov qword ptr [rcx + r8 * 8], rbx
+  lea rdi, [rip + jogrt_elastic_lock]
+  call jogrt_unlock
+  # Spawn outside lock (clone).
+  cmp qword ptr [rip + jogrt_pool_started], 0
+  je .Lel_done
+  cmp qword ptr [rip + jogrt_disp_mode], 1
+  je .Lel_done
+  mov rdi, r8
+  mov rsi, r8
+  inc rsi
+  call jogrt_spawn_workers
+  call jogrt_wake_one
+  pop r15
+  pop r14
+  pop r13
+  pop r12
+  pop rbx
+  ret
+.Lel_unlock:
+  lea rdi, [rip + jogrt_elastic_lock]
+  call jogrt_unlock
+.Lel_done:
+  pop r15
+  pop r14
+  pop r13
+  pop r12
+  pop rbx
+  ret
+
+# sleep_ms(ms): blocking nanosleep on the current OS thread (IO-pool proof).
+# Does not yield the coro — pins this worker until the sleep returns.
+.globl jogrt_sleep_ms
+.type jogrt_sleep_ms, @function
+jogrt_sleep_ms:
+  push rbx
+  mov rbx, rdi
+  test rbx, rbx
+  jle .Lsleep_ret
+  # timespec on stack: tv_sec, tv_nsec
+  mov rax, rbx
+  mov ecx, 1000
+  xor edx, edx
+  div rcx                                  # rax=sec, rdx=ms rem
+  mov rcx, rdx
+  imul rcx, rcx, 1000000                   # nsec
+  sub rsp, 16
+  mov qword ptr [rsp], rax
+  mov qword ptr [rsp + 8], rcx
+.Lsleep_retry:
+  mov eax, SYS_NANOSLEEP
+  mov rdi, rsp
+  xor esi, esi
+  syscall
+  cmp rax, -4                              # -EINTR
+  je .Lsleep_retry
+  add rsp, 16
+.Lsleep_ret:
+  xor eax, eax
+  pop rbx
+  ret
 
 # Enter Dispatcher context: nest + migrate if pool differs (Kotlin withContext shape).
 .globl jogrt_dispatcher_enter
@@ -1608,6 +1846,9 @@ jogrt_disp_bad_msg_len = . - jogrt_disp_bad_msg
 jogrt_disp_new_fail_msg:
   .ascii "jogrt: dispatcher_new failed (pools/workers exhausted)\n"
 jogrt_disp_new_fail_msg_len = . - jogrt_disp_new_fail_msg
+jogrt_disp_io_fail_msg:
+  .ascii "jogrt: dispatcher_io failed (pools/workers exhausted)\n"
+jogrt_disp_io_fail_msg_len = . - jogrt_disp_io_fail_msg
 jogrt_disp_nest_msg:
   .ascii "jogrt: Dispatcher with nest too deep\n"
 jogrt_disp_nest_msg_len = . - jogrt_disp_nest_msg

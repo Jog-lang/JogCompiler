@@ -31,6 +31,7 @@ build coro_yield.jog coro_yield
 build coro_pool.jog coro_pool
 build coro_pool_stress.jog coro_pool_stress
 build coro_with_dispatcher.jog coro_with
+build coro_io_dispatcher.jog coro_io
 
 echo "== coro_with_dispatcher (gate 3) x$ROUNDS =="
 for i in $(seq 1 "$ROUNDS"); do
@@ -52,6 +53,38 @@ for cid, wids in by.items():
 PY
 done
 echo "with-dispatcher ok"
+
+echo "== coro_io_dispatcher (gate 4) x$ROUNDS =="
+for i in $(seq 1 "$ROUNDS"); do
+  out="$(run_bounded coro_io)" || { echo "HANG/FAIL io round $i"; exit 1; }
+  echo "$out" | tail -n1 | grep -q 'io done' || { echo "FAIL io round $i"; echo "$out"; exit 1; }
+  python3 - "$out" <<'PY' || { echo "FAIL io checks round $i"; echo "$out"; exit 1; }
+import re, sys
+out = sys.argv[1]
+lines = out.splitlines()
+assert any(l == "io done" for l in lines), "missing io done"
+assert any(l == "cpu" for l in lines), "missing cpu progress"
+assert sum(1 for l in lines if l == "block-enter") >= 4
+assert sum(1 for l in lines if l == "block-leave") >= 4
+wids = []
+for line in lines:
+    m = re.match(r"tid=\d+ wid=(\d+) cid=(\d+)", line)
+    if m:
+        wids.append(int(m.group(1)))
+assert wids, "no tid lines"
+# Default pool (primary 2 workers) must run; unlocked print can interleave
+# markers with tid lines, so attribute by wid ranges only.
+assert any(w in (0, 1) for w in wids), wids
+io_wids = [w for w in wids if w >= 2]
+assert io_wids, wids
+assert len(set(io_wids)) >= 2, ("expected elastic IO grow", io_wids)
+# cpu marker while blockers are outstanding (default pool not stalled).
+enter_i = next(i for i, l in enumerate(lines) if l == "block-enter")
+leave_i = max(i for i, l in enumerate(lines) if l == "block-leave")
+assert any(l == "cpu" for l in lines[enter_i:leave_i+1]), "cpu did not progress during blocking window"
+PY
+done
+echo "io-dispatcher ok"
 
 echo "== coro_yield x$ROUNDS =="
 for i in $(seq 1 "$ROUNDS"); do
