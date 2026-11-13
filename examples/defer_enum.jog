@@ -1,0 +1,45 @@
+// defer (LIFO) + tag enums + when (JOG-87 P1).
+
+enum Color {
+    Red
+    Green
+    Blue = 10
+}
+
+fn paint(c: Color): i64 {
+    return when c {
+        Red -> 1
+        Green -> 2
+        Blue -> 10
+        else -> 0
+    }
+}
+
+fn main() {
+    var n: i64 = 0
+    if (true) {
+        defer {
+            n = n + 1
+        }
+        defer {
+            n = n + 10
+        }
+        if (paint(Color.Red) != 1) {
+            panic("red\n")
+        }
+        if (paint(Color.Blue) != 10) {
+            panic("blue\n")
+        }
+        if (Color.Green != 1) {
+            panic("green tag\n")
+        }
+        if (paint(Color.Green) != 2) {
+            panic("green when\n")
+        }
+    }
+    if (n == 11) {
+        print("defer enum ok\n")
+    } else {
+        panic("defer count\n")
+    }
+}

@@ -29,6 +29,10 @@ pub const TokenKind = enum {
     kw_break,
     kw_for,
     kw_continue,
+    kw_defer,
+    kw_enum,
+    kw_when,
+    kw_import,
     // punct
     at,
     slash,
@@ -42,6 +46,7 @@ pub const TokenKind = enum {
     gte,
     shl,
     shr,
+    arrow, // ->
     lparen,
     rparen,
     lbrace,
@@ -166,6 +171,11 @@ pub const Lexer = struct {
             self.advance();
             return .{ .kind = .shr, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
         }
+        if (c == '-' and self.i + 1 < self.src.len and self.src[self.i + 1] == '>') {
+            self.advance();
+            self.advance();
+            return .{ .kind = .arrow, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+        }
         // Division vs // comment (comments already skipped in trivia when //).
         if (c == '/' and !(self.i + 1 < self.src.len and self.src[self.i + 1] == '/')) {
             self.advance();
@@ -270,6 +280,10 @@ fn keyword(text: []const u8) TokenKind {
         .{ "break", TokenKind.kw_break },
         .{ "for", TokenKind.kw_for },
         .{ "continue", TokenKind.kw_continue },
+        .{ "defer", TokenKind.kw_defer },
+        .{ "enum", TokenKind.kw_enum },
+        .{ "when", TokenKind.kw_when },
+        .{ "import", TokenKind.kw_import },
     };
     inline for (map) |e| {
         if (std.mem.eql(u8, text, e[0])) return e[1];

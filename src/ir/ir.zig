@@ -94,6 +94,20 @@ const StructInfo = struct {
     fields: []ast.Field,
 };
 
+const EnumInfo = struct {
+    variants: []EnumVariantVal,
+};
+
+const EnumVariantVal = struct {
+    name: []const u8,
+    value: i64,
+};
+
+const DeferItem = union(enum) {
+    expr: *ast.Expr,
+    block: *ast.Block,
+};
+
 const MethodInfo = struct {
     mangled: []const u8,
     pointer_recv: bool,
@@ -152,6 +166,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
     var callees: std.ArrayListUnmanaged(Callee) = .{};
     var callee_map: std.StringHashMapUnmanaged(u32) = .{};
     var structs: std.StringHashMapUnmanaged(StructInfo) = .{};
+    var enums: std.StringHashMapUnmanaged(EnumInfo) = .{};
     var methods: std.StringHashMapUnmanaged(MethodInfo) = .{}; // "Type.method"
     var ifaces: std.StringHashMapUnmanaged(IfaceInfo) = .{};
     var fn_infos: std.StringHashMapUnmanaged(FnInfo) = .{};
@@ -185,6 +200,16 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
     for (file.decls) |d| {
         switch (d) {
             .struct_decl => |sd| try structs.put(a, sd.name, .{ .fields = sd.fields }),
+            .enum_decl => |ed| {
+                var variants: std.ArrayListUnmanaged(EnumVariantVal) = .{};
+                var next: i64 = 0;
+                for (ed.variants) |v| {
+                    const val = v.value orelse next;
+                    try variants.append(a, .{ .name = v.name, .value = val });
+                    next = val + 1;
+                }
+                try enums.put(a, ed.name, .{ .variants = try variants.toOwnedSlice(a) });
+            },
             .interface_struct => |ins| try ifaces.put(a, ins.name, .{ .methods = ins.methods }),
             .extern_block => |eb| {
                 if (eb.link_lib) |lib| {
@@ -281,7 +306,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                 .exported = fd.exported or std.mem.eql(u8, fd.name, "main"),
                 .self_type = null,
                 .pointer_recv = false,
-            }, &strings, &callee_map, &structs, &methods, &ifaces, &fn_infos, &vtables, &vtable_map);
+            }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map);
             try funcs.append(a, f);
         } else if (d == .method and d.method.body != null) {
             const md = d.method;
@@ -294,7 +319,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                 .exported = true,
                 .self_type = md.type_name,
                 .pointer_recv = md.pointer_recv,
-            }, &strings, &callee_map, &structs, &methods, &ifaces, &fn_infos, &vtables, &vtable_map);
+            }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map);
             try funcs.append(a, f);
         }
     }
@@ -328,6 +353,7 @@ const Ctx = struct {
     strings: *std.ArrayListUnmanaged([]const u8),
     callee_map: *std.StringHashMapUnmanaged(u32),
     structs: *std.StringHashMapUnmanaged(StructInfo),
+    enums: *std.StringHashMapUnmanaged(EnumInfo),
     methods: *std.StringHashMapUnmanaged(MethodInfo),
     ifaces: *std.StringHashMapUnmanaged(IfaceInfo),
     fn_infos: *std.StringHashMapUnmanaged(FnInfo),
@@ -342,6 +368,7 @@ const Ctx = struct {
     break_jmps: *std.ArrayListUnmanaged(usize),
     /// Indices of `jmp` insts from `continue`; patched to loop head.
     continue_jmps: *std.ArrayListUnmanaged(usize),
+    defer_stack: *std.ArrayListUnmanaged(std.ArrayListUnmanaged(DeferItem)),
 
     fn fresh(self: *Ctx) !u32 {
         const s = self.next_slot.*;
@@ -359,6 +386,7 @@ fn lowerFn(
     strings: *std.ArrayListUnmanaged([]const u8),
     callee_map: *std.StringHashMapUnmanaged(u32),
     structs: *std.StringHashMapUnmanaged(StructInfo),
+    enums: *std.StringHashMapUnmanaged(EnumInfo),
     methods: *std.StringHashMapUnmanaged(MethodInfo),
     ifaces: *std.StringHashMapUnmanaged(IfaceInfo),
     fn_infos: *std.StringHashMapUnmanaged(FnInfo),
@@ -401,11 +429,13 @@ fn lowerFn(
     var insts: std.ArrayListUnmanaged(Inst) = .{};
     var break_jmps: std.ArrayListUnmanaged(usize) = .{};
     var continue_jmps: std.ArrayListUnmanaged(usize) = .{};
+    var defer_stack: std.ArrayListUnmanaged(std.ArrayListUnmanaged(DeferItem)) = .{};
     var ctx = Ctx{
         .a = a,
         .strings = strings,
         .callee_map = callee_map,
         .structs = structs,
+        .enums = enums,
         .methods = methods,
         .ifaces = ifaces,
         .fn_infos = fn_infos,
@@ -418,9 +448,11 @@ fn lowerFn(
         .ambient = &ambient,
         .break_jmps = &break_jmps,
         .continue_jmps = &continue_jmps,
+        .defer_stack = &defer_stack,
     };
     try lowerBlock(&ctx, fl.body);
     if (insts.items.len == 0 or insts.items[insts.items.len - 1].op != .ret) {
+        try emitAllDefers(&ctx);
         try ctx.emit(.{ .op = .ret, .src0 = none });
     }
     return .{
@@ -478,7 +510,42 @@ fn isBuiltinScalar(name: []const u8) bool {
 }
 
 fn lowerBlock(ctx: *Ctx, block: *ast.Block) LowerError!void {
+    try ctx.defer_stack.append(ctx.a, .{});
     for (block.stmts) |stmt| try lowerStmt(ctx, stmt);
+    try emitCurrentDefers(ctx);
+    _ = ctx.defer_stack.pop();
+}
+
+fn emitDeferItem(ctx: *Ctx, item: DeferItem) LowerError!void {
+    switch (item) {
+        .expr => |ex| _ = try lowerExpr(ctx, ex),
+        .block => |b| try lowerBlock(ctx, b),
+    }
+}
+
+fn emitCurrentDefers(ctx: *Ctx) LowerError!void {
+    if (ctx.defer_stack.items.len == 0) return;
+    const frame = &ctx.defer_stack.items[ctx.defer_stack.items.len - 1];
+    var i: usize = frame.items.len;
+    while (i > 0) {
+        i -= 1;
+        try emitDeferItem(ctx, frame.items[i]);
+    }
+    frame.clearRetainingCapacity();
+}
+
+fn emitAllDefers(ctx: *Ctx) LowerError!void {
+    var fi: usize = ctx.defer_stack.items.len;
+    while (fi > 0) {
+        fi -= 1;
+        const frame = &ctx.defer_stack.items[fi];
+        var i: usize = frame.items.len;
+        while (i > 0) {
+            i -= 1;
+            try emitDeferItem(ctx, frame.items[i]);
+        }
+        frame.clearRetainingCapacity();
+    }
 }
 
 fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
@@ -540,11 +607,17 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
         },
         .expr => |e| _ = try lowerExpr(ctx, e),
         .return_stmt => |re| {
-            if (re) |e| {
-                try ctx.emit(.{ .op = .ret, .src0 = try lowerExpr(ctx, e) });
-            } else {
-                try ctx.emit(.{ .op = .ret, .src0 = none });
-            }
+            const ret_slot: u32 = if (re) |e| try lowerExpr(ctx, e) else none;
+            try emitAllDefers(ctx);
+            try ctx.emit(.{ .op = .ret, .src0 = ret_slot });
+        },
+        .defer_stmt => |ds| {
+            if (ctx.defer_stack.items.len == 0) return error.TypeError;
+            const frame = &ctx.defer_stack.items[ctx.defer_stack.items.len - 1];
+            try frame.append(ctx.a, switch (ds) {
+                .expr => |ex| .{ .expr = ex },
+                .block => |b| .{ .block = b },
+            });
         },
         .if_stmt => |ifs| {
             const cond = try lowerExpr(ctx, ifs.cond);
@@ -850,6 +923,19 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
             return d;
         },
         .field => |f| {
+            if (f.base.* == .ident) {
+                if (ctx.enums.get(f.base.ident)) |ei| {
+                    for (ei.variants) |v| {
+                        if (std.mem.eql(u8, v.name, f.name)) {
+                            const d = try ctx.fresh();
+                            try ctx.emit(.{ .op = .iconst, .dst = d, .aux = v.value });
+                            return d;
+                        }
+                    }
+                    std.debug.print("lower UnknownName enum variant {s}.{s}\n", .{ f.base.ident, f.name });
+                    return error.UnknownName;
+                }
+            }
             const base = try lowerExpr(ctx, f.base);
             const off = try fieldOffset(ctx, f.base, f.name);
             const addr = try ctx.fresh();
@@ -859,6 +945,66 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
             const d = try ctx.fresh();
             try ctx.emit(.{ .op = .load, .dst = d, .src0 = addr });
             return d;
+        },
+        .when_expr => |w| {
+            const scrut = try lowerExpr(ctx, w.scrutinee);
+            const result = try ctx.fresh();
+            const enum_name = inferTypeNameFromExpr(ctx, w.scrutinee);
+            var end_jmps: std.ArrayListUnmanaged(usize) = .{};
+            for (w.arms) |arm| {
+                var tag_val: i64 = undefined;
+                var found = false;
+                if (enum_name) |en| {
+                    if (ctx.enums.get(en)) |ei| {
+                        for (ei.variants) |v| {
+                            if (std.mem.eql(u8, v.name, arm.pattern)) {
+                                tag_val = v.value;
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!found) {
+                    var eit = ctx.enums.iterator();
+                    while (eit.next()) |entry| {
+                        for (entry.value_ptr.variants) |v| {
+                            if (std.mem.eql(u8, v.name, arm.pattern)) {
+                                tag_val = v.value;
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (found) break;
+                    }
+                }
+                if (!found) {
+                    std.debug.print("lower UnknownName when pattern {s}\n", .{arm.pattern});
+                    return error.UnknownName;
+                }
+                const tag = try ctx.fresh();
+                try ctx.emit(.{ .op = .iconst, .dst = tag, .aux = tag_val });
+                const cmp = try ctx.fresh();
+                try ctx.emit(.{ .op = .eq, .dst = cmp, .src0 = scrut, .src1 = tag });
+                const jz_i = ctx.insts.items.len;
+                try ctx.emit(.{ .op = .jz, .src0 = cmp, .aux = 0 });
+                const body_v = try lowerExpr(ctx, arm.body);
+                try ctx.emit(.{ .op = .copy, .dst = result, .src0 = body_v });
+                const jmp_i = ctx.insts.items.len;
+                try ctx.emit(.{ .op = .jmp, .aux = 0 });
+                try end_jmps.append(ctx.a, jmp_i);
+                const next_pos: i64 = @intCast(ctx.insts.items.len);
+                ctx.insts.items[jz_i].aux = next_pos;
+            }
+            if (w.else_body) |eb| {
+                const body_v = try lowerExpr(ctx, eb);
+                try ctx.emit(.{ .op = .copy, .dst = result, .src0 = body_v });
+            } else {
+                try ctx.emit(.{ .op = .iconst, .dst = result, .aux = 0 });
+            }
+            const end_pos: i64 = @intCast(ctx.insts.items.len);
+            for (end_jmps.items) |ji| ctx.insts.items[ji].aux = end_pos;
+            return result;
         },
         .optional_call => |oc| {
             const base = try lowerExpr(ctx, oc.base);

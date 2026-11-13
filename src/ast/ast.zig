@@ -34,6 +34,7 @@ pub const ContextParam = struct {
 pub const Decl = union(enum) {
     type_alias: TypeAlias,
     struct_decl: StructDecl,
+    enum_decl: EnumDecl,
     interface_fn: InterfaceFn,
     interface_struct: InterfaceStruct,
     fn_decl: FnDecl,
@@ -41,6 +42,22 @@ pub const Decl = union(enum) {
     extern_block: ExternBlock,
     expect_fn: ExternFn,
     actual_fn: FnDecl,
+    import_decl: ImportDecl,
+};
+
+pub const ImportDecl = struct {
+    path: []const u8,
+    alias: ?[]const u8 = null,
+};
+
+pub const EnumDecl = struct {
+    name: []const u8,
+    variants: []EnumVariant,
+};
+
+pub const EnumVariant = struct {
+    name: []const u8,
+    value: ?i64 = null,
 };
 
 pub const ExternBlock = struct {
@@ -124,6 +141,12 @@ pub const Stmt = union(enum) {
     break_stmt,
     continue_stmt,
     with_stmt: WithStmt,
+    defer_stmt: DeferStmt,
+};
+
+pub const DeferStmt = union(enum) {
+    expr: *Expr,
+    block: *Block,
 };
 
 pub const WhileStmt = struct {
@@ -182,6 +205,18 @@ pub const Expr = union(enum) {
     optional_call: OptionalCall,
     struct_lit: StructLit,
     panic_call: PanicCall,
+    when_expr: WhenExpr,
+};
+
+pub const WhenExpr = struct {
+    scrutinee: *Expr,
+    arms: []WhenArm,
+    else_body: ?*Expr,
+};
+
+pub const WhenArm = struct {
+    pattern: []const u8,
+    body: *Expr,
 };
 
 pub const IndexAccess = struct {

@@ -22,6 +22,7 @@ pub const TypeKind = enum {
     optional,
     array_ty,
     struct_ty,
+    enum_ty,
     iface_fn,
     iface_struct,
     string_ty,
@@ -111,6 +112,12 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
                 ti.* = .{ .kind = .struct_ty, .name = sd.name };
                 try types.put(a, sd.name, ti);
             },
+            .enum_decl => |ed| {
+                const ti = try a.create(TypeInfo);
+                ti.* = .{ .kind = .enum_ty, .name = ed.name, .bits = 64, .unsigned = false };
+                try types.put(a, ed.name, ti);
+            },
+            .import_decl => {},
             .interface_fn => |*inf| {
                 try iface_fns.put(a, inf.name, inf);
                 const ti = try a.create(TypeInfo);
@@ -428,6 +435,12 @@ fn checkStmt(
             for (ws.values) |v| _ = try checkExpr(a, types, fns, scope, v, diags);
             try checkBlock(a, types, fns, ws.body, diags, scope);
         },
+        .defer_stmt => |ds| {
+            switch (ds) {
+                .expr => |ex| _ = try checkExpr(a, types, fns, scope, ex, diags),
+                .block => |b| try checkBlock(a, types, fns, b, diags, scope),
+            }
+        },
     }
 }
 
@@ -592,11 +605,23 @@ fn checkExpr(
         },
         .field => |f| {
             const base = try checkExpr(a, types, fns, scope, f.base, diags);
-            _ = base;
-            // field type resolution deferred to IR layout; treat as i64/ptr-sized
+            if (base.kind == .enum_ty) return base;
             const ti = try a.create(TypeInfo);
             ti.* = .{ .kind = .i64_ty, .name = "i64", .bits = 64, .unsigned = false };
             return ti;
+        },
+        .when_expr => |w| {
+            _ = try checkExpr(a, types, fns, scope, w.scrutinee, diags);
+            var result: ?*TypeInfo = null;
+            for (w.arms) |arm| {
+                const bt = try checkExpr(a, types, fns, scope, arm.body, diags);
+                if (result == null) result = bt;
+            }
+            if (w.else_body) |eb| {
+                const bt = try checkExpr(a, types, fns, scope, eb, diags);
+                if (result == null) result = bt;
+            }
+            return result orelse try voidType(a);
         },
         .index => |ix| {
             const base = try checkExpr(a, types, fns, scope, ix.base, diags);

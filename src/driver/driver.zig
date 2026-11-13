@@ -158,6 +158,8 @@ pub fn cmdParse(allocator: std.mem.Allocator, path: []const u8, writer: anytype)
         switch (d) {
             .type_alias => |t| try writer.print("  type {s}\n", .{t.name}),
             .struct_decl => |s| try writer.print("  struct {s}\n", .{s.name}),
+            .enum_decl => |e| try writer.print("  enum {s}\n", .{e.name}),
+            .import_decl => |i| try writer.print("  import {s}\n", .{i.path}),
             .interface_fn => |i| try writer.print("  interface fn {s}\n", .{i.name}),
             .interface_struct => |i| try writer.print("  interface struct {s}\n", .{i.name}),
             .fn_decl => |f| try writer.print("  fn {s}\n", .{f.name}),

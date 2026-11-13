@@ -81,6 +81,8 @@ pub const Parser = struct {
         switch (self.tok.kind) {
             .kw_type => return .{ .type_alias = try self.parseTypeAlias() },
             .kw_struct => return .{ .struct_decl = try self.parseStruct() },
+            .kw_enum => return .{ .enum_decl = try self.parseEnum() },
+            .kw_import => return .{ .import_decl = try self.parseImport() },
             .kw_interface => return try self.parseInterface(),
             .kw_extern => return .{ .extern_block = try self.parseExternBlock() },
             .kw_expect => {
@@ -157,6 +159,57 @@ pub const Parser = struct {
         }
         try self.expect(.rbrace);
         return .{ .fns = try fns.toOwnedSlice(self.allocator), .link_lib = null };
+    }
+
+    fn parseImport(self: *Parser) ParseError!ast.ImportDecl {
+        try self.expect(.kw_import);
+        if (self.tok.kind != .ident) return error.UnexpectedToken;
+        var path = self.tok.text;
+        self.advance();
+        while (self.tok.kind == .dot) {
+            self.advance();
+            if (self.tok.kind != .ident) return error.UnexpectedToken;
+            path = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ path, self.tok.text });
+            self.advance();
+        }
+        var alias: ?[]const u8 = null;
+        if (self.tok.kind == .kw_as) {
+            self.advance();
+            if (self.tok.kind != .ident) return error.UnexpectedToken;
+            alias = self.tok.text;
+            self.advance();
+        }
+        return .{ .path = path, .alias = alias };
+    }
+
+    fn parseEnum(self: *Parser) ParseError!ast.EnumDecl {
+        try self.expect(.kw_enum);
+        if (self.tok.kind != .ident) return error.UnexpectedToken;
+        const name = self.tok.text;
+        self.advance();
+        if (self.tok.kind == .colon) {
+            self.advance();
+            _ = try self.parseTypeExpr();
+        }
+        try self.expect(.lbrace);
+        var variants: std.ArrayListUnmanaged(ast.EnumVariant) = .{};
+        while (self.tok.kind != .rbrace and self.tok.kind != .eof) {
+            if (self.tok.kind != .ident) return error.UnexpectedToken;
+            const vname = self.tok.text;
+            self.advance();
+            var value: ?i64 = null;
+            if (self.tok.kind == .eq) {
+                self.advance();
+                if (self.tok.kind != .int) return error.UnexpectedToken;
+                value = try std.fmt.parseInt(i64, self.tok.text, 10);
+                self.advance();
+            }
+            if (self.tok.kind == .lparen) return error.UnexpectedToken;
+            try variants.append(self.allocator, .{ .name = vname, .value = value });
+            if (self.tok.kind == .comma) self.advance();
+        }
+        try self.expect(.rbrace);
+        return .{ .name = name, .variants = try variants.toOwnedSlice(self.allocator) };
     }
 
     fn parseTypeAlias(self: *Parser) ParseError!ast.TypeAlias {
@@ -490,6 +543,13 @@ pub const Parser = struct {
                 self.advance();
                 return .continue_stmt;
             },
+            .kw_defer => {
+                self.advance();
+                if (self.tok.kind == .lbrace) {
+                    return .{ .defer_stmt = .{ .block = try self.parseBlock() } };
+                }
+                return .{ .defer_stmt = .{ .expr = try self.parseExpr() } };
+            },
             .kw_with => {
                 self.advance();
                 try self.expect(.lparen);
@@ -819,6 +879,34 @@ pub const Parser = struct {
     fn parsePrimary(self: *Parser) ParseError!*ast.Expr {
         const e = try self.allocator.create(ast.Expr);
         switch (self.tok.kind) {
+            .kw_when => {
+                self.advance();
+                const scrutinee = try self.parseExpr();
+                try self.expect(.lbrace);
+                var arms: std.ArrayListUnmanaged(ast.WhenArm) = .{};
+                var else_body: ?*ast.Expr = null;
+                while (self.tok.kind != .rbrace and self.tok.kind != .eof) {
+                    if (self.tok.kind == .kw_else) {
+                        self.advance();
+                        try self.expect(.arrow);
+                        else_body = try self.parseExpr();
+                        continue;
+                    }
+                    if (self.tok.kind != .ident) return error.UnexpectedToken;
+                    const pat = self.tok.text;
+                    self.advance();
+                    try self.expect(.arrow);
+                    const body = try self.parseExpr();
+                    try arms.append(self.allocator, .{ .pattern = pat, .body = body });
+                }
+                try self.expect(.rbrace);
+                e.* = .{ .when_expr = .{
+                    .scrutinee = scrutinee,
+                    .arms = try arms.toOwnedSlice(self.allocator),
+                    .else_body = else_body,
+                } };
+                return e;
+            },
             .ident => {
                 const name = self.tok.text;
                 self.advance();
