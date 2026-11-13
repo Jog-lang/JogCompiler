@@ -1,0 +1,15 @@
+// Packed [N]byte index load/store (1-byte stride).
+
+fn main() {
+    var buf: [4]byte
+    buf[0] = 10
+    buf[1] = 20
+    buf[2] = 30
+    buf[3] = 40
+    val sum = buf[0] + buf[1] + buf[2] + buf[3]
+    if (sum == 100) {
+        print("byte array ok\n")
+    } else {
+        panic("byte array fail\n")
+    }
+}

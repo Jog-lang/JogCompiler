@@ -949,6 +949,12 @@ pub const Parser = struct {
                 e.* = .{ .int = n };
                 return e;
             },
+            .float => {
+                const n = try std.fmt.parseFloat(f64, self.tok.text);
+                self.advance();
+                e.* = .{ .float = n };
+                return e;
+            },
             .string => {
                 const raw = self.tok.text;
                 self.advance();

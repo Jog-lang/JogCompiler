@@ -1,0 +1,22 @@
+// Builtin `error` + `error?` (optional) — success is null.
+
+fn mightFail(ok: bool): error? {
+    if (ok) {
+        return null
+    }
+    return 7
+}
+
+fn main() {
+    val a = mightFail(true)
+    val b = mightFail(false)
+    if (a == null && b != null) {
+        if (b == 7) {
+            print("error opt ok\n")
+        } else {
+            panic("code\n")
+        }
+    } else {
+        panic("opt\n")
+    }
+}

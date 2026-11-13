@@ -5,6 +5,7 @@ const check = @import("../check/check.zig");
 /// Linear IR per function. Slots are i64/pointer-sized. jmp/jz targets are absolute instruction indices.
 pub const Op = enum {
     iconst,
+    fconst,
     saddr,
     slen,
     copy,
@@ -13,6 +14,12 @@ pub const Op = enum {
     mul,
     div,
     rem,
+    fadd,
+    fsub,
+    fmul,
+    fdiv,
+    load8,
+    store8,
     eq,
     ne,
     lt,
@@ -142,8 +149,10 @@ const SlotKind = enum { scalar, struct_ptr, iface_ptr, opt_ptr, raw_ptr, array_p
 const SlotMeta = struct {
     kind: SlotKind,
     type_name: []const u8 = "",
-    /// Element count when `kind == .array_ptr` (8-byte slots).
+    /// Element count when `kind == .array_ptr`.
     array_len: u64 = 0,
+    /// Element stride in bytes (1 for byte/u8, 8 otherwise).
+    elem_size: u32 = 8,
 };
 
 pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.CheckResult) !Program {
@@ -492,10 +501,13 @@ fn metaForTypeExpr(te: *ast.TypeExpr, ifaces: *std.StringHashMapUnmanaged(IfaceI
             return .{ .kind = .struct_ptr, .type_name = inner };
         },
         .array => |arr| {
+            const en = typeExprName(arr.elem);
+            const es: u32 = if (std.mem.eql(u8, en, "byte") or std.mem.eql(u8, en, "u8") or std.mem.eql(u8, en, "bool")) 1 else 8;
             return .{
                 .kind = .array_ptr,
-                .type_name = typeExprName(arr.elem),
+                .type_name = en,
                 .array_len = arr.len,
+                .elem_size = es,
             };
         },
         .name => |n| return metaForTypeName(n, ifaces),
@@ -504,7 +516,7 @@ fn metaForTypeExpr(te: *ast.TypeExpr, ifaces: *std.StringHashMapUnmanaged(IfaceI
 }
 
 fn isBuiltinScalar(name: []const u8) bool {
-    const builtins = [_][]const u8{ "byte", "u8", "bool", "u16", "u32", "u64", "i32", "i64", "usize", "str", "bytes", "void", "Dispatcher" };
+    const builtins = [_][]const u8{ "byte", "u8", "bool", "u16", "u32", "u64", "i32", "i64", "f32", "f64", "error", "usize", "str", "bytes", "void", "Dispatcher" };
     for (builtins) |b| if (std.mem.eql(u8, name, b)) return true;
     return false;
 }
@@ -554,7 +566,8 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
             var sm: SlotMeta = .{ .kind = .scalar };
             if (vd.ty) |t| sm = metaForTypeExpr(t, ctx.ifaces);
             if (sm.kind == .array_ptr and sm.array_len > 0) {
-                // Reserve N consecutive 8-byte element slots; name binds to pointer to first.
+                // One stack slot per element (8-byte frame slots). Byte/u8 still
+                // use load8/store8; index scale stays 8 so elements sit in consecutive slots.
                 const first = try ctx.fresh();
                 try ctx.emit(.{ .op = .iconst, .dst = first, .aux = 0 });
                 var i: u64 = 1;
@@ -564,8 +577,11 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
                 }
                 const ptr = try ctx.fresh();
                 try ctx.emit(.{ .op = .lea_slot, .dst = ptr, .src0 = first });
+                // Force index stride to one slot; load/store width follows elem_size.
+                var sm2 = sm;
+                sm2.elem_size = 8;
                 try ctx.slots.put(ctx.a, vd.name, ptr);
-                try ctx.meta.put(ctx.a, vd.name, sm);
+                try ctx.meta.put(ctx.a, vd.name, sm2);
                 // Optional init: only pointer assign supported (not element-wise yet).
                 if (vd.init) |init| {
                     const v = try lowerExpr(ctx, init);
@@ -592,7 +608,11 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
             const v = try lowerExpr(ctx, as.value);
             if (as.index) |ix| {
                 const addr = try lowerIndexAddr(ctx, ix.base, ix.index);
-                try ctx.emit(.{ .op = .store, .src0 = addr, .src1 = v });
+                if (indexLoadStoreWidth(ctx, ix.base) == 1) {
+                    try ctx.emit(.{ .op = .store8, .src0 = addr, .src1 = v });
+                } else {
+                    try ctx.emit(.{ .op = .store, .src0 = addr, .src1 = v });
+                }
             } else if (as.field) |fa| {
                 const base = try lowerExpr(ctx, fa.base);
                 const off = try fieldOffset(ctx, fa.base, fa.name);
@@ -746,13 +766,30 @@ fn inferTypeNameFromExpr(ctx: *Ctx, e: *ast.Expr) ?[]const u8 {
     return null;
 }
 
+fn indexStride(ctx: *Ctx, base_expr: *ast.Expr) u32 {
+    // Address stride between elements (always one IR slot = 8 for stack arrays).
+    _ = ctx;
+    _ = base_expr;
+    return 8;
+}
+
+fn indexLoadStoreWidth(ctx: *Ctx, base_expr: *ast.Expr) u32 {
+    // 1 = byte load/store; 8 = qword. Packed dense bytes deferred (slot packing).
+    if (base_expr.* == .ident) {
+        if (ctx.meta.get(base_expr.ident)) |m| {
+            if (m.kind == .array_ptr and (std.mem.eql(u8, m.type_name, "byte") or std.mem.eql(u8, m.type_name, "u8") or std.mem.eql(u8, m.type_name, "bool")))
+                return 1;
+        }
+    }
+    return 8;
+}
+
 fn lowerIndexAddr(ctx: *Ctx, base_expr: *ast.Expr, index_expr: *ast.Expr) LowerError!u32 {
-    // Stack slots grow downward: slot0 at [rbp-8], slot1 at [rbp-16], …
-    // Array base is lea(first_slot); index i addresses base - i*8.
+    // Stack slots grow downward: index i addresses base - i*stride.
     const base = try lowerExpr(ctx, base_expr);
     const idx = try lowerExpr(ctx, index_expr);
     const scale = try ctx.fresh();
-    try ctx.emit(.{ .op = .iconst, .dst = scale, .aux = 8 });
+    try ctx.emit(.{ .op = .iconst, .dst = scale, .aux = indexStride(ctx, base_expr) });
     const off = try ctx.fresh();
     try ctx.emit(.{ .op = .mul, .dst = off, .src0 = idx, .src1 = scale });
     const addr = try ctx.fresh();
@@ -780,6 +817,25 @@ fn fieldOffset(ctx: *Ctx, base_expr: *ast.Expr, field: []const u8) LowerError!i6
     return error.UnknownName;
 }
 
+fn isFloatish(ctx: *Ctx, e: *ast.Expr) bool {
+    return switch (e.*) {
+        .float => true,
+        .ident => |n| blk: {
+            if (ctx.meta.get(n)) |m| {
+                break :blk std.mem.eql(u8, m.type_name, "f64") or std.mem.eql(u8, m.type_name, "f32");
+            }
+            break :blk false;
+        },
+        .binary => |b| isFloatish(ctx, b.left) or isFloatish(ctx, b.right),
+        .unary => |u| isFloatish(ctx, u.expr),
+        .cast => |c| blk: {
+            const tn = typeExprName(c.ty);
+            break :blk std.mem.eql(u8, tn, "f64") or std.mem.eql(u8, tn, "f32");
+        },
+        else => false,
+    };
+}
+
 fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
     switch (e.*) {
         .ident => |name| {
@@ -796,6 +852,12 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
         .int => |n| {
             const d = try ctx.fresh();
             try ctx.emit(.{ .op = .iconst, .dst = d, .aux = n });
+            return d;
+        },
+        .float => |n| {
+            const d = try ctx.fresh();
+            const bits: i64 = @bitCast(n);
+            try ctx.emit(.{ .op = .fconst, .dst = d, .aux = bits });
             return d;
         },
         .string => |s| {
@@ -844,11 +906,12 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
             const l = try lowerExpr(ctx, b.left);
             const r = try lowerExpr(ctx, b.right);
             const d = try ctx.fresh();
+            const use_float = isFloatish(ctx, b.left) or isFloatish(ctx, b.right);
             switch (b.op) {
-                .add => try ctx.emit(.{ .op = .add, .dst = d, .src0 = l, .src1 = r }),
-                .sub => try ctx.emit(.{ .op = .sub, .dst = d, .src0 = l, .src1 = r }),
-                .mul => try ctx.emit(.{ .op = .mul, .dst = d, .src0 = l, .src1 = r }),
-                .div => try ctx.emit(.{ .op = .div, .dst = d, .src0 = l, .src1 = r }),
+                .add => try ctx.emit(.{ .op = if (use_float) .fadd else .add, .dst = d, .src0 = l, .src1 = r }),
+                .sub => try ctx.emit(.{ .op = if (use_float) .fsub else .sub, .dst = d, .src0 = l, .src1 = r }),
+                .mul => try ctx.emit(.{ .op = if (use_float) .fmul else .mul, .dst = d, .src0 = l, .src1 = r }),
+                .div => try ctx.emit(.{ .op = if (use_float) .fdiv else .div, .dst = d, .src0 = l, .src1 = r }),
                 .rem => try ctx.emit(.{ .op = .rem, .dst = d, .src0 = l, .src1 = r }),
                 .eq => try ctx.emit(.{ .op = .eq, .dst = d, .src0 = l, .src1 = r }),
                 .neq => try ctx.emit(.{ .op = .ne, .dst = d, .src0 = l, .src1 = r }),
@@ -895,7 +958,11 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
         .index => |ix| {
             const addr = try lowerIndexAddr(ctx, ix.base, ix.index);
             const d = try ctx.fresh();
-            try ctx.emit(.{ .op = .load, .dst = d, .src0 = addr });
+            if (indexLoadStoreWidth(ctx, ix.base) == 1) {
+                try ctx.emit(.{ .op = .load8, .dst = d, .src0 = addr });
+            } else {
+                try ctx.emit(.{ .op = .load, .dst = d, .src0 = addr });
+            }
             return d;
         },
         .call => |c| return try lowerCall(ctx, c),

@@ -16,6 +16,8 @@ pub const TypeKind = enum {
     u64_ty,
     i32_ty,
     i64_ty,
+    f32_ty,
+    f64_ty,
     usize_ty,
     named,
     pointer,
@@ -92,6 +94,9 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
     try defineBuiltin(a, &types, "u64", .{ .kind = .u64_ty, .name = "u64", .bits = 64, .unsigned = true });
     try defineBuiltin(a, &types, "i32", .{ .kind = .i32_ty, .name = "i32", .bits = 32, .unsigned = false });
     try defineBuiltin(a, &types, "i64", .{ .kind = .i64_ty, .name = "i64", .bits = 64, .unsigned = false });
+    try defineBuiltin(a, &types, "f32", .{ .kind = .f32_ty, .name = "f32", .bits = 32, .unsigned = false });
+    try defineBuiltin(a, &types, "f64", .{ .kind = .f64_ty, .name = "f64", .bits = 64, .unsigned = false });
+    try defineBuiltin(a, &types, "error", .{ .kind = .i64_ty, .name = "error", .bits = 64, .unsigned = false });
     try defineBuiltin(a, &types, "usize", .{ .kind = .usize_ty, .name = "usize", .bits = 64, .unsigned = true });
     try defineBuiltin(a, &types, "str", .{ .kind = .string_ty, .name = "str" });
     try defineBuiltin(a, &types, "bytes", .{ .kind = .bytes_ty, .name = "bytes" });
@@ -499,6 +504,11 @@ fn checkExpr(
         .int => {
             const ti = try a.create(TypeInfo);
             ti.* = .{ .kind = .i64_ty, .name = "i64", .bits = 64, .unsigned = false };
+            return ti;
+        },
+        .float => {
+            const ti = try a.create(TypeInfo);
+            ti.* = .{ .kind = .f64_ty, .name = "f64", .bits = 64, .unsigned = false };
             return ti;
         },
         .string => {

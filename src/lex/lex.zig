@@ -4,6 +4,7 @@ pub const TokenKind = enum {
     eof,
     ident,
     int,
+    float,
     string,
     // keywords
     kw_fn,
@@ -111,6 +112,11 @@ pub const Lexer = struct {
         if (c >= '0' and c <= '9') {
             self.advance();
             while (self.i < self.src.len and self.src[self.i] >= '0' and self.src[self.i] <= '9') self.advance();
+            if (self.i + 1 < self.src.len and self.src[self.i] == '.' and self.src[self.i + 1] >= '0' and self.src[self.i + 1] <= '9') {
+                self.advance(); // .
+                while (self.i < self.src.len and self.src[self.i] >= '0' and self.src[self.i] <= '9') self.advance();
+                return .{ .kind = .float, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+            }
             return .{ .kind = .int, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
         }
         if (c == '"') {

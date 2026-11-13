@@ -194,6 +194,7 @@ pub const WithStmt = struct {
 pub const Expr = union(enum) {
     ident: []const u8,
     int: i64,
+    float: f64,
     string: []const u8,
     null_lit,
     binary: Binary,

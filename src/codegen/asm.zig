@@ -97,6 +97,11 @@ fn emitInst(writer: anytype, prog: *const ir.Program, fname: []const u8, ninst: 
             try writer.print("  mov rax, {d}\n", .{inst.aux});
             try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{slot(inst.dst)});
         },
+        .fconst => {
+            // aux holds IEEE754 bit pattern of f64
+            try writer.print("  mov rax, {d}\n", .{inst.aux});
+            try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{slot(inst.dst)});
+        },
         .saddr => {
             if (inst.aux < 0) {
                 // function address: aux = -1 - callee_index
@@ -122,10 +127,20 @@ fn emitInst(writer: anytype, prog: *const ir.Program, fname: []const u8, ninst: 
             try writer.writeAll("  mov rax, qword ptr [rax]\n");
             try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{slot(inst.dst)});
         },
+        .load8 => {
+            try writer.print("  mov rax, qword ptr [rbp - {d}]\n", .{slot(inst.src0)});
+            try writer.writeAll("  movzx eax, byte ptr [rax]\n");
+            try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{slot(inst.dst)});
+        },
         .store => {
             try writer.print("  mov rax, qword ptr [rbp - {d}]\n", .{slot(inst.src0)});
             try writer.print("  mov rcx, qword ptr [rbp - {d}]\n", .{slot(inst.src1)});
             try writer.writeAll("  mov qword ptr [rax], rcx\n");
+        },
+        .store8 => {
+            try writer.print("  mov rax, qword ptr [rbp - {d}]\n", .{slot(inst.src0)});
+            try writer.print("  mov rcx, qword ptr [rbp - {d}]\n", .{slot(inst.src1)});
+            try writer.writeAll("  mov byte ptr [rax], cl\n");
         },
         .lea_slot => {
             try writer.print("  lea rax, [rbp - {d}]\n", .{slot(inst.src0)});
@@ -175,6 +190,18 @@ fn emitInst(writer: anytype, prog: *const ir.Program, fname: []const u8, ninst: 
             try writer.writeAll("  cqo\n");
             try writer.print("  idiv qword ptr [rbp - {d}]\n", .{slot(inst.src1)});
             try writer.print("  mov qword ptr [rbp - {d}], rdx\n", .{slot(inst.dst)});
+        },
+        .fadd, .fsub, .fmul, .fdiv => {
+            try writer.print("  movsd xmm0, qword ptr [rbp - {d}]\n", .{slot(inst.src0)});
+            const mop = switch (inst.op) {
+                .fadd => "addsd",
+                .fsub => "subsd",
+                .fmul => "mulsd",
+                .fdiv => "divsd",
+                else => unreachable,
+            };
+            try writer.print("  {s} xmm0, qword ptr [rbp - {d}]\n", .{ mop, slot(inst.src1) });
+            try writer.print("  movsd qword ptr [rbp - {d}], xmm0\n", .{slot(inst.dst)});
         },
         .and_op, .or_op => {
             // Lowered to short-circuit control flow in IR; should not reach asm.
