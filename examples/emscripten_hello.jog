@@ -1,0 +1,6 @@
+// Minimal wasm32-emscripten smoke: print then exit (no SDL).
+// Build: jog build examples/emscripten_hello.jog --target wasm32-emscripten -o out/hello.html
+
+fn main() {
+    print("hello emscripten\n")
+}

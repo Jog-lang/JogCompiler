@@ -84,6 +84,12 @@ pub const Callee = struct {
     float_ret: bool = false,
     /// Bit i set ⇒ argument i is f32/f64 (xmm classification for `extern`).
     float_args: u8 = 0,
+    /// Bit i set ⇒ argument i is i64/u64 (wasm32 needs real i64, not intptr_t).
+    wide_args: u8 = 0,
+    /// `extern` return is i64/u64 (wasm32 i64, not intptr_t).
+    wide_ret: bool = false,
+    /// `extern` with no return type — wasm32 void vs i32 signature.
+    void_ret: bool = false,
 };
 
 pub const Global = struct {
@@ -128,6 +134,22 @@ fn floatArgMask(params: []ast.Param) u8 {
     for (params, 0..) |p, i| {
         if (i >= 8) break;
         if (isFloatTypeExpr(p.ty)) mask |= @as(u8, 1) << @intCast(i);
+    }
+    return mask;
+}
+
+fn isWideIntTypeExpr(te: *ast.TypeExpr) bool {
+    return switch (te.*) {
+        .name => |n| std.mem.eql(u8, n, "i64") or std.mem.eql(u8, n, "u64"),
+        else => false,
+    };
+}
+
+fn wideArgMask(params: []ast.Param) u8 {
+    var mask: u8 = 0;
+    for (params, 0..) |p, i| {
+        if (i >= 8) break;
+        if (isWideIntTypeExpr(p.ty)) mask |= @as(u8, 1) << @intCast(i);
     }
     return mask;
 }
@@ -307,11 +329,15 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                 }
                 for (eb.fns) |ef| {
                     const fret = if (ef.ret) |r| isFloatTypeExpr(r) else false;
+                    const wret = if (ef.ret) |r| isWideIntTypeExpr(r) else false;
                     try internCallee(a, &callees, &callee_map, .{
                         .kind = .extern_c,
                         .name = ef.name,
                         .float_ret = fret,
                         .float_args = floatArgMask(ef.params),
+                        .wide_args = wideArgMask(ef.params),
+                        .wide_ret = wret,
+                        .void_ret = ef.ret == null,
                     });
                     var ret_name: []const u8 = "";
                     if (ef.ret) |r| ret_name = try resolveRetName(a, &structs, r);

@@ -1,4 +1,13 @@
-# Jog v2 ABI (linux x64)
+# Jog v2 ABI (linux x64 + wasm32-emscripten)
+
+## wasm32-emscripten (JOG-90)
+
+`--target wasm32-emscripten` lowers IR → C → **emcc** (not freestanding wasm32).
+Slots stay `int64_t`; extern calls cast through wasm32-friendly `intptr_t` /
+`int64_t` / `double` / `void` based on the Jog `extern` signature (`wide_args`,
+`wide_ret`, `void_ret`, `float_*`). Runtime: `runtime/emscripten/jogrt.c` +
+`jogrt_mainloop.c` (`jog_host_run_loop` → `emscripten_set_main_loop`).
+Output: `.html` / `.js` / `.wasm`. Coroutines/`go` abort (no stack switch).
 
 ## Jog ABI v0
 

@@ -6,7 +6,7 @@ const ir = @import("../ir/ir.zig");
 const link = @import("../codegen/link.zig");
 const mod = @import("../mod/mod.zig");
 
-pub const version_string = "jog 0.2.6-v2 (zig host, ir→asm→native)";
+pub const version_string = "jog 0.2.7-v2 (zig host, ir→asm→native | ir→c→emcc)";
 
 pub fn cmdVersion(writer: anytype) !void {
     try writer.print("{s}\n", .{version_string});
@@ -295,7 +295,21 @@ pub fn cmdCheck(allocator: std.mem.Allocator, path: []const u8, diag_json: bool,
     }
 }
 
+pub const BuildOptions = struct {
+    keep_asm: bool = false,
+    keep_c: bool = false,
+    target: link.Target = .native,
+    cli_libdirs: []const []const u8 = &.{},
+};
+
 pub fn cmdBuild(allocator: std.mem.Allocator, path: []const u8, out_path: []const u8, keep_asm: bool, cli_libdirs: []const []const u8, writer: anytype) !void {
+    try cmdBuildOpts(allocator, path, out_path, .{
+        .keep_asm = keep_asm,
+        .cli_libdirs = cli_libdirs,
+    }, writer);
+}
+
+pub fn cmdBuildOpts(allocator: std.mem.Allocator, path: []const u8, out_path: []const u8, opts: BuildOptions, writer: anytype) !void {
     var unit = try loadPath(allocator, path, writer);
     defer unit.deinit();
     var result = try check_mod.check(allocator, &unit.file);
@@ -317,17 +331,20 @@ pub fn cmdBuild(allocator: std.mem.Allocator, path: []const u8, out_path: []cons
     };
     defer program.deinit();
 
-    // Merge jog.mod link/libdir with CLI --libdir into the program (arena-owned).
-    try mergeLinkMeta(allocator, &program, path, cli_libdirs);
+    const mod_target: []const u8 = switch (opts.target) {
+        .native => "linux",
+        .wasm32_emscripten => "emscripten",
+    };
+    try mergeLinkMeta(allocator, &program, path, opts.cli_libdirs, mod_target);
 
     if (std.fs.path.dirname(out_path)) |dir| {
         std.fs.cwd().makePath(dir) catch {};
     }
 
-    try link.buildExecutable(allocator, &program, out_path, keep_asm, writer);
+    try link.buildExecutableTargeted(allocator, &program, out_path, opts.keep_asm, opts.keep_c, opts.target, writer);
 }
 
-fn mergeLinkMeta(allocator: std.mem.Allocator, program: *ir.Program, path: []const u8, cli_libdirs: []const []const u8) !void {
+fn mergeLinkMeta(allocator: std.mem.Allocator, program: *ir.Program, path: []const u8, cli_libdirs: []const []const u8, build_target: []const u8) !void {
     const a = program.arena.allocator();
     var libs: std.ArrayListUnmanaged([]const u8) = .{};
     var dirs: std.ArrayListUnmanaged([]const u8) = .{};
@@ -338,10 +355,16 @@ fn mergeLinkMeta(allocator: std.mem.Allocator, program: *ir.Program, path: []con
         if (mod.loadFromPath(allocator, path)) |manifest_val| {
             var m = manifest_val;
             defer m.deinit();
-            for (m.link_libs) |l| {
-                if (!containsStr(libs.items, l)) try libs.append(a, try a.dupe(u8, l));
-            }
-            if (mod.resolveLibdirs(allocator, &m)) |resolved| {
+            if (m.linksFor(allocator, build_target)) |filtered| {
+                defer {
+                    for (filtered) |l| allocator.free(l);
+                    allocator.free(filtered);
+                }
+                for (filtered) |l| {
+                    if (!containsStr(libs.items, l)) try libs.append(a, try a.dupe(u8, l));
+                }
+            } else |_| {}
+            if (m.libdirsFor(allocator, build_target)) |resolved| {
                 defer {
                     for (resolved) |p| allocator.free(p);
                     allocator.free(resolved);
@@ -392,9 +415,12 @@ pub fn usage(writer: anytype) !void {
         \\  parse <path>            parse and list declarations
         \\  check [--diag=json] <path>
         \\                          typecheck subset (JSON diags for LSP)
-        \\  build <path> -o OUT [--keep-asm] [--libdir DIR | -L DIR]...
-        \\                          IR → asm → native link (no C intermediate)
-        \\                          @link / jog.mod link.* → -l; libdir → -L + rpath
+        \\  build <path> -o OUT [--keep-asm] [--keep-c]
+        \\                          [--target wasm32-emscripten]
+        \\                          [--libdir DIR | -L DIR]...
+        \\                          native: IR → asm → zig cc
+        \\                          wasm32-emscripten: IR → C → emcc (.html/.js)
+        \\                          @link / jog.mod link.* → -l; libdir → -L (+ rpath native)
         \\  deps [path]             print module source paths (jog.mod)
         \\  help                    this message
         \\

@@ -57,9 +57,12 @@ pub fn main() !void {
         return;
     }
     if (std.mem.eql(u8, cmd, "build")) {
+        const link = @import("codegen/link.zig");
         var path: ?[]const u8 = null;
         var out_path: ?[]const u8 = null;
         var keep_asm = false;
+        var keep_c = false;
+        var target: link.Target = .native;
         var libdirs: std.ArrayListUnmanaged([]const u8) = .{};
         defer libdirs.deinit(allocator);
         while (args.next()) |a| {
@@ -70,6 +73,27 @@ pub fn main() !void {
                 };
             } else if (std.mem.eql(u8, a, "--keep-asm")) {
                 keep_asm = true;
+            } else if (std.mem.eql(u8, a, "--keep-c")) {
+                keep_c = true;
+            } else if (std.mem.eql(u8, a, "--target")) {
+                const t = args.next() orelse {
+                    try stderr.writeAll("build: --target needs wasm32-emscripten\n");
+                    std.process.exit(2);
+                };
+                if (std.mem.eql(u8, t, "wasm32-emscripten")) {
+                    target = .wasm32_emscripten;
+                } else {
+                    try stderr.print("build: unsupported --target {s} (v2: wasm32-emscripten)\n", .{t});
+                    std.process.exit(2);
+                }
+            } else if (std.mem.startsWith(u8, a, "--target=")) {
+                const t = a["--target=".len..];
+                if (std.mem.eql(u8, t, "wasm32-emscripten")) {
+                    target = .wasm32_emscripten;
+                } else {
+                    try stderr.print("build: unsupported --target {s} (v2: wasm32-emscripten)\n", .{t});
+                    std.process.exit(2);
+                }
             } else if (std.mem.eql(u8, a, "--libdir") or std.mem.eql(u8, a, "-L")) {
                 const dir = args.next() orelse {
                     try stderr.writeAll("build: --libdir needs a directory\n");
@@ -90,10 +114,16 @@ pub fn main() !void {
                 std.process.exit(2);
             }
         }
-        try driver.cmdBuild(allocator, path orelse {
+        const default_out: []const u8 = if (target == .wasm32_emscripten) "a.out.html" else "a.out";
+        try driver.cmdBuildOpts(allocator, path orelse {
             try stderr.writeAll("build: missing file\n");
             std.process.exit(2);
-        }, out_path orelse "a.out", keep_asm, libdirs.items, stdout);
+        }, out_path orelse default_out, .{
+            .keep_asm = keep_asm,
+            .keep_c = keep_c,
+            .target = target,
+            .cli_libdirs = libdirs.items,
+        }, stdout);
         return;
     }
     if (std.mem.eql(u8, cmd, "deps")) {

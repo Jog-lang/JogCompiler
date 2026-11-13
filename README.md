@@ -1,6 +1,6 @@
 # JogCompiler (v2)
 
-Zig-hosted Jog compiler that emits **native linux x64 ELF** with no C intermediate.
+Zig-hosted Jog compiler: **native linux x64 ELF** (IR→asm) and **`--target wasm32-emscripten`** (IR→C→emcc).
 
 v1 lives on branches `develop` (jogc) and `seed` (C `jog`). This branch (`v2`) is a greenfield rewrite. Design: JogDocs `design/v2/`.
 
@@ -17,19 +17,21 @@ zig build
 jog version
 jog parse <path>
 jog check <path>
-jog build <path> -o <out> [--keep-asm] [--libdir DIR | -L DIR]...
+jog build <path> -o <out> [--keep-asm] [--keep-c]
+              [--target wasm32-emscripten] [--libdir DIR | -L DIR]...
 jog deps [path]
 ```
 
-`path` may be a `.jog` file, a directory with `jog.mod`, or a `jog.mod` file. Module sources listed in `jog.mod` (`root` + optional `source` lines) are parsed and typechecked together. `@link("lib")` and `jog.mod` `link.*` / `libdir.*` feed the native linker (`-l` / `-L` / rpath).
+`path` may be a `.jog` file, a directory with `jog.mod`, or a `jog.mod` file. Module sources listed in `jog.mod` (`root` + optional `source` lines) are parsed and typechecked together. `@link("lib")` and `jog.mod` `link.*` / `libdir.*` feed the linker (`-l` / `-L`; rpath on native). `link.emscripten` / `libdir.emscripten` apply only with `--target wasm32-emscripten`.
 
 ## Pipeline
 
 ```
-.jog → lex → parse → check → IR → GAS asm → zig cc + runtime/*.s → ELF
+native:              .jog → lex → parse → check → IR → GAS asm → zig cc + runtime/*.s → ELF
+wasm32-emscripten:   .jog → … → IR → C → emcc + runtime/emscripten/* → .html/.js/.wasm
 ```
 
-No C source is generated from Jog. Freestanding programs use `runtime/linux_x64_start.s`; `extern` pulls in libc. ABI notes: `docs/abi.md`.
+Native freestanding programs use `runtime/linux_x64_start.s`; `extern` pulls in libc. Emscripten uses emcc's libc + `runtime/emscripten/jogrt.c` (4 MiB bump `alloc`) and `jogrt_mainloop.c` (`jog_host_run_loop` → `emscripten_set_main_loop`). ABI notes: `docs/abi.md`. Requires [emsdk](https://emscripten.org/) (`emcc` on `PATH` or `EMCC`).
 
 ## Examples
 
@@ -59,6 +61,13 @@ zig build
 ./zig-out/bin/jog build examples/globals.jog -o out/globals && ./out/globals
 ./zig-out/bin/jog build examples/float_extern.jog -o out/float_extern && ./out/float_extern
 ./zig-out/bin/jog build examples/host_run_loop.jog -o out/host_run_loop && ./out/host_run_loop
+
+# Emscripten (JOG-90) — source emsdk first
+source ~/emsdk/emsdk_env.sh
+./zig-out/bin/jog build examples/emscripten_hello.jog --target wasm32-emscripten -o out/hello.html
+./zig-out/bin/jog build examples/emscripten_tick.jog --target wasm32-emscripten -o out/tick.html
+# Serve and open in a browser, e.g.:
+#   python3 -m http.server -d out 8000
 ```
 
-Language subset (milestone): structs/fields, pointers, `T?` + `?.`, widen/`as` narrow, `with` contexts, `interface struct` fat ptrs. Minimal `jog.mod` module graph (`root` + `source` + `link.*` / `libdir.*`). `while`/`for`/`break`/`continue`, `&&`/`||`, arith/`%`, `<=`/`>=`, bitwise, `[N]T` index, `@link` / `--libdir`. Stackful `go`/`yield`, multi-worker steal, `with (Dispatcher)` hop, and elastic IO pool: `docs/coroutines.md`.
+Language subset (milestone): structs/fields, pointers, `T?` + `?.`, widen/`as` narrow, `with` contexts, `interface struct` fat ptrs. Minimal `jog.mod` module graph (`root` + `source` + `link.*` / `libdir.*`). `while`/`for`/`break`/`continue`, `&&`/`||`, arith/`%`, `<=`/`>=`, bitwise, `[N]T` index, `@link` / `--libdir`. Stackful `go`/`yield`, multi-worker steal, `with (Dispatcher)` hop, and elastic IO pool: `docs/coroutines.md`. Browser+SDL: `--target wasm32-emscripten` + returning `jog_host_run_loop(tick)` (JOG-90).
