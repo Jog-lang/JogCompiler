@@ -1,0 +1,25 @@
+// for-in ranges, compound assign, infinite for (JOG-88).
+
+fn main() {
+    var sum: i64 = 0
+    for i in 0..5 {
+        if (i == 0) {
+            continue
+        }
+        sum += i
+    }
+    // 1+2+3+4 = 10
+    for sum < 12 {
+        sum += 1
+    }
+    var hit: i64 = 0
+    for {
+        hit += 1
+        break
+    }
+    if (sum == 12 && hit == 1) {
+        print("for range ok\n")
+    } else {
+        panic("for range fail\n")
+    }
+}

@@ -1,0 +1,13 @@
+// f64 literals and arithmetic (JOG-87 P1).
+
+fn main() {
+    val a: f64 = 1.5
+    val b: f64 = 2.0
+    val c = a * b + 0.5
+    // 1.5*2 + 0.5 = 3.5; compare via bit pattern of 3.5
+    if (c == 3.5) {
+        print("floats ok\n")
+    } else {
+        panic("floats fail\n")
+    }
+}

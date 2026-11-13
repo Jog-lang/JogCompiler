@@ -1,0 +1,9 @@
+import util
+
+fn main() {
+    if (answer() == 42) {
+        print("import ok\n")
+    } else {
+        panic("import fail\n")
+    }
+}

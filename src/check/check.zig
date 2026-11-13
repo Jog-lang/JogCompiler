@@ -16,11 +16,15 @@ pub const TypeKind = enum {
     u64_ty,
     i32_ty,
     i64_ty,
+    f32_ty,
+    f64_ty,
     usize_ty,
     named,
     pointer,
     optional,
+    array_ty,
     struct_ty,
+    enum_ty,
     iface_fn,
     iface_struct,
     string_ty,
@@ -31,6 +35,8 @@ pub const TypeInfo = struct {
     kind: TypeKind,
     name: []const u8 = "",
     pointee: ?*TypeInfo = null,
+    /// Fixed array length when `kind == .array_ty`.
+    array_len: u64 = 0,
     /// bit width for integers (for widen/narrow)
     bits: u16 = 0,
     unsigned: bool = true,
@@ -88,6 +94,9 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
     try defineBuiltin(a, &types, "u64", .{ .kind = .u64_ty, .name = "u64", .bits = 64, .unsigned = true });
     try defineBuiltin(a, &types, "i32", .{ .kind = .i32_ty, .name = "i32", .bits = 32, .unsigned = false });
     try defineBuiltin(a, &types, "i64", .{ .kind = .i64_ty, .name = "i64", .bits = 64, .unsigned = false });
+    try defineBuiltin(a, &types, "f32", .{ .kind = .f32_ty, .name = "f32", .bits = 32, .unsigned = false });
+    try defineBuiltin(a, &types, "f64", .{ .kind = .f64_ty, .name = "f64", .bits = 64, .unsigned = false });
+    try defineBuiltin(a, &types, "error", .{ .kind = .i64_ty, .name = "error", .bits = 64, .unsigned = false });
     try defineBuiltin(a, &types, "usize", .{ .kind = .usize_ty, .name = "usize", .bits = 64, .unsigned = true });
     try defineBuiltin(a, &types, "str", .{ .kind = .string_ty, .name = "str" });
     try defineBuiltin(a, &types, "bytes", .{ .kind = .bytes_ty, .name = "bytes" });
@@ -107,7 +116,22 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
                 const ti = try a.create(TypeInfo);
                 ti.* = .{ .kind = .struct_ty, .name = sd.name };
                 try types.put(a, sd.name, ti);
+                // Type params are placeholders; field types referencing them resolve when used.
+                for (sd.type_params) |tp| {
+                    if (!types.contains(tp)) {
+                        const tpi = try a.create(TypeInfo);
+                        tpi.* = .{ .kind = .named, .name = tp };
+                        try types.put(a, tp, tpi);
+                    }
+                }
             },
+            .enum_decl => |ed| {
+                const ti = try a.create(TypeInfo);
+                ti.* = .{ .kind = .enum_ty, .name = ed.name, .bits = 64, .unsigned = false };
+                try types.put(a, ed.name, ti);
+            },
+            .import_decl => {},
+            .require_decl => {},
             .interface_fn => |*inf| {
                 try iface_fns.put(a, inf.name, inf);
                 const ti = try a.create(TypeInfo);
@@ -169,6 +193,16 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
     var it = fns.iterator();
     while (it.next()) |e| {
         const fd = e.value_ptr.*;
+        // Bind generic type params as opaque named types for the duration of this check.
+        var bound: std.ArrayListUnmanaged([]const u8) = .{};
+        for (fd.type_params) |tp| {
+            if (!types.contains(tp)) {
+                const ti = try a.create(TypeInfo);
+                ti.* = .{ .kind = .named, .name = tp };
+                try types.put(a, tp, ti);
+                try bound.append(a, tp);
+            }
+        }
         // contexts: with before return — already parsed; ensure types resolve
         for (fd.contexts) |ctx| {
             _ = try resolveTypeExpr(a, &types, ctx.ty, &diags);
@@ -185,6 +219,7 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
         if (fd.body) |body| {
             try checkFunctionBody(a, &types, &fns, fd.params, fd.contexts, body, &diags);
         }
+        for (bound.items) |tp| _ = types.remove(tp);
     }
 
     // methods: structural interface satisfaction (basic)
@@ -272,6 +307,53 @@ fn resolveTypeExpr(
             const p = try resolveTypeExpr(a, types, inner, diags);
             const ti = try a.create(TypeInfo);
             ti.* = .{ .kind = .optional, .pointee = p, .name = "opt" };
+            return ti;
+        },
+        .array => |arr| {
+            const elem = try resolveTypeExpr(a, types, arr.elem, diags);
+            const ti = try a.create(TypeInfo);
+            ti.* = .{
+                .kind = .array_ty,
+                .name = try std.fmt.allocPrint(a, "[{d}]{s}", .{ arr.len, elem.name }),
+                .pointee = elem,
+                .array_len = arr.len,
+            };
+            return ti;
+        },
+        .named_app => |na| {
+            // Surface accept: resolve args; treat as named struct of mangled form.
+            var buf: std.ArrayListUnmanaged(u8) = .{};
+            try buf.appendSlice(a, na.name);
+            for (na.args) |arg| {
+                const at = try resolveTypeExpr(a, types, arg, diags);
+                try buf.appendSlice(a, "__");
+                try buf.appendSlice(a, at.name);
+            }
+            const mangled = try buf.toOwnedSlice(a);
+            if (types.get(mangled)) |t| return t;
+            if (types.get(na.name)) |t| return t;
+            const ti = try a.create(TypeInfo);
+            ti.* = .{ .kind = .struct_ty, .name = mangled };
+            try types.put(a, mangled, ti);
+            return ti;
+        },
+        .tuple => |elems| {
+            for (elems) |el| _ = try resolveTypeExpr(a, types, el, diags);
+            const ti = try a.create(TypeInfo);
+            ti.* = .{
+                .kind = .struct_ty,
+                .name = try std.fmt.allocPrint(a, "__Tup{d}", .{elems.len}),
+            };
+            return ti;
+        },
+        .slice_view => |sv| {
+            const elem = try resolveTypeExpr(a, types, sv.elem, diags);
+            const ti = try a.create(TypeInfo);
+            ti.* = .{
+                .kind = .struct_ty,
+                .name = try std.fmt.allocPrint(a, "View_{s}", .{elem.name}),
+                .pointee = elem,
+            };
             return ti;
         },
         .iface_fn => {
@@ -370,8 +452,30 @@ fn checkStmt(
                 try scope.vars.put(a, vd.name, .{ .ty = t, .mutable = vd.mutable });
             }
         },
+        .destructure => |ds| {
+            const it = try checkExpr(a, types, fns, scope, ds.init, diags);
+            _ = it;
+            const i64t = types.get("i64").?;
+            for (ds.names) |n| {
+                try scope.vars.put(a, n, .{ .ty = i64t, .mutable = ds.mutable });
+            }
+        },
+        .for_in_stmt => |fs| {
+            _ = try checkExpr(a, types, fns, scope, fs.iter, diags);
+            const i64t = types.get("i64").?;
+            try scope.vars.put(a, fs.name, .{ .ty = i64t, .mutable = false });
+            try checkBlock(a, types, fns, fs.body, diags, scope);
+        },
+        .errdefer_stmt => |ds| switch (ds) {
+            .expr => |ex| _ = try checkExpr(a, types, fns, scope, ex, diags),
+            .block => |b| try checkBlock(a, types, fns, b, diags, scope),
+        },
         .assign => |as| {
-            if (as.field) |fa| {
+            if (as.index) |ix| {
+                _ = try checkExpr(a, types, fns, scope, ix.base, diags);
+                _ = try checkExpr(a, types, fns, scope, ix.index, diags);
+                _ = try checkExpr(a, types, fns, scope, as.value, diags);
+            } else if (as.field) |fa| {
                 _ = try checkExpr(a, types, fns, scope, fa.base, diags);
                 _ = try checkExpr(a, types, fns, scope, as.value, diags);
             } else {
@@ -405,10 +509,16 @@ fn checkStmt(
             _ = try checkExpr(a, types, fns, scope, ws.cond, diags);
             try checkBlock(a, types, fns, ws.body, diags, scope);
         },
-        .break_stmt => {},
+        .break_stmt, .continue_stmt => {},
         .with_stmt => |ws| {
             for (ws.values) |v| _ = try checkExpr(a, types, fns, scope, v, diags);
             try checkBlock(a, types, fns, ws.body, diags, scope);
+        },
+        .defer_stmt => |ds| {
+            switch (ds) {
+                .expr => |ex| _ = try checkExpr(a, types, fns, scope, ex, diags),
+                .block => |b| try checkBlock(a, types, fns, b, diags, scope),
+            }
         },
     }
 }
@@ -470,6 +580,11 @@ fn checkExpr(
             ti.* = .{ .kind = .i64_ty, .name = "i64", .bits = 64, .unsigned = false };
             return ti;
         },
+        .float => {
+            const ti = try a.create(TypeInfo);
+            ti.* = .{ .kind = .f64_ty, .name = "f64", .bits = 64, .unsigned = false };
+            return ti;
+        },
         .string => {
             return types.get("str").?;
         },
@@ -482,8 +597,9 @@ fn checkExpr(
             const l = try checkExpr(a, types, fns, scope, b.left, diags);
             const r = try checkExpr(a, types, fns, scope, b.right, diags);
             _ = r;
-            if (b.op == .eq or b.op == .neq) return types.get("bool").?;
-            // arithmetic: allow widen
+            if (b.op == .eq or b.op == .neq or b.op == .lt or b.op == .gt or b.op == .lte or b.op == .gte or b.op == .and_op or b.op == .or_op)
+                return types.get("bool").?;
+            // arithmetic / bitwise: allow widen
             return l;
         },
         .unary => |u| {
@@ -493,6 +609,7 @@ fn checkExpr(
                 ti.* = .{ .kind = .pointer, .pointee = t, .name = "ptr" };
                 return ti;
             }
+            if (u.op == .not) return types.get("bool").?;
             return t;
         },
         .call => |c| {
@@ -552,6 +669,35 @@ fn checkExpr(
                 if (fns.get(c.callee.ident)) |fd| {
                     for (c.args) |arg| _ = try checkExpr(a, types, fns, scope, arg, diags);
                     for (c.with_args) |w| _ = try checkExpr(a, types, fns, scope, w, diags);
+                    for (c.type_args) |ta| _ = try resolveTypeExpr(a, types, ta, diags);
+                    if (fd.type_params.len > 0) {
+                        // Explicit type args, or infer from first arg (int → i64).
+                        var targ_buf: [4]*ast.TypeExpr = undefined;
+                        var nta: usize = c.type_args.len;
+                        if (nta == 0 and c.args.len > 0 and fd.type_params.len == 1) {
+                            const te = try a.create(ast.TypeExpr);
+                            const at = try checkExpr(a, types, fns, scope, c.args[0], diags);
+                            te.* = .{ .name = if (at.name.len > 0) at.name else "i64" };
+                            targ_buf[0] = te;
+                            nta = 1;
+                        }
+                        if (nta == fd.type_params.len) {
+                            var saved: std.ArrayListUnmanaged(struct { []const u8, ?*TypeInfo }) = .{};
+                            var i: usize = 0;
+                            while (i < nta) : (i += 1) {
+                                const ta = if (c.type_args.len > 0) c.type_args[i] else targ_buf[i];
+                                const prev = types.get(fd.type_params[i]);
+                                try saved.append(a, .{ fd.type_params[i], prev });
+                                const concrete = try resolveTypeExpr(a, types, ta, diags);
+                                try types.put(a, fd.type_params[i], concrete);
+                            }
+                            const result = if (fd.ret) |r| try resolveTypeExpr(a, types, r, diags) else try voidType(a);
+                            for (saved.items) |s| {
+                                if (s[1]) |p| try types.put(a, s[0], p) else _ = types.remove(s[0]);
+                            }
+                            return result;
+                        }
+                    }
                     if (fd.ret) |r| return try resolveTypeExpr(a, types, r, diags);
                     return try voidType(a);
                 }
@@ -572,8 +718,41 @@ fn checkExpr(
         },
         .field => |f| {
             const base = try checkExpr(a, types, fns, scope, f.base, diags);
-            _ = base;
-            // field type resolution deferred to IR layout; treat as i64/ptr-sized
+            if (base.kind == .enum_ty) return base;
+            const ti = try a.create(TypeInfo);
+            ti.* = .{ .kind = .i64_ty, .name = "i64", .bits = 64, .unsigned = false };
+            return ti;
+        },
+        .when_expr => |w| {
+            _ = try checkExpr(a, types, fns, scope, w.scrutinee, diags);
+            var result: ?*TypeInfo = null;
+            for (w.arms) |arm| {
+                const bt = try checkExpr(a, types, fns, scope, arm.body, diags);
+                if (result == null) result = bt;
+            }
+            if (w.else_body) |eb| {
+                const bt = try checkExpr(a, types, fns, scope, eb, diags);
+                if (result == null) result = bt;
+            }
+            return result orelse try voidType(a);
+        },
+        .index => |ix| {
+            const base = try checkExpr(a, types, fns, scope, ix.base, diags);
+            _ = try checkExpr(a, types, fns, scope, ix.index, diags);
+            if (base.kind == .array_ty) {
+                return base.pointee orelse {
+                    const ti = try a.create(TypeInfo);
+                    ti.* = .{ .kind = .i64_ty, .name = "i64", .bits = 64, .unsigned = false };
+                    return ti;
+                };
+            }
+            if (base.kind == .pointer) {
+                return base.pointee orelse {
+                    const ti = try a.create(TypeInfo);
+                    ti.* = .{ .kind = .i64_ty, .name = "i64", .bits = 64, .unsigned = false };
+                    return ti;
+                };
+            }
             const ti = try a.create(TypeInfo);
             ti.* = .{ .kind = .i64_ty, .name = "i64", .bits = 64, .unsigned = false };
             return ti;
@@ -605,12 +784,62 @@ fn checkExpr(
             return try voidType(a);
         },
         .struct_lit => |sl| {
-            if (types.get(sl.type_name)) |t| {
-                for (sl.fields) |f| _ = try checkExpr(a, types, fns, scope, f.value, diags);
-                return t;
+            for (sl.fields) |f| _ = try checkExpr(a, types, fns, scope, f.value, diags);
+            if (sl.type_args.len > 0) {
+                const te = try a.create(ast.TypeExpr);
+                te.* = .{ .named_app = .{ .name = sl.type_name, .args = sl.type_args } };
+                return try resolveTypeExpr(a, types, te, diags);
             }
+            if (types.get(sl.type_name)) |t| return t;
             try diags.append(a, .{ .message = try std.fmt.allocPrint(a, "unknown struct '{s}'", .{sl.type_name}) });
             return try voidType(a);
+        },
+        .tuple => |elems| {
+            for (elems) |el| _ = try checkExpr(a, types, fns, scope, el, diags);
+            const ti = try a.create(TypeInfo);
+            ti.* = .{
+                .kind = .struct_ty,
+                .name = try std.fmt.allocPrint(a, "__Tup{d}", .{elems.len}),
+            };
+            return ti;
+        },
+        .cstring => return types.get("str").?,
+        .range => |r| {
+            _ = try checkExpr(a, types, fns, scope, r.start, diags);
+            _ = try checkExpr(a, types, fns, scope, r.end, diags);
+            const ti = try a.create(TypeInfo);
+            ti.* = .{ .kind = .i64_ty, .name = "range", .bits = 64, .unsigned = false };
+            return ti;
+        },
+        .array_lit => |al| {
+            for (al.elems) |el| _ = try checkExpr(a, types, fns, scope, el, diags);
+            const ti = try a.create(TypeInfo);
+            ti.* = .{
+                .kind = .array_ty,
+                .name = "array_lit",
+                .array_len = al.elems.len,
+                .pointee = types.get("i64"),
+            };
+            return ti;
+        },
+        .interp => |ip| {
+            for (ip.parts) |p| switch (p) {
+                .text => {},
+                .expr => |ex| _ = try checkExpr(a, types, fns, scope, ex, diags),
+            };
+            return types.get("str").?;
+        },
+        .try_cast => |c| {
+            _ = try checkExpr(a, types, fns, scope, c.expr, diags);
+            const to = try resolveTypeExpr(a, types, c.ty, diags);
+            const ti = try a.create(TypeInfo);
+            ti.* = .{ .kind = .optional, .name = "opt", .pointee = to };
+            return ti;
+        },
+        .is_type => |it| {
+            _ = try checkExpr(a, types, fns, scope, it.expr, diags);
+            _ = try resolveTypeExpr(a, types, it.ty, diags);
+            return types.get("bool").?;
         },
     }
 }

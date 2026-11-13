@@ -6,7 +6,7 @@ const ir = @import("../ir/ir.zig");
 const link = @import("../codegen/link.zig");
 const mod = @import("../mod/mod.zig");
 
-pub const version_string = "jog 0.2.4-v2 (zig host, ir→asm→native)";
+pub const version_string = "jog 0.2.5-v2 (zig host, ir→asm→native)";
 
 pub fn cmdVersion(writer: anytype) !void {
     try writer.print("{s}\n", .{version_string});
@@ -40,19 +40,119 @@ pub const Unit = struct {
 };
 
 fn loadSingle(allocator: std.mem.Allocator, path: []const u8) !Unit {
-    const src = try std.fs.cwd().readFileAlloc(allocator, path, 16 * 1024 * 1024);
-    errdefer allocator.free(src);
-    var file = try parse.Parser.parseFile(allocator, src);
-    errdefer file.deinit();
-    const srcs = try allocator.alloc([]u8, 1);
-    srcs[0] = src;
+    // Follow `import` decls to sibling `.jog` files (BFS). jog.mod multi-file
+    // builds already merge listed sources. `std.*` imports are ignored here.
+    var pending: std.ArrayListUnmanaged([]const u8) = .{};
+    defer {
+        for (pending.items) |x| allocator.free(x);
+        pending.deinit(allocator);
+    }
+    var seen: std.StringHashMapUnmanaged(void) = .{};
+    defer seen.deinit(allocator);
+
+    const root = try allocator.dupe(u8, path);
+    try pending.append(allocator, root);
+    try seen.put(allocator, root, {});
+
+    var srcs: std.ArrayListUnmanaged([]u8) = .{};
+    errdefer {
+        for (srcs.items) |s| allocator.free(s);
+        srcs.deinit(allocator);
+    }
+    var parts: std.ArrayListUnmanaged(ast.File) = .{};
+    errdefer {
+        for (parts.items) |*pf| pf.deinit();
+        parts.deinit(allocator);
+    }
+    var decls: std.ArrayListUnmanaged(ast.Decl) = .{};
+    errdefer decls.deinit(allocator);
+
+    var qi: usize = 0;
+    while (qi < pending.items.len) : (qi += 1) {
+        const cur = pending.items[qi];
+        const src = try std.fs.cwd().readFileAlloc(allocator, cur, 16 * 1024 * 1024);
+        try srcs.append(allocator, src);
+        const file = try parse.Parser.parseFile(allocator, src);
+        try decls.appendSlice(allocator, file.decls);
+        for (file.decls) |d| {
+            if (d == .import_decl) {
+                const imp = d.import_decl;
+                if (std.mem.startsWith(u8, imp.path, "std.") or std.mem.eql(u8, imp.path, "std") or std.mem.eql(u8, imp.path, "core")) continue;
+                const resolved = (try resolveImportPath(allocator, cur, imp.path)) orelse continue;
+                defer allocator.free(resolved);
+                if (seen.contains(resolved)) continue;
+                std.fs.cwd().access(resolved, .{}) catch continue;
+                const owned = try allocator.dupe(u8, resolved);
+                try seen.put(allocator, owned, {});
+                try pending.append(allocator, owned);
+            } else if (d == .require_decl) {
+                const req = d.require_decl;
+                const resolved = (try resolveRequirePath(allocator, cur, req.name)) orelse continue;
+                defer allocator.free(resolved);
+                if (seen.contains(resolved)) continue;
+                std.fs.cwd().access(resolved, .{}) catch continue;
+                const owned = try allocator.dupe(u8, resolved);
+                try seen.put(allocator, owned, {});
+                try pending.append(allocator, owned);
+            }
+        }
+        try parts.append(allocator, file);
+    }
+
+    if (parts.items.len == 1) {
+        // Single file, no imports pulled — same shape as before.
+        decls.deinit(allocator);
+        const srcs_slice = try srcs.toOwnedSlice(allocator);
+        const parts_owned = try parts.toOwnedSlice(allocator);
+        const file = parts_owned[0];
+        allocator.free(parts_owned);
+        return .{
+            .file = file,
+            .srcs = srcs_slice,
+            .parts = &[_]ast.File{},
+            .merged_decls = null,
+            .allocator = allocator,
+        };
+    }
+
+    const merged = try decls.toOwnedSlice(allocator);
     return .{
-        .file = file,
-        .srcs = srcs,
-        .parts = &[_]ast.File{},
-        .merged_decls = null,
+        .file = .{
+            .decls = merged,
+            .arena = std.heap.ArenaAllocator.init(allocator),
+        },
+        .srcs = try srcs.toOwnedSlice(allocator),
+        .parts = try parts.toOwnedSlice(allocator),
+        .merged_decls = merged,
         .allocator = allocator,
     };
+}
+
+fn resolveImportPath(allocator: std.mem.Allocator, from_file: []const u8, import_path: []const u8) !?[]u8 {
+    const dir = std.fs.path.dirname(from_file) orelse ".";
+    var leaf = import_path;
+    if (std.mem.lastIndexOfScalar(u8, import_path, '.')) |dot| {
+        leaf = import_path[dot + 1 ..];
+    }
+    const name = try std.fmt.allocPrint(allocator, "{s}.jog", .{leaf});
+    defer allocator.free(name);
+    const joined = try std.fs.path.join(allocator, &.{ dir, name });
+    return joined;
+}
+
+/// `require foo` → sibling `foo.jog`, `foo/root.jog`, or `foo/main.jog`.
+fn resolveRequirePath(allocator: std.mem.Allocator, from_file: []const u8, name: []const u8) !?[]u8 {
+    const dir = std.fs.path.dirname(from_file) orelse ".";
+    const a = try std.fmt.allocPrint(allocator, "{s}/{s}.jog", .{ dir, name });
+    defer allocator.free(a);
+    if (std.fs.cwd().access(a, .{})) |_| return try allocator.dupe(u8, a) else |_| {}
+    const b = try std.fmt.allocPrint(allocator, "{s}/{s}/root.jog", .{ dir, name });
+    defer allocator.free(b);
+    if (std.fs.cwd().access(b, .{})) |_| return try allocator.dupe(u8, b) else |_| {}
+    const c = try std.fmt.allocPrint(allocator, "{s}/{s}/main.jog", .{ dir, name });
+    defer allocator.free(c);
+    if (std.fs.cwd().access(c, .{})) |_| return try allocator.dupe(u8, c) else |_| {}
+    return null;
 }
 
 fn loadModule(allocator: std.mem.Allocator, path: []const u8, writer: anytype) !Unit {
@@ -158,6 +258,9 @@ pub fn cmdParse(allocator: std.mem.Allocator, path: []const u8, writer: anytype)
         switch (d) {
             .type_alias => |t| try writer.print("  type {s}\n", .{t.name}),
             .struct_decl => |s| try writer.print("  struct {s}\n", .{s.name}),
+            .enum_decl => |e| try writer.print("  enum {s}\n", .{e.name}),
+            .import_decl => |i| try writer.print("  import {s}\n", .{i.path}),
+            .require_decl => |r| try writer.print("  require {s}\n", .{r.name}),
             .interface_fn => |i| try writer.print("  interface fn {s}\n", .{i.name}),
             .interface_struct => |i| try writer.print("  interface struct {s}\n", .{i.name}),
             .fn_decl => |f| try writer.print("  fn {s}\n", .{f.name}),

@@ -1,0 +1,21 @@
+// []T view type parses as bytes-first {ptr,len}-shaped raw view (JOG-88).
+
+fn take(v: []byte): i64 {
+    // Surface: views lower as raw ptr; len not yet a first-class field.
+    return 1
+}
+
+fn main() {
+    var buf: [4]byte
+    buf[0] = 1
+    buf[1] = 2
+    buf[2] = 3
+    buf[3] = 4
+    val p: *byte = alloc(4)
+    p[0] = 9
+    if (take(p) == 1 && buf[0] == 1) {
+        print("view type ok\n")
+    } else {
+        panic("view fail\n")
+    }
+}

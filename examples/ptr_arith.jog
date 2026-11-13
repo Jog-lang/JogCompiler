@@ -1,0 +1,16 @@
+// Raw pointer index as byte-stride arithmetic.
+
+fn main() {
+    var buf: [3]i64
+    buf[0] = 10
+    buf[1] = 20
+    buf[2] = 30
+    val p: *byte = alloc(24)
+    // Store via raw pointer indices (byte stride)
+    p[0] = 7
+    if (p[0] == 7 && buf[1] == 20) {
+        print("ptr arith ok\n")
+    } else {
+        panic("ptr arith fail\n")
+    }
+}

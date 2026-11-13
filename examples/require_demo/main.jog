@@ -1,0 +1,9 @@
+require util
+
+fn main() {
+    if (util_answer() == 9) {
+        print("require ok\n")
+    } else {
+        panic("require fail\n")
+    }
+}

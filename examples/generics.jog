@@ -1,0 +1,19 @@
+// Explicit type-arg monomorphization (JOG-87 P1).
+
+fn id<T>(x: T): T {
+    return x
+}
+
+struct Box<T> {
+    value: T
+}
+
+fn main() {
+    val a = id<i64>(42)
+    val b = Box<i64>(value: 7)
+    if (a == 42 && b.value == 7) {
+        print("generics ok\n")
+    } else {
+        panic("generics fail\n")
+    }
+}

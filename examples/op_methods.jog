@@ -1,0 +1,21 @@
+// Operator methods: `a + b` → Type.op+ (JOG-87 P1).
+
+struct Vec2 {
+    x: i64
+    y: i64
+}
+
+fn Vec2.op+(o: Vec2): Vec2 {
+    return Vec2(x: self.x + o.x, y: self.y + o.y)
+}
+
+fn main() {
+    val a = Vec2(x: 1, y: 2)
+    val b = Vec2(x: 3, y: 4)
+    val c = a + b
+    if (c.x == 4 && c.y == 6) {
+        print("op methods ok\n")
+    } else {
+        panic("op methods fail\n")
+    }
+}
