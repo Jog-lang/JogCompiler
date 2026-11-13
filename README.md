@@ -17,11 +17,11 @@ zig build
 jog version
 jog parse <path>
 jog check <path>
-jog build <path> -o <out>
+jog build <path> -o <out> [--keep-asm] [--libdir DIR | -L DIR]...
 jog deps [path]
 ```
 
-`path` may be a `.jog` file, a directory with `jog.mod`, or a `jog.mod` file. Module sources listed in `jog.mod` (`root` + optional `source` lines) are parsed and typechecked together.
+`path` may be a `.jog` file, a directory with `jog.mod`, or a `jog.mod` file. Module sources listed in `jog.mod` (`root` + optional `source` lines) are parsed and typechecked together. `@link("lib")` and `jog.mod` `link.*` / `libdir.*` feed the native linker (`-l` / `-L` / rpath).
 
 ## Pipeline
 
@@ -51,6 +51,8 @@ zig build
 ./zig-out/bin/jog build examples/coro_with_dispatcher.jog -o out/coro_with && ./out/coro_with
 ./zig-out/bin/jog build examples/coro_io_dispatcher.jog -o out/coro_io && ./out/coro_io
 ./zig-out/bin/jog build examples/spawn.jog -o out/spawn && ./out/spawn
+./zig-out/bin/jog build examples/while_ops.jog -o out/while_ops && ./out/while_ops
+./zig-out/bin/jog build examples/link_attr.jog -o out/link_attr && ./out/link_attr
 ```
 
-Language subset (milestone): structs/fields, pointers, `T?` + `?.`, widen/`as` narrow, `with` contexts, `interface struct` fat ptrs. Minimal `jog.mod` module graph (`root` + `source`). Stackful `go`/`yield`, multi-worker steal, `with (Dispatcher)` hop, and elastic IO pool: `docs/coroutines.md`.
+Language subset (milestone): structs/fields, pointers, `T?` + `?.`, widen/`as` narrow, `with` contexts, `interface struct` fat ptrs. Minimal `jog.mod` module graph (`root` + `source` + `link.*` / `libdir.*`). `while`/`break`, `&&`/`||`, `*`/`/`, `@link` / `--libdir`. Stackful `go`/`yield`, multi-worker steal, `with (Dispatcher)` hop, and elastic IO pool: `docs/coroutines.md`.

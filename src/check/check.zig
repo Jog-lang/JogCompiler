@@ -81,6 +81,7 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
 
     // builtins
     try defineBuiltin(a, &types, "byte", .{ .kind = .byte_ty, .name = "byte", .bits = 8, .unsigned = true });
+    try defineBuiltin(a, &types, "u8", .{ .kind = .byte_ty, .name = "u8", .bits = 8, .unsigned = true });
     try defineBuiltin(a, &types, "bool", .{ .kind = .bool_ty, .name = "bool", .bits = 1, .unsigned = true });
     try defineBuiltin(a, &types, "u16", .{ .kind = .u16_ty, .name = "u16", .bits = 16, .unsigned = true });
     try defineBuiltin(a, &types, "u32", .{ .kind = .u32_ty, .name = "u32", .bits = 32, .unsigned = true });
@@ -400,6 +401,11 @@ fn checkStmt(
                 try checkBlock(a, types, fns, eb, diags, scope);
             }
         },
+        .while_stmt => |ws| {
+            _ = try checkExpr(a, types, fns, scope, ws.cond, diags);
+            try checkBlock(a, types, fns, ws.body, diags, scope);
+        },
+        .break_stmt => {},
         .with_stmt => |ws| {
             for (ws.values) |v| _ = try checkExpr(a, types, fns, scope, v, diags);
             try checkBlock(a, types, fns, ws.body, diags, scope);

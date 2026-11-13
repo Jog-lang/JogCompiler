@@ -28,10 +28,38 @@ pub fn buildExecutable(
     defer allocator.free(rt_start);
 
     var argv: std.ArrayListUnmanaged([]const u8) = .{};
-    defer argv.deinit(allocator);
+    defer {
+        // Free only the owned -l/-L/rpath strings we allocated below.
+        // Base slice entries are literals / stack paths.
+        argv.deinit(allocator);
+    }
     try argv.appendSlice(allocator, &.{ "zig", "cc", "-no-pie", "-o", out_path, asm_path, rt_main, rt_coro });
     if (!program.needs_libc) {
         try argv.appendSlice(allocator, &.{ rt_start, "-nostdlib", "-fno-stack-protector" });
+    }
+
+    // Owned link flag strings (freed after spawn).
+    var owned_flags: std.ArrayListUnmanaged([]u8) = .{};
+    defer {
+        for (owned_flags.items) |s| allocator.free(s);
+        owned_flags.deinit(allocator);
+    }
+
+    for (program.libdirs) |dir| {
+        const abs = try absPath(allocator, dir);
+        defer allocator.free(abs);
+        const lflag = try std.fmt.allocPrint(allocator, "-L{s}", .{abs});
+        try owned_flags.append(allocator, lflag);
+        try argv.append(allocator, lflag);
+        // Embed RUNPATH so the loader finds prefix libs without LD_LIBRARY_PATH.
+        const rflag = try std.fmt.allocPrint(allocator, "-Wl,-rpath,{s}", .{abs});
+        try owned_flags.append(allocator, rflag);
+        try argv.append(allocator, rflag);
+    }
+    for (program.link_libs) |lib| {
+        const flag = try std.fmt.allocPrint(allocator, "-l{s}", .{lib});
+        try owned_flags.append(allocator, flag);
+        try argv.append(allocator, flag);
     }
 
     var child = std.process.Child.init(argv.items, allocator);
@@ -62,6 +90,13 @@ pub fn buildExecutable(
 
     const mode: []const u8 = if (program.needs_libc) "asm+runtime+libc (C ABI extern)" else "asm+runtime freestanding";
     try writer.print("wrote {s} ({s}, no C intermediate)\n", .{ out_path, mode });
+}
+
+fn absPath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (std.fs.path.isAbsolute(path)) return try allocator.dupe(u8, path);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = try std.fs.cwd().realpath(".", &buf);
+    return try std.fs.path.join(allocator, &.{ cwd, path });
 }
 
 fn findRuntimeDir(allocator: std.mem.Allocator) ![]u8 {

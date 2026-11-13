@@ -1,0 +1,11 @@
+// `@link("name")` adds `-lname` at native link (FFI surface parity with jogc).
+
+@link("c")
+extern {
+    fn puts(s: *byte): i32
+}
+
+fn main(): i64 {
+    puts("link attr ok\0")
+    return 0
+}

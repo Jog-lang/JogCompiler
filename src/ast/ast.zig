@@ -39,6 +39,8 @@ pub const Decl = union(enum) {
 pub const ExternBlock = struct {
     /// C ABI SysV (linux x64) for now.
     fns: []ExternFn,
+    /// From `@link("name")` — host `-lname` at link time.
+    link_lib: ?[]const u8 = null,
 };
 
 pub const ExternFn = struct {
@@ -111,7 +113,14 @@ pub const Stmt = union(enum) {
     expr: *Expr,
     return_stmt: ?*Expr,
     if_stmt: IfStmt,
+    while_stmt: WhileStmt,
+    break_stmt,
     with_stmt: WithStmt,
+};
+
+pub const WhileStmt = struct {
+    cond: *Expr,
+    body: *Block,
 };
 
 pub const VarDecl = struct {
@@ -170,7 +179,7 @@ pub const Binary = struct {
     right: *Expr,
 };
 
-pub const BinaryOp = enum { eq, neq, add, sub, lt, gt };
+pub const BinaryOp = enum { eq, neq, add, sub, mul, div, lt, gt, and_op, or_op };
 
 pub const Unary = struct {
     op: UnaryOp,

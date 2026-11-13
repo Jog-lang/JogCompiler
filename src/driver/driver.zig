@@ -6,7 +6,7 @@ const ir = @import("../ir/ir.zig");
 const link = @import("../codegen/link.zig");
 const mod = @import("../mod/mod.zig");
 
-pub const version_string = "jog 0.2.3-v2 (zig host, ir→asm→native)";
+pub const version_string = "jog 0.2.4-v2 (zig host, ir→asm→native)";
 
 pub fn cmdVersion(writer: anytype) !void {
     try writer.print("{s}\n", .{version_string});
@@ -191,7 +191,7 @@ pub fn cmdCheck(allocator: std.mem.Allocator, path: []const u8, diag_json: bool,
     }
 }
 
-pub fn cmdBuild(allocator: std.mem.Allocator, path: []const u8, out_path: []const u8, keep_asm: bool, writer: anytype) !void {
+pub fn cmdBuild(allocator: std.mem.Allocator, path: []const u8, out_path: []const u8, keep_asm: bool, cli_libdirs: []const []const u8, writer: anytype) !void {
     var unit = try loadPath(allocator, path, writer);
     defer unit.deinit();
     var result = try check_mod.check(allocator, &unit.file);
@@ -213,11 +213,53 @@ pub fn cmdBuild(allocator: std.mem.Allocator, path: []const u8, out_path: []cons
     };
     defer program.deinit();
 
+    // Merge jog.mod link/libdir with CLI --libdir into the program (arena-owned).
+    try mergeLinkMeta(allocator, &program, path, cli_libdirs);
+
     if (std.fs.path.dirname(out_path)) |dir| {
         std.fs.cwd().makePath(dir) catch {};
     }
 
     try link.buildExecutable(allocator, &program, out_path, keep_asm, writer);
+}
+
+fn mergeLinkMeta(allocator: std.mem.Allocator, program: *ir.Program, path: []const u8, cli_libdirs: []const []const u8) !void {
+    const a = program.arena.allocator();
+    var libs: std.ArrayListUnmanaged([]const u8) = .{};
+    var dirs: std.ArrayListUnmanaged([]const u8) = .{};
+    for (program.link_libs) |l| try libs.append(a, l);
+    for (program.libdirs) |d| try dirs.append(a, d);
+
+    if (mod.isModulePath(path)) {
+        if (mod.loadFromPath(allocator, path)) |manifest_val| {
+            var m = manifest_val;
+            defer m.deinit();
+            for (m.link_libs) |l| {
+                if (!containsStr(libs.items, l)) try libs.append(a, try a.dupe(u8, l));
+            }
+            if (mod.resolveLibdirs(allocator, &m)) |resolved| {
+                defer {
+                    for (resolved) |p| allocator.free(p);
+                    allocator.free(resolved);
+                }
+                for (resolved) |d| {
+                    if (!containsStr(dirs.items, d)) try dirs.append(a, try a.dupe(u8, d));
+                }
+            } else |_| {}
+        } else |_| {}
+    }
+    for (cli_libdirs) |d| {
+        if (!containsStr(dirs.items, d)) try dirs.append(a, try a.dupe(u8, d));
+    }
+    program.link_libs = try libs.toOwnedSlice(a);
+    program.libdirs = try dirs.toOwnedSlice(a);
+}
+
+fn containsStr(hay: []const []const u8, needle: []const u8) bool {
+    for (hay) |e| {
+        if (std.mem.eql(u8, e, needle)) return true;
+    }
+    return false;
 }
 
 pub fn cmdDeps(allocator: std.mem.Allocator, path: []const u8, writer: anytype) !void {
@@ -246,8 +288,9 @@ pub fn usage(writer: anytype) !void {
         \\  parse <path>            parse and list declarations
         \\  check [--diag=json] <path>
         \\                          typecheck subset (JSON diags for LSP)
-        \\  build <path> -o OUT [--keep-asm]
+        \\  build <path> -o OUT [--keep-asm] [--libdir DIR | -L DIR]...
         \\                          IR → asm → native link (no C intermediate)
+        \\                          @link / jog.mod link.* → -l; libdir → -L + rpath
         \\  deps [path]             print module source paths (jog.mod)
         \\  help                    this message
         \\
