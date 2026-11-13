@@ -1,0 +1,28 @@
+// @test, @packed, @intrinsic, private (surface accept).
+
+@intrinsic(int, signed: true, bits: 8)
+type i8: byte
+
+@packed
+struct Tiny {
+    a: i64
+    b: i64
+}
+
+private fn helper(): i64 {
+    return 3
+}
+
+@test
+fn test_helper(): i64 {
+    return helper()
+}
+
+fn main() {
+    val t = Tiny(a: 1, b: 2)
+    if (helper() == 3 && test_helper() == 3 && t.a + t.b == 3) {
+        print("attrs private ok\n")
+    } else {
+        panic("attrs fail\n")
+    }
+}

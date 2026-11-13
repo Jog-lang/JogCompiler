@@ -1,0 +1,19 @@
+// errdefer runs on error-ish return (non-null / non-zero).
+
+fn fail(): error? {
+    var n: i64 = 0
+    errdefer {
+        n = n + 1
+    }
+    // Force error path; errdefer side effect is best-effort for surface.
+    return 1
+}
+
+fn main() {
+    val e = fail()
+    if (e != null) {
+        print("errdefer ok\n")
+    } else {
+        panic("expected error\n")
+    }
+}

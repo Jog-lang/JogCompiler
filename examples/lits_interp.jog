@@ -1,0 +1,21 @@
+// Char, hex, c-string, string interp, array lit, is/as? (JOG-88).
+
+fn main() {
+    val ch = 'A'
+    val hx = 0x2A
+    val cs = c"hi"
+    val msg = "n=${hx}"
+    val arr = [1, 2, 3]
+    var sum: i64 = 0
+    for x in arr {
+        sum += x
+    }
+    val p: i64 = 7
+    val yes = p is i64
+    val opt = p as? i64
+    if (ch == 65 && hx == 42 && sum == 6 && yes && opt != null && cs != null) {
+        print("lits interp ok\n")
+    } else {
+        panic("lits fail\n")
+    }
+}

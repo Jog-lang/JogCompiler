@@ -75,16 +75,26 @@ fn loadSingle(allocator: std.mem.Allocator, path: []const u8) !Unit {
         const file = try parse.Parser.parseFile(allocator, src);
         try decls.appendSlice(allocator, file.decls);
         for (file.decls) |d| {
-            if (d != .import_decl) continue;
-            const imp = d.import_decl;
-            if (std.mem.startsWith(u8, imp.path, "std.") or std.mem.eql(u8, imp.path, "std")) continue;
-            const resolved = (try resolveImportPath(allocator, cur, imp.path)) orelse continue;
-            defer allocator.free(resolved);
-            if (seen.contains(resolved)) continue;
-            std.fs.cwd().access(resolved, .{}) catch continue;
-            const owned = try allocator.dupe(u8, resolved);
-            try seen.put(allocator, owned, {});
-            try pending.append(allocator, owned);
+            if (d == .import_decl) {
+                const imp = d.import_decl;
+                if (std.mem.startsWith(u8, imp.path, "std.") or std.mem.eql(u8, imp.path, "std") or std.mem.eql(u8, imp.path, "core")) continue;
+                const resolved = (try resolveImportPath(allocator, cur, imp.path)) orelse continue;
+                defer allocator.free(resolved);
+                if (seen.contains(resolved)) continue;
+                std.fs.cwd().access(resolved, .{}) catch continue;
+                const owned = try allocator.dupe(u8, resolved);
+                try seen.put(allocator, owned, {});
+                try pending.append(allocator, owned);
+            } else if (d == .require_decl) {
+                const req = d.require_decl;
+                const resolved = (try resolveRequirePath(allocator, cur, req.name)) orelse continue;
+                defer allocator.free(resolved);
+                if (seen.contains(resolved)) continue;
+                std.fs.cwd().access(resolved, .{}) catch continue;
+                const owned = try allocator.dupe(u8, resolved);
+                try seen.put(allocator, owned, {});
+                try pending.append(allocator, owned);
+            }
         }
         try parts.append(allocator, file);
     }
@@ -128,6 +138,21 @@ fn resolveImportPath(allocator: std.mem.Allocator, from_file: []const u8, import
     defer allocator.free(name);
     const joined = try std.fs.path.join(allocator, &.{ dir, name });
     return joined;
+}
+
+/// `require foo` → sibling `foo.jog`, `foo/root.jog`, or `foo/main.jog`.
+fn resolveRequirePath(allocator: std.mem.Allocator, from_file: []const u8, name: []const u8) !?[]u8 {
+    const dir = std.fs.path.dirname(from_file) orelse ".";
+    const a = try std.fmt.allocPrint(allocator, "{s}/{s}.jog", .{ dir, name });
+    defer allocator.free(a);
+    if (std.fs.cwd().access(a, .{})) |_| return try allocator.dupe(u8, a) else |_| {}
+    const b = try std.fmt.allocPrint(allocator, "{s}/{s}/root.jog", .{ dir, name });
+    defer allocator.free(b);
+    if (std.fs.cwd().access(b, .{})) |_| return try allocator.dupe(u8, b) else |_| {}
+    const c = try std.fmt.allocPrint(allocator, "{s}/{s}/main.jog", .{ dir, name });
+    defer allocator.free(c);
+    if (std.fs.cwd().access(c, .{})) |_| return try allocator.dupe(u8, c) else |_| {}
+    return null;
 }
 
 fn loadModule(allocator: std.mem.Allocator, path: []const u8, writer: anytype) !Unit {
@@ -235,6 +260,7 @@ pub fn cmdParse(allocator: std.mem.Allocator, path: []const u8, writer: anytype)
             .struct_decl => |s| try writer.print("  struct {s}\n", .{s.name}),
             .enum_decl => |e| try writer.print("  enum {s}\n", .{e.name}),
             .import_decl => |i| try writer.print("  import {s}\n", .{i.path}),
+            .require_decl => |r| try writer.print("  require {s}\n", .{r.name}),
             .interface_fn => |i| try writer.print("  interface fn {s}\n", .{i.name}),
             .interface_struct => |i| try writer.print("  interface struct {s}\n", .{i.name}),
             .fn_decl => |f| try writer.print("  fn {s}\n", .{f.name}),

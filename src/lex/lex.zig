@@ -6,6 +6,8 @@ pub const TokenKind = enum {
     int,
     float,
     string,
+    cstring,
+    char,
     // keywords
     kw_fn,
     kw_struct,
@@ -31,9 +33,14 @@ pub const TokenKind = enum {
     kw_for,
     kw_continue,
     kw_defer,
+    kw_errdefer,
     kw_enum,
     kw_when,
     kw_import,
+    kw_in,
+    kw_private,
+    kw_require,
+    kw_is,
     // punct
     at,
     slash,
@@ -48,6 +55,12 @@ pub const TokenKind = enum {
     shl,
     shr,
     arrow, // ->
+    dotdot, // ..
+    pluseq,
+    minuseq,
+    stareq,
+    slasheq,
+    percenteq,
     lparen,
     rparen,
     lbrace,
@@ -98,6 +111,17 @@ pub const Lexer = struct {
         const start_col = self.col;
         const c = self.src[self.i];
 
+        // c"…" before treating `c` as an ident
+        if (c == 'c' and self.i + 1 < self.src.len and self.src[self.i + 1] == '"') {
+            self.advance(); // c
+            self.advance(); // "
+            while (self.i < self.src.len and self.src[self.i] != '"') {
+                if (self.src[self.i] == '\\' and self.i + 1 < self.src.len) self.advance();
+                self.advance();
+            }
+            if (self.i < self.src.len) self.advance();
+            return .{ .kind = .cstring, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+        }
         if (isIdentStart(c)) {
             self.advance();
             while (self.i < self.src.len and isIdentCont(self.src[self.i])) self.advance();
@@ -111,6 +135,12 @@ pub const Lexer = struct {
         }
         if (c >= '0' and c <= '9') {
             self.advance();
+            // Hex: 0x… / 0X…
+            if ((c == '0') and self.i < self.src.len and (self.src[self.i] == 'x' or self.src[self.i] == 'X')) {
+                self.advance();
+                while (self.i < self.src.len and isHex(self.src[self.i])) self.advance();
+                return .{ .kind = .int, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+            }
             while (self.i < self.src.len and self.src[self.i] >= '0' and self.src[self.i] <= '9') self.advance();
             if (self.i + 1 < self.src.len and self.src[self.i] == '.' and self.src[self.i + 1] >= '0' and self.src[self.i + 1] <= '9') {
                 self.advance(); // .
@@ -182,10 +212,55 @@ pub const Lexer = struct {
             self.advance();
             return .{ .kind = .arrow, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
         }
-        // Division vs // comment (comments already skipped in trivia when //).
-        if (c == '/' and !(self.i + 1 < self.src.len and self.src[self.i + 1] == '/')) {
+        if (c == '.' and self.i + 1 < self.src.len and self.src[self.i + 1] == '.') {
             self.advance();
-            return .{ .kind = .slash, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+            self.advance();
+            return .{ .kind = .dotdot, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+        }
+        if (c == '+' and self.i + 1 < self.src.len and self.src[self.i + 1] == '=') {
+            self.advance();
+            self.advance();
+            return .{ .kind = .pluseq, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+        }
+        if (c == '-' and self.i + 1 < self.src.len and self.src[self.i + 1] == '=') {
+            self.advance();
+            self.advance();
+            return .{ .kind = .minuseq, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+        }
+        if (c == '*' and self.i + 1 < self.src.len and self.src[self.i + 1] == '=') {
+            self.advance();
+            self.advance();
+            return .{ .kind = .stareq, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+        }
+        if (c == '%' and self.i + 1 < self.src.len and self.src[self.i + 1] == '=') {
+            self.advance();
+            self.advance();
+            return .{ .kind = .percenteq, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+        }
+        // Division vs // comment vs /= .
+        if (c == '/') {
+            if (self.i + 1 < self.src.len and self.src[self.i + 1] == '/') {
+                // comment handled in skipTrivia; fall through shouldn't happen
+            } else if (self.i + 1 < self.src.len and self.src[self.i + 1] == '=') {
+                self.advance();
+                self.advance();
+                return .{ .kind = .slasheq, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+            } else {
+                self.advance();
+                return .{ .kind = .slash, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+            }
+        }
+        // Char lit 'x' or '\n'
+        if (c == '\'') {
+            self.advance();
+            if (self.i < self.src.len and self.src[self.i] == '\\' and self.i + 1 < self.src.len) {
+                self.advance();
+                self.advance();
+            } else if (self.i < self.src.len) {
+                self.advance();
+            }
+            if (self.i < self.src.len and self.src[self.i] == '\'') self.advance();
+            return .{ .kind = .char, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
         }
 
         self.advance();
@@ -260,6 +335,9 @@ fn isIdentStart(c: u8) bool {
 fn isIdentCont(c: u8) bool {
     return isIdentStart(c) or (c >= '0' and c <= '9');
 }
+fn isHex(c: u8) bool {
+    return (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
+}
 
 fn keyword(text: []const u8) TokenKind {
     const map = .{
@@ -287,9 +365,14 @@ fn keyword(text: []const u8) TokenKind {
         .{ "for", TokenKind.kw_for },
         .{ "continue", TokenKind.kw_continue },
         .{ "defer", TokenKind.kw_defer },
+        .{ "errdefer", TokenKind.kw_errdefer },
         .{ "enum", TokenKind.kw_enum },
         .{ "when", TokenKind.kw_when },
         .{ "import", TokenKind.kw_import },
+        .{ "in", TokenKind.kw_in },
+        .{ "private", TokenKind.kw_private },
+        .{ "require", TokenKind.kw_require },
+        .{ "is", TokenKind.kw_is },
     };
     inline for (map) |e| {
         if (std.mem.eql(u8, text, e[0])) return e[1];

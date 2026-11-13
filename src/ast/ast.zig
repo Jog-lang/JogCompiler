@@ -9,10 +9,17 @@ pub const TypeExpr = union(enum) {
     optional: *TypeExpr,
     /// Fixed array `[N]T` (elements stored as 8-byte slots for now).
     array: ArrayType,
+    /// View `[]T` / `[]const T` → `{ ptr, len }` (bytes-first; not jogc slice).
+    slice_view: SliceView,
     /// Product type `(T, U, …)` — lowered as synthetic `__TupN` struct.
     tuple: []*TypeExpr,
     iface_fn: *IfaceFnType,
     bad,
+};
+
+pub const SliceView = struct {
+    elem: *TypeExpr,
+    is_const: bool,
 };
 
 pub const NamedApp = struct {
@@ -52,11 +59,17 @@ pub const Decl = union(enum) {
     expect_fn: ExternFn,
     actual_fn: FnDecl,
     import_decl: ImportDecl,
+    require_decl: RequireDecl,
 };
 
 pub const ImportDecl = struct {
     path: []const u8,
     alias: ?[]const u8 = null,
+};
+
+pub const RequireDecl = struct {
+    /// Module name as in `require foo` / `require "path"`.
+    name: []const u8,
 };
 
 pub const EnumDecl = struct {
@@ -97,6 +110,8 @@ pub const StructDecl = struct {
     /// Generic params e.g. `struct Box<T>`.
     type_params: [][]const u8 = &.{},
     fields: []Field,
+    /// `@packed` — request dense layout (byte-packed when fields are byte-sized).
+    packed_attr: bool = false,
 };
 
 pub const InterfaceFn = struct {
@@ -122,12 +137,18 @@ pub const FnDecl = struct {
     name: []const u8,
     /// Generic params e.g. `fn id<T>(…)`.
     type_params: [][]const u8 = &.{},
+    /// Optional constraints parallel to type_params (`T: Iface`).
+    type_constraints: []?[]const u8 = &.{},
     params: []Param,
     contexts: []ContextParam,
     ret: ?*TypeExpr,
     body: ?*Block,
     /// C-callable export (SysV). Jog callers still use the Jog path; export adds .globl for C.
     exported: bool = false,
+    /// `@test` — test entry; not linked as main.
+    is_test: bool = false,
+    /// `private` — file-local (enforced when multi-file).
+    is_private: bool = false,
 };
 
 pub const MethodDecl = struct {
@@ -152,10 +173,12 @@ pub const Stmt = union(enum) {
     return_stmt: ?*Expr,
     if_stmt: IfStmt,
     while_stmt: WhileStmt,
+    for_in_stmt: ForInStmt,
     break_stmt,
     continue_stmt,
     with_stmt: WithStmt,
     defer_stmt: DeferStmt,
+    errdefer_stmt: DeferStmt,
 };
 
 pub const DeferStmt = union(enum) {
@@ -165,6 +188,13 @@ pub const DeferStmt = union(enum) {
 
 pub const WhileStmt = struct {
     cond: *Expr,
+    body: *Block,
+};
+
+/// `for x in iter { }` — iter is range `a..b` or array.
+pub const ForInStmt = struct {
+    name: []const u8,
+    iter: *Expr,
     body: *Block,
 };
 
@@ -188,6 +218,8 @@ pub const Assign = struct {
     value: *Expr,
     field: ?FieldAssign = null,
     index: ?IndexAssign = null,
+    /// Compound `+=` etc.; null means plain `=`.
+    compound: ?BinaryOp = null,
 };
 
 pub const FieldAssign = struct {
@@ -217,6 +249,8 @@ pub const Expr = union(enum) {
     int: i64,
     float: f64,
     string: []const u8,
+    /// `c"…"` — string bytes with trailing NUL for FFI.
+    cstring: []const u8,
     null_lit,
     binary: Binary,
     unary: Unary,
@@ -224,12 +258,46 @@ pub const Expr = union(enum) {
     field: FieldAccess,
     index: IndexAccess,
     cast: Cast,
+    /// `e as? T` — optional cast (null on failure).
+    try_cast: Cast,
+    /// `e is T` — type test → bool.
+    is_type: IsType,
     optional_call: OptionalCall,
     struct_lit: StructLit,
     panic_call: PanicCall,
     when_expr: WhenExpr,
     /// `(a, b, …)` product value.
     tuple: []*Expr,
+    /// `a..b` half-open range (start inclusive, end exclusive).
+    range: Range,
+    /// `[a, b, c]` array literal (fixed len).
+    array_lit: ArrayLit,
+    /// `"a ${x} b"` interpolation pieces (string/expr alternating).
+    interp: Interp,
+};
+
+pub const Range = struct {
+    start: *Expr,
+    end: *Expr,
+};
+
+pub const ArrayLit = struct {
+    elems: []*Expr,
+};
+
+pub const Interp = struct {
+    /// Alternating string literal chunks and expression values.
+    parts: []InterpPart,
+};
+
+pub const InterpPart = union(enum) {
+    text: []const u8,
+    expr: *Expr,
+};
+
+pub const IsType = struct {
+    expr: *Expr,
+    ty: *TypeExpr,
 };
 
 pub const WhenExpr = struct {
@@ -277,6 +345,7 @@ pub const BinaryOp = enum {
     bit_xor,
     shl,
     shr,
+    coalesce, // ?:
 };
 
 pub const Unary = struct {

@@ -1,0 +1,13 @@
+// Elvis ?: — null coalesce (JOG-88).
+
+fn main() {
+    val a: i64? = null
+    val b: i64? = 5
+    val x = a ?: 3
+    val y = b ?: 9
+    if (x == 3 && y == 5) {
+        print("elvis ok\n")
+    } else {
+        panic("elvis fail\n")
+    }
+}

@@ -131,6 +131,7 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
                 try types.put(a, ed.name, ti);
             },
             .import_decl => {},
+            .require_decl => {},
             .interface_fn => |*inf| {
                 try iface_fns.put(a, inf.name, inf);
                 const ti = try a.create(TypeInfo);
@@ -345,6 +346,16 @@ fn resolveTypeExpr(
             };
             return ti;
         },
+        .slice_view => |sv| {
+            const elem = try resolveTypeExpr(a, types, sv.elem, diags);
+            const ti = try a.create(TypeInfo);
+            ti.* = .{
+                .kind = .struct_ty,
+                .name = try std.fmt.allocPrint(a, "View_{s}", .{elem.name}),
+                .pointee = elem,
+            };
+            return ti;
+        },
         .iface_fn => {
             const ti = try a.create(TypeInfo);
             ti.* = .{ .kind = .iface_fn, .name = "iface_fn" };
@@ -448,6 +459,16 @@ fn checkStmt(
             for (ds.names) |n| {
                 try scope.vars.put(a, n, .{ .ty = i64t, .mutable = ds.mutable });
             }
+        },
+        .for_in_stmt => |fs| {
+            _ = try checkExpr(a, types, fns, scope, fs.iter, diags);
+            const i64t = types.get("i64").?;
+            try scope.vars.put(a, fs.name, .{ .ty = i64t, .mutable = false });
+            try checkBlock(a, types, fns, fs.body, diags, scope);
+        },
+        .errdefer_stmt => |ds| switch (ds) {
+            .expr => |ex| _ = try checkExpr(a, types, fns, scope, ex, diags),
+            .block => |b| try checkBlock(a, types, fns, b, diags, scope),
         },
         .assign => |as| {
             if (as.index) |ix| {
@@ -649,20 +670,33 @@ fn checkExpr(
                     for (c.args) |arg| _ = try checkExpr(a, types, fns, scope, arg, diags);
                     for (c.with_args) |w| _ = try checkExpr(a, types, fns, scope, w, diags);
                     for (c.type_args) |ta| _ = try resolveTypeExpr(a, types, ta, diags);
-                    if (fd.type_params.len > 0 and c.type_args.len == fd.type_params.len) {
-                        // Temporarily bind T → concrete for return-type resolve.
-                        var saved: std.ArrayListUnmanaged(struct { []const u8, ?*TypeInfo }) = .{};
-                        for (fd.type_params, 0..) |tp, i| {
-                            const prev = types.get(tp);
-                            try saved.append(a, .{ tp, prev });
-                            const concrete = try resolveTypeExpr(a, types, c.type_args[i], diags);
-                            try types.put(a, tp, concrete);
+                    if (fd.type_params.len > 0) {
+                        // Explicit type args, or infer from first arg (int → i64).
+                        var targ_buf: [4]*ast.TypeExpr = undefined;
+                        var nta: usize = c.type_args.len;
+                        if (nta == 0 and c.args.len > 0 and fd.type_params.len == 1) {
+                            const te = try a.create(ast.TypeExpr);
+                            const at = try checkExpr(a, types, fns, scope, c.args[0], diags);
+                            te.* = .{ .name = if (at.name.len > 0) at.name else "i64" };
+                            targ_buf[0] = te;
+                            nta = 1;
                         }
-                        const result = if (fd.ret) |r| try resolveTypeExpr(a, types, r, diags) else try voidType(a);
-                        for (saved.items) |s| {
-                            if (s[1]) |p| try types.put(a, s[0], p) else _ = types.remove(s[0]);
+                        if (nta == fd.type_params.len) {
+                            var saved: std.ArrayListUnmanaged(struct { []const u8, ?*TypeInfo }) = .{};
+                            var i: usize = 0;
+                            while (i < nta) : (i += 1) {
+                                const ta = if (c.type_args.len > 0) c.type_args[i] else targ_buf[i];
+                                const prev = types.get(fd.type_params[i]);
+                                try saved.append(a, .{ fd.type_params[i], prev });
+                                const concrete = try resolveTypeExpr(a, types, ta, diags);
+                                try types.put(a, fd.type_params[i], concrete);
+                            }
+                            const result = if (fd.ret) |r| try resolveTypeExpr(a, types, r, diags) else try voidType(a);
+                            for (saved.items) |s| {
+                                if (s[1]) |p| try types.put(a, s[0], p) else _ = types.remove(s[0]);
+                            }
+                            return result;
                         }
-                        return result;
                     }
                     if (fd.ret) |r| return try resolveTypeExpr(a, types, r, diags);
                     return try voidType(a);
@@ -768,6 +802,44 @@ fn checkExpr(
                 .name = try std.fmt.allocPrint(a, "__Tup{d}", .{elems.len}),
             };
             return ti;
+        },
+        .cstring => return types.get("str").?,
+        .range => |r| {
+            _ = try checkExpr(a, types, fns, scope, r.start, diags);
+            _ = try checkExpr(a, types, fns, scope, r.end, diags);
+            const ti = try a.create(TypeInfo);
+            ti.* = .{ .kind = .i64_ty, .name = "range", .bits = 64, .unsigned = false };
+            return ti;
+        },
+        .array_lit => |al| {
+            for (al.elems) |el| _ = try checkExpr(a, types, fns, scope, el, diags);
+            const ti = try a.create(TypeInfo);
+            ti.* = .{
+                .kind = .array_ty,
+                .name = "array_lit",
+                .array_len = al.elems.len,
+                .pointee = types.get("i64"),
+            };
+            return ti;
+        },
+        .interp => |ip| {
+            for (ip.parts) |p| switch (p) {
+                .text => {},
+                .expr => |ex| _ = try checkExpr(a, types, fns, scope, ex, diags),
+            };
+            return types.get("str").?;
+        },
+        .try_cast => |c| {
+            _ = try checkExpr(a, types, fns, scope, c.expr, diags);
+            const to = try resolveTypeExpr(a, types, c.ty, diags);
+            const ti = try a.create(TypeInfo);
+            ti.* = .{ .kind = .optional, .name = "opt", .pointee = to };
+            return ti;
+        },
+        .is_type => |it| {
+            _ = try checkExpr(a, types, fns, scope, it.expr, diags);
+            _ = try resolveTypeExpr(a, types, it.ty, diags);
+            return types.get("bool").?;
         },
     }
 }

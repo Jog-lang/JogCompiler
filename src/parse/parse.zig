@@ -54,7 +54,18 @@ pub const Parser = struct {
     }
 
     fn parseDecl(self: *Parser) ParseError!ast.Decl {
-        // @link("lib") extern { ... }  or  @export fn ...
+        var is_private = false;
+        if (self.tok.kind == .kw_private) {
+            is_private = true;
+            self.advance();
+            // private(package) — accept and ignore scope for now
+            if (self.tok.kind == .lparen) {
+                self.advance();
+                if (self.tok.kind == .ident) self.advance();
+                try self.expect(.rparen);
+            }
+        }
+        // @link / @export / @test / @packed / @intrinsic
         if (self.tok.kind == .at) {
             self.advance();
             if (self.tok.kind != .ident) return error.UnexpectedToken;
@@ -73,7 +84,29 @@ pub const Parser = struct {
             } else if (std.mem.eql(u8, attr, "export")) {
                 var fd = try self.parseFn();
                 fd.exported = true;
+                fd.is_private = is_private;
                 return .{ .fn_decl = fd };
+            } else if (std.mem.eql(u8, attr, "test")) {
+                var fd = try self.parseFn();
+                fd.is_test = true;
+                fd.is_private = is_private;
+                return .{ .fn_decl = fd };
+            } else if (std.mem.eql(u8, attr, "packed")) {
+                var sd = try self.parseStruct();
+                sd.packed_attr = true;
+                return .{ .struct_decl = sd };
+            } else if (std.mem.eql(u8, attr, "intrinsic")) {
+                // @intrinsic(...) type Name: …  — skip args, parse type alias
+                if (self.tok.kind == .lparen) {
+                    self.advance();
+                    var depth: u32 = 1;
+                    while (self.tok.kind != .eof and depth > 0) {
+                        if (self.tok.kind == .lparen) depth += 1;
+                        if (self.tok.kind == .rparen) depth -= 1;
+                        self.advance();
+                    }
+                }
+                return .{ .type_alias = try self.parseTypeAlias() };
             } else {
                 return error.UnexpectedToken;
             }
@@ -83,6 +116,19 @@ pub const Parser = struct {
             .kw_struct => return .{ .struct_decl = try self.parseStruct() },
             .kw_enum => return .{ .enum_decl = try self.parseEnum() },
             .kw_import => return .{ .import_decl = try self.parseImport() },
+            .kw_require => {
+                self.advance();
+                if (self.tok.kind == .string) {
+                    const raw = self.tok.text;
+                    self.advance();
+                    const name = try unescape(self.allocator, if (raw.len >= 2) raw[1 .. raw.len - 1] else raw);
+                    return .{ .require_decl = .{ .name = name } };
+                }
+                if (self.tok.kind != .ident) return error.UnexpectedToken;
+                const name = self.tok.text;
+                self.advance();
+                return .{ .require_decl = .{ .name = name } };
+            },
             .kw_interface => return try self.parseInterface(),
             .kw_extern => return .{ .extern_block = try self.parseExternBlock() },
             .kw_expect => {
@@ -107,6 +153,7 @@ pub const Parser = struct {
                 self.advance();
                 var fd = try self.parseFn();
                 fd.exported = true;
+                fd.is_private = is_private;
                 return .{ .fn_decl = fd };
             },
             .kw_fn => {
@@ -134,7 +181,9 @@ pub const Parser = struct {
                 self.lx.line = save_line;
                 self.lx.col = save_col;
                 self.tok = save_tok;
-                return .{ .fn_decl = try self.parseFn() };
+                var fd = try self.parseFn();
+                fd.is_private = is_private;
+                return .{ .fn_decl = fd };
             },
             else => return error.UnexpectedToken,
         }
@@ -217,7 +266,10 @@ pub const Parser = struct {
         if (self.tok.kind != .ident) return error.UnexpectedToken;
         const name = self.tok.text;
         self.advance();
-        try self.expect(.eq);
+        // `type Name = T` or jogc `type Name: T`
+        if (self.tok.kind == .eq or self.tok.kind == .colon) {
+            self.advance();
+        } else return error.UnexpectedToken;
         const ty = try self.parseTypeExpr();
         return .{ .name = name, .ty = ty };
     }
@@ -392,6 +444,12 @@ pub const Parser = struct {
             if (self.tok.kind != .ident) return error.UnexpectedToken;
             try params.append(self.allocator, self.tok.text);
             self.advance();
+            // Optional constraint `T: Iface`
+            if (self.tok.kind == .colon) {
+                self.advance();
+                if (self.tok.kind != .ident) return error.UnexpectedToken;
+                self.advance(); // constraint name recorded lightly on FnDecl later via parseFn
+            }
             if (self.tok.kind == .comma) {
                 self.advance();
                 continue;
@@ -503,6 +561,19 @@ pub const Parser = struct {
         }
         if (self.tok.kind == .lbracket) {
             self.advance();
+            // `[]T` / `[]const T` view, or `[N]T` fixed array
+            if (self.tok.kind == .rbracket) {
+                self.advance();
+                var is_const = false;
+                if (self.tok.kind == .ident and std.mem.eql(u8, self.tok.text, "const")) {
+                    is_const = true;
+                    self.advance();
+                }
+                const elem = try self.parseTypePrimary();
+                const ty = try self.allocator.create(ast.TypeExpr);
+                ty.* = .{ .slice_view = .{ .elem = elem, .is_const = is_const } };
+                return ty;
+            }
             if (self.tok.kind != .int) return error.UnexpectedToken;
             const len = try std.fmt.parseInt(u64, self.tok.text, 10);
             self.advance();
@@ -633,9 +704,40 @@ pub const Parser = struct {
                 }
                 return .{ .if_stmt = .{ .cond = cond, .then_block = then_b, .else_block = else_b } };
             },
-            .kw_while, .kw_for => {
-                // `for cond { }` is the jogc condition-loop form (same as while for now).
+            .kw_while => {
                 self.advance();
+                var cond: *ast.Expr = undefined;
+                if (self.tok.kind == .lparen) {
+                    self.advance();
+                    cond = try self.parseExpr();
+                    try self.expect(.rparen);
+                } else {
+                    cond = try self.parseExpr();
+                }
+                const body = try self.parseBlock();
+                return .{ .while_stmt = .{ .cond = cond, .body = body } };
+            },
+            .kw_for => {
+                self.advance();
+                // `for { }` infinite; `for x in iter { }`; `for cond { }`
+                if (self.tok.kind == .lbrace) {
+                    const one = try self.allocator.create(ast.Expr);
+                    one.* = .{ .int = 1 };
+                    return .{ .while_stmt = .{ .cond = one, .body = try self.parseBlock() } };
+                }
+                // Lookahead: ident `in` → for-in
+                if (self.tok.kind == .ident) {
+                    const save = self.snapshot();
+                    const name = self.tok.text;
+                    self.advance();
+                    if (self.tok.kind == .kw_in) {
+                        self.advance();
+                        const iter = try self.parseExpr();
+                        const body = try self.parseBlock();
+                        return .{ .for_in_stmt = .{ .name = name, .iter = iter, .body = body } };
+                    }
+                    self.restore(save);
+                }
                 var cond: *ast.Expr = undefined;
                 if (self.tok.kind == .lparen) {
                     self.advance();
@@ -661,6 +763,13 @@ pub const Parser = struct {
                     return .{ .defer_stmt = .{ .block = try self.parseBlock() } };
                 }
                 return .{ .defer_stmt = .{ .expr = try self.parseExpr() } };
+            },
+            .kw_errdefer => {
+                self.advance();
+                if (self.tok.kind == .lbrace) {
+                    return .{ .errdefer_stmt = .{ .block = try self.parseBlock() } };
+                }
+                return .{ .errdefer_stmt = .{ .expr = try self.parseExpr() } };
             },
             .kw_with => {
                 self.advance();
@@ -691,35 +800,75 @@ pub const Parser = struct {
             },
             else => {
                 const e = try self.parseExpr();
-                if (self.tok.kind == .eq) {
-                    self.advance();
-                    const v = try self.parseExpr();
-                    if (e.* == .ident) {
-                        return .{ .assign = .{ .name = e.ident, .value = v } };
-                    }
-                    if (e.* == .field) {
-                        return .{ .assign = .{
-                            .name = e.field.name,
-                            .value = v,
-                            .field = .{ .base = e.field.base, .name = e.field.name },
-                        } };
-                    }
-                    if (e.* == .index) {
-                        return .{ .assign = .{
-                            .name = "",
-                            .value = v,
-                            .index = .{ .base = e.index.base, .index = e.index.index },
-                        } };
-                    }
-                    return error.UnexpectedToken;
+                const compound: ?ast.BinaryOp = switch (self.tok.kind) {
+                    .eq => null,
+                    .pluseq => .add,
+                    .minuseq => .sub,
+                    .stareq => .mul,
+                    .slasheq => .div,
+                    .percenteq => .rem,
+                    else => {
+                        return .{ .expr = e };
+                    },
+                };
+                self.advance();
+                const v = try self.parseExpr();
+                if (e.* == .ident) {
+                    return .{ .assign = .{ .name = e.ident, .value = v, .compound = compound } };
                 }
-                return .{ .expr = e };
+                if (e.* == .field) {
+                    return .{ .assign = .{
+                        .name = e.field.name,
+                        .value = v,
+                        .field = .{ .base = e.field.base, .name = e.field.name },
+                        .compound = compound,
+                    } };
+                }
+                if (e.* == .index) {
+                    return .{ .assign = .{
+                        .name = "",
+                        .value = v,
+                        .index = .{ .base = e.index.base, .index = e.index.index },
+                        .compound = compound,
+                    } };
+                }
+                return error.UnexpectedToken;
             },
         }
     }
 
     fn parseExpr(self: *Parser) ParseError!*ast.Expr {
-        return try self.parseOr();
+        return try self.parseRange();
+    }
+
+    fn parseRange(self: *Parser) ParseError!*ast.Expr {
+        const left = try self.parseCoalesce();
+        if (self.tok.kind == .dotdot) {
+            self.advance();
+            const right = try self.parseCoalesce();
+            const e = try self.allocator.create(ast.Expr);
+            e.* = .{ .range = .{ .start = left, .end = right } };
+            return e;
+        }
+        return left;
+    }
+
+    fn parseCoalesce(self: *Parser) ParseError!*ast.Expr {
+        var left = try self.parseOr();
+        while (self.tok.kind == .question) {
+            const save = self.snapshot();
+            self.advance();
+            if (self.tok.kind != .colon) {
+                self.restore(save);
+                break;
+            }
+            self.advance();
+            const right = try self.parseOr();
+            const e = try self.allocator.create(ast.Expr);
+            e.* = .{ .binary = .{ .op = .coalesce, .left = left, .right = right } };
+            left = e;
+        }
+        return left;
     }
 
     fn parseOr(self: *Parser) ParseError!*ast.Expr {
@@ -993,9 +1142,23 @@ pub const Parser = struct {
             }
             if (self.tok.kind == .kw_as) {
                 self.advance();
+                const try_cast = self.tok.kind == .question;
+                if (try_cast) self.advance();
                 const ty = try self.parseTypeExpr();
                 const c = try self.allocator.create(ast.Expr);
-                c.* = .{ .cast = .{ .expr = e, .ty = ty } };
+                if (try_cast) {
+                    c.* = .{ .try_cast = .{ .expr = e, .ty = ty } };
+                } else {
+                    c.* = .{ .cast = .{ .expr = e, .ty = ty } };
+                }
+                e = c;
+                continue;
+            }
+            if (self.tok.kind == .kw_is) {
+                self.advance();
+                const ty = try self.parseTypeExpr();
+                const c = try self.allocator.create(ast.Expr);
+                c.* = .{ .is_type = .{ .expr = e, .ty = ty } };
                 e = c;
                 continue;
             }
@@ -1115,8 +1278,12 @@ pub const Parser = struct {
                 return e;
             },
             .int => {
-                const n = try std.fmt.parseInt(i64, self.tok.text, 10);
+                const text = self.tok.text;
                 self.advance();
+                const n: i64 = if (text.len >= 2 and text[0] == '0' and (text[1] == 'x' or text[1] == 'X'))
+                    try std.fmt.parseInt(i64, text[2..], 16)
+                else
+                    try std.fmt.parseInt(i64, text, 10);
                 e.* = .{ .int = n };
                 return e;
             },
@@ -1126,12 +1293,70 @@ pub const Parser = struct {
                 e.* = .{ .float = n };
                 return e;
             },
+            .char => {
+                const raw = self.tok.text;
+                self.advance();
+                // 'x' or '\n'
+                var val: i64 = 0;
+                if (raw.len >= 3 and raw[0] == '\'') {
+                    if (raw[1] == '\\' and raw.len >= 4) {
+                        val = switch (raw[2]) {
+                            'n' => '\n',
+                            't' => '\t',
+                            'r' => '\r',
+                            '0' => 0,
+                            '\\' => '\\',
+                            '\'' => '\'',
+                            else => raw[2],
+                        };
+                    } else {
+                        val = raw[1];
+                    }
+                }
+                e.* = .{ .int = val };
+                return e;
+            },
+            .cstring => {
+                const raw = self.tok.text;
+                self.advance();
+                // c"…"
+                const inner = if (raw.len >= 3) raw[2 .. raw.len - 1] else "";
+                const s = try unescape(self.allocator, inner);
+                // Append NUL for C interop
+                var buf = try self.allocator.alloc(u8, s.len + 1);
+                @memcpy(buf[0..s.len], s);
+                buf[s.len] = 0;
+                e.* = .{ .cstring = buf };
+                return e;
+            },
             .string => {
                 const raw = self.tok.text;
                 self.advance();
-                // strip quotes; minimal unescape
+                // strip quotes; support ${expr} interpolation
                 const inner = if (raw.len >= 2) raw[1 .. raw.len - 1] else raw;
+                if (std.mem.indexOf(u8, inner, "${")) |_| {
+                    e.* = .{ .interp = try self.parseInterpParts(inner) };
+                    return e;
+                }
                 e.* = .{ .string = try unescape(self.allocator, inner) };
+                return e;
+            },
+            .lbracket => {
+                // Array literal `[a, b, c]`
+                self.advance();
+                var elems: std.ArrayListUnmanaged(*ast.Expr) = .{};
+                if (self.tok.kind != .rbracket) {
+                    while (true) {
+                        try elems.append(self.allocator, try self.parseExpr());
+                        if (self.tok.kind == .comma) {
+                            self.advance();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                try self.expect(.rbracket);
+                e.* = .{ .array_lit = .{ .elems = try elems.toOwnedSlice(self.allocator) } };
                 return e;
             },
             .kw_null => {
@@ -1187,6 +1412,48 @@ pub const Parser = struct {
         self.lx.line = s.line;
         self.lx.col = s.col;
         self.tok = s.tok;
+    }
+
+    fn parseInterpParts(self: *Parser, inner: []const u8) ParseError!ast.Interp {
+        var parts: std.ArrayListUnmanaged(ast.InterpPart) = .{};
+        var i: usize = 0;
+        var text_start: usize = 0;
+        while (i < inner.len) {
+            if (i + 1 < inner.len and inner[i] == '$' and inner[i + 1] == '{') {
+                if (i > text_start) {
+                    const chunk = try unescape(self.allocator, inner[text_start..i]);
+                    try parts.append(self.allocator, .{ .text = chunk });
+                }
+                i += 2;
+                const expr_start = i;
+                var depth: u32 = 1;
+                while (i < inner.len and depth > 0) : (i += 1) {
+                    if (inner[i] == '{') depth += 1;
+                    if (inner[i] == '}') {
+                        depth -= 1;
+                        if (depth == 0) break;
+                    }
+                }
+                if (depth != 0) return error.UnexpectedToken;
+                const expr_src = inner[expr_start..i];
+                i += 1; // }
+                text_start = i;
+                var nested = Parser{
+                    .allocator = self.allocator,
+                    .lx = lex.Lexer.init(expr_src),
+                    .tok = undefined,
+                };
+                nested.tok = nested.lx.next();
+                const ex = try nested.parseExpr();
+                try parts.append(self.allocator, .{ .expr = ex });
+            } else {
+                i += 1;
+            }
+        }
+        if (text_start < inner.len) {
+            try parts.append(self.allocator, .{ .text = try unescape(self.allocator, inner[text_start..]) });
+        }
+        return .{ .parts = try parts.toOwnedSlice(self.allocator) };
     }
 };
 

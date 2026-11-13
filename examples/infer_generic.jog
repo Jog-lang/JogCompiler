@@ -1,0 +1,14 @@
+// Inference-only generic call id(42) → id__i64.
+
+fn id<T>(x: T): T {
+    return x
+}
+
+fn main() {
+    val a = id(42)
+    if (a == 42) {
+        print("infer generic ok\n")
+    } else {
+        panic("infer fail\n")
+    }
+}
