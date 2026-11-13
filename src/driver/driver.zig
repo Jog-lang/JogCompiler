@@ -6,7 +6,7 @@ const ir = @import("../ir/ir.zig");
 const link = @import("../codegen/link.zig");
 const mod = @import("../mod/mod.zig");
 
-pub const version_string = "jog 0.2.4-v2 (zig host, ir→asm→native)";
+pub const version_string = "jog 0.2.5-v2 (zig host, ir→asm→native)";
 
 pub fn cmdVersion(writer: anytype) !void {
     try writer.print("{s}\n", .{version_string});

@@ -53,6 +53,9 @@ zig build
 ./zig-out/bin/jog build examples/spawn.jog -o out/spawn && ./out/spawn
 ./zig-out/bin/jog build examples/while_ops.jog -o out/while_ops && ./out/while_ops
 ./zig-out/bin/jog build examples/link_attr.jog -o out/link_attr && ./out/link_attr
+./zig-out/bin/jog build examples/for_continue.jog -o out/for_continue && ./out/for_continue
+./zig-out/bin/jog build examples/bitwise_ops.jog -o out/bitwise_ops && ./out/bitwise_ops
+./zig-out/bin/jog build examples/arrays.jog -o out/arrays && ./out/arrays
 ```
 
-Language subset (milestone): structs/fields, pointers, `T?` + `?.`, widen/`as` narrow, `with` contexts, `interface struct` fat ptrs. Minimal `jog.mod` module graph (`root` + `source` + `link.*` / `libdir.*`). `while`/`break`, `&&`/`||`, `*`/`/`, `@link` / `--libdir`. Stackful `go`/`yield`, multi-worker steal, `with (Dispatcher)` hop, and elastic IO pool: `docs/coroutines.md`.
+Language subset (milestone): structs/fields, pointers, `T?` + `?.`, widen/`as` narrow, `with` contexts, `interface struct` fat ptrs. Minimal `jog.mod` module graph (`root` + `source` + `link.*` / `libdir.*`). `while`/`for`/`break`/`continue`, `&&`/`||`, arith/`%`, `<=`/`>=`, bitwise, `[N]T` index, `@link` / `--libdir`. Stackful `go`/`yield`, multi-worker steal, `with (Dispatcher)` hop, and elastic IO pool: `docs/coroutines.md`.
