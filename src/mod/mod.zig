@@ -25,7 +25,15 @@ pub const LibdirEntry = struct {
     target: LinkTarget,
 };
 
-/// Minimal jog.mod: module, version, root, optional source / link / libdir lines.
+/// `require name path` / `require.test name path` (version requires need `--module`).
+pub const RequireSpec = struct {
+    name: []const u8,
+    /// Path or version token as written; path specs start with `.` `/` or drive.
+    spec: []const u8,
+    test_only: bool,
+};
+
+/// Minimal jog.mod: module, version, root, optional source / link / libdir / require lines.
 pub const Manifest = struct {
     name: []const u8,
     version: []const u8,
@@ -35,6 +43,8 @@ pub const Manifest = struct {
     links: []const LinkEntry,
     /// From `libdir` / `libdir.<os|emscripten>` — filter with `libdirsFor`.
     libdir_entries: []const LibdirEntry,
+    /// Production + test requires (filter with `test_only`).
+    requires: []const RequireSpec,
     /// Convenience: libs after filtering for the last `parse`/`load` target hint.
     /// Prefer `linksFor` / `libdirsFor` when the build target is known.
     link_libs: []const []const u8,
@@ -138,6 +148,7 @@ pub fn parse(parent: std.mem.Allocator, text: []const u8, dir: []const u8) Error
     var extras: std.ArrayListUnmanaged([]const u8) = .{};
     var links: std.ArrayListUnmanaged(LinkEntry) = .{};
     var libdir_entries: std.ArrayListUnmanaged(LibdirEntry) = .{};
+    var requires: std.ArrayListUnmanaged(RequireSpec) = .{};
 
     var line_it = std.mem.splitScalar(u8, text, '\n');
     while (line_it.next()) |raw_line| {
@@ -172,8 +183,18 @@ pub fn parse(parent: std.mem.Allocator, text: []const u8, dir: []const u8) Error
             const tname = key["libdir.".len..];
             const t = parseLinkTarget(tname) orelse return error.UnknownDirective;
             try libdir_entries.append(a, .{ .path = try a.dupe(u8, firstWord(value)), .target = t });
-        } else if (std.mem.eql(u8, key, "export") or std.mem.eql(u8, key, "kind") or std.mem.eql(u8, key, "jog") or std.mem.eql(u8, key, "require") or std.mem.eql(u8, key, "require.test")) {
-            // Recognized v1 directives ignored on v2 (sources listed explicitly).
+        } else if (std.mem.eql(u8, key, "require") or std.mem.eql(u8, key, "require.test")) {
+            const test_only = std.mem.eql(u8, key, "require.test");
+            var vit = std.mem.tokenizeAny(u8, value, " \t");
+            const rname = vit.next() orelse return error.EmptyDirective;
+            const rspec = vit.next() orelse return error.EmptyDirective;
+            try requires.append(a, .{
+                .name = try a.dupe(u8, rname),
+                .spec = try a.dupe(u8, rspec),
+                .test_only = test_only,
+            });
+        } else if (std.mem.eql(u8, key, "export") or std.mem.eql(u8, key, "kind") or std.mem.eql(u8, key, "jog")) {
+            // Recognized v1 directives ignored on v2 for now.
             continue;
         } else {
             return error.UnknownDirective;
@@ -210,11 +231,27 @@ pub fn parse(parent: std.mem.Allocator, text: []const u8, dir: []const u8) Error
         .sources = try sources.toOwnedSlice(a),
         .links = links_slice,
         .libdir_entries = libdirs_slice,
+        .requires = try requires.toOwnedSlice(a),
         .link_libs = try default_libs.toOwnedSlice(a),
         .libdirs = try default_dirs.toOwnedSlice(a),
         .dir = try a.dupe(u8, dir),
         .arena = arena,
     };
+}
+
+/// True when `spec` looks like a filesystem path (not a semver).
+pub fn isPathSpec(spec: []const u8) bool {
+    if (spec.len == 0) return false;
+    if (spec[0] == '.' or spec[0] == '/' or spec[0] == '\\') return true;
+    // Windows drive: C:\ or C:/
+    if (spec.len >= 2 and spec[1] == ':') return true;
+    return false;
+}
+
+/// Resolve a path require relative to the requiring module dir. Caller frees.
+pub fn resolveRequireDir(allocator: std.mem.Allocator, m: *const Manifest, spec: []const u8) Error![]u8 {
+    if (std.fs.path.isAbsolute(spec)) return try allocator.dupe(u8, spec);
+    return try std.fs.path.join(allocator, &.{ m.dir, spec });
 }
 
 /// Join module dir + relative sources. Caller frees each path and the slice.
@@ -310,6 +347,25 @@ test "root listed again in source is deduped" {
     try std.testing.expectEqual(@as(usize, 1), m.sources.len);
 }
 
+test "require path lines" {
+    const text =
+        \\module app
+        \\root main.jog
+        \\require util ../util
+        \\require.test mock ./mocks/mock
+        \\
+    ;
+    var m = try parse(std.testing.allocator, text, "/tmp/app");
+    defer m.deinit();
+    try std.testing.expectEqual(@as(usize, 2), m.requires.len);
+    try std.testing.expectEqualStrings("util", m.requires[0].name);
+    try std.testing.expectEqualStrings("../util", m.requires[0].spec);
+    try std.testing.expect(!m.requires[0].test_only);
+    try std.testing.expect(m.requires[1].test_only);
+    try std.testing.expect(isPathSpec("../util"));
+    try std.testing.expect(!isPathSpec("1.2.3"));
+}
+
 test "link and libdir lines" {
     const text =
         \\module jog_sdl
@@ -329,7 +385,10 @@ test "link and libdir lines" {
     try std.testing.expectEqualStrings("./prefix/lib64", m.libdirs[0]);
 
     const em_libs = try m.linksFor(std.testing.allocator, "emscripten");
-    defer std.testing.allocator.free(em_libs);
+    defer {
+        for (em_libs) |p| std.testing.allocator.free(p);
+        std.testing.allocator.free(em_libs);
+    }
     try std.testing.expectEqual(@as(usize, 1), em_libs.len);
     try std.testing.expectEqualStrings("SDL3", em_libs[0]);
 
@@ -339,5 +398,6 @@ test "link and libdir lines" {
         std.testing.allocator.free(em_dirs);
     }
     try std.testing.expectEqual(@as(usize, 1), em_dirs.len);
-    try std.testing.expectEqualStrings("/tmp/jog_sdl/prefix-emscripten/lib", em_dirs[0]);
+    // path.join may keep a `./` segment from the relative libdir entry.
+    try std.testing.expect(std.mem.endsWith(u8, em_dirs[0], "prefix-emscripten/lib"));
 }

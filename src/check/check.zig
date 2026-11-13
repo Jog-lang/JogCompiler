@@ -48,6 +48,29 @@ pub const Diagnostic = struct {
     message: []const u8,
 };
 
+/// Active file while `check` runs (CLI is single-threaded). Used to attach
+/// expression spans to diagnostics without threading File through every helper.
+threadlocal var active_file: ?*const ast.File = null;
+
+fn emitDiag(
+    a: std.mem.Allocator,
+    diags: *std.ArrayListUnmanaged(Diagnostic),
+    at: ?*const ast.Expr,
+    line: u32,
+    col: u32,
+    message: []const u8,
+) !void {
+    var d: Diagnostic = .{ .line = line, .col = col, .message = message };
+    if (at) |e| {
+        if (active_file) |f| {
+            const sp = f.spanOf(e);
+            d.line = sp.line;
+            d.col = sp.col;
+        }
+    }
+    try diags.append(a, d);
+}
+
 pub const CheckResult = struct {
     ok: bool,
     diagnostics: []Diagnostic,
@@ -76,6 +99,9 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
     };
     errdefer result.deinit();
     const a = result.arena.allocator();
+    const prev_file = active_file;
+    active_file = file;
+    defer active_file = prev_file;
 
     var diags: std.ArrayListUnmanaged(Diagnostic) = .{};
     var types = std.StringHashMapUnmanaged(*TypeInfo){};
@@ -251,7 +277,7 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
     while (mit.next()) |e| {
         const md = e.value_ptr.*;
         if (structs.get(md.type_name) == null) {
-            try diags.append(a, .{ .message = try std.fmt.allocPrint(a, "method on unknown type '{s}'", .{md.type_name}) });
+            try emitDiag(a, &diags, null, 1, 1, try std.fmt.allocPrint(a, "method on unknown type '{s}'", .{md.type_name}));
         }
         for (md.contexts) |ctx| _ = try resolveTypeExpr(a, &types, ctx.ty, &diags);
         if (md.ret) |r| _ = try resolveTypeExpr(a, &types, r, &diags);
@@ -310,7 +336,7 @@ fn resolveTypeExpr(
     switch (te.*) {
         .name => |n| {
             if (types.get(n)) |t| return t;
-            try diags.append(a, .{ .message = try std.fmt.allocPrint(a, "unknown type '{s}'", .{n}) });
+            try emitDiag(a, diags, null, 1, 1, try std.fmt.allocPrint(a, "unknown type '{s}'", .{n}));
             const bad = try a.create(TypeInfo);
             bad.* = .{ .kind = .named, .name = n };
             return bad;
@@ -473,7 +499,7 @@ fn checkStmt(
                 const it = try checkExpr(a, types, fns, structs, methods, scope, init, diags);
                 if (ty) |t| {
                     if (!canAssign(it, t)) {
-                        try diags.append(a, .{ .message = try std.fmt.allocPrint(a, "cannot assign {s} to {s}", .{ it.name, t.name }) });
+                        try emitDiag(a, diags, init, vd.line, vd.col, try std.fmt.allocPrint(a, "cannot assign {s} to {s}", .{ it.name, t.name }));
                     }
                 } else {
                     ty = it;
@@ -511,12 +537,12 @@ fn checkStmt(
                 _ = try checkExpr(a, types, fns, structs, methods, scope, as.value, diags);
             } else {
                 const v = lookupVar(scope, as.name) orelse {
-                    try diags.append(a, .{ .message = try std.fmt.allocPrint(a, "unknown name '{s}'", .{as.name}) });
+                    try emitDiag(a, diags, as.value, 1, 1, try std.fmt.allocPrint(a, "unknown name '{s}'", .{as.name}));
                     return;
                 };
                 const rt = try checkExpr(a, types, fns, structs, methods, scope, as.value, diags);
                 if (!canAssign(rt, v.ty)) {
-                    try diags.append(a, .{ .message = "assignment type mismatch" });
+                    try emitDiag(a, diags, as.value, 1, 1, "assignment type mismatch");
                 }
             }
         },
@@ -605,7 +631,7 @@ fn checkExpr(
                 return ti;
             }
             if (types.get(name)) |t| return t;
-            try diags.append(a, .{ .message = try std.fmt.allocPrint(a, "unknown name '{s}'", .{name}) });
+            try emitDiag(a, diags, e, 1, 1, try std.fmt.allocPrint(a, "unknown name '{s}'", .{name}));
             return try voidType(a);
         },
         .int => {
@@ -835,13 +861,13 @@ fn checkExpr(
             const from = try checkExpr(a, types, fns, structs, methods, scope, c.expr, diags);
             const to = try resolveTypeExpr(a, types, c.ty, diags);
             if (!castAllowed(from, to, true)) {
-                try diags.append(a, .{ .message = try std.fmt.allocPrint(a, "cannot cast {s} to {s}", .{ from.name, to.name }) });
+                try emitDiag(a, diags, e, 1, 1, try std.fmt.allocPrint(a, "cannot cast {s} to {s}", .{ from.name, to.name }));
             }
             // narrowing int constant fold check
             if (c.expr.* == .int and to.bits > 0 and to.bits < 64) {
                 const max: i64 = (@as(i64, 1) << @intCast(to.bits)) - 1;
                 if (c.expr.int < 0 or c.expr.int > max) {
-                    try diags.append(a, .{ .message = "integer constant does not fit in cast target" });
+                    try emitDiag(a, diags, e, 1, 1, "integer constant does not fit in cast target");
                 }
             }
             return to;
@@ -865,7 +891,7 @@ fn checkExpr(
                 return try resolveTypeExpr(a, types, te, diags);
             }
             if (types.get(sl.type_name)) |t| return t;
-            try diags.append(a, .{ .message = try std.fmt.allocPrint(a, "unknown struct '{s}'", .{sl.type_name}) });
+            try emitDiag(a, diags, e, 1, 1, try std.fmt.allocPrint(a, "unknown struct '{s}'", .{sl.type_name}));
             return try voidType(a);
         },
         .tuple => |elems| {
