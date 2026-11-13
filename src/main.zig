@@ -60,6 +60,8 @@ pub fn main() !void {
         var path: ?[]const u8 = null;
         var out_path: ?[]const u8 = null;
         var keep_asm = false;
+        var libdirs: std.ArrayListUnmanaged([]const u8) = .{};
+        defer libdirs.deinit(allocator);
         while (args.next()) |a| {
             if (std.mem.eql(u8, a, "-o")) {
                 out_path = args.next() orelse {
@@ -68,6 +70,16 @@ pub fn main() !void {
                 };
             } else if (std.mem.eql(u8, a, "--keep-asm")) {
                 keep_asm = true;
+            } else if (std.mem.eql(u8, a, "--libdir") or std.mem.eql(u8, a, "-L")) {
+                const dir = args.next() orelse {
+                    try stderr.writeAll("build: --libdir needs a directory\n");
+                    std.process.exit(2);
+                };
+                try libdirs.append(allocator, dir);
+            } else if (std.mem.startsWith(u8, a, "--libdir=")) {
+                try libdirs.append(allocator, a["--libdir=".len..]);
+            } else if (std.mem.startsWith(u8, a, "-L") and a.len > 2) {
+                try libdirs.append(allocator, a[2..]);
             } else if (std.mem.startsWith(u8, a, "-")) {
                 try stderr.print("build: unknown arg {s}\n", .{a});
                 std.process.exit(2);
@@ -81,7 +93,7 @@ pub fn main() !void {
         try driver.cmdBuild(allocator, path orelse {
             try stderr.writeAll("build: missing file\n");
             std.process.exit(2);
-        }, out_path orelse "a.out", keep_asm, stdout);
+        }, out_path orelse "a.out", keep_asm, libdirs.items, stdout);
         return;
     }
     if (std.mem.eql(u8, cmd, "deps")) {

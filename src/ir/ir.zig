@@ -10,9 +10,13 @@ pub const Op = enum {
     copy,
     add,
     sub,
+    mul,
+    div,
     eq,
     ne,
     lt,
+    and_op,
+    or_op,
     neg,
     load,
     store,
@@ -65,6 +69,10 @@ pub const Program = struct {
     funcs: []Func,
     vtables: []VTable,
     needs_libc: bool,
+    /// `-l` names from `@link` / jog.mod link.* lines.
+    link_libs: [][]const u8,
+    /// `-L` / rpath dirs from CLI `--libdir` / jog.mod libdir.* lines.
+    libdirs: [][]const u8,
     arena: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *Program) void {
@@ -86,6 +94,7 @@ const MethodInfo = struct {
     nparams: u32, // excluding self
     ncontexts: u32,
     contexts: []ast.ContextParam,
+    ret_name: []const u8 = "",
 };
 
 const IfaceInfo = struct {
@@ -97,6 +106,8 @@ const FnInfo = struct {
     nparams: u32,
     contexts: []ast.ContextParam,
     exported: bool,
+    /// Return type name when a named struct/scalar; empty if void/unknown.
+    ret_name: []const u8 = "",
 };
 
 const Ambient = struct {
@@ -119,12 +130,15 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
         .funcs = &[_]Func{},
         .vtables = &[_]VTable{},
         .needs_libc = false,
+        .link_libs = &[_][]const u8{},
+        .libdirs = &[_][]const u8{},
         .arena = std.heap.ArenaAllocator.init(parent),
     };
     errdefer program.deinit();
     const a = program.arena.allocator();
 
     var strings: std.ArrayListUnmanaged([]const u8) = .{};
+    var link_libs: std.ArrayListUnmanaged([]const u8) = .{};
     var callees: std.ArrayListUnmanaged(Callee) = .{};
     var callee_map: std.StringHashMapUnmanaged(u32) = .{};
     var structs: std.StringHashMapUnmanaged(StructInfo) = .{};
@@ -163,13 +177,26 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
             .struct_decl => |sd| try structs.put(a, sd.name, .{ .fields = sd.fields }),
             .interface_struct => |ins| try ifaces.put(a, ins.name, .{ .methods = ins.methods }),
             .extern_block => |eb| {
+                if (eb.link_lib) |lib| {
+                    var dup = false;
+                    for (link_libs.items) |existing| {
+                        if (std.mem.eql(u8, existing, lib)) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (!dup) try link_libs.append(a, try a.dupe(u8, lib));
+                }
                 for (eb.fns) |ef| {
                     try internCallee(a, &callees, &callee_map, .{ .kind = .extern_c, .name = ef.name });
+                    var ret_name: []const u8 = "";
+                    if (ef.ret) |r| ret_name = typeExprName(r);
                     try fn_infos.put(a, ef.name, .{
                         .mangled = ef.name,
                         .nparams = @intCast(ef.params.len),
                         .contexts = &[_]ast.ContextParam{},
                         .exported = false,
+                        .ret_name = ret_name,
                     });
                     program.needs_libc = true;
                 }
@@ -177,11 +204,14 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
             .fn_decl, .actual_fn => |fd| {
                 if (fd.body != null) {
                     try internCallee(a, &callees, &callee_map, .{ .kind = .jog_fn, .name = fd.name });
+                    var ret_name: []const u8 = "";
+                    if (fd.ret) |r| ret_name = typeExprName(r);
                     try fn_infos.put(a, fd.name, .{
                         .mangled = fd.name,
                         .nparams = @intCast(fd.params.len),
                         .contexts = fd.contexts,
                         .exported = fd.exported or std.mem.eql(u8, fd.name, "main"),
+                        .ret_name = ret_name,
                     });
                 }
             },
@@ -190,11 +220,14 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                 if (!callee_map.contains(ef.name)) {
                     const kind: CalleeKind = if (std.mem.startsWith(u8, ef.name, "jogrt_")) .runtime else .jog_fn;
                     try internCallee(a, &callees, &callee_map, .{ .kind = kind, .name = ef.name });
+                    var ret_name: []const u8 = "";
+                    if (ef.ret) |r| ret_name = typeExprName(r);
                     try fn_infos.put(a, ef.name, .{
                         .mangled = ef.name,
                         .nparams = @intCast(ef.params.len),
                         .contexts = &[_]ast.ContextParam{},
                         .exported = false,
+                        .ret_name = ret_name,
                     });
                 }
             },
@@ -203,6 +236,8 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                     const mangled = try std.fmt.allocPrint(a, "{s}_{s}", .{ md.type_name, md.name });
                     const key = try std.fmt.allocPrint(a, "{s}.{s}", .{ md.type_name, md.name });
                     try internCallee(a, &callees, &callee_map, .{ .kind = .jog_fn, .name = mangled });
+                    var mret: []const u8 = "";
+                    if (md.ret) |r| mret = typeExprName(r);
                     try methods.put(a, key, .{
                         .mangled = mangled,
                         .pointer_recv = md.pointer_recv,
@@ -211,6 +246,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                         .nparams = @intCast(md.params.len),
                         .ncontexts = @intCast(md.contexts.len),
                         .contexts = md.contexts,
+                        .ret_name = mret,
                     });
                 }
             },
@@ -257,6 +293,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
     program.callees = try callees.toOwnedSlice(a);
     program.funcs = try funcs.toOwnedSlice(a);
     program.vtables = try vtables.toOwnedSlice(a);
+    program.link_libs = try link_libs.toOwnedSlice(a);
     return program;
 }
 
@@ -291,6 +328,8 @@ const Ctx = struct {
     next_slot: *u32,
     insts: *std.ArrayListUnmanaged(Inst),
     ambient: *std.ArrayListUnmanaged(Ambient),
+    /// Indices of `jmp` insts from `break` in the innermost while; patched to loop end.
+    break_jmps: *std.ArrayListUnmanaged(usize),
 
     fn fresh(self: *Ctx) !u32 {
         const s = self.next_slot.*;
@@ -348,6 +387,7 @@ fn lowerFn(
     const nparams = next_slot;
 
     var insts: std.ArrayListUnmanaged(Inst) = .{};
+    var break_jmps: std.ArrayListUnmanaged(usize) = .{};
     var ctx = Ctx{
         .a = a,
         .strings = strings,
@@ -363,6 +403,7 @@ fn lowerFn(
         .next_slot = &next_slot,
         .insts = &insts,
         .ambient = &ambient,
+        .break_jmps = &break_jmps,
     };
     try lowerBlock(&ctx, fl.body);
     if (insts.items.len == 0 or insts.items[insts.items.len - 1].op != .ret) {
@@ -409,7 +450,7 @@ fn metaForTypeExpr(te: *ast.TypeExpr, ifaces: *std.StringHashMapUnmanaged(IfaceI
 }
 
 fn isBuiltinScalar(name: []const u8) bool {
-    const builtins = [_][]const u8{ "byte", "bool", "u16", "u32", "u64", "i32", "i64", "usize", "str", "bytes", "void", "Dispatcher" };
+    const builtins = [_][]const u8{ "byte", "u8", "bool", "u16", "u32", "u64", "i32", "i64", "usize", "str", "bytes", "void", "Dispatcher" };
     for (builtins) |b| if (std.mem.eql(u8, name, b)) return true;
     return false;
 }
@@ -478,6 +519,26 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
                 ctx.insts.items[jz_i].aux = end_pos;
             }
         },
+        .while_stmt => |ws| {
+            const break_mark = ctx.break_jmps.items.len;
+            const head: i64 = @intCast(ctx.insts.items.len);
+            const cond = try lowerExpr(ctx, ws.cond);
+            const jz_i = ctx.insts.items.len;
+            try ctx.emit(.{ .op = .jz, .src0 = cond, .aux = 0 });
+            try lowerBlock(ctx, ws.body);
+            try ctx.emit(.{ .op = .jmp, .aux = head });
+            const end_pos: i64 = @intCast(ctx.insts.items.len);
+            ctx.insts.items[jz_i].aux = end_pos;
+            while (ctx.break_jmps.items.len > break_mark) {
+                const ji = ctx.break_jmps.pop().?;
+                ctx.insts.items[ji].aux = end_pos;
+            }
+        },
+        .break_stmt => {
+            const ji = ctx.insts.items.len;
+            try ctx.emit(.{ .op = .jmp, .aux = 0 });
+            try ctx.break_jmps.append(ctx.a, ji);
+        },
         .with_stmt => |ws| {
             const mark = ctx.ambient.items.len;
             var n_disp_enter: u32 = 0;
@@ -523,6 +584,26 @@ fn inferMetaFromExpr(ctx: *Ctx, e: *ast.Expr) ?SlotMeta {
                 std.mem.eql(u8, c.callee.ident, "dispatcher_get") or
                 std.mem.eql(u8, c.callee.ident, "dispatcher_io")))
                 return .{ .kind = .scalar, .type_name = "Dispatcher" };
+            if (c.callee.* == .ident) {
+                if (ctx.fn_infos.get(c.callee.ident)) |fi| {
+                    if (fi.ret_name.len > 0) {
+                        if (ctx.structs.contains(fi.ret_name))
+                            return .{ .kind = .struct_ptr, .type_name = fi.ret_name };
+                        return .{ .kind = .scalar, .type_name = fi.ret_name };
+                    }
+                }
+            }
+            if (c.callee.* == .field) {
+                const base_tn = inferTypeNameFromExpr(ctx, c.callee.field.base) orelse "";
+                const key = std.fmt.allocPrint(ctx.a, "{s}.{s}", .{ base_tn, c.callee.field.name }) catch return .{ .kind = .raw_ptr };
+                if (ctx.methods.get(key)) |mi| {
+                    if (mi.ret_name.len > 0) {
+                        if (ctx.structs.contains(mi.ret_name))
+                            return .{ .kind = .struct_ptr, .type_name = mi.ret_name };
+                        return .{ .kind = .scalar, .type_name = mi.ret_name };
+                    }
+                }
+            }
             return .{ .kind = .raw_ptr };
         },
         .cast => |c| return metaForTypeExpr(c.ty, ctx.ifaces),
@@ -543,12 +624,17 @@ fn fieldOffset(ctx: *Ctx, base_expr: *ast.Expr, field: []const u8) LowerError!i6
             if (ctx.meta.get(base_expr.ident)) |m| break :blk m.type_name;
         }
         if (inferTypeNameFromExpr(ctx, base_expr)) |t| break :blk t;
+        std.debug.print("lower UnknownName fieldOffset type for field {s}\n", .{field});
         return error.UnknownName;
     };
-    const sd = ctx.structs.get(tn) orelse return error.UnknownName;
+    const sd = ctx.structs.get(tn) orelse {
+        std.debug.print("lower UnknownName struct {s} field {s}\n", .{ tn, field });
+        return error.UnknownName;
+    };
     for (sd.fields, 0..) |f, i| {
         if (std.mem.eql(u8, f.name, field)) return @intCast(i * 8);
     }
+    std.debug.print("lower UnknownName missing field {s}.{s}\n", .{ tn, field });
     return error.UnknownName;
 }
 
@@ -562,6 +648,7 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
                 try ctx.emit(.{ .op = .saddr, .dst = d, .aux = -1 - @as(i64, @intCast(cid)) });
                 return d;
             }
+            std.debug.print("lower UnknownName ident: {s}\n", .{name});
             return error.UnknownName;
         },
         .int => |n| {
@@ -582,16 +669,49 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
             return d;
         },
         .binary => |b| {
+            // Short-circuit && / ||
+            if (b.op == .and_op) {
+                const l = try lowerExpr(ctx, b.left);
+                const d = try ctx.fresh();
+                try ctx.emit(.{ .op = .copy, .dst = d, .src0 = l });
+                const jz_i = ctx.insts.items.len;
+                try ctx.emit(.{ .op = .jz, .src0 = d, .aux = 0 });
+                const r = try lowerExpr(ctx, b.right);
+                try ctx.emit(.{ .op = .copy, .dst = d, .src0 = r });
+                const end_pos: i64 = @intCast(ctx.insts.items.len);
+                ctx.insts.items[jz_i].aux = end_pos;
+                return d;
+            }
+            if (b.op == .or_op) {
+                const l = try lowerExpr(ctx, b.left);
+                const d = try ctx.fresh();
+                try ctx.emit(.{ .op = .copy, .dst = d, .src0 = l });
+                const jz_i = ctx.insts.items.len;
+                try ctx.emit(.{ .op = .jz, .src0 = d, .aux = 0 });
+                // left was true: skip right
+                const jmp_true = ctx.insts.items.len;
+                try ctx.emit(.{ .op = .jmp, .aux = 0 });
+                const right_pos: i64 = @intCast(ctx.insts.items.len);
+                ctx.insts.items[jz_i].aux = right_pos;
+                const r = try lowerExpr(ctx, b.right);
+                try ctx.emit(.{ .op = .copy, .dst = d, .src0 = r });
+                const end_pos: i64 = @intCast(ctx.insts.items.len);
+                ctx.insts.items[jmp_true].aux = end_pos;
+                return d;
+            }
             const l = try lowerExpr(ctx, b.left);
             const r = try lowerExpr(ctx, b.right);
             const d = try ctx.fresh();
             switch (b.op) {
                 .add => try ctx.emit(.{ .op = .add, .dst = d, .src0 = l, .src1 = r }),
                 .sub => try ctx.emit(.{ .op = .sub, .dst = d, .src0 = l, .src1 = r }),
+                .mul => try ctx.emit(.{ .op = .mul, .dst = d, .src0 = l, .src1 = r }),
+                .div => try ctx.emit(.{ .op = .div, .dst = d, .src0 = l, .src1 = r }),
                 .eq => try ctx.emit(.{ .op = .eq, .dst = d, .src0 = l, .src1 = r }),
                 .neq => try ctx.emit(.{ .op = .ne, .dst = d, .src0 = l, .src1 = r }),
                 .lt => try ctx.emit(.{ .op = .lt, .dst = d, .src0 = l, .src1 = r }),
                 .gt => try ctx.emit(.{ .op = .lt, .dst = d, .src0 = r, .src1 = l }),
+                .and_op, .or_op => unreachable,
             }
             return d;
         },

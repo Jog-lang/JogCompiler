@@ -1,0 +1,23 @@
+// while / break, short-circuit && ||, and * / (parity unlock).
+
+fn main() {
+    var i: i64 = 0
+    var acc: i64 = 1
+    while (i < 5) {
+        acc = acc * 2
+        i = i + 1
+        if (i == 3 && acc > 1) {
+            break
+        }
+    }
+    val q = acc / 2
+    if (acc == 8 || false) {
+        if (q == 4) {
+            print("while ops ok\n")
+        } else {
+            panic("div\n")
+        }
+    } else {
+        panic("while fail\n")
+    }
+}

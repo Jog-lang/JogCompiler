@@ -159,6 +159,21 @@ fn emitInst(writer: anytype, prog: *const ir.Program, fname: []const u8, ninst: 
             try writer.print("  sub rax, qword ptr [rbp - {d}]\n", .{slot(inst.src1)});
             try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{slot(inst.dst)});
         },
+        .mul => {
+            try writer.print("  mov rax, qword ptr [rbp - {d}]\n", .{slot(inst.src0)});
+            try writer.print("  imul rax, qword ptr [rbp - {d}]\n", .{slot(inst.src1)});
+            try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{slot(inst.dst)});
+        },
+        .div => {
+            try writer.print("  mov rax, qword ptr [rbp - {d}]\n", .{slot(inst.src0)});
+            try writer.writeAll("  cqo\n");
+            try writer.print("  idiv qword ptr [rbp - {d}]\n", .{slot(inst.src1)});
+            try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{slot(inst.dst)});
+        },
+        .and_op, .or_op => {
+            // Lowered to short-circuit control flow in IR; should not reach asm.
+            try writer.writeAll("  ud2\n");
+        },
         .eq, .ne, .lt => {
             try writer.print("  mov rax, qword ptr [rbp - {d}]\n", .{slot(inst.src0)});
             try writer.print("  cmp rax, qword ptr [rbp - {d}]\n", .{slot(inst.src1)});

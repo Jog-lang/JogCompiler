@@ -12,12 +12,16 @@ pub const Error = error{
     OutOfMemory,
 };
 
-/// Minimal jog.mod: module, version, root, optional source lines.
+/// Minimal jog.mod: module, version, root, optional source / link / libdir lines.
 pub const Manifest = struct {
     name: []const u8,
     version: []const u8,
     /// Paths relative to the module directory; root first, then source lines (deduped).
     sources: []const []const u8,
+    /// From `link.linux SDL3` (and other link.* — collected for native linux first).
+    link_libs: []const []const u8,
+    /// From `libdir.linux ./prefix/lib` — relative paths resolved against `dir`.
+    libdirs: []const []const u8,
     /// Directory that contains jog.mod (as given / relative to cwd).
     dir: []const u8,
     arena: std.heap.ArenaAllocator,
@@ -66,6 +70,8 @@ pub fn parse(parent: std.mem.Allocator, text: []const u8, dir: []const u8) Error
     var version: ?[]const u8 = null;
     var root: ?[]const u8 = null;
     var extras: std.ArrayListUnmanaged([]const u8) = .{};
+    var link_libs: std.ArrayListUnmanaged([]const u8) = .{};
+    var libdirs: std.ArrayListUnmanaged([]const u8) = .{};
 
     var line_it = std.mem.splitScalar(u8, text, '\n');
     while (line_it.next()) |raw_line| {
@@ -88,6 +94,14 @@ pub fn parse(parent: std.mem.Allocator, text: []const u8, dir: []const u8) Error
             root = try a.dupe(u8, firstWord(value));
         } else if (std.mem.eql(u8, key, "source")) {
             try extras.append(a, try a.dupe(u8, firstWord(value)));
+        } else if (std.mem.startsWith(u8, key, "link.")) {
+            // link.linux / link.emscripten / … — collect all for now (native first).
+            try appendUnique(&link_libs, a, firstWord(value));
+        } else if (std.mem.startsWith(u8, key, "libdir.")) {
+            try appendUnique(&libdirs, a, firstWord(value));
+        } else if (std.mem.eql(u8, key, "export") or std.mem.eql(u8, key, "kind") or std.mem.eql(u8, key, "jog") or std.mem.eql(u8, key, "require") or std.mem.eql(u8, key, "require.test")) {
+            // Recognized v1 directives ignored on v2 (sources listed explicitly).
+            continue;
         } else {
             return error.UnknownDirective;
         }
@@ -108,6 +122,8 @@ pub fn parse(parent: std.mem.Allocator, text: []const u8, dir: []const u8) Error
         .name = mod_name,
         .version = mod_version,
         .sources = try sources.toOwnedSlice(a),
+        .link_libs = try link_libs.toOwnedSlice(a),
+        .libdirs = try libdirs.toOwnedSlice(a),
         .dir = try a.dupe(u8, dir),
         .arena = arena,
     };
@@ -125,6 +141,30 @@ pub fn resolveSourcePaths(allocator: std.mem.Allocator, m: *const Manifest) Erro
         try out.append(allocator, joined);
     }
     return try out.toOwnedSlice(allocator);
+}
+
+/// Resolve libdir entries relative to the module directory. Caller frees.
+pub fn resolveLibdirs(allocator: std.mem.Allocator, m: *const Manifest) Error![][]const u8 {
+    var out: std.ArrayListUnmanaged([]const u8) = .{};
+    errdefer {
+        for (out.items) |p| allocator.free(p);
+        out.deinit(allocator);
+    }
+    for (m.libdirs) |rel| {
+        if (std.fs.path.isAbsolute(rel)) {
+            try out.append(allocator, try allocator.dupe(u8, rel));
+        } else {
+            try out.append(allocator, try std.fs.path.join(allocator, &.{ m.dir, rel }));
+        }
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn appendUnique(list: *std.ArrayListUnmanaged([]const u8), a: std.mem.Allocator, word: []const u8) !void {
+    for (list.items) |e| {
+        if (std.mem.eql(u8, e, word)) return;
+    }
+    try list.append(a, try a.dupe(u8, word));
 }
 
 fn containsPath(hay: []const []const u8, needle: []const u8) bool {
@@ -173,4 +213,21 @@ test "root listed again in source is deduped" {
     var m = try parse(std.testing.allocator, text, ".");
     defer m.deinit();
     try std.testing.expectEqual(@as(usize, 1), m.sources.len);
+}
+
+test "link and libdir lines" {
+    const text =
+        \\module jog_sdl
+        \\root sdl.jog
+        \\link.linux SDL3
+        \\libdir.linux ./prefix/lib64
+        \\export sdl
+        \\
+    ;
+    var m = try parse(std.testing.allocator, text, "/tmp/jog_sdl");
+    defer m.deinit();
+    try std.testing.expectEqual(@as(usize, 1), m.link_libs.len);
+    try std.testing.expectEqualStrings("SDL3", m.link_libs[0]);
+    try std.testing.expectEqual(@as(usize, 1), m.libdirs.len);
+    try std.testing.expectEqualStrings("./prefix/lib64", m.libdirs[0]);
 }
