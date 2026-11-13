@@ -69,6 +69,8 @@ pub const GlobalDecl = struct {
     name: []const u8,
     ty: ?*TypeExpr,
     init: ?*Expr,
+    line: u32 = 1,
+    col: u32 = 1,
 };
 
 pub const ImportDecl = struct {
@@ -84,6 +86,8 @@ pub const RequireDecl = struct {
 pub const EnumDecl = struct {
     name: []const u8,
     variants: []EnumVariant,
+    line: u32 = 1,
+    col: u32 = 1,
 };
 
 pub const EnumVariant = struct {
@@ -116,6 +120,8 @@ pub const Field = struct {
 
 pub const StructDecl = struct {
     name: []const u8,
+    line: u32 = 1,
+    col: u32 = 1,
     /// Generic params e.g. `struct Box<T>`.
     type_params: [][]const u8 = &.{},
     fields: []Field,
@@ -158,6 +164,9 @@ pub const FnDecl = struct {
     is_test: bool = false,
     /// `private` — file-local (enforced when multi-file).
     is_private: bool = false,
+    /// Name token location (for `jog symbols` / LSP).
+    line: u32 = 1,
+    col: u32 = 1,
 };
 
 pub const MethodDecl = struct {
@@ -212,6 +221,8 @@ pub const VarDecl = struct {
     name: []const u8,
     ty: ?*TypeExpr,
     init: ?*Expr,
+    line: u32 = 1,
+    col: u32 = 1,
 };
 
 /// `val (a, b) = expr` — bind tuple fields by index.
@@ -401,11 +412,23 @@ pub const StructLitField = struct {
     value: *Expr,
 };
 
+/// 1-based source location (LSP / `--diag=json` contract).
+pub const Span = struct {
+    line: u32 = 1,
+    col: u32 = 1,
+};
+
 pub const File = struct {
     decls: []Decl,
     arena: std.heap.ArenaAllocator,
+    /// Expression node → span. Key is `@intFromPtr(*Expr)`. Arena-backed.
+    expr_spans: std.AutoHashMapUnmanaged(usize, Span) = .{},
 
     pub fn deinit(self: *File) void {
         self.arena.deinit();
+    }
+
+    pub fn spanOf(self: *const File, e: *const Expr) Span {
+        return self.expr_spans.get(@intFromPtr(e)) orelse .{};
     }
 };

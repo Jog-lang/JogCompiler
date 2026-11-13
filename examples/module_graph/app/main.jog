@@ -1,0 +1,7 @@
+fn main() {
+    if (greet_answer() == 42) {
+        print("module graph ok\n")
+    } else {
+        panic("module graph fail\n")
+    }
+}
