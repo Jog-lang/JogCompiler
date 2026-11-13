@@ -1,0 +1,20 @@
+// Fixed `[N]T` arrays + index load/store (8-byte elements).
+
+fn main() {
+    var xs: [4]i64
+    xs[0] = 10
+    xs[1] = 20
+    xs[2] = 30
+    xs[3] = 40
+    var i: i64 = 0
+    var sum: i64 = 0
+    while (i < 4) {
+        sum = sum + xs[i]
+        i = i + 1
+    }
+    if (sum == 100 && xs[2] == 30) {
+        print("arrays ok\n")
+    } else {
+        panic("arrays fail\n")
+    }
+}

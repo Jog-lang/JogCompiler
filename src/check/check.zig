@@ -20,6 +20,7 @@ pub const TypeKind = enum {
     named,
     pointer,
     optional,
+    array_ty,
     struct_ty,
     iface_fn,
     iface_struct,
@@ -31,6 +32,8 @@ pub const TypeInfo = struct {
     kind: TypeKind,
     name: []const u8 = "",
     pointee: ?*TypeInfo = null,
+    /// Fixed array length when `kind == .array_ty`.
+    array_len: u64 = 0,
     /// bit width for integers (for widen/narrow)
     bits: u16 = 0,
     unsigned: bool = true,
@@ -274,6 +277,17 @@ fn resolveTypeExpr(
             ti.* = .{ .kind = .optional, .pointee = p, .name = "opt" };
             return ti;
         },
+        .array => |arr| {
+            const elem = try resolveTypeExpr(a, types, arr.elem, diags);
+            const ti = try a.create(TypeInfo);
+            ti.* = .{
+                .kind = .array_ty,
+                .name = try std.fmt.allocPrint(a, "[{d}]{s}", .{ arr.len, elem.name }),
+                .pointee = elem,
+                .array_len = arr.len,
+            };
+            return ti;
+        },
         .iface_fn => {
             const ti = try a.create(TypeInfo);
             ti.* = .{ .kind = .iface_fn, .name = "iface_fn" };
@@ -371,7 +385,11 @@ fn checkStmt(
             }
         },
         .assign => |as| {
-            if (as.field) |fa| {
+            if (as.index) |ix| {
+                _ = try checkExpr(a, types, fns, scope, ix.base, diags);
+                _ = try checkExpr(a, types, fns, scope, ix.index, diags);
+                _ = try checkExpr(a, types, fns, scope, as.value, diags);
+            } else if (as.field) |fa| {
                 _ = try checkExpr(a, types, fns, scope, fa.base, diags);
                 _ = try checkExpr(a, types, fns, scope, as.value, diags);
             } else {
@@ -405,7 +423,7 @@ fn checkStmt(
             _ = try checkExpr(a, types, fns, scope, ws.cond, diags);
             try checkBlock(a, types, fns, ws.body, diags, scope);
         },
-        .break_stmt => {},
+        .break_stmt, .continue_stmt => {},
         .with_stmt => |ws| {
             for (ws.values) |v| _ = try checkExpr(a, types, fns, scope, v, diags);
             try checkBlock(a, types, fns, ws.body, diags, scope);
@@ -482,8 +500,9 @@ fn checkExpr(
             const l = try checkExpr(a, types, fns, scope, b.left, diags);
             const r = try checkExpr(a, types, fns, scope, b.right, diags);
             _ = r;
-            if (b.op == .eq or b.op == .neq) return types.get("bool").?;
-            // arithmetic: allow widen
+            if (b.op == .eq or b.op == .neq or b.op == .lt or b.op == .gt or b.op == .lte or b.op == .gte or b.op == .and_op or b.op == .or_op)
+                return types.get("bool").?;
+            // arithmetic / bitwise: allow widen
             return l;
         },
         .unary => |u| {
@@ -493,6 +512,7 @@ fn checkExpr(
                 ti.* = .{ .kind = .pointer, .pointee = t, .name = "ptr" };
                 return ti;
             }
+            if (u.op == .not) return types.get("bool").?;
             return t;
         },
         .call => |c| {
@@ -574,6 +594,27 @@ fn checkExpr(
             const base = try checkExpr(a, types, fns, scope, f.base, diags);
             _ = base;
             // field type resolution deferred to IR layout; treat as i64/ptr-sized
+            const ti = try a.create(TypeInfo);
+            ti.* = .{ .kind = .i64_ty, .name = "i64", .bits = 64, .unsigned = false };
+            return ti;
+        },
+        .index => |ix| {
+            const base = try checkExpr(a, types, fns, scope, ix.base, diags);
+            _ = try checkExpr(a, types, fns, scope, ix.index, diags);
+            if (base.kind == .array_ty) {
+                return base.pointee orelse {
+                    const ti = try a.create(TypeInfo);
+                    ti.* = .{ .kind = .i64_ty, .name = "i64", .bits = 64, .unsigned = false };
+                    return ti;
+                };
+            }
+            if (base.kind == .pointer) {
+                return base.pointee orelse {
+                    const ti = try a.create(TypeInfo);
+                    ti.* = .{ .kind = .i64_ty, .name = "i64", .bits = 64, .unsigned = false };
+                    return ti;
+                };
+            }
             const ti = try a.create(TypeInfo);
             ti.* = .{ .kind = .i64_ty, .name = "i64", .bits = 64, .unsigned = false };
             return ti;

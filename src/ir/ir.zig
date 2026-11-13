@@ -12,12 +12,20 @@ pub const Op = enum {
     sub,
     mul,
     div,
+    rem,
     eq,
     ne,
     lt,
+    le,
     and_op,
     or_op,
+    bit_and,
+    bit_or,
+    bit_xor,
+    shl,
+    shr,
     neg,
+    bit_not,
     load,
     store,
     lea_slot,
@@ -115,11 +123,13 @@ const Ambient = struct {
     type_name: []const u8, // concrete struct or iface name
 };
 
-const SlotKind = enum { scalar, struct_ptr, iface_ptr, opt_ptr, raw_ptr };
+const SlotKind = enum { scalar, struct_ptr, iface_ptr, opt_ptr, raw_ptr, array_ptr };
 
 const SlotMeta = struct {
     kind: SlotKind,
     type_name: []const u8 = "",
+    /// Element count when `kind == .array_ptr` (8-byte slots).
+    array_len: u64 = 0,
 };
 
 pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.CheckResult) !Program {
@@ -330,6 +340,8 @@ const Ctx = struct {
     ambient: *std.ArrayListUnmanaged(Ambient),
     /// Indices of `jmp` insts from `break` in the innermost while; patched to loop end.
     break_jmps: *std.ArrayListUnmanaged(usize),
+    /// Indices of `jmp` insts from `continue`; patched to loop head.
+    continue_jmps: *std.ArrayListUnmanaged(usize),
 
     fn fresh(self: *Ctx) !u32 {
         const s = self.next_slot.*;
@@ -388,6 +400,7 @@ fn lowerFn(
 
     var insts: std.ArrayListUnmanaged(Inst) = .{};
     var break_jmps: std.ArrayListUnmanaged(usize) = .{};
+    var continue_jmps: std.ArrayListUnmanaged(usize) = .{};
     var ctx = Ctx{
         .a = a,
         .strings = strings,
@@ -404,6 +417,7 @@ fn lowerFn(
         .insts = &insts,
         .ambient = &ambient,
         .break_jmps = &break_jmps,
+        .continue_jmps = &continue_jmps,
     };
     try lowerBlock(&ctx, fl.body);
     if (insts.items.len == 0 or insts.items[insts.items.len - 1].op != .ret) {
@@ -422,6 +436,7 @@ fn typeExprName(te: *ast.TypeExpr) []const u8 {
     return switch (te.*) {
         .name => |n| n,
         .pointer, .pointer_const, .optional => |inner| typeExprName(inner),
+        .array => |arr| typeExprName(arr.elem),
         else => "",
     };
 }
@@ -444,6 +459,13 @@ fn metaForTypeExpr(te: *ast.TypeExpr, ifaces: *std.StringHashMapUnmanaged(IfaceI
                 return .{ .kind = .raw_ptr, .type_name = inner };
             return .{ .kind = .struct_ptr, .type_name = inner };
         },
+        .array => |arr| {
+            return .{
+                .kind = .array_ptr,
+                .type_name = typeExprName(arr.elem),
+                .array_len = arr.len,
+            };
+        },
         .name => |n| return metaForTypeName(n, ifaces),
         else => return .{ .kind = .scalar },
     }
@@ -462,10 +484,30 @@ fn lowerBlock(ctx: *Ctx, block: *ast.Block) LowerError!void {
 fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
     switch (stmt) {
         .var_decl => |vd| {
-            const slot = try ctx.fresh();
-            try ctx.slots.put(ctx.a, vd.name, slot);
             var sm: SlotMeta = .{ .kind = .scalar };
             if (vd.ty) |t| sm = metaForTypeExpr(t, ctx.ifaces);
+            if (sm.kind == .array_ptr and sm.array_len > 0) {
+                // Reserve N consecutive 8-byte element slots; name binds to pointer to first.
+                const first = try ctx.fresh();
+                try ctx.emit(.{ .op = .iconst, .dst = first, .aux = 0 });
+                var i: u64 = 1;
+                while (i < sm.array_len) : (i += 1) {
+                    const s = try ctx.fresh();
+                    try ctx.emit(.{ .op = .iconst, .dst = s, .aux = 0 });
+                }
+                const ptr = try ctx.fresh();
+                try ctx.emit(.{ .op = .lea_slot, .dst = ptr, .src0 = first });
+                try ctx.slots.put(ctx.a, vd.name, ptr);
+                try ctx.meta.put(ctx.a, vd.name, sm);
+                // Optional init: only pointer assign supported (not element-wise yet).
+                if (vd.init) |init| {
+                    const v = try lowerExpr(ctx, init);
+                    try ctx.emit(.{ .op = .copy, .dst = ptr, .src0 = v });
+                }
+                return;
+            }
+            const slot = try ctx.fresh();
+            try ctx.slots.put(ctx.a, vd.name, slot);
             if (vd.init) |init| {
                 const v = try lowerExpr(ctx, init);
                 try ctx.emit(.{ .op = .copy, .dst = slot, .src0 = v });
@@ -481,7 +523,10 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
         },
         .assign => |as| {
             const v = try lowerExpr(ctx, as.value);
-            if (as.field) |fa| {
+            if (as.index) |ix| {
+                const addr = try lowerIndexAddr(ctx, ix.base, ix.index);
+                try ctx.emit(.{ .op = .store, .src0 = addr, .src1 = v });
+            } else if (as.field) |fa| {
                 const base = try lowerExpr(ctx, fa.base);
                 const off = try fieldOffset(ctx, fa.base, fa.name);
                 const addr = try ctx.fresh();
@@ -521,6 +566,7 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
         },
         .while_stmt => |ws| {
             const break_mark = ctx.break_jmps.items.len;
+            const cont_mark = ctx.continue_jmps.items.len;
             const head: i64 = @intCast(ctx.insts.items.len);
             const cond = try lowerExpr(ctx, ws.cond);
             const jz_i = ctx.insts.items.len;
@@ -533,11 +579,20 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
                 const ji = ctx.break_jmps.pop().?;
                 ctx.insts.items[ji].aux = end_pos;
             }
+            while (ctx.continue_jmps.items.len > cont_mark) {
+                const ji = ctx.continue_jmps.pop().?;
+                ctx.insts.items[ji].aux = head;
+            }
         },
         .break_stmt => {
             const ji = ctx.insts.items.len;
             try ctx.emit(.{ .op = .jmp, .aux = 0 });
             try ctx.break_jmps.append(ctx.a, ji);
+        },
+        .continue_stmt => {
+            const ji = ctx.insts.items.len;
+            try ctx.emit(.{ .op = .jmp, .aux = 0 });
+            try ctx.continue_jmps.append(ctx.a, ji);
         },
         .with_stmt => |ws| {
             const mark = ctx.ambient.items.len;
@@ -616,6 +671,20 @@ fn inferTypeNameFromExpr(ctx: *Ctx, e: *ast.Expr) ?[]const u8 {
         if (m.type_name.len > 0) return m.type_name;
     }
     return null;
+}
+
+fn lowerIndexAddr(ctx: *Ctx, base_expr: *ast.Expr, index_expr: *ast.Expr) LowerError!u32 {
+    // Stack slots grow downward: slot0 at [rbp-8], slot1 at [rbp-16], …
+    // Array base is lea(first_slot); index i addresses base - i*8.
+    const base = try lowerExpr(ctx, base_expr);
+    const idx = try lowerExpr(ctx, index_expr);
+    const scale = try ctx.fresh();
+    try ctx.emit(.{ .op = .iconst, .dst = scale, .aux = 8 });
+    const off = try ctx.fresh();
+    try ctx.emit(.{ .op = .mul, .dst = off, .src0 = idx, .src1 = scale });
+    const addr = try ctx.fresh();
+    try ctx.emit(.{ .op = .sub, .dst = addr, .src0 = base, .src1 = off });
+    return addr;
 }
 
 fn fieldOffset(ctx: *Ctx, base_expr: *ast.Expr, field: []const u8) LowerError!i64 {
@@ -707,10 +776,18 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
                 .sub => try ctx.emit(.{ .op = .sub, .dst = d, .src0 = l, .src1 = r }),
                 .mul => try ctx.emit(.{ .op = .mul, .dst = d, .src0 = l, .src1 = r }),
                 .div => try ctx.emit(.{ .op = .div, .dst = d, .src0 = l, .src1 = r }),
+                .rem => try ctx.emit(.{ .op = .rem, .dst = d, .src0 = l, .src1 = r }),
                 .eq => try ctx.emit(.{ .op = .eq, .dst = d, .src0 = l, .src1 = r }),
                 .neq => try ctx.emit(.{ .op = .ne, .dst = d, .src0 = l, .src1 = r }),
                 .lt => try ctx.emit(.{ .op = .lt, .dst = d, .src0 = l, .src1 = r }),
                 .gt => try ctx.emit(.{ .op = .lt, .dst = d, .src0 = r, .src1 = l }),
+                .lte => try ctx.emit(.{ .op = .le, .dst = d, .src0 = l, .src1 = r }),
+                .gte => try ctx.emit(.{ .op = .le, .dst = d, .src0 = r, .src1 = l }),
+                .bit_and => try ctx.emit(.{ .op = .bit_and, .dst = d, .src0 = l, .src1 = r }),
+                .bit_or => try ctx.emit(.{ .op = .bit_or, .dst = d, .src0 = l, .src1 = r }),
+                .bit_xor => try ctx.emit(.{ .op = .bit_xor, .dst = d, .src0 = l, .src1 = r }),
+                .shl => try ctx.emit(.{ .op = .shl, .dst = d, .src0 = l, .src1 = r }),
+                .shr => try ctx.emit(.{ .op = .shr, .dst = d, .src0 = l, .src1 = r }),
                 .and_op, .or_op => unreachable,
             }
             return d;
@@ -720,6 +797,7 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
             const d = try ctx.fresh();
             switch (u.op) {
                 .neg => try ctx.emit(.{ .op = .neg, .dst = d, .src0 = v }),
+                .bit_not => try ctx.emit(.{ .op = .bit_not, .dst = d, .src0 = v }),
                 .not => {
                     const z = try ctx.fresh();
                     try ctx.emit(.{ .op = .iconst, .dst = z, .aux = 0 });
@@ -728,10 +806,23 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
                 .addr => {
                     if (u.expr.* != .ident) return error.TypeError;
                     const slot = ctx.slots.get(u.expr.ident) orelse return error.UnknownName;
+                    // Array names already hold a pointer; &arr is the same pointer.
+                    if (ctx.meta.get(u.expr.ident)) |m| {
+                        if (m.kind == .array_ptr) {
+                            try ctx.emit(.{ .op = .copy, .dst = d, .src0 = slot });
+                            return d;
+                        }
+                    }
                     try ctx.emit(.{ .op = .lea_slot, .dst = d, .src0 = slot });
                 },
                 .deref => try ctx.emit(.{ .op = .load, .dst = d, .src0 = v }),
             }
+            return d;
+        },
+        .index => |ix| {
+            const addr = try lowerIndexAddr(ctx, ix.base, ix.index);
+            const d = try ctx.fresh();
+            try ctx.emit(.{ .op = .load, .dst = d, .src0 = addr });
             return d;
         },
         .call => |c| return try lowerCall(ctx, c),

@@ -27,12 +27,21 @@ pub const TokenKind = enum {
     kw_panic,
     kw_while,
     kw_break,
+    kw_for,
+    kw_continue,
     // punct
     at,
     slash,
     pipe,
     ampamp,
     pipepipe,
+    percent,
+    caret,
+    tilde,
+    lte,
+    gte,
+    shl,
+    shr,
     lparen,
     rparen,
     lbrace,
@@ -137,6 +146,26 @@ pub const Lexer = struct {
             self.advance();
             return .{ .kind = .pipepipe, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
         }
+        if (c == '<' and self.i + 1 < self.src.len and self.src[self.i + 1] == '=') {
+            self.advance();
+            self.advance();
+            return .{ .kind = .lte, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+        }
+        if (c == '>' and self.i + 1 < self.src.len and self.src[self.i + 1] == '=') {
+            self.advance();
+            self.advance();
+            return .{ .kind = .gte, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+        }
+        if (c == '<' and self.i + 1 < self.src.len and self.src[self.i + 1] == '<') {
+            self.advance();
+            self.advance();
+            return .{ .kind = .shl, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+        }
+        if (c == '>' and self.i + 1 < self.src.len and self.src[self.i + 1] == '>') {
+            self.advance();
+            self.advance();
+            return .{ .kind = .shr, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+        }
         // Division vs // comment (comments already skipped in trivia when //).
         if (c == '/' and !(self.i + 1 < self.src.len and self.src[self.i + 1] == '/')) {
             self.advance();
@@ -166,6 +195,9 @@ pub const Lexer = struct {
             '?' => .question,
             '@' => .at,
             '|' => .pipe,
+            '%' => .percent,
+            '^' => .caret,
+            '~' => .tilde,
             else => .eof,
         };
         return .{ .kind = kind, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
@@ -236,6 +268,8 @@ fn keyword(text: []const u8) TokenKind {
         .{ "panic", TokenKind.kw_panic },
         .{ "while", TokenKind.kw_while },
         .{ "break", TokenKind.kw_break },
+        .{ "for", TokenKind.kw_for },
+        .{ "continue", TokenKind.kw_continue },
     };
     inline for (map) |e| {
         if (std.mem.eql(u8, text, e[0])) return e[1];

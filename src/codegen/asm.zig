@@ -170,17 +170,51 @@ fn emitInst(writer: anytype, prog: *const ir.Program, fname: []const u8, ninst: 
             try writer.print("  idiv qword ptr [rbp - {d}]\n", .{slot(inst.src1)});
             try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{slot(inst.dst)});
         },
+        .rem => {
+            try writer.print("  mov rax, qword ptr [rbp - {d}]\n", .{slot(inst.src0)});
+            try writer.writeAll("  cqo\n");
+            try writer.print("  idiv qword ptr [rbp - {d}]\n", .{slot(inst.src1)});
+            try writer.print("  mov qword ptr [rbp - {d}], rdx\n", .{slot(inst.dst)});
+        },
         .and_op, .or_op => {
             // Lowered to short-circuit control flow in IR; should not reach asm.
             try writer.writeAll("  ud2\n");
         },
-        .eq, .ne, .lt => {
+        .bit_and => {
+            try writer.print("  mov rax, qword ptr [rbp - {d}]\n", .{slot(inst.src0)});
+            try writer.print("  and rax, qword ptr [rbp - {d}]\n", .{slot(inst.src1)});
+            try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{slot(inst.dst)});
+        },
+        .bit_or => {
+            try writer.print("  mov rax, qword ptr [rbp - {d}]\n", .{slot(inst.src0)});
+            try writer.print("  or rax, qword ptr [rbp - {d}]\n", .{slot(inst.src1)});
+            try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{slot(inst.dst)});
+        },
+        .bit_xor => {
+            try writer.print("  mov rax, qword ptr [rbp - {d}]\n", .{slot(inst.src0)});
+            try writer.print("  xor rax, qword ptr [rbp - {d}]\n", .{slot(inst.src1)});
+            try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{slot(inst.dst)});
+        },
+        .shl => {
+            try writer.print("  mov rax, qword ptr [rbp - {d}]\n", .{slot(inst.src0)});
+            try writer.print("  mov rcx, qword ptr [rbp - {d}]\n", .{slot(inst.src1)});
+            try writer.writeAll("  shl rax, cl\n");
+            try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{slot(inst.dst)});
+        },
+        .shr => {
+            try writer.print("  mov rax, qword ptr [rbp - {d}]\n", .{slot(inst.src0)});
+            try writer.print("  mov rcx, qword ptr [rbp - {d}]\n", .{slot(inst.src1)});
+            try writer.writeAll("  shr rax, cl\n");
+            try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{slot(inst.dst)});
+        },
+        .eq, .ne, .lt, .le => {
             try writer.print("  mov rax, qword ptr [rbp - {d}]\n", .{slot(inst.src0)});
             try writer.print("  cmp rax, qword ptr [rbp - {d}]\n", .{slot(inst.src1)});
             const set = switch (inst.op) {
                 .eq => "sete",
                 .ne => "setne",
                 .lt => "setl",
+                .le => "setle",
                 else => unreachable,
             };
             try writer.print("  {s} al\n", .{set});
@@ -190,6 +224,11 @@ fn emitInst(writer: anytype, prog: *const ir.Program, fname: []const u8, ninst: 
         .neg => {
             try writer.print("  mov rax, qword ptr [rbp - {d}]\n", .{slot(inst.src0)});
             try writer.writeAll("  neg rax\n");
+            try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{slot(inst.dst)});
+        },
+        .bit_not => {
+            try writer.print("  mov rax, qword ptr [rbp - {d}]\n", .{slot(inst.src0)});
+            try writer.writeAll("  not rax\n");
             try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{slot(inst.dst)});
         },
         .call => {

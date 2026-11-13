@@ -5,8 +5,15 @@ pub const TypeExpr = union(enum) {
     pointer: *TypeExpr,
     pointer_const: *TypeExpr,
     optional: *TypeExpr,
+    /// Fixed array `[N]T` (elements stored as 8-byte slots for now).
+    array: ArrayType,
     iface_fn: *IfaceFnType,
     bad,
+};
+
+pub const ArrayType = struct {
+    len: u64,
+    elem: *TypeExpr,
 };
 
 pub const IfaceFnType = struct {
@@ -115,6 +122,7 @@ pub const Stmt = union(enum) {
     if_stmt: IfStmt,
     while_stmt: WhileStmt,
     break_stmt,
+    continue_stmt,
     with_stmt: WithStmt,
 };
 
@@ -131,15 +139,21 @@ pub const VarDecl = struct {
 };
 
 pub const Assign = struct {
-    /// Simple `name = value`, or field store when `field` is set (`base.name = value`).
+    /// Simple `name = value`, field store (`base.name = value`), or index store (`base[i] = value`).
     name: []const u8,
     value: *Expr,
     field: ?FieldAssign = null,
+    index: ?IndexAssign = null,
 };
 
 pub const FieldAssign = struct {
     base: *Expr,
     name: []const u8,
+};
+
+pub const IndexAssign = struct {
+    base: *Expr,
+    index: *Expr,
 };
 
 pub const IfStmt = struct {
@@ -163,10 +177,16 @@ pub const Expr = union(enum) {
     unary: Unary,
     call: Call,
     field: FieldAccess,
+    index: IndexAccess,
     cast: Cast,
     optional_call: OptionalCall,
     struct_lit: StructLit,
     panic_call: PanicCall,
+};
+
+pub const IndexAccess = struct {
+    base: *Expr,
+    index: *Expr,
 };
 
 pub const PanicCall = struct {
@@ -179,14 +199,33 @@ pub const Binary = struct {
     right: *Expr,
 };
 
-pub const BinaryOp = enum { eq, neq, add, sub, mul, div, lt, gt, and_op, or_op };
+pub const BinaryOp = enum {
+    eq,
+    neq,
+    add,
+    sub,
+    mul,
+    div,
+    rem,
+    lt,
+    gt,
+    lte,
+    gte,
+    and_op,
+    or_op,
+    bit_and,
+    bit_or,
+    bit_xor,
+    shl,
+    shr,
+};
 
 pub const Unary = struct {
     op: UnaryOp,
     expr: *Expr,
 };
 
-pub const UnaryOp = enum { neg, not, addr, deref };
+pub const UnaryOp = enum { neg, not, bit_not, addr, deref };
 
 pub const Call = struct {
     callee: *Expr,
