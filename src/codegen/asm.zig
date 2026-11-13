@@ -49,6 +49,19 @@ pub fn emit(allocator: std.mem.Allocator, program: *const ir.Program, writer: an
         try writer.writeAll("\n");
     }
 
+    if (program.globals.len > 0) {
+        try writer.writeAll(".section .data\n");
+        try writer.writeAll(".align 8\n");
+        for (program.globals, 0..) |g, i| {
+            try writer.print(".globl jog_global_{d}\n", .{i});
+            try writer.print("jog_global_{d}:\n", .{i});
+            try writer.print("  .quad {d}\n", .{g.init_bits});
+            _ = g.name;
+            _ = g.mutable;
+            _ = g.is_float;
+        }
+    }
+
     try writer.writeAll(".section .rodata\n");
     try writer.writeAll(".align 8\n");
     for (program.vtables, 0..) |vt, i| {
@@ -147,22 +160,43 @@ fn emitInst(writer: anytype, prog: *const ir.Program, fname: []const u8, ninst: 
             try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{slot(inst.dst)});
         },
         .narrow => {
-            // panic if bits above aux are set; then mask
+            // panic if bits above aux are set; then zero-extend into rax.
+            // Note: `and rax, imm32` sign-extends the immediate, so 0xffffffff is
+            // unusable as a 32-bit mask — use mov/movzx instead (JOG-89).
             const bits: u6 = @intCast(inst.aux);
-            const mask: u64 = if (bits >= 64) std.math.maxInt(u64) else (@as(u64, 1) << bits) - 1;
             try writer.print("  mov rax, qword ptr [rbp - {d}]\n", .{slot(inst.src0)});
             try writer.writeAll("  mov rcx, rax\n");
             try writer.print("  shr rcx, {d}\n", .{bits});
-            // unique labels: emitInst does not get ii — use dst slot as discriminator
             try writer.print("  jz .Lnarrow_ok_{s}_{d}\n", .{ mangle(fname), inst.dst });
             try writer.writeAll("  lea rdi, [rip + jog_narrow_msg]\n");
-            // length is a fixed ascii string; avoid absolute-symbol reloc quirks
             try writer.writeAll("  mov esi, 28\n");
             try writer.writeAll("  call jogrt_panic\n");
             try writer.writeAll("  ud2\n");
             try writer.print(".Lnarrow_ok_{s}_{d}:\n", .{ mangle(fname), inst.dst });
-            try writer.print("  and rax, {d}\n", .{mask});
+            if (bits >= 64) {
+                // no-op
+            } else if (bits == 32) {
+                try writer.writeAll("  mov eax, eax\n");
+            } else if (bits == 16) {
+                try writer.writeAll("  movzx eax, ax\n");
+            } else if (bits == 8) {
+                try writer.writeAll("  movzx eax, al\n");
+            } else if (bits == 1) {
+                try writer.writeAll("  and eax, 1\n");
+            } else {
+                const mask: u64 = (@as(u64, 1) << bits) - 1;
+                try writer.print("  mov rcx, {d}\n", .{mask});
+                try writer.writeAll("  and rax, rcx\n");
+            }
             try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{slot(inst.dst)});
+        },
+        .gload => {
+            try writer.print("  mov rax, qword ptr [rip + jog_global_{d}]\n", .{inst.aux});
+            try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{slot(inst.dst)});
+        },
+        .gstore => {
+            try writer.print("  mov rax, qword ptr [rbp - {d}]\n", .{slot(inst.src0)});
+            try writer.print("  mov qword ptr [rip + jog_global_{d}], rax\n", .{inst.aux});
         },
         .add => {
             try writer.print("  mov rax, qword ptr [rbp - {d}]\n", .{slot(inst.src0)});
@@ -261,14 +295,44 @@ fn emitInst(writer: anytype, prog: *const ir.Program, fname: []const u8, ninst: 
         .call => {
             const cid: usize = @intCast(inst.aux);
             const callee = prog.callees[cid];
-            const regs = [_][]const u8{ "rdi", "rsi", "rdx", "rcx", "r8", "r9" };
-            var i: u8 = 0;
-            while (i < inst.arity and i < regs.len) : (i += 1) {
-                try writer.print("  mov {s}, qword ptr [rbp - {d}]\n", .{ regs[i], slot(inst.args[i]) });
-            }
-            try writer.print("  call {s}\n", .{callee.name});
-            if (inst.dst != ir.none) {
-                try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{slot(inst.dst)});
+            const use_sysv_float = callee.kind == .extern_c and (callee.float_ret or callee.float_args != 0);
+            if (use_sysv_float) {
+                // System V AMD64: integer/pointer in GPR sequence; floats in xmm0+.
+                const gprs = [_][]const u8{ "rdi", "rsi", "rdx", "rcx", "r8", "r9" };
+                const xmms = [_][]const u8{ "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7" };
+                var gi: u8 = 0;
+                var fi: u8 = 0;
+                var i: u8 = 0;
+                while (i < inst.arity and i < 8) : (i += 1) {
+                    const is_f = (callee.float_args & (@as(u8, 1) << @intCast(i))) != 0;
+                    if (is_f) {
+                        if (fi < xmms.len) {
+                            try writer.print("  movsd {s}, qword ptr [rbp - {d}]\n", .{ xmms[fi], slot(inst.args[i]) });
+                            fi += 1;
+                        }
+                    } else if (gi < gprs.len) {
+                        try writer.print("  mov {s}, qword ptr [rbp - {d}]\n", .{ gprs[gi], slot(inst.args[i]) });
+                        gi += 1;
+                    }
+                }
+                try writer.print("  call {s}\n", .{callee.name});
+                if (inst.dst != ir.none) {
+                    if (callee.float_ret) {
+                        try writer.print("  movsd qword ptr [rbp - {d}], xmm0\n", .{slot(inst.dst)});
+                    } else {
+                        try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{slot(inst.dst)});
+                    }
+                }
+            } else {
+                const regs = [_][]const u8{ "rdi", "rsi", "rdx", "rcx", "r8", "r9" };
+                var i: u8 = 0;
+                while (i < inst.arity and i < regs.len) : (i += 1) {
+                    try writer.print("  mov {s}, qword ptr [rbp - {d}]\n", .{ regs[i], slot(inst.args[i]) });
+                }
+                try writer.print("  call {s}\n", .{callee.name});
+                if (inst.dst != ir.none) {
+                    try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{slot(inst.dst)});
+                }
             }
         },
         .icall => {

@@ -13,11 +13,17 @@ Aggregates / multi-value returns are not defined yet.
 
 ## C ABI / `extern`
 
-`extern { fn name(...): T }` declares a **C SysV** symbol. The compiler emits `.extern name` and uses the same argument registers as Jog ABI v0 for scalar/pointer parameters. Linking pulls in libc when any extern is present (`zig cc` without `-nostdlib`).
+`extern { fn name(...): T }` declares a **C SysV** symbol. The compiler emits `.extern name`. Integer/pointer args use `rdi`…`r9`; **`f32`/`f64` args and returns use `xmm0`…** (System V AMD64). Linking pulls in libc when any extern is present (`zig cc` without `-nostdlib`).
 
-## `export fn`
+Jog↔Jog float calls still pass bit patterns in GPRs (internal convention). Only `extern` uses the xmm SysV path.
 
-Marks a Jog function `.globl` so C can call it under SysV. `main` is always exported.
+## `export fn` / `@export`
+
+Marks a Jog function `.globl` so C can call it under SysV. `main` is always exported. `@export` is accepted (keyword `export` after `@`).
+
+## Package `val` / `var`
+
+Top-level `val` with a literal init is a compile-time constant (folded). Top-level `var` is a `.data` global (`jog_global_N`).
 
 ## Runtime (`runtime/linux_x64*.s`)
 
@@ -26,7 +32,8 @@ Marks a Jog function `.globl` so C can call it under SysV. `main` is always expo
 | `_start` | Freestanding entry → `main` → `exit` (omitted when linking libc) |
 | `jogrt_print` | `write(1, ptr, len)` |
 | `jogrt_panic` | `write(2, …)` + `exit(1)` |
-| `jogrt_alloc` | bump allocator (Allocator stub) |
+| `jogrt_alloc` | bump allocator (4 MiB heap) |
+| `jog_host_run_loop` / `jogrt_host_run_loop` | desktop returning mainloop (`while (tick())`) |
 | `jogrt_dispatcher_stub` | No-op stub (pool is `jogrt_dispatcher_pool`) |
 | `jogrt_dispatcher_single` / `jogrt_dispatcher_pool` | Primary Dispatcher handle (1 thread vs N-worker pool) |
 | `jogrt_dispatcher_new` / `jogrt_dispatcher_get` | Extra fixed pools / handle lookup |

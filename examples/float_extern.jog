@@ -1,0 +1,15 @@
+// SysV float ABI for libm (xmm0).
+
+@link("m")
+extern {
+    fn cos(x: f64): f64
+}
+
+fn main() {
+    val c = cos(0.0)
+    if (c == 1.0) {
+        print("float extern ok\n")
+    } else {
+        panic("float extern fail\n")
+    }
+}

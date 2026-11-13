@@ -40,6 +40,10 @@ pub const Op = enum {
     call,
     icall,
     vtaddr,
+    /// Load package-level `var` (aux = global index).
+    gload,
+    /// Store package-level `var` (aux = global index, src0 = value).
+    gstore,
     ret,
     jmp,
     jz,
@@ -76,6 +80,17 @@ pub const CalleeKind = enum { jog_fn, extern_c, runtime };
 pub const Callee = struct {
     kind: CalleeKind,
     name: []const u8,
+    /// SysV float return (xmm0) — set for `extern` f32/f64 returns.
+    float_ret: bool = false,
+    /// Bit i set ⇒ argument i is f32/f64 (xmm classification for `extern`).
+    float_args: u8 = 0,
+};
+
+pub const Global = struct {
+    name: []const u8,
+    mutable: bool,
+    init_bits: i64 = 0,
+    is_float: bool = false,
 };
 
 pub const Program = struct {
@@ -83,6 +98,7 @@ pub const Program = struct {
     callees: []Callee,
     funcs: []Func,
     vtables: []VTable,
+    globals: []Global,
     needs_libc: bool,
     /// `-l` names from `@link` / jog.mod link.* lines.
     link_libs: [][]const u8,
@@ -94,6 +110,47 @@ pub const Program = struct {
         self.arena.deinit();
     }
 };
+
+const ConstVal = struct {
+    bits: i64,
+    is_float: bool,
+};
+
+fn isFloatTypeExpr(te: *ast.TypeExpr) bool {
+    return switch (te.*) {
+        .name => |n| std.mem.eql(u8, n, "f64") or std.mem.eql(u8, n, "f32"),
+        else => false,
+    };
+}
+
+fn floatArgMask(params: []ast.Param) u8 {
+    var mask: u8 = 0;
+    for (params, 0..) |p, i| {
+        if (i >= 8) break;
+        if (isFloatTypeExpr(p.ty)) mask |= @as(u8, 1) << @intCast(i);
+    }
+    return mask;
+}
+
+fn literalConstBits(e: *ast.Expr) ?ConstVal {
+    return switch (e.*) {
+        .int => |n| .{ .bits = n, .is_float = false },
+        .float => |n| .{ .bits = @bitCast(n), .is_float = true },
+        .unary => |u| blk: {
+            if (u.op == .neg) {
+                if (literalConstBits(u.expr)) |inner| {
+                    if (inner.is_float) {
+                        const f: f64 = @bitCast(inner.bits);
+                        break :blk .{ .bits = @bitCast(-f), .is_float = true };
+                    }
+                    break :blk .{ .bits = -inner.bits, .is_float = false };
+                }
+            }
+            break :blk null;
+        },
+        else => null,
+    };
+}
 
 const LowerError = error{ UnknownName, OutOfMemory, TooManyArgs, TypeError };
 
@@ -165,6 +222,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
         .callees = &[_]Callee{},
         .funcs = &[_]Func{},
         .vtables = &[_]VTable{},
+        .globals = &[_]Global{},
         .needs_libc = false,
         .link_libs = &[_][]const u8{},
         .libdirs = &[_][]const u8{},
@@ -184,6 +242,9 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
     var fn_infos: std.StringHashMapUnmanaged(FnInfo) = .{};
     var vtables: std.ArrayListUnmanaged(VTable) = .{};
     var vtable_map: std.StringHashMapUnmanaged(u32) = .{};
+    var globals: std.ArrayListUnmanaged(Global) = .{};
+    var global_map: std.StringHashMapUnmanaged(u32) = .{};
+    var const_vals: std.StringHashMapUnmanaged(ConstVal) = .{};
 
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_print" });
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_panic" });
@@ -208,6 +269,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_print_tid" });
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_worker_id" });
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_gettid" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_host_run_loop" });
 
     var generic_fns: std.StringHashMapUnmanaged(ast.FnDecl) = .{};
     var generic_structs: std.StringHashMapUnmanaged(ast.StructDecl) = .{};
@@ -244,7 +306,13 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                     if (!dup) try link_libs.append(a, try a.dupe(u8, lib));
                 }
                 for (eb.fns) |ef| {
-                    try internCallee(a, &callees, &callee_map, .{ .kind = .extern_c, .name = ef.name });
+                    const fret = if (ef.ret) |r| isFloatTypeExpr(r) else false;
+                    try internCallee(a, &callees, &callee_map, .{
+                        .kind = .extern_c,
+                        .name = ef.name,
+                        .float_ret = fret,
+                        .float_args = floatArgMask(ef.params),
+                    });
                     var ret_name: []const u8 = "";
                     if (ef.ret) |r| ret_name = try resolveRetName(a, &structs, r);
                     try fn_infos.put(a, ef.name, .{
@@ -255,6 +323,38 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                         .ret_name = ret_name,
                     });
                     program.needs_libc = true;
+                }
+            },
+            .global_decl => |gd| {
+                var bits: i64 = 0;
+                var is_float = false;
+                if (gd.init) |init| {
+                    if (literalConstBits(init)) |cv| {
+                        bits = cv.bits;
+                        is_float = cv.is_float;
+                    } else if (init.* == .null_lit) {
+                        bits = 0;
+                    } else {
+                        std.debug.print("lower: top-level {s} '{s}' needs a literal/null init\n", .{ if (gd.mutable) "var" else "val", gd.name });
+                        return error.TypeError;
+                    }
+                }
+                if (gd.ty) |te| {
+                    if (isFloatTypeExpr(te)) is_float = true;
+                }
+                if (!gd.mutable) {
+                    // Compile-time constant: fold at use sites (no storage).
+                    try const_vals.put(a, gd.name, .{ .bits = bits, .is_float = is_float });
+                } else {
+                    // Mutable: zero-init OK when no initializer (BSS-like .data zero).
+                    const idx: u32 = @intCast(globals.items.len);
+                    try globals.append(a, .{
+                        .name = try a.dupe(u8, gd.name),
+                        .mutable = true,
+                        .init_bits = bits,
+                        .is_float = is_float,
+                    });
+                    try global_map.put(a, gd.name, idx);
                 }
             },
             .fn_decl, .actual_fn => |fd| {
@@ -334,7 +434,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                 .exported = fd.exported or std.mem.eql(u8, fd.name, "main"),
                 .self_type = null,
                 .pointer_recv = false,
-            }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map);
+            }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map);
             try funcs.append(a, f);
         } else if (d == .method and d.method.body != null) {
             const md = d.method;
@@ -348,7 +448,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                 .exported = true,
                 .self_type = md.type_name,
                 .pointer_recv = md.pointer_recv,
-            }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map);
+            }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map);
             try funcs.append(a, f);
         }
     }
@@ -361,7 +461,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
             .exported = false,
             .self_type = null,
             .pointer_recv = false,
-        }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map);
+        }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map);
         try funcs.append(a, f);
     }
 
@@ -369,6 +469,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
     program.callees = try callees.toOwnedSlice(a);
     program.funcs = try funcs.toOwnedSlice(a);
     program.vtables = try vtables.toOwnedSlice(a);
+    program.globals = try globals.toOwnedSlice(a);
     program.link_libs = try link_libs.toOwnedSlice(a);
     return program;
 }
@@ -722,6 +823,8 @@ const Ctx = struct {
     fn_infos: *std.StringHashMapUnmanaged(FnInfo),
     vtables: *std.ArrayListUnmanaged(VTable),
     vtable_map: *std.StringHashMapUnmanaged(u32),
+    const_vals: *std.StringHashMapUnmanaged(ConstVal),
+    global_map: *std.StringHashMapUnmanaged(u32),
     slots: *std.StringHashMapUnmanaged(u32),
     meta: *std.StringHashMapUnmanaged(SlotMeta),
     next_slot: *u32,
@@ -755,6 +858,8 @@ fn lowerFn(
     fn_infos: *std.StringHashMapUnmanaged(FnInfo),
     vtables: *std.ArrayListUnmanaged(VTable),
     vtable_map: *std.StringHashMapUnmanaged(u32),
+    const_vals: *std.StringHashMapUnmanaged(ConstVal),
+    global_map: *std.StringHashMapUnmanaged(u32),
 ) !Func {
     var slots: std.StringHashMapUnmanaged(u32) = .{};
     var meta: std.StringHashMapUnmanaged(SlotMeta) = .{};
@@ -804,6 +909,8 @@ fn lowerFn(
         .fn_infos = fn_infos,
         .vtables = vtables,
         .vtable_map = vtable_map,
+        .const_vals = const_vals,
+        .global_map = global_map,
         .slots = &slots,
         .meta = &meta,
         .next_slot = &next_slot,
@@ -1161,8 +1268,14 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
                         const d = try ctx.fresh();
                         try ctx.emit(.{ .op = .load, .dst = d, .src0 = addr });
                         break :blk d;
+                    } else if (ctx.slots.get(as.name)) |slot| {
+                        break :blk slot;
+                    } else if (ctx.global_map.get(as.name)) |gi| {
+                        const d = try ctx.fresh();
+                        try ctx.emit(.{ .op = .gload, .dst = d, .aux = @intCast(gi) });
+                        break :blk d;
                     } else {
-                        break :blk ctx.slots.get(as.name) orelse return error.UnknownName;
+                        return error.UnknownName;
                     }
                 };
                 const d = try ctx.fresh();
@@ -1192,9 +1305,13 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
                 try ctx.emit(.{ .op = .iconst, .dst = addr, .aux = off });
                 try ctx.emit(.{ .op = .add, .dst = addr, .src0 = base, .src1 = addr });
                 try ctx.emit(.{ .op = .store, .src0 = addr, .src1 = v });
-            } else {
-                const slot = ctx.slots.get(as.name) orelse return error.UnknownName;
+            } else if (ctx.slots.get(as.name)) |slot| {
                 try ctx.emit(.{ .op = .copy, .dst = slot, .src0 = v });
+            } else if (ctx.global_map.get(as.name)) |gi| {
+                try ctx.emit(.{ .op = .gstore, .src0 = v, .aux = @intCast(gi) });
+            } else {
+                std.debug.print("lower UnknownName assign: {s}\n", .{as.name});
+                return error.UnknownName;
             }
         },
         .expr => |e| _ = try lowerExpr(ctx, e),
@@ -1648,6 +1765,20 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
     switch (e.*) {
         .ident => |name| {
             if (ctx.slots.get(name)) |s| return s;
+            if (ctx.const_vals.get(name)) |cv| {
+                const d = try ctx.fresh();
+                if (cv.is_float) {
+                    try ctx.emit(.{ .op = .fconst, .dst = d, .aux = cv.bits });
+                } else {
+                    try ctx.emit(.{ .op = .iconst, .dst = d, .aux = cv.bits });
+                }
+                return d;
+            }
+            if (ctx.global_map.get(name)) |gi| {
+                const d = try ctx.fresh();
+                try ctx.emit(.{ .op = .gload, .dst = d, .aux = @intCast(gi) });
+                return d;
+            }
             // function address
             if (ctx.callee_map.get(name)) |cid| {
                 const d = try ctx.fresh();
@@ -2121,6 +2252,17 @@ fn lowerCall(ctx: *Ctx, c: ast.Call) LowerError!u32 {
             var inst = Inst{ .op = .call, .dst = none, .aux = cid, .arity = 2 };
             inst.args[0] = fp;
             inst.args[1] = arg;
+            try ctx.emit(inst);
+            const d = try ctx.fresh();
+            try ctx.emit(.{ .op = .iconst, .dst = d, .aux = 0 });
+            return d;
+        }
+        if (std.mem.eql(u8, name, "jog_host_run_loop")) {
+            if (c.args.len != 1) return error.TooManyArgs;
+            const fp = try lowerExpr(ctx, c.args[0]);
+            const cid = ctx.callee_map.get("jogrt_host_run_loop").?;
+            var inst = Inst{ .op = .call, .dst = none, .aux = cid, .arity = 1 };
+            inst.args[0] = fp;
             try ctx.emit(inst);
             const d = try ctx.fresh();
             try ctx.emit(.{ .op = .iconst, .dst = d, .aux = 0 });

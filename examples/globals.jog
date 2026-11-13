@@ -1,0 +1,13 @@
+// Package-level val (folded) and var (data global).
+
+val WIDTH: i64 = 640
+var counter: i64 = 0
+
+fn main() {
+    counter = counter + WIDTH / 640
+    if (WIDTH == 640 && counter == 1) {
+        print("globals ok\n")
+    } else {
+        panic("globals fail\n")
+    }
+}

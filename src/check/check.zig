@@ -182,7 +182,31 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
                     if (ef.ret) |r| _ = try resolveTypeExpr(a, &types, r, &diags);
                 }
             },
+            .global_decl => {}, // bound into package scope below
         }
+    }
+
+    // Package-level val/var — visible as the parent scope of every function body.
+    var globals_scope = Scope{ .parent = null, .vars = .{}, .narrowed = .{} };
+    for (file.decls) |*d| {
+        if (d.* != .global_decl) continue;
+        const gd = d.global_decl;
+        var t: *TypeInfo = undefined;
+        if (gd.ty) |te| {
+            t = try resolveTypeExpr(a, &types, te, &diags);
+        } else if (gd.init) |init| {
+            // Infer from a literal init only (const fold path).
+            t = switch (init.*) {
+                .float => types.get("f64").?,
+                else => types.get("i64").?,
+            };
+        } else {
+            t = types.get("i64").?;
+        }
+        if (gd.init) |init| {
+            _ = try checkExpr(a, &types, &fns, &structs, &methods, &globals_scope, init, &diags);
+        }
+        try globals_scope.vars.put(a, gd.name, .{ .ty = t, .mutable = gd.mutable });
     }
 
     // check interface structs have methods only (already true by grammar)
@@ -217,7 +241,7 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
             }
         }
         if (fd.body) |body| {
-            try checkFunctionBody(a, &types, &fns, fd.params, fd.contexts, body, &diags);
+            try checkFunctionBody(a, &types, &fns, &structs, &methods, fd.params, fd.contexts, body, &diags, &globals_scope);
         }
         for (bound.items) |tp| _ = types.remove(tp);
     }
@@ -245,7 +269,7 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
             }
             try params_with_self.append(a, .{ .name = "self", .ty = self_ty });
             for (md.params) |p| try params_with_self.append(a, p);
-            try checkFunctionBody(a, &types, &fns, try params_with_self.toOwnedSlice(a), md.contexts, body, &diags);
+            try checkFunctionBody(a, &types, &fns, &structs, &methods, try params_with_self.toOwnedSlice(a), md.contexts, body, &diags, &globals_scope);
         }
     }
 
@@ -385,13 +409,16 @@ fn checkFunctionBody(
     a: std.mem.Allocator,
     types: *std.StringHashMapUnmanaged(*TypeInfo),
     fns: *std.StringHashMapUnmanaged(*ast.FnDecl),
+    structs: *std.StringHashMapUnmanaged(*ast.StructDecl),
+    methods: *std.StringHashMapUnmanaged(*ast.MethodDecl),
     params: []ast.Param,
     contexts: []ast.ContextParam,
     body: *ast.Block,
     diags: *std.ArrayListUnmanaged(Diagnostic),
+    package_scope: ?*Scope,
 ) CheckError!void {
     var scope = Scope{
-        .parent = null,
+        .parent = package_scope,
         .vars = .{},
         .narrowed = .{},
     };
@@ -405,13 +432,15 @@ fn checkFunctionBody(
             try scope.vars.put(a, n, .{ .ty = ty, .mutable = false });
         }
     }
-    try checkBlock(a, types, fns, body, diags, &scope);
+    try checkBlock(a, types, fns, structs, methods, body, diags, &scope);
 }
 
 fn checkBlock(
     a: std.mem.Allocator,
     types: *std.StringHashMapUnmanaged(*TypeInfo),
     fns: *std.StringHashMapUnmanaged(*ast.FnDecl),
+    structs: *std.StringHashMapUnmanaged(*ast.StructDecl),
+    methods: *std.StringHashMapUnmanaged(*ast.MethodDecl),
     block: *ast.Block,
     diags: *std.ArrayListUnmanaged(Diagnostic),
     parent_scope: ?*Scope,
@@ -422,7 +451,7 @@ fn checkBlock(
         .narrowed = .{},
     };
     for (block.stmts) |stmt| {
-        try checkStmt(a, types, fns, &scope, stmt, diags);
+        try checkStmt(a, types, fns, structs, methods, &scope, stmt, diags);
     }
 }
 
@@ -430,6 +459,8 @@ fn checkStmt(
     a: std.mem.Allocator,
     types: *std.StringHashMapUnmanaged(*TypeInfo),
     fns: *std.StringHashMapUnmanaged(*ast.FnDecl),
+    structs: *std.StringHashMapUnmanaged(*ast.StructDecl),
+    methods: *std.StringHashMapUnmanaged(*ast.MethodDecl),
     scope: *Scope,
     stmt: ast.Stmt,
     diags: *std.ArrayListUnmanaged(Diagnostic),
@@ -439,7 +470,7 @@ fn checkStmt(
             var ty: ?*TypeInfo = null;
             if (vd.ty) |t| ty = try resolveTypeExpr(a, types, t, diags);
             if (vd.init) |init| {
-                const it = try checkExpr(a, types, fns, scope, init, diags);
+                const it = try checkExpr(a, types, fns, structs, methods, scope, init, diags);
                 if (ty) |t| {
                     if (!canAssign(it, t)) {
                         try diags.append(a, .{ .message = try std.fmt.allocPrint(a, "cannot assign {s} to {s}", .{ it.name, t.name }) });
@@ -453,7 +484,7 @@ fn checkStmt(
             }
         },
         .destructure => |ds| {
-            const it = try checkExpr(a, types, fns, scope, ds.init, diags);
+            const it = try checkExpr(a, types, fns, structs, methods, scope, ds.init, diags);
             _ = it;
             const i64t = types.get("i64").?;
             for (ds.names) |n| {
@@ -461,63 +492,63 @@ fn checkStmt(
             }
         },
         .for_in_stmt => |fs| {
-            _ = try checkExpr(a, types, fns, scope, fs.iter, diags);
+            _ = try checkExpr(a, types, fns, structs, methods, scope, fs.iter, diags);
             const i64t = types.get("i64").?;
             try scope.vars.put(a, fs.name, .{ .ty = i64t, .mutable = false });
-            try checkBlock(a, types, fns, fs.body, diags, scope);
+            try checkBlock(a, types, fns, structs, methods, fs.body, diags, scope);
         },
         .errdefer_stmt => |ds| switch (ds) {
-            .expr => |ex| _ = try checkExpr(a, types, fns, scope, ex, diags),
-            .block => |b| try checkBlock(a, types, fns, b, diags, scope),
+            .expr => |ex| _ = try checkExpr(a, types, fns, structs, methods, scope, ex, diags),
+            .block => |b| try checkBlock(a, types, fns, structs, methods, b, diags, scope),
         },
         .assign => |as| {
             if (as.index) |ix| {
-                _ = try checkExpr(a, types, fns, scope, ix.base, diags);
-                _ = try checkExpr(a, types, fns, scope, ix.index, diags);
-                _ = try checkExpr(a, types, fns, scope, as.value, diags);
+                _ = try checkExpr(a, types, fns, structs, methods, scope, ix.base, diags);
+                _ = try checkExpr(a, types, fns, structs, methods, scope, ix.index, diags);
+                _ = try checkExpr(a, types, fns, structs, methods, scope, as.value, diags);
             } else if (as.field) |fa| {
-                _ = try checkExpr(a, types, fns, scope, fa.base, diags);
-                _ = try checkExpr(a, types, fns, scope, as.value, diags);
+                _ = try checkExpr(a, types, fns, structs, methods, scope, fa.base, diags);
+                _ = try checkExpr(a, types, fns, structs, methods, scope, as.value, diags);
             } else {
                 const v = lookupVar(scope, as.name) orelse {
                     try diags.append(a, .{ .message = try std.fmt.allocPrint(a, "unknown name '{s}'", .{as.name}) });
                     return;
                 };
-                const rt = try checkExpr(a, types, fns, scope, as.value, diags);
+                const rt = try checkExpr(a, types, fns, structs, methods, scope, as.value, diags);
                 if (!canAssign(rt, v.ty)) {
                     try diags.append(a, .{ .message = "assignment type mismatch" });
                 }
             }
         },
-        .expr => |e| _ = try checkExpr(a, types, fns, scope, e, diags),
+        .expr => |e| _ = try checkExpr(a, types, fns, structs, methods, scope, e, diags),
         .return_stmt => |re| {
-            if (re) |e| _ = try checkExpr(a, types, fns, scope, e, diags);
+            if (re) |e| _ = try checkExpr(a, types, fns, structs, methods, scope, e, diags);
         },
         .if_stmt => |ifs| {
-            _ = try checkExpr(a, types, fns, scope, ifs.cond, diags);
+            _ = try checkExpr(a, types, fns, structs, methods, scope, ifs.cond, diags);
             // flow-sensitive: if (x != null) narrow x
             var then_scope = Scope{ .parent = scope, .vars = .{}, .narrowed = .{} };
             if (nullCheckIdent(ifs.cond)) |name| {
                 try then_scope.narrowed.put(a, name, {});
             }
-            try checkBlock(a, types, fns, ifs.then_block, diags, &then_scope);
+            try checkBlock(a, types, fns, structs, methods, ifs.then_block, diags, &then_scope);
             if (ifs.else_block) |eb| {
-                try checkBlock(a, types, fns, eb, diags, scope);
+                try checkBlock(a, types, fns, structs, methods, eb, diags, scope);
             }
         },
         .while_stmt => |ws| {
-            _ = try checkExpr(a, types, fns, scope, ws.cond, diags);
-            try checkBlock(a, types, fns, ws.body, diags, scope);
+            _ = try checkExpr(a, types, fns, structs, methods, scope, ws.cond, diags);
+            try checkBlock(a, types, fns, structs, methods, ws.body, diags, scope);
         },
         .break_stmt, .continue_stmt => {},
         .with_stmt => |ws| {
-            for (ws.values) |v| _ = try checkExpr(a, types, fns, scope, v, diags);
-            try checkBlock(a, types, fns, ws.body, diags, scope);
+            for (ws.values) |v| _ = try checkExpr(a, types, fns, structs, methods, scope, v, diags);
+            try checkBlock(a, types, fns, structs, methods, ws.body, diags, scope);
         },
         .defer_stmt => |ds| {
             switch (ds) {
-                .expr => |ex| _ = try checkExpr(a, types, fns, scope, ex, diags),
-                .block => |b| try checkBlock(a, types, fns, b, diags, scope),
+                .expr => |ex| _ = try checkExpr(a, types, fns, structs, methods, scope, ex, diags),
+                .block => |b| try checkBlock(a, types, fns, structs, methods, b, diags, scope),
             }
         },
     }
@@ -554,6 +585,8 @@ fn checkExpr(
     a: std.mem.Allocator,
     types: *std.StringHashMapUnmanaged(*TypeInfo),
     fns: *std.StringHashMapUnmanaged(*ast.FnDecl),
+    structs: *std.StringHashMapUnmanaged(*ast.StructDecl),
+    methods: *std.StringHashMapUnmanaged(*ast.MethodDecl),
     scope: *Scope,
     e: *ast.Expr,
     diags: *std.ArrayListUnmanaged(Diagnostic),
@@ -594,8 +627,8 @@ fn checkExpr(
             return ti;
         },
         .binary => |b| {
-            const l = try checkExpr(a, types, fns, scope, b.left, diags);
-            const r = try checkExpr(a, types, fns, scope, b.right, diags);
+            const l = try checkExpr(a, types, fns, structs, methods, scope, b.left, diags);
+            const r = try checkExpr(a, types, fns, structs, methods, scope, b.right, diags);
             _ = r;
             if (b.op == .eq or b.op == .neq or b.op == .lt or b.op == .gt or b.op == .lte or b.op == .gte or b.op == .and_op or b.op == .or_op)
                 return types.get("bool").?;
@@ -603,7 +636,7 @@ fn checkExpr(
             return l;
         },
         .unary => |u| {
-            const t = try checkExpr(a, types, fns, scope, u.expr, diags);
+            const t = try checkExpr(a, types, fns, structs, methods, scope, u.expr, diags);
             if (u.op == .addr) {
                 const ti = try a.create(TypeInfo);
                 ti.* = .{ .kind = .pointer, .pointee = t, .name = "ptr" };
@@ -614,22 +647,26 @@ fn checkExpr(
         },
         .call => |c| {
             if (c.callee.* == .ident and std.mem.eql(u8, c.callee.ident, "print")) {
-                for (c.args) |arg| _ = try checkExpr(a, types, fns, scope, arg, diags);
-                for (c.with_args) |w| _ = try checkExpr(a, types, fns, scope, w, diags);
+                for (c.args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
+                for (c.with_args) |w| _ = try checkExpr(a, types, fns, structs, methods, scope, w, diags);
                 return try voidType(a);
             }
             if (c.callee.* == .ident and std.mem.eql(u8, c.callee.ident, "alloc")) {
-                for (c.args) |arg| _ = try checkExpr(a, types, fns, scope, arg, diags);
+                for (c.args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
                 const ti = try a.create(TypeInfo);
                 ti.* = .{ .kind = .pointer, .name = "ptr", .pointee = types.get("byte") };
                 return ti;
             }
             if (c.callee.* == .ident and std.mem.eql(u8, c.callee.ident, "spawn")) {
-                for (c.args) |arg| _ = try checkExpr(a, types, fns, scope, arg, diags);
+                for (c.args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
+                return try voidType(a);
+            }
+            if (c.callee.* == .ident and std.mem.eql(u8, c.callee.ident, "jog_host_run_loop")) {
+                for (c.args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
                 return try voidType(a);
             }
             if (c.callee.* == .ident and std.mem.eql(u8, c.callee.ident, "go")) {
-                for (c.args) |arg| _ = try checkExpr(a, types, fns, scope, arg, diags);
+                for (c.args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
                 return try voidType(a);
             }
             if (c.callee.* == .ident and (std.mem.eql(u8, c.callee.ident, "yield") or
@@ -638,7 +675,7 @@ fn checkExpr(
                 std.mem.eql(u8, c.callee.ident, "print_tid") or
                 std.mem.eql(u8, c.callee.ident, "sleep_ms")))
             {
-                for (c.args) |arg| _ = try checkExpr(a, types, fns, scope, arg, diags);
+                for (c.args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
                 return try voidType(a);
             }
             if (c.callee.* == .ident and (std.mem.eql(u8, c.callee.ident, "dispatcher_single") or
@@ -647,7 +684,7 @@ fn checkExpr(
                 std.mem.eql(u8, c.callee.ident, "dispatcher_get") or
                 std.mem.eql(u8, c.callee.ident, "dispatcher_io")))
             {
-                for (c.args) |arg| _ = try checkExpr(a, types, fns, scope, arg, diags);
+                for (c.args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
                 const ti = try a.create(TypeInfo);
                 ti.* = .{ .kind = .i64_ty, .name = "Dispatcher", .bits = 64, .unsigned = false };
                 return ti;
@@ -662,13 +699,13 @@ fn checkExpr(
                 return ti;
             }
             if (c.callee.* == .ident and std.mem.eql(u8, c.callee.ident, "coro_unpark")) {
-                for (c.args) |arg| _ = try checkExpr(a, types, fns, scope, arg, diags);
+                for (c.args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
                 return try voidType(a);
             }
             if (c.callee.* == .ident) {
                 if (fns.get(c.callee.ident)) |fd| {
-                    for (c.args) |arg| _ = try checkExpr(a, types, fns, scope, arg, diags);
-                    for (c.with_args) |w| _ = try checkExpr(a, types, fns, scope, w, diags);
+                    for (c.args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
+                    for (c.with_args) |w| _ = try checkExpr(a, types, fns, structs, methods, scope, w, diags);
                     for (c.type_args) |ta| _ = try resolveTypeExpr(a, types, ta, diags);
                     if (fd.type_params.len > 0) {
                         // Explicit type args, or infer from first arg (int → i64).
@@ -676,7 +713,7 @@ fn checkExpr(
                         var nta: usize = c.type_args.len;
                         if (nta == 0 and c.args.len > 0 and fd.type_params.len == 1) {
                             const te = try a.create(ast.TypeExpr);
-                            const at = try checkExpr(a, types, fns, scope, c.args[0], diags);
+                            const at = try checkExpr(a, types, fns, structs, methods, scope, c.args[0], diags);
                             te.* = .{ .name = if (at.name.len > 0) at.name else "i64" };
                             targ_buf[0] = te;
                             nta = 1;
@@ -703,42 +740,79 @@ fn checkExpr(
                 }
             }
             if (c.callee.* == .field) {
-                _ = try checkExpr(a, types, fns, scope, c.callee.field.base, diags);
-                for (c.args) |arg| _ = try checkExpr(a, types, fns, scope, arg, diags);
-                for (c.with_args) |w| _ = try checkExpr(a, types, fns, scope, w, diags);
-                // method return unknown without full resolution — pointer-ish default
+                const base_t = try checkExpr(a, types, fns, structs, methods, scope, c.callee.field.base, diags);
+                for (c.args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
+                for (c.with_args) |w| _ = try checkExpr(a, types, fns, structs, methods, scope, w, diags);
+                const type_name = blk: {
+                    if (base_t.kind == .struct_ty) break :blk base_t.name;
+                    if (base_t.kind == .pointer) {
+                        if (base_t.pointee) |po| {
+                            if (po.kind == .struct_ty) break :blk po.name;
+                        }
+                    }
+                    break :blk "";
+                };
+                if (type_name.len > 0) {
+                    const key = try std.fmt.allocPrint(a, "{s}.{s}", .{ type_name, c.callee.field.name });
+                    if (methods.get(key)) |md| {
+                        if (md.ret) |r| return try resolveTypeExpr(a, types, r, diags);
+                        return try voidType(a);
+                    }
+                }
                 const ti = try a.create(TypeInfo);
                 ti.* = .{ .kind = .pointer, .name = "ptr", .pointee = types.get("byte") };
                 return ti;
             }
-            _ = try checkExpr(a, types, fns, scope, c.callee, diags);
-            for (c.args) |arg| _ = try checkExpr(a, types, fns, scope, arg, diags);
-            for (c.with_args) |w| _ = try checkExpr(a, types, fns, scope, w, diags);
+            _ = try checkExpr(a, types, fns, structs, methods, scope, c.callee, diags);
+            for (c.args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
+            for (c.with_args) |w| _ = try checkExpr(a, types, fns, structs, methods, scope, w, diags);
             return try voidType(a);
         },
         .field => |f| {
-            const base = try checkExpr(a, types, fns, scope, f.base, diags);
+            const base = try checkExpr(a, types, fns, structs, methods, scope, f.base, diags);
             if (base.kind == .enum_ty) return base;
+            if (base.kind == .struct_ty) {
+                if (structs.get(base.name)) |sd| {
+                    for (sd.fields) |fld| {
+                        if (std.mem.eql(u8, fld.name, f.name)) {
+                            return try resolveTypeExpr(a, types, fld.ty, diags);
+                        }
+                    }
+                }
+            }
+            if (base.kind == .pointer) {
+                if (base.pointee) |po| {
+                    if (po.kind == .struct_ty) {
+                        if (structs.get(po.name)) |sd| {
+                            for (sd.fields) |fld| {
+                                if (std.mem.eql(u8, fld.name, f.name)) {
+                                    return try resolveTypeExpr(a, types, fld.ty, diags);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             const ti = try a.create(TypeInfo);
             ti.* = .{ .kind = .i64_ty, .name = "i64", .bits = 64, .unsigned = false };
             return ti;
         },
         .when_expr => |w| {
-            _ = try checkExpr(a, types, fns, scope, w.scrutinee, diags);
+            _ = try checkExpr(a, types, fns, structs, methods, scope, w.scrutinee, diags);
             var result: ?*TypeInfo = null;
             for (w.arms) |arm| {
-                const bt = try checkExpr(a, types, fns, scope, arm.body, diags);
+                const bt = try checkExpr(a, types, fns, structs, methods, scope, arm.body, diags);
                 if (result == null) result = bt;
             }
             if (w.else_body) |eb| {
-                const bt = try checkExpr(a, types, fns, scope, eb, diags);
+                const bt = try checkExpr(a, types, fns, structs, methods, scope, eb, diags);
                 if (result == null) result = bt;
             }
             return result orelse try voidType(a);
         },
         .index => |ix| {
-            const base = try checkExpr(a, types, fns, scope, ix.base, diags);
-            _ = try checkExpr(a, types, fns, scope, ix.index, diags);
+            const base = try checkExpr(a, types, fns, structs, methods, scope, ix.base, diags);
+            _ = try checkExpr(a, types, fns, structs, methods, scope, ix.index, diags);
             if (base.kind == .array_ty) {
                 return base.pointee orelse {
                     const ti = try a.create(TypeInfo);
@@ -758,7 +832,7 @@ fn checkExpr(
             return ti;
         },
         .cast => |c| {
-            const from = try checkExpr(a, types, fns, scope, c.expr, diags);
+            const from = try checkExpr(a, types, fns, structs, methods, scope, c.expr, diags);
             const to = try resolveTypeExpr(a, types, c.ty, diags);
             if (!castAllowed(from, to, true)) {
                 try diags.append(a, .{ .message = try std.fmt.allocPrint(a, "cannot cast {s} to {s}", .{ from.name, to.name }) });
@@ -773,18 +847,18 @@ fn checkExpr(
             return to;
         },
         .optional_call => |oc| {
-            _ = try checkExpr(a, types, fns, scope, oc.base, diags);
-            for (oc.args) |arg| _ = try checkExpr(a, types, fns, scope, arg, diags);
+            _ = try checkExpr(a, types, fns, structs, methods, scope, oc.base, diags);
+            for (oc.args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
             const ti = try a.create(TypeInfo);
             ti.* = .{ .kind = .optional, .name = "opt_result", .pointee = try voidType(a) };
             return ti;
         },
         .panic_call => |p| {
-            _ = try checkExpr(a, types, fns, scope, p.message, diags);
+            _ = try checkExpr(a, types, fns, structs, methods, scope, p.message, diags);
             return try voidType(a);
         },
         .struct_lit => |sl| {
-            for (sl.fields) |f| _ = try checkExpr(a, types, fns, scope, f.value, diags);
+            for (sl.fields) |f| _ = try checkExpr(a, types, fns, structs, methods, scope, f.value, diags);
             if (sl.type_args.len > 0) {
                 const te = try a.create(ast.TypeExpr);
                 te.* = .{ .named_app = .{ .name = sl.type_name, .args = sl.type_args } };
@@ -795,7 +869,7 @@ fn checkExpr(
             return try voidType(a);
         },
         .tuple => |elems| {
-            for (elems) |el| _ = try checkExpr(a, types, fns, scope, el, diags);
+            for (elems) |el| _ = try checkExpr(a, types, fns, structs, methods, scope, el, diags);
             const ti = try a.create(TypeInfo);
             ti.* = .{
                 .kind = .struct_ty,
@@ -805,14 +879,14 @@ fn checkExpr(
         },
         .cstring => return types.get("str").?,
         .range => |r| {
-            _ = try checkExpr(a, types, fns, scope, r.start, diags);
-            _ = try checkExpr(a, types, fns, scope, r.end, diags);
+            _ = try checkExpr(a, types, fns, structs, methods, scope, r.start, diags);
+            _ = try checkExpr(a, types, fns, structs, methods, scope, r.end, diags);
             const ti = try a.create(TypeInfo);
             ti.* = .{ .kind = .i64_ty, .name = "range", .bits = 64, .unsigned = false };
             return ti;
         },
         .array_lit => |al| {
-            for (al.elems) |el| _ = try checkExpr(a, types, fns, scope, el, diags);
+            for (al.elems) |el| _ = try checkExpr(a, types, fns, structs, methods, scope, el, diags);
             const ti = try a.create(TypeInfo);
             ti.* = .{
                 .kind = .array_ty,
@@ -825,19 +899,19 @@ fn checkExpr(
         .interp => |ip| {
             for (ip.parts) |p| switch (p) {
                 .text => {},
-                .expr => |ex| _ = try checkExpr(a, types, fns, scope, ex, diags),
+                .expr => |ex| _ = try checkExpr(a, types, fns, structs, methods, scope, ex, diags),
             };
             return types.get("str").?;
         },
         .try_cast => |c| {
-            _ = try checkExpr(a, types, fns, scope, c.expr, diags);
+            _ = try checkExpr(a, types, fns, structs, methods, scope, c.expr, diags);
             const to = try resolveTypeExpr(a, types, c.ty, diags);
             const ti = try a.create(TypeInfo);
             ti.* = .{ .kind = .optional, .name = "opt", .pointee = to };
             return ti;
         },
         .is_type => |it| {
-            _ = try checkExpr(a, types, fns, scope, it.expr, diags);
+            _ = try checkExpr(a, types, fns, structs, methods, scope, it.expr, diags);
             _ = try resolveTypeExpr(a, types, it.ty, diags);
             return types.get("bool").?;
         },
