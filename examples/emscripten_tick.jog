@@ -1,0 +1,18 @@
+// Returning mainloop for wasm32-emscripten (and native).
+// Build: jog build examples/emscripten_tick.jog --target wasm32-emscripten -o out/tick.html
+
+var ticks: i64 = 0
+
+@export
+fn tick(): i32 {
+    ticks = ticks + 1
+    if (ticks >= 3) {
+        return 0
+    }
+    return 1
+}
+
+fn main() {
+    jog_host_run_loop(tick)
+    print("tick loop done\n")
+}
