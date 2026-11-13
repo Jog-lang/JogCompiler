@@ -5,8 +5,10 @@
 
 .bss
 .align 16
+# Bump heap (JOG-89): 4 MiB so software framebuffers fit without libc malloc.
+.set JOGRT_HEAP_SIZE, 4194304
 jogrt_heap:
-  .zero 65536
+  .zero JOGRT_HEAP_SIZE
 jogrt_heap_ptr:
   .zero 8
 
@@ -48,7 +50,7 @@ jogrt_alloc:
   mov rdx, rax
   add rax, rdi
   lea rsi, [rip + jogrt_heap]
-  add rsi, 65536
+  add rsi, JOGRT_HEAP_SIZE
   cmp rax, rsi
   ja 2f
   mov qword ptr [rcx], rax
@@ -73,6 +75,30 @@ jogrt_spawn:
   mov rax, rdi
   mov rdi, rsi
   call rax
+  ret
+
+# Returning mainloop (desktop): rdi = tick fn () -> i64/i32; stop when tick returns 0.
+# Emscripten/wasm is a separate target (JOG-90); this is the native while-loop actual.
+.globl jog_host_run_loop
+.type jog_host_run_loop, @function
+.globl jogrt_host_run_loop
+.type jogrt_host_run_loop, @function
+jog_host_run_loop:
+jogrt_host_run_loop:
+  push rbp
+  mov rbp, rsp
+  push rbx
+  mov rbx, rdi
+  test rbx, rbx
+  jz 2f
+1:
+  xor eax, eax
+  call rbx
+  test rax, rax
+  jnz 1b
+2:
+  pop rbx
+  pop rbp
   ret
 
 .section .rodata

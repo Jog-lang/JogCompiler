@@ -56,6 +56,9 @@ zig build
 ./zig-out/bin/jog build examples/for_continue.jog -o out/for_continue && ./out/for_continue
 ./zig-out/bin/jog build examples/bitwise_ops.jog -o out/bitwise_ops && ./out/bitwise_ops
 ./zig-out/bin/jog build examples/arrays.jog -o out/arrays && ./out/arrays
+./zig-out/bin/jog build examples/globals.jog -o out/globals && ./out/globals
+./zig-out/bin/jog build examples/float_extern.jog -o out/float_extern && ./out/float_extern
+./zig-out/bin/jog build examples/host_run_loop.jog -o out/host_run_loop && ./out/host_run_loop
 ```
 
 Language subset (milestone): structs/fields, pointers, `T?` + `?.`, widen/`as` narrow, `with` contexts, `interface struct` fat ptrs. Minimal `jog.mod` module graph (`root` + `source` + `link.*` / `libdir.*`). `while`/`for`/`break`/`continue`, `&&`/`||`, arith/`%`, `<=`/`>=`, bitwise, `[N]T` index, `@link` / `--libdir`. Stackful `go`/`yield`, multi-worker steal, `with (Dispatcher)` hop, and elastic IO pool: `docs/coroutines.md`.

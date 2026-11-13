@@ -68,8 +68,12 @@ pub const Parser = struct {
         // @link / @export / @test / @packed / @intrinsic
         if (self.tok.kind == .at) {
             self.advance();
-            if (self.tok.kind != .ident) return error.UnexpectedToken;
-            const attr = self.tok.text;
+            // `export` is a keyword; other attrs are bare idents.
+            const attr = blk: {
+                if (self.tok.kind == .ident) break :blk self.tok.text;
+                if (self.tok.kind == .kw_export) break :blk @as([]const u8, "export");
+                return error.UnexpectedToken;
+            };
             self.advance();
             if (std.mem.eql(u8, attr, "link")) {
                 try self.expect(.lparen);
@@ -155,6 +159,24 @@ pub const Parser = struct {
                 fd.exported = true;
                 fd.is_private = is_private;
                 return .{ .fn_decl = fd };
+            },
+            .kw_val, .kw_var => {
+                const mutable = self.tok.kind == .kw_var;
+                self.advance();
+                if (self.tok.kind != .ident) return error.UnexpectedToken;
+                const name = self.tok.text;
+                self.advance();
+                var ty: ?*ast.TypeExpr = null;
+                if (self.tok.kind == .colon) {
+                    self.advance();
+                    ty = try self.parseTypeExpr();
+                }
+                var init_e: ?*ast.Expr = null;
+                if (self.tok.kind == .eq) {
+                    self.advance();
+                    init_e = try self.parseExpr();
+                }
+                return .{ .global_decl = .{ .mutable = mutable, .name = name, .ty = ty, .init = init_e } };
             },
             .kw_fn => {
                 // method: fn *Type.name or fn Type.name

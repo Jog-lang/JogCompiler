@@ -60,6 +60,15 @@ pub const Decl = union(enum) {
     actual_fn: FnDecl,
     import_decl: ImportDecl,
     require_decl: RequireDecl,
+    /// Package-level `val` / `var` (compile-time const or mutable global).
+    global_decl: GlobalDecl,
+};
+
+pub const GlobalDecl = struct {
+    mutable: bool,
+    name: []const u8,
+    ty: ?*TypeExpr,
+    init: ?*Expr,
 };
 
 pub const ImportDecl = struct {
