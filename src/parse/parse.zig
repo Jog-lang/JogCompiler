@@ -542,7 +542,12 @@ pub const Parser = struct {
                 }
                 try self.expect(.rparen);
                 var with_args: []*ast.Expr = &.{};
+                // Call-site `f() with (ctx)` must not steal statement `with (ctx) { ... }`.
                 if (self.tok.kind == .kw_with) {
+                    const save_i = self.lx.i;
+                    const save_line = self.lx.line;
+                    const save_col = self.lx.col;
+                    const save_tok = self.tok;
                     self.advance();
                     try self.expect(.lparen);
                     var wargs: std.ArrayListUnmanaged(*ast.Expr) = .{};
@@ -555,7 +560,15 @@ pub const Parser = struct {
                         break;
                     }
                     try self.expect(.rparen);
-                    with_args = try wargs.toOwnedSlice(self.allocator);
+                    if (self.tok.kind == .lbrace) {
+                        // Block with-stmt — rewind so parseStmt handles it.
+                        self.lx.i = save_i;
+                        self.lx.line = save_line;
+                        self.lx.col = save_col;
+                        self.tok = save_tok;
+                    } else {
+                        with_args = try wargs.toOwnedSlice(self.allocator);
+                    }
                 }
                 const call = try self.allocator.create(ast.Expr);
                 call.* = .{ .call = .{
