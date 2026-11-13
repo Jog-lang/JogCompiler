@@ -1,0 +1,47 @@
+// Chase-Lev steal contention: many coros, many yields, 8 workers so idle
+// thieves race the owner bottom-pop path. Hang / lost wakeup = fail.
+
+fn work(arg: *byte) {
+    print_tid()
+    yield()
+    print_tid()
+    yield()
+    print_tid()
+    yield()
+    print_tid()
+    yield()
+    print_tid()
+    yield()
+    print_tid()
+}
+
+fn main() {
+    dispatcher_pool(8)
+    // 24 coros on 8 workers (slot cap 32; leave headroom for main).
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    go(work, null)
+    coro_drain()
+    print("steal done\n")
+}

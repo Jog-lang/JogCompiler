@@ -3,6 +3,7 @@
 # Gate step 3: with (Dispatcher) cross-pool hop (park + rsp swap onto target pool).
 # Gate step 2: multi-worker pool + work-steal; ambient Dispatcher.
 # Gate step 1 (rsp swap, park stubs) preserved; single-thread via dispatcher_single.
+# JOG-78: Chase-Lev lock-free work-stealing deques (owner bottom, thieves top).
 # Stability: futex wake_all on enqueue; YRQ published before rsp swap; drain join
 # wakes idle workers; finish uses EXITING+YRQ retire (never yield-requeue after
 # clear) so go() cannot reuse a winding-down stack; steal start = rdtsc % n.
@@ -21,7 +22,7 @@
 #   0x00 wid  0x08 current (0=home/sched)  0x10 home_ctx*  0x18 yield_requeue
 # yield always hops to home first; home requeues after the rsp save (no dual-run race).
 #
-# Per-worker locked FIFO queues; steal only within the same Dispatcher pool.
+# Per-worker Chase-Lev deques; steal only within the same Dispatcher pool.
 
 .intel_syntax noprefix
 
@@ -129,17 +130,29 @@ jogrt_io_disp:
 jogrt_elastic_lock:
   .zero 8
 
+# Per-pool locked inbox for remote submits (cross-pool migrate / go from
+# a worker outside the target pool). Owner threads never push here — they
+# use the Chase-Lev deque so bottom stays single-writer.
+jogrt_inbox_head:
+  .zero JOGRT_MAX_POOLS * 8
+jogrt_inbox_tail:
+  .zero JOGRT_MAX_POOLS * 8
+jogrt_inbox_lock:
+  .zero JOGRT_MAX_POOLS * 8
+.align 16
+jogrt_inbox_data:
+  .zero JOGRT_MAX_POOLS * JOGRT_QUEUE_CAP * 8
+
 .align 16
 jogrt_tls:
   .zero JOGRT_MAX_WORKERS * JOGRT_TLS_SIZE
 jogrt_home_ctx:
   .zero JOGRT_MAX_WORKERS * JOGRT_HOME_SIZE
+# Chase-Lev indices (monotonic u64): top=head (steal), bottom=tail (owner).
 jogrt_wq_head:
-  .zero JOGRT_MAX_WORKERS * 8   # steal / FIFO end
+  .zero JOGRT_MAX_WORKERS * 8   # top — thieves + owner CAS on last element
 jogrt_wq_tail:
-  .zero JOGRT_MAX_WORKERS * 8   # owner push/pop end
-jogrt_wq_lock:
-  .zero JOGRT_MAX_WORKERS * 8
+  .zero JOGRT_MAX_WORKERS * 8   # bottom — owner push / pop only
 jogrt_wq_park:
   .zero JOGRT_MAX_WORKERS * 8   # low 32 bits used as futex word
 .align 16
@@ -365,7 +378,9 @@ jogrt_pool_register:
   pop rbx
   ret
 
-# rdi = pool id, rsi = coro index — RR enqueue onto that pool + wake.
+# rdi = pool id, rsi = coro index — enqueue onto that pool + wake.
+# If this thread’s wid is in the pool: Chase-Lev owner push (local).
+# Otherwise: locked per-pool inbox (remote submit / cross-pool migrate).
 # Elastic pools may grow a worker when queued work pressure is high.
 .type jogrt_pool_enqueue, @function
 jogrt_pool_enqueue:
@@ -380,20 +395,25 @@ jogrt_pool_enqueue:
   mov r13, qword ptr [rax + rbx * 8]
   test r13, r13
   jz .Lpenq_bad
-  lea rax, [rip + jogrt_pool_rr]
-  mov rcx, qword ptr [rax + rbx * 8]
-  mov rdx, rcx
-  inc rdx
-  mov qword ptr [rax + rbx * 8], rdx
-  xor edx, edx
-  mov rax, rcx
-  div r13
-  # rdx = offset within pool
+  # Local owner push when current wid belongs to this pool.
+  mov rcx, qword ptr fs:[TLS_OFF_WID]
   lea rax, [rip + jogrt_pool_base]
-  add rdx, qword ptr [rax + rbx * 8]
-  mov rdi, rdx
+  mov rdx, qword ptr [rax + rbx * 8]       # base
+  cmp rcx, rdx
+  jb .Lpenq_remote
+  mov rax, rcx
+  sub rax, rdx
+  cmp rax, r13
+  jae .Lpenq_remote
+  mov rdi, rcx
   mov rsi, r12
   call jogrt_wq_push
+  jmp .Lpenq_wake
+.Lpenq_remote:
+  mov rdi, rbx
+  mov rsi, r12
+  call jogrt_inbox_push
+.Lpenq_wake:
   call jogrt_wake_one
   # Grow elastic IO pool under backlog (queued >= live workers).
   lea rax, [rip + jogrt_pool_elastic]
@@ -666,7 +686,7 @@ jogrt_elastic_maybe_grow:
   jae .Lel_unlock
   cmp qword ptr [rip + jogrt_nworkers], JOGRT_MAX_WORKERS
   jae .Lel_unlock
-  # Count queued items across live workers in this pool.
+  # Count queued items across live workers in this pool (saturating size).
   lea rax, [rip + jogrt_pool_base]
   mov r14, qword ptr [rax + rbx * 8]       # base
   xor r15d, r15d                           # queued
@@ -679,14 +699,21 @@ jogrt_elastic_maybe_grow:
   mov rax, rdx
   imul rax, rax, 8
   lea rsi, [rip + jogrt_wq_tail]
-  mov r8, qword ptr [rsi + rax]
+  mov r8, qword ptr [rsi + rax]            # bottom
   lea rsi, [rip + jogrt_wq_head]
-  mov r9, qword ptr [rsi + rax]
+  mov r9, qword ptr [rsi + rax]            # top
+  cmp r8, r9
+  jle .Lel_qnext                           # signed: empty or transient
   sub r8, r9
   add r15, r8
+.Lel_qnext:
   inc rcx
   jmp .Lel_qloop
 .Lel_qdone:
+  # Include remote inbox backlog for this pool.
+  mov rdi, rbx
+  call jogrt_inbox_count
+  add r15, rax
   # Grow when backlog >= live workers (need another OS thread for blocking work).
   cmp r15, r12
   jb .Lel_unlock
@@ -974,25 +1001,23 @@ jogrt_coro_arm:
   ret
 
 # ---------------------------------------------------------------------------
-# Work queues: locked deque (owner pops tail; thieves steal head)
+# Per-pool locked inbox (remote submits only)
 # ---------------------------------------------------------------------------
-.type jogrt_wq_push, @function
-# rdi = wid, rsi = coro index
-jogrt_wq_push:
+.type jogrt_inbox_push, @function
+# rdi = pool id, rsi = coro index
+jogrt_inbox_push:
   push rbx
   push r12
   push r13
   mov rbx, rdi
   mov r12, rsi
-  lea rdi, [rip + jogrt_wq_lock]
+  lea rdi, [rip + jogrt_inbox_lock]
   lea rdi, [rdi + rbx * 8]
   call jogrt_lock
-  mov rax, rbx
-  imul rax, rax, 8
-  lea rdx, [rip + jogrt_wq_tail]
-  mov r8, qword ptr [rdx + rax]          # tail
-  lea rdx, [rip + jogrt_wq_head]
-  mov r9, qword ptr [rdx + rax]          # head
+  lea rdx, [rip + jogrt_inbox_tail]
+  mov r8, qword ptr [rdx + rbx * 8]
+  lea rdx, [rip + jogrt_inbox_head]
+  mov r9, qword ptr [rdx + rbx * 8]
   mov r10, r8
   inc r10
   mov r13, r10
@@ -1000,82 +1025,228 @@ jogrt_wq_push:
   mov r11, r9
   and r11, JOGRT_QUEUE_CAP - 1
   cmp r13, r11
-  je .Lwq_push_full                      # full: drop lock and panic
+  je .Linbox_full
   mov r10, r8
   and r10, JOGRT_QUEUE_CAP - 1
   mov rax, rbx
   imul rax, rax, JOGRT_QUEUE_CAP
   add rax, r10
-  lea rdx, [rip + jogrt_wq_data]
+  lea rdx, [rip + jogrt_inbox_data]
   mov qword ptr [rdx + rax * 8], r12
-  lea rdx, [rip + jogrt_wq_tail]
-  mov rax, rbx
+  lea rdx, [rip + jogrt_inbox_tail]
   inc r8
-  mov qword ptr [rdx + rax * 8], r8
-  lea rdi, [rip + jogrt_wq_lock]
+  mov qword ptr [rdx + rbx * 8], r8
+  lea rdi, [rip + jogrt_inbox_lock]
   lea rdi, [rdi + rbx * 8]
   call jogrt_unlock
   pop r13
   pop r12
   pop rbx
   ret
-.Lwq_push_full:
-  lea rdi, [rip + jogrt_wq_lock]
+.Linbox_full:
+  lea rdi, [rip + jogrt_inbox_lock]
   lea rdi, [rdi + rbx * 8]
   call jogrt_unlock
   lea rdi, [rip + jogrt_wq_full_msg]
   mov esi, jogrt_wq_full_msg_len
   call jogrt_panic
 
-.type jogrt_wq_pop, @function
-# rdi = wid → rax = coro or -1 (FIFO from head; matches go enqueue order)
-jogrt_wq_pop:
-  mov rdi, rdi
-  jmp jogrt_wq_steal
-
-.type jogrt_wq_steal, @function
-# rdi = victim wid → rax = coro or -1
-jogrt_wq_steal:
+.type jogrt_inbox_pop, @function
+# rdi = pool id → rax = coro or -1
+jogrt_inbox_pop:
   push rbx
   mov rbx, rdi
-  lea rdi, [rip + jogrt_wq_lock]
+  lea rdi, [rip + jogrt_inbox_lock]
   lea rdi, [rdi + rbx * 8]
   call jogrt_lock
-  mov rax, rbx
-  imul rax, rax, 8
-  lea rdx, [rip + jogrt_wq_tail]
-  mov r8, qword ptr [rdx + rax]
-  lea rdx, [rip + jogrt_wq_head]
-  mov r9, qword ptr [rdx + rax]
+  lea rdx, [rip + jogrt_inbox_tail]
+  mov r8, qword ptr [rdx + rbx * 8]
+  lea rdx, [rip + jogrt_inbox_head]
+  mov r9, qword ptr [rdx + rbx * 8]
   cmp r8, r9
-  je .Lwq_steal_empty
+  je .Linbox_empty
   mov r10, r9
   and r10, JOGRT_QUEUE_CAP - 1
   mov rax, rbx
   imul rax, rax, JOGRT_QUEUE_CAP
   add rax, r10
-  lea rdx, [rip + jogrt_wq_data]
+  lea rdx, [rip + jogrt_inbox_data]
   mov rsi, qword ptr [rdx + rax * 8]
   inc r9
-  lea rdx, [rip + jogrt_wq_head]
+  lea rdx, [rip + jogrt_inbox_head]
   mov qword ptr [rdx + rbx * 8], r9
-  lea rdi, [rip + jogrt_wq_lock]
+  lea rdi, [rip + jogrt_inbox_lock]
   lea rdi, [rdi + rbx * 8]
   call jogrt_unlock
   mov rax, rsi
   pop rbx
   ret
-.Lwq_steal_empty:
-  lea rdi, [rip + jogrt_wq_lock]
+.Linbox_empty:
+  lea rdi, [rip + jogrt_inbox_lock]
   lea rdi, [rdi + rbx * 8]
   call jogrt_unlock
   mov rax, -1
   pop rbx
   ret
 
+.type jogrt_inbox_count, @function
+# rdi = pool id → rax = approximate queued count
+jogrt_inbox_count:
+  lea rdx, [rip + jogrt_inbox_tail]
+  mov r8, qword ptr [rdx + rdi * 8]
+  lea rdx, [rip + jogrt_inbox_head]
+  mov r9, qword ptr [rdx + rdi * 8]
+  mov rax, r8
+  sub rax, r9
+  ret
+
+# ---------------------------------------------------------------------------
+# Chase-Lev lock-free work-stealing deques (fixed circular arrays).
+# top=jogrt_wq_head (steal end); bottom=jogrt_wq_tail (owner push/pop).
+# Monotonic counters; slot index = counter & (CAP-1). Empty iff top == bottom.
+# Owner push/pop bottom; thieves CAS top. On x86-64 TSO, owner pop needs mfence
+# between storing bottom and loading top (store-load). Push: data then bottom
+# (store-store ordered). Steal: load top, load bottom, load slot, lock cmpxchg.
+# ABA: top only increases, so successful CAS claims that generation of the slot.
+# Only the owner thread may push (enforced by jogrt_pool_enqueue); remote
+# submits use the per-pool inbox.
+# ---------------------------------------------------------------------------
+.type jogrt_wq_push, @function
+# rdi = wid, rsi = coro index — owner push at bottom
+jogrt_wq_push:
+  push rbx
+  push r12
+  mov rbx, rdi
+  mov r12, rsi
+  lea rdx, [rip + jogrt_wq_tail]
+  mov r8, qword ptr [rdx + rbx * 8]        # bottom
+  lea rdx, [rip + jogrt_wq_head]
+  mov r9, qword ptr [rdx + rbx * 8]        # top
+  mov r10, r8
+  sub r10, r9
+  cmp r10, JOGRT_QUEUE_CAP
+  jae .Lwq_push_full
+  mov r10, r8
+  and r10, JOGRT_QUEUE_CAP - 1
+  mov rax, rbx
+  imul rax, rax, JOGRT_QUEUE_CAP
+  add rax, r10
+  lea rdx, [rip + jogrt_wq_data]
+  mov qword ptr [rdx + rax * 8], r12       # publish task before bottom++
+  lea rdx, [rip + jogrt_wq_tail]
+  inc r8
+  mov qword ptr [rdx + rbx * 8], r8        # bottom = b + 1
+  pop r12
+  pop rbx
+  ret
+.Lwq_push_full:
+  lea rdi, [rip + jogrt_wq_full_msg]
+  mov esi, jogrt_wq_full_msg_len
+  call jogrt_panic
+
+.type jogrt_wq_pop, @function
+# rdi = wid → rax = coro or -1 — owner pop from bottom (LIFO)
+# Indices are monotonic u64 but empty pop does b=bottom-1 before the check;
+# when bottom==top==0 that yields b=-1 — must use signed compares (jl/jg),
+# matching Chase-Lev / Lea (signed top/bottom).
+jogrt_wq_pop:
+  push rbx
+  push r12
+  mov rbx, rdi
+  lea rdx, [rip + jogrt_wq_tail]
+  mov r8, qword ptr [rdx + rbx * 8]        # bottom
+  dec r8                                   # b = bottom - 1 (may be -1 if empty)
+  mov qword ptr [rdx + rbx * 8], r8        # bottom = b
+  mfence                                   # store-load vs thieves' top
+  lea rdx, [rip + jogrt_wq_head]
+  mov r9, qword ptr [rdx + rbx * 8]        # top
+  cmp r8, r9
+  jl .Lwq_pop_empty                        # signed: b < t ⇒ empty
+  mov r10, r8
+  and r10, JOGRT_QUEUE_CAP - 1
+  mov rax, rbx
+  imul rax, rax, JOGRT_QUEUE_CAP
+  add rax, r10
+  lea rdx, [rip + jogrt_wq_data]
+  mov r12, qword ptr [rdx + rax * 8]       # task
+  cmp r8, r9
+  jg .Lwq_pop_ok                           # signed: b > t ⇒ no race
+  # b == t: competing with a thief for the last element
+  mov rax, r9
+  lea rdx, [rip + jogrt_wq_head]
+  lea rdx, [rdx + rbx * 8]
+  mov rcx, r9
+  inc rcx
+  lock cmpxchg qword ptr [rdx], rcx        # CAS top: t → t+1
+  jnz .Lwq_pop_lost
+  lea rdx, [rip + jogrt_wq_tail]
+  mov qword ptr [rdx + rbx * 8], rcx       # bottom = t + 1
+  mov rax, r12
+  pop r12
+  pop rbx
+  ret
+.Lwq_pop_lost:
+  lea rdx, [rip + jogrt_wq_tail]
+  lea rcx, [r9 + 1]
+  mov qword ptr [rdx + rbx * 8], rcx       # bottom = t + 1
+  mov rax, -1
+  pop r12
+  pop rbx
+  ret
+.Lwq_pop_ok:
+  mov rax, r12
+  pop r12
+  pop rbx
+  ret
+.Lwq_pop_empty:
+  lea rdx, [rip + jogrt_wq_tail]
+  mov qword ptr [rdx + rbx * 8], r9        # bottom = top
+  mov rax, -1
+  pop r12
+  pop rbx
+  ret
+
+.type jogrt_wq_steal, @function
+# rdi = victim wid → rax = coro or -1 — thief steal from top
+# Signed top/bottom compares: owner empty-pop briefly stores bottom=-1; an
+# unsigned "t >= b" would see that as non-empty and CAS top past bottom.
+jogrt_wq_steal:
+  push rbx
+  push r12
+  mov rbx, rdi
+  lea rdx, [rip + jogrt_wq_head]
+  mov r9, qword ptr [rdx + rbx * 8]        # top
+  lea rdx, [rip + jogrt_wq_tail]
+  mov r8, qword ptr [rdx + rbx * 8]        # bottom
+  cmp r9, r8
+  jge .Lwq_steal_empty                     # signed: t >= b ⇒ empty
+  mov r10, r9
+  and r10, JOGRT_QUEUE_CAP - 1
+  mov rax, rbx
+  imul rax, rax, JOGRT_QUEUE_CAP
+  add rax, r10
+  lea rdx, [rip + jogrt_wq_data]
+  mov r12, qword ptr [rdx + rax * 8]       # task (before CAS)
+  mov rax, r9
+  lea rdx, [rip + jogrt_wq_head]
+  lea rdx, [rdx + rbx * 8]
+  mov rcx, r9
+  inc rcx
+  lock cmpxchg qword ptr [rdx], rcx        # CAS top: t → t+1
+  jnz .Lwq_steal_empty                     # lost race → -1 (caller may retry)
+  mov rax, r12
+  pop r12
+  pop rbx
+  ret
+.Lwq_steal_empty:
+  mov rax, -1
+  pop r12
+  pop rbx
+  ret
+
 .type jogrt_take_work, @function
 # → rax = coro index or -1
-# Prefer local queue, then steal within the same Dispatcher pool only.
+# Local Chase-Lev pop, then pool inbox, then steal within the same pool.
 jogrt_take_work:
   push rbx
   push r12
@@ -1090,6 +1261,10 @@ jogrt_take_work:
   jne .Ltake_done
   lea rax, [rip + jogrt_wid_pool]
   mov r15, qword ptr [rax + rbx * 8]       # my pool
+  mov rdi, r15
+  call jogrt_inbox_pop
+  cmp rax, -1
+  jne .Ltake_done
   lea rax, [rip + jogrt_pool_nw]
   mov r12, qword ptr [rax + r15 * 8]
   test r12, r12
@@ -1753,7 +1928,7 @@ jogrt_queues_empty:
   xor edx, edx
 .Lqe_loop:
   cmp rdx, rcx
-  jae .Lqe_yes
+  jae .Lqe_inbox
   mov rax, rdx
   imul rax, rax, 8
   lea rsi, [rip + jogrt_wq_tail]
@@ -1761,9 +1936,23 @@ jogrt_queues_empty:
   lea rsi, [rip + jogrt_wq_head]
   mov r9, qword ptr [rsi + rax]
   cmp r8, r9
-  jne .Lqe_no
+  jg .Lqe_no                               # signed: bottom > top ⇒ non-empty
   inc rdx
   jmp .Lqe_loop
+.Lqe_inbox:
+  mov rcx, qword ptr [rip + jogrt_npools]
+  xor edx, edx
+.Lqe_inbox_loop:
+  cmp rdx, rcx
+  jae .Lqe_yes
+  lea rsi, [rip + jogrt_inbox_tail]
+  mov r8, qword ptr [rsi + rdx * 8]
+  lea rsi, [rip + jogrt_inbox_head]
+  mov r9, qword ptr [rsi + rdx * 8]
+  cmp r8, r9
+  jne .Lqe_no
+  inc rdx
+  jmp .Lqe_inbox_loop
 .Lqe_yes:
   mov eax, 1
   ret
