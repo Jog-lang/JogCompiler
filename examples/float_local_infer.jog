@@ -1,0 +1,23 @@
+// Untyped float locals must stay f64 so later ops use fadd (not integer add).
+
+fn main() {
+    var a = 0.5
+    var b = 1000000000.0
+    var s = ((2 as f64) + 1.0 - 2.5) * b
+    if (s == 500000000.0) {
+        print("infer mul ok\n")
+    } else {
+        panic("infer mul fail\n")
+    }
+    if (a < s) {
+        print("infer cmp ok\n")
+    } else {
+        panic("infer cmp fail\n")
+    }
+    a = a + 1.0
+    if (a == 1.5) {
+        print("infer add ok\n")
+    } else {
+        panic("infer add fail\n")
+    }
+}

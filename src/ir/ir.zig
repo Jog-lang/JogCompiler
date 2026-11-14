@@ -1510,8 +1510,18 @@ fn inferMetaFromExpr(ctx: *Ctx, e: *ast.Expr) ?SlotMeta {
             return .{ .kind = .struct_ptr, .type_name = sl.type_name };
         },
         .null_lit => return .{ .kind = .opt_ptr },
+        .float => return .{ .kind = .scalar, .type_name = "f64" },
+        .int => return .{ .kind = .scalar, .type_name = "i64" },
         .ident => |n| {
             if (ctx.meta.get(n)) |m| return m;
+            if (ctx.const_vals.get(n)) |cv| {
+                if (cv.is_float) return .{ .kind = .scalar, .type_name = "f64" };
+                return .{ .kind = .scalar, .type_name = "i64" };
+            }
+            if (ctx.global_map.get(n)) |gi| {
+                if (gi < ctx.globals.len and ctx.globals[gi].is_float)
+                    return .{ .kind = .scalar, .type_name = "f64" };
+            }
             if (ctx.object_map.contains(n)) return .{ .kind = .struct_ptr, .type_name = n };
             return null;
         },
@@ -1544,7 +1554,10 @@ fn inferMetaFromExpr(ctx: *Ctx, e: *ast.Expr) ?SlotMeta {
                     }
                 }
             }
-            return null;
+            // Untyped `var x = a + b` must keep f64 so later `x + y` uses fadd (not integer add).
+            if (isFloatish(ctx, b.left) or isFloatish(ctx, b.right))
+                return .{ .kind = .scalar, .type_name = "f64" };
+            return .{ .kind = .scalar, .type_name = "i64" };
         },
         .call => |c| {
             if (c.callee.* == .ident and std.mem.eql(u8, c.callee.ident, "alloc"))
