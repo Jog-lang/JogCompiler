@@ -1,0 +1,174 @@
+// Package std.io. print, println, eprint, and eprintln return error?.
+// null is success. ErrIO means that write failed. fd 1 is stdout and
+// fd 2 is stderr, the split jogrt_write implements. A newline is a
+// second write of "\n". If the first write fails, the second does not run.
+// read_some and binary_stdio are for a program that speaks a byte
+// protocol over stdin and stdout, such as a language server.
+// read_some still returns (usize, bool). An empty buffer panics.
+// binary_stdio still returns bool.
+// read_all and write_all take a str path and return error? as the last
+// result. The platform file opens it: _wfopen from UTF-16 on Windows,
+// fopen on POSIX. A missing file is ErrNotFound. Any other open, read,
+// write, or close failure is ErrIO. The path must be under 4096 bytes.
+// That limit is the path length. Reads use a 4096-byte chunk, and the
+// file itself may be longer. A short read ends the file. If the
+// allocator returns an error from resize, that error is returned and
+// the bytes are empty. The std heap panics instead of returning one.
+
+import std.c
+import std.error as errors
+import std.mem
+
+private(package) expect fn open_c_file(path: str, mode: *const c.char): (*c.FILE?, error?)
+
+// ENOENT is 2 on the Windows CRT, Linux, and macOS. Any other code is
+// ErrIO. A failure that never reached the OS returns ErrIO itself and
+// does not call this with a stale errno.
+private(package) fn open_failed(code: c.int): error? {
+    if code == 2 {
+        return errors.ErrNotFound
+    }
+    return errors.ErrIO
+}
+
+private fn write_fd(fd: c.int, text: str): error? {
+    if !c.jogrt_write(fd, text.ptr as *const void?, text.len) {
+        return errors.ErrIO
+    }
+    return null
+}
+
+// Writes text to stdout. ErrIO means the write failed.
+fn print(text: str): error? {
+    return write_fd(1, text)
+}
+
+// Writes text to stdout, then "\n". ErrIO means one of those writes failed.
+fn println(text: str): error? {
+    val err = print(text)
+    if err != null {
+        return err
+    }
+    return print("\n")
+}
+
+// Writes text to stderr. ErrIO means the write failed.
+fn eprint(text: str): error? {
+    return write_fd(2, text)
+}
+
+// Writes text to stderr, then "\n". ErrIO means one of those writes failed.
+fn eprintln(text: str): error? {
+    val err = eprint(text)
+    if err != null {
+        return err
+    }
+    return eprint("\n")
+}
+
+// A longer path does not open. The platform file adds the trailing NUL.
+private fn open_file(path: str, mode: *const c.char): (*c.FILE?, error?) {
+    return open_c_file(path, mode)
+}
+
+// Reads up to buf.len bytes from stdin and returns as soon as at least
+// one is available, so a pipe does not wait for a full buffer. (n, true)
+// with n > 0 is data, (0, true) is end of input, and (0, false) is a read
+// error. An empty buf is a programmer error and panics. The handle is read
+// directly, past C stdio's buffer, so do not mix this with fread on stdin.
+fn read_some(buf: bytes): (usize, bool) {
+    if buf.len == 0 {
+        panic("read_some needs a non-empty buffer")
+    }
+    val n = c.jogrt_stdin_read(buf.ptr as *void, buf.len)
+    if n < 0 {
+        return 0, false
+    }
+    return n as usize, true
+}
+
+// Puts stdin and stdout in binary mode, so print writes "\n" as one byte
+// and reads see "\r\n" unchanged. stdout is flushed first. false means a
+// mode could not be set. On hosts with no text mode it does nothing and
+// returns true.
+fn binary_stdio(): bool {
+    return c.jogrt_stdio_binary()
+}
+
+// Bytes come from the Allocator already in scope. ErrNotFound means the
+// file is missing. ErrIO means some other open, read, or close failed,
+// and the bytes are empty. A null error with empty bytes is an empty
+// file. The caller frees the bytes. A short read ends the file.
+fn read_all(path: str): (bytes, error?) with (a: mem.Allocator) {
+    val (file, open_err) = open_file(path, c"rb")
+    if open_err != null {
+        return bytes(), open_err
+    }
+    var acc = bytes()
+    var chunk: [4096]byte
+    val chunk_ptr = chunk[..].ptr
+    for {
+        val n = c.fread(chunk_ptr as *void, 1, 4096, file!!)
+        if n == 0 {
+            break
+        }
+        val old = acc.len
+        val (grown, err) = a.resize(acc, old + n)
+        if err != null {
+            a.free(acc)
+            c.fclose(file!!)
+            return bytes(), err
+        }
+        c.memcpy((grown.ptr + old) as *void, chunk_ptr as *const void, n)
+        acc = grown
+        if n < 4096 {
+            break
+        }
+    }
+    if c.fclose(file!!) != 0 {
+        a.free(acc)
+        return bytes(), errors.ErrIO
+    }
+    return acc, null
+}
+
+// Creates or replaces the file. ErrNotFound means a parent path is
+// missing. ErrIO means some other open, write, or close failed.
+fn write_all(path: str, data: bytes): error? {
+    val (file, open_err) = open_file(path, c"wb")
+    if open_err != null {
+        return open_err
+    }
+    if data.len > 0 {
+        val n = c.fwrite(data.ptr as *const void, 1, data.len, file!!)
+        if n != data.len {
+            c.fclose(file!!)
+            return errors.ErrIO
+        }
+    }
+    if c.fclose(file!!) != 0 {
+        return errors.ErrIO
+    }
+    return null
+}
+
+// Logger writes to stderr. The value is one Stderr, the same shape as
+// mem.heap's one Malloc. write returns false when that write fails.
+interface Logger {
+    fn write(msg: str): bool
+}
+
+struct Stderr {
+    tag: u8
+}
+
+var stderr_logger: Stderr
+
+fn logger(): Logger {
+    return &stderr_logger
+}
+
+// false means eprint returned an error.
+fn Stderr.write(msg: str): bool {
+    return eprint(msg) == null
+}

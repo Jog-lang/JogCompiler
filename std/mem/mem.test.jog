@@ -1,0 +1,70 @@
+// newSlice zero-fills. freeSlice releases the block. An empty count
+// allocates nothing. slice is a view: n == 0 is empty, including a
+// null pointer, and n > 0 with a null pointer panics.
+
+import std.testing
+
+struct Slot {
+    n: i32
+}
+
+@test
+fn byteIterPull() with (t: testing.Testing) {
+    val text = "a\0b"
+    var src = bytes()
+    src.ptr = text.ptr as *u8
+    src.len = text.len
+    var cur = byte_iter(src)
+    val (a, aok) = cur.next()
+    t.expect(aok)
+    t.expect(a == 'a' as u8)
+    val (z, zok) = cur.next()
+    t.expect(zok)
+    t.expect(z == 0)
+    val (b, bok) = cur.next()
+    t.expect(bok)
+    t.expect(b == 'b' as u8)
+    val (_, more) = cur.next()
+    t.expect(!more)
+    var empty = byte_iter(bytes())
+    val (none, nok) = empty.next()
+    t.expect(!nok)
+    t.expect(none == 0)
+}
+
+@test
+fn zeroedSlice() with (t: testing.Testing) {
+    with (heap()) {
+        var slots = newSlice<Slot>(2)
+        t.expect(slots.len == 2)
+        t.expect(slots[0].n == 0)
+        slots[0].n = 4
+        t.expect(slots[0].n == 4)
+        freeSlice(slots)
+        var none = newSlice<Slot>(0)
+        t.expect(none.len == 0)
+        freeSlice(none)
+    }
+}
+
+@test
+fn sliceFromPointer() with (t: testing.Testing) {
+    with (heap()) {
+        var slots = newSlice<Slot>(2)
+        slots[0].n = 3
+        slots[1].n = 4
+        var view = slice(slots.ptr, slots.len)
+        t.expect(view.len == 2)
+        t.expect(view[0].n == 3)
+        view[1].n = 8
+        t.expect(slots[1].n == 8)
+        var none = slice(slots.ptr, 0)
+        t.expect(none.len == 0)
+        var opt: *Slot? = null
+        val missing = opt as *Slot
+        var emptyNull = slice(missing, 0)
+        t.expect(emptyNull.len == 0)
+        t.expectPanic() { slice(missing, 1) }
+        freeSlice(slots)
+    }
+}

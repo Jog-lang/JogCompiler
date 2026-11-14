@@ -5,11 +5,24 @@ const check_mod = @import("../check/check.zig");
 const ir = @import("../ir/ir.zig");
 const link = @import("../codegen/link.zig");
 const mod = @import("../mod/mod.zig");
+const roots_mod = @import("roots.zig");
 
-pub const version_string = "jog 0.2.8-v2 (zig host, ir→asm→native | ir→c→emcc; LSP surfaces)";
+pub const version_string = "jog 0.2.9-v2 (zig host, std/core roots; ir→asm→native | ir→c→emcc; LSP surfaces)";
 
 pub fn cmdVersion(writer: anytype) !void {
     try writer.print("{s}\n", .{version_string});
+}
+
+pub fn cmdRoots(allocator: std.mem.Allocator, writer: anytype) !void {
+    var roots = try roots_mod.locate(allocator);
+    defer roots.deinit(allocator);
+    try writer.print("source: {s}\n", .{roots.source});
+    try writer.print("std: {s}\n", .{if (roots.std_root.len > 0) roots.std_root else "(missing)"});
+    try writer.print("core: {s}\n", .{if (roots.core_root.len > 0) roots.core_root else "(missing)"});
+    if (try roots_mod.resolveCoreScalar(allocator, roots.core_root)) |scalar| {
+        defer allocator.free(scalar);
+        try writer.print("core/scalar.jog: {s}\n", .{scalar});
+    }
 }
 
 /// `--module name=dir` mapping (absolute or cwd-relative).
@@ -73,8 +86,10 @@ pub const Unit = struct {
 };
 
 fn loadSingle(allocator: std.mem.Allocator, path: []const u8, modules: []const ModuleMapping) !Unit {
-    // Follow `import` decls to sibling `.jog` files (BFS). jog.mod multi-file
-    // builds already merge listed sources. `std.*` imports are ignored here.
+    // Follow `import` decls to sibling `.jog` files and `std.*` via library roots (BFS).
+    var lib_roots = try roots_mod.locate(allocator);
+    defer lib_roots.deinit(allocator);
+
     var pending: std.ArrayListUnmanaged([]const u8) = .{};
     defer {
         for (pending.items) |x| allocator.free(x);
@@ -110,14 +125,15 @@ fn loadSingle(allocator: std.mem.Allocator, path: []const u8, modules: []const M
         for (file.decls) |d| {
             if (d == .import_decl) {
                 const imp = d.import_decl;
-                if (std.mem.startsWith(u8, imp.path, "std.") or std.mem.eql(u8, imp.path, "std") or std.mem.eql(u8, imp.path, "core")) continue;
-                const resolved = (try resolveImportPath(allocator, cur, imp.path, modules)) orelse continue;
+                if (std.mem.eql(u8, imp.path, "core") or std.mem.eql(u8, imp.path, "std")) continue;
+                const resolved = (try resolveImportPath(allocator, cur, imp.path, modules, &lib_roots)) orelse continue;
                 defer allocator.free(resolved);
                 if (seen.contains(resolved)) continue;
                 std.fs.cwd().access(resolved, .{}) catch continue;
                 const owned = try allocator.dupe(u8, resolved);
                 try seen.put(allocator, owned, {});
                 try pending.append(allocator, owned);
+                try enqueuePlatformSiblings(allocator, &pending, &seen, owned);
             } else if (d == .require_decl) {
                 const req = d.require_decl;
                 var resolved: ?[]u8 = null;
@@ -192,7 +208,13 @@ fn resolveImportPath(
     from_file: []const u8,
     import_path: []const u8,
     modules: []const ModuleMapping,
+    lib_roots: *const roots_mod.Roots,
 ) !?[]u8 {
+    // Library: `import std.math` → `$JOG_ROOT/std/math/math.jog` (etc.).
+    if (std.mem.startsWith(u8, import_path, "std.")) {
+        if (try roots_mod.resolveStdImport(allocator, lib_roots.std_root, import_path)) |p| return p;
+    }
+
     // `mod.leaf` → look in mapped module dir first when `mod` is a mapping name.
     if (std.mem.indexOfScalar(u8, import_path, '.')) |dot| {
         const head = import_path[0..dot];
@@ -229,6 +251,27 @@ fn resolveImportPath(
     defer allocator.free(name);
     const joined = try std.fs.path.join(allocator, &.{ dir, name });
     return joined;
+}
+
+/// When loading `foo.jog`, also queue `foo.posix.jog` / `foo.linux.jog` if present (std platform files).
+fn enqueuePlatformSiblings(
+    allocator: std.mem.Allocator,
+    pending: *std.ArrayListUnmanaged([]const u8),
+    seen: *std.StringHashMapUnmanaged(void),
+    path: []const u8,
+) !void {
+    if (!std.mem.endsWith(u8, path, ".jog")) return;
+    const base = path[0 .. path.len - ".jog".len];
+    const plats = [_][]const u8{ "posix", "linux" };
+    for (plats) |plat| {
+        const cand = try std.fmt.allocPrint(allocator, "{s}.{s}.jog", .{ base, plat });
+        defer allocator.free(cand);
+        std.fs.cwd().access(cand, .{}) catch continue;
+        if (seen.contains(cand)) continue;
+        const owned = try allocator.dupe(u8, cand);
+        try seen.put(allocator, owned, {});
+        try pending.append(allocator, owned);
+    }
 }
 
 /// `require foo` → sibling `foo.jog`, `foo/root.jog`, or `foo/main.jog`.
@@ -388,6 +431,9 @@ fn loadModuleWithOverride(
     var decls: std.ArrayListUnmanaged(ast.Decl) = .{};
     errdefer decls.deinit(allocator);
 
+    var lib_roots = try roots_mod.locate(allocator);
+    defer lib_roots.deinit(allocator);
+
     var pi: usize = 0;
     while (pi < path_list.items.len) : (pi += 1) {
         const p = path_list.items[pi];
@@ -411,15 +457,34 @@ fn loadModuleWithOverride(
             std.process.exit(1);
         };
         try decls.appendSlice(allocator, file.decls);
-        // Also BFS imports from each file against the module map.
+        // Also BFS imports from each file against the module map / std roots.
         for (file.decls) |d| {
             if (d != .import_decl) continue;
             const imp = d.import_decl;
-            if (std.mem.startsWith(u8, imp.path, "std.") or std.mem.eql(u8, imp.path, "std") or std.mem.eql(u8, imp.path, "core")) continue;
-            const resolved = (try resolveImportPath(allocator, p, imp.path, modules)) orelse continue;
+            if (std.mem.eql(u8, imp.path, "core") or std.mem.eql(u8, imp.path, "std")) continue;
+            const resolved = (try resolveImportPath(allocator, p, imp.path, modules, &lib_roots)) orelse continue;
             defer allocator.free(resolved);
             std.fs.cwd().access(resolved, .{}) catch continue;
             try appendUniquePath(&path_list, allocator, resolved);
+            // Platform siblings for std packages (c.posix.jog, …).
+            if (!std.mem.endsWith(u8, resolved, ".jog")) continue;
+            const base = resolved[0 .. resolved.len - ".jog".len];
+            for ([_][]const u8{ "posix", "linux" }) |plat| {
+                const cand = try std.fmt.allocPrint(allocator, "{s}.{s}.jog", .{ base, plat });
+                defer allocator.free(cand);
+                std.fs.cwd().access(cand, .{}) catch continue;
+                try appendUniquePath(&path_list, allocator, cand);
+            }
+        }
+        // Platform siblings of each listed source (std.c → c.posix.jog).
+        if (std.mem.endsWith(u8, p, ".jog")) {
+            const base = p[0 .. p.len - ".jog".len];
+            for ([_][]const u8{ "posix", "linux" }) |plat| {
+                const cand = try std.fmt.allocPrint(allocator, "{s}.{s}.jog", .{ base, plat });
+                defer allocator.free(cand);
+                std.fs.cwd().access(cand, .{}) catch continue;
+                try appendUniquePath(&path_list, allocator, cand);
+            }
         }
         try parts.append(allocator, file);
     }
@@ -735,9 +800,11 @@ pub fn usage(writer: anytype) !void {
         \\                          jog.mod require path| --module for deps
         \\  deps [--flags] [--test] [path]
         \\                          source paths, or --module flags for LSP
+        \\  roots                   print std/core discovery ($JOG_ROOT or next to jog)
         \\  help                    this message
         \\
         \\path may be a .jog file, a directory with jog.mod, or a jog.mod file.
+        \\std/core: $JOG_ROOT/{std,core} or <jog>/../{std,core} (see `jog roots`).
         \\
     );
 }

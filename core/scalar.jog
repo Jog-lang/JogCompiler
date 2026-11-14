@@ -1,0 +1,282 @@
+@intrinsic(int, signed: false, bits: 8)
+type u8: byte
+
+@intrinsic(int, signed: true, bits: 8)
+type i8: byte
+
+@intrinsic(int, signed: false, bits: 16)
+type u16: [2]byte
+
+@intrinsic(int, signed: true, bits: 16)
+type i16: [2]byte
+
+@intrinsic(int, signed: false, bits: 32)
+type u32: [4]byte
+
+@intrinsic(int, signed: true, bits: 32)
+type i32: [4]byte
+
+@intrinsic(int, signed: false, bits: 64)
+type u64: [8]byte
+
+@intrinsic(int, signed: true, bits: 64)
+type i64: [8]byte
+
+@intrinsic(int, signed: false, bits: ptr)
+type usize: [ptr]byte
+
+@intrinsic(int, signed: true, bits: ptr)
+type isize: [ptr]byte
+
+@intrinsic(float, bits: 32)
+type f32: [4]byte
+
+@intrinsic(float, bits: 64)
+type f64: [8]byte
+
+@intrinsic(bool)
+type bool: byte
+
+type rune: u32
+
+type bytes = []byte
+type str: []const byte
+
+// Operator methods. Each body is one intrinsic.
+
+fn i8.op+(o: i8): i8 = @add(self, o)
+fn i8.op-(o: i8): i8 = @sub(self, o)
+fn i8.op*(o: i8): i8 = @mul(self, o)
+fn i8.op/(o: i8): i8 = @div(self, o)
+fn i8.op%(o: i8): i8 = @rem(self, o)
+fn i8.op&(o: i8): i8 = @and(self, o)
+fn i8.op|(o: i8): i8 = @or(self, o)
+fn i8.op^(o: i8): i8 = @xor(self, o)
+fn i8.op<<(o: i8): i8 = @shl(self, o)
+fn i8.op>>(o: i8): i8 = @shr(self, o)
+fn i8.op==(o: i8): bool = @eq(self, o)
+fn i8.op!=(o: i8): bool = @ne(self, o)
+fn i8.op<(o: i8): bool = @lt(self, o)
+fn i8.op<=(o: i8): bool = @le(self, o)
+fn i8.op>(o: i8): bool = @gt(self, o)
+fn i8.op>=(o: i8): bool = @ge(self, o)
+fn i8.op-(): i8 = @neg(self)
+fn i8.op~(): i8 = @bitnot(self)
+
+fn i16.op+(o: i16): i16 = @add(self, o)
+fn i16.op-(o: i16): i16 = @sub(self, o)
+fn i16.op*(o: i16): i16 = @mul(self, o)
+fn i16.op/(o: i16): i16 = @div(self, o)
+fn i16.op%(o: i16): i16 = @rem(self, o)
+fn i16.op&(o: i16): i16 = @and(self, o)
+fn i16.op|(o: i16): i16 = @or(self, o)
+fn i16.op^(o: i16): i16 = @xor(self, o)
+fn i16.op<<(o: i16): i16 = @shl(self, o)
+fn i16.op>>(o: i16): i16 = @shr(self, o)
+fn i16.op==(o: i16): bool = @eq(self, o)
+fn i16.op!=(o: i16): bool = @ne(self, o)
+fn i16.op<(o: i16): bool = @lt(self, o)
+fn i16.op<=(o: i16): bool = @le(self, o)
+fn i16.op>(o: i16): bool = @gt(self, o)
+fn i16.op>=(o: i16): bool = @ge(self, o)
+fn i16.op-(): i16 = @neg(self)
+fn i16.op~(): i16 = @bitnot(self)
+
+fn i32.op+(o: i32): i32 = @add(self, o)
+fn i32.op-(o: i32): i32 = @sub(self, o)
+fn i32.op*(o: i32): i32 = @mul(self, o)
+fn i32.op/(o: i32): i32 = @div(self, o)
+fn i32.op%(o: i32): i32 = @rem(self, o)
+fn i32.op&(o: i32): i32 = @and(self, o)
+fn i32.op|(o: i32): i32 = @or(self, o)
+fn i32.op^(o: i32): i32 = @xor(self, o)
+fn i32.op<<(o: i32): i32 = @shl(self, o)
+fn i32.op>>(o: i32): i32 = @shr(self, o)
+fn i32.op==(o: i32): bool = @eq(self, o)
+fn i32.op!=(o: i32): bool = @ne(self, o)
+fn i32.op<(o: i32): bool = @lt(self, o)
+fn i32.op<=(o: i32): bool = @le(self, o)
+fn i32.op>(o: i32): bool = @gt(self, o)
+fn i32.op>=(o: i32): bool = @ge(self, o)
+fn i32.op-(): i32 = @neg(self)
+fn i32.op~(): i32 = @bitnot(self)
+
+fn i64.op+(o: i64): i64 = @add(self, o)
+fn i64.op-(o: i64): i64 = @sub(self, o)
+fn i64.op*(o: i64): i64 = @mul(self, o)
+fn i64.op/(o: i64): i64 = @div(self, o)
+fn i64.op%(o: i64): i64 = @rem(self, o)
+fn i64.op&(o: i64): i64 = @and(self, o)
+fn i64.op|(o: i64): i64 = @or(self, o)
+fn i64.op^(o: i64): i64 = @xor(self, o)
+fn i64.op<<(o: i64): i64 = @shl(self, o)
+fn i64.op>>(o: i64): i64 = @shr(self, o)
+fn i64.op==(o: i64): bool = @eq(self, o)
+fn i64.op!=(o: i64): bool = @ne(self, o)
+fn i64.op<(o: i64): bool = @lt(self, o)
+fn i64.op<=(o: i64): bool = @le(self, o)
+fn i64.op>(o: i64): bool = @gt(self, o)
+fn i64.op>=(o: i64): bool = @ge(self, o)
+fn i64.op-(): i64 = @neg(self)
+fn i64.op~(): i64 = @bitnot(self)
+
+fn u8.op+(o: u8): u8 = @add(self, o)
+fn u8.op-(o: u8): u8 = @sub(self, o)
+fn u8.op*(o: u8): u8 = @mul(self, o)
+fn u8.op/(o: u8): u8 = @div(self, o)
+fn u8.op%(o: u8): u8 = @rem(self, o)
+fn u8.op&(o: u8): u8 = @and(self, o)
+fn u8.op|(o: u8): u8 = @or(self, o)
+fn u8.op^(o: u8): u8 = @xor(self, o)
+fn u8.op<<(o: u8): u8 = @shl(self, o)
+fn u8.op>>(o: u8): u8 = @shr(self, o)
+fn u8.op==(o: u8): bool = @eq(self, o)
+fn u8.op!=(o: u8): bool = @ne(self, o)
+fn u8.op<(o: u8): bool = @lt(self, o)
+fn u8.op<=(o: u8): bool = @le(self, o)
+fn u8.op>(o: u8): bool = @gt(self, o)
+fn u8.op>=(o: u8): bool = @ge(self, o)
+fn u8.op-(): u8 = @neg(self)
+fn u8.op~(): u8 = @bitnot(self)
+
+fn u16.op+(o: u16): u16 = @add(self, o)
+fn u16.op-(o: u16): u16 = @sub(self, o)
+fn u16.op*(o: u16): u16 = @mul(self, o)
+fn u16.op/(o: u16): u16 = @div(self, o)
+fn u16.op%(o: u16): u16 = @rem(self, o)
+fn u16.op&(o: u16): u16 = @and(self, o)
+fn u16.op|(o: u16): u16 = @or(self, o)
+fn u16.op^(o: u16): u16 = @xor(self, o)
+fn u16.op<<(o: u16): u16 = @shl(self, o)
+fn u16.op>>(o: u16): u16 = @shr(self, o)
+fn u16.op==(o: u16): bool = @eq(self, o)
+fn u16.op!=(o: u16): bool = @ne(self, o)
+fn u16.op<(o: u16): bool = @lt(self, o)
+fn u16.op<=(o: u16): bool = @le(self, o)
+fn u16.op>(o: u16): bool = @gt(self, o)
+fn u16.op>=(o: u16): bool = @ge(self, o)
+fn u16.op-(): u16 = @neg(self)
+fn u16.op~(): u16 = @bitnot(self)
+
+fn u32.op+(o: u32): u32 = @add(self, o)
+fn u32.op-(o: u32): u32 = @sub(self, o)
+fn u32.op*(o: u32): u32 = @mul(self, o)
+fn u32.op/(o: u32): u32 = @div(self, o)
+fn u32.op%(o: u32): u32 = @rem(self, o)
+fn u32.op&(o: u32): u32 = @and(self, o)
+fn u32.op|(o: u32): u32 = @or(self, o)
+fn u32.op^(o: u32): u32 = @xor(self, o)
+fn u32.op<<(o: u32): u32 = @shl(self, o)
+fn u32.op>>(o: u32): u32 = @shr(self, o)
+fn u32.op==(o: u32): bool = @eq(self, o)
+fn u32.op!=(o: u32): bool = @ne(self, o)
+fn u32.op<(o: u32): bool = @lt(self, o)
+fn u32.op<=(o: u32): bool = @le(self, o)
+fn u32.op>(o: u32): bool = @gt(self, o)
+fn u32.op>=(o: u32): bool = @ge(self, o)
+fn u32.op-(): u32 = @neg(self)
+fn u32.op~(): u32 = @bitnot(self)
+
+fn u64.op+(o: u64): u64 = @add(self, o)
+fn u64.op-(o: u64): u64 = @sub(self, o)
+fn u64.op*(o: u64): u64 = @mul(self, o)
+fn u64.op/(o: u64): u64 = @div(self, o)
+fn u64.op%(o: u64): u64 = @rem(self, o)
+fn u64.op&(o: u64): u64 = @and(self, o)
+fn u64.op|(o: u64): u64 = @or(self, o)
+fn u64.op^(o: u64): u64 = @xor(self, o)
+fn u64.op<<(o: u64): u64 = @shl(self, o)
+fn u64.op>>(o: u64): u64 = @shr(self, o)
+fn u64.op==(o: u64): bool = @eq(self, o)
+fn u64.op!=(o: u64): bool = @ne(self, o)
+fn u64.op<(o: u64): bool = @lt(self, o)
+fn u64.op<=(o: u64): bool = @le(self, o)
+fn u64.op>(o: u64): bool = @gt(self, o)
+fn u64.op>=(o: u64): bool = @ge(self, o)
+fn u64.op-(): u64 = @neg(self)
+fn u64.op~(): u64 = @bitnot(self)
+
+fn isize.op+(o: isize): isize = @add(self, o)
+fn isize.op-(o: isize): isize = @sub(self, o)
+fn isize.op*(o: isize): isize = @mul(self, o)
+fn isize.op/(o: isize): isize = @div(self, o)
+fn isize.op%(o: isize): isize = @rem(self, o)
+fn isize.op&(o: isize): isize = @and(self, o)
+fn isize.op|(o: isize): isize = @or(self, o)
+fn isize.op^(o: isize): isize = @xor(self, o)
+fn isize.op<<(o: isize): isize = @shl(self, o)
+fn isize.op>>(o: isize): isize = @shr(self, o)
+fn isize.op==(o: isize): bool = @eq(self, o)
+fn isize.op!=(o: isize): bool = @ne(self, o)
+fn isize.op<(o: isize): bool = @lt(self, o)
+fn isize.op<=(o: isize): bool = @le(self, o)
+fn isize.op>(o: isize): bool = @gt(self, o)
+fn isize.op>=(o: isize): bool = @ge(self, o)
+fn isize.op-(): isize = @neg(self)
+fn isize.op~(): isize = @bitnot(self)
+
+fn usize.op+(o: usize): usize = @add(self, o)
+fn usize.op-(o: usize): usize = @sub(self, o)
+fn usize.op*(o: usize): usize = @mul(self, o)
+fn usize.op/(o: usize): usize = @div(self, o)
+fn usize.op%(o: usize): usize = @rem(self, o)
+fn usize.op&(o: usize): usize = @and(self, o)
+fn usize.op|(o: usize): usize = @or(self, o)
+fn usize.op^(o: usize): usize = @xor(self, o)
+fn usize.op<<(o: usize): usize = @shl(self, o)
+fn usize.op>>(o: usize): usize = @shr(self, o)
+fn usize.op==(o: usize): bool = @eq(self, o)
+fn usize.op!=(o: usize): bool = @ne(self, o)
+fn usize.op<(o: usize): bool = @lt(self, o)
+fn usize.op<=(o: usize): bool = @le(self, o)
+fn usize.op>(o: usize): bool = @gt(self, o)
+fn usize.op>=(o: usize): bool = @ge(self, o)
+fn usize.op-(): usize = @neg(self)
+fn usize.op~(): usize = @bitnot(self)
+
+fn f32.op+(o: f32): f32 = @add(self, o)
+fn f32.op-(o: f32): f32 = @sub(self, o)
+fn f32.op*(o: f32): f32 = @mul(self, o)
+fn f32.op/(o: f32): f32 = @div(self, o)
+fn f32.op%(o: f32): f32 = @rem(self, o)
+fn f32.op==(o: f32): bool = @eq(self, o)
+fn f32.op!=(o: f32): bool = @ne(self, o)
+fn f32.op<(o: f32): bool = @lt(self, o)
+fn f32.op<=(o: f32): bool = @le(self, o)
+fn f32.op>(o: f32): bool = @gt(self, o)
+fn f32.op>=(o: f32): bool = @ge(self, o)
+fn f32.op-(): f32 = @neg(self)
+
+fn f64.op+(o: f64): f64 = @add(self, o)
+fn f64.op-(o: f64): f64 = @sub(self, o)
+fn f64.op*(o: f64): f64 = @mul(self, o)
+fn f64.op/(o: f64): f64 = @div(self, o)
+fn f64.op%(o: f64): f64 = @rem(self, o)
+fn f64.op==(o: f64): bool = @eq(self, o)
+fn f64.op!=(o: f64): bool = @ne(self, o)
+fn f64.op<(o: f64): bool = @lt(self, o)
+fn f64.op<=(o: f64): bool = @le(self, o)
+fn f64.op>(o: f64): bool = @gt(self, o)
+fn f64.op>=(o: f64): bool = @ge(self, o)
+fn f64.op-(): f64 = @neg(self)
+
+fn bool.op==(o: bool): bool = @eq(self, o)
+fn bool.op!=(o: bool): bool = @ne(self, o)
+fn bool.op!(): bool = @not(self)
+
+struct void {}
+
+enum Option<T> {
+    None
+    Some(value: T)
+}
+
+enum Ordering: i8 {
+    Less = -1
+    Equal = 0
+    Greater = 1
+}
+
+interface error {
+    fn message(): str
+}

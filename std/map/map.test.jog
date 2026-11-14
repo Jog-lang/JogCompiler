@@ -1,0 +1,526 @@
+// Package map, same as map.jog, so the tests see Map, empty, and fnv1a
+// with no import of std.map. insert, get, remove, and free need the
+// allocator context: with (mem.heap()). t.expect takes a bool.
+//
+// The hash is an argument. fnv1a covers str. A constant hash forces
+// every key into one probe chain. each, contains, keys, and values walk
+// live slots. keys and values allocate lists, and those lists are freed.
+// Programmer-error panics are expectPanic tests at the bottom. Out of
+// memory in grow is not an @test.
+
+import std.mem
+import std.testing
+
+struct Id {
+    n: i32
+}
+
+fn Id.op==(o: Id): bool {
+    return self.n == o.n
+}
+
+fn hash_i32(n: i32): u32 {
+    return n as u32
+}
+
+@test
+fn emptyMap() with (t: testing.Testing) {
+    var m = empty<i32, i32>()
+    t.expect(m.count == 0)
+    t.expect(m.cap == 0)
+    t.expect(m.tombs == 0)
+    t.expect(fnv1a("") == 0x811c9dc5)
+    t.expect(fnv1a("a") != fnv1a("b"))
+}
+
+@test
+fn strInsertGetRemove() with (t: testing.Testing) {
+    var m = empty<str, i32>()
+    with (mem.heap()) {
+        m.insert("a", fnv1a("a"), 1)
+        m.insert("b", fnv1a("b"), 2)
+        m.insert("c", fnv1a("c"), 3)
+        t.expect(m.count == 3)
+        t.expect(m.cap == 8)
+        var got: i32 = 0
+        t.expect(m.get("a", fnv1a("a"), &got))
+        t.expect(got == 1)
+        t.expect(m.get("b", fnv1a("b"), &got))
+        t.expect(got == 2)
+        t.expect(m.get("c", fnv1a("c"), &got))
+        t.expect(got == 3)
+        var missing: i32 = 7
+        t.expect(!m.get("z", fnv1a("z"), &missing))
+        t.expect(missing == 7)
+        m.insert("a", fnv1a("a"), 9)
+        t.expect(m.count == 3)
+        t.expect(m.get("a", fnv1a("a"), &got))
+        t.expect(got == 9)
+        m.insert("", fnv1a(""), 4)
+        t.expect(m.get("", fnv1a(""), &got))
+        t.expect(got == 4)
+        t.expect(m.count == 4)
+        val cap = m.cap
+        t.expect(m.remove("b", fnv1a("b")))
+        t.expect(m.count == 3)
+        t.expect(m.tombs == 1)
+        t.expect(m.cap == cap)
+        t.expect(!m.get("b", fnv1a("b"), &got))
+        t.expect(!m.remove("b", fnv1a("b")))
+        t.expect(m.tombs == 1)
+        m.insert("b", fnv1a("b"), 5)
+        t.expect(m.count == 4)
+        t.expect(m.tombs == 0)
+        t.expect(m.cap == cap)
+        t.expect(m.get("b", fnv1a("b"), &got))
+        t.expect(got == 5)
+        t.expect(m.get("c", fnv1a("c"), &got))
+        t.expect(got == 3)
+        m.free()
+        t.expect(m.count == 0)
+        t.expect(m.cap == 0)
+        m.insert("a", fnv1a("a"), 1)
+        t.expect(m.get("a", fnv1a("a"), &got))
+        t.expect(got == 1)
+        t.expect(m.cap == 8)
+        m.free()
+    }
+}
+
+@test
+fn growResizes() with (t: testing.Testing) {
+    // 6 live slots fill 3/4 of 8, so the 7th insert doubles to 16.
+    // 12 fills 3/4 of 16, 24 fills 3/4 of 32, and the next insert doubles.
+    var m = empty<i32, i32>()
+    with (mem.heap()) {
+        var n: i32 = 0
+        for _ in 0 as usize..6 {
+            m.insert(n, hash_i32(n), n)
+            n = n + 1
+        }
+        t.expect(m.count == 6)
+        t.expect(m.cap == 8)
+        m.insert(n, hash_i32(n), n)
+        n = n + 1
+        t.expect(m.count == 7)
+        t.expect(m.cap == 16)
+        for _ in 0 as usize..5 {
+            m.insert(n, hash_i32(n), n)
+            n = n + 1
+        }
+        t.expect(m.count == 12)
+        t.expect(m.cap == 16)
+        m.insert(n, hash_i32(n), n)
+        n = n + 1
+        t.expect(m.count == 13)
+        t.expect(m.cap == 32)
+        for _ in 0 as usize..11 {
+            m.insert(n, hash_i32(n), n)
+            n = n + 1
+        }
+        t.expect(m.count == 24)
+        t.expect(m.cap == 32)
+        m.insert(n, hash_i32(n), n)
+        t.expect(m.count == 25)
+        t.expect(m.cap == 64)
+        var i: i32 = 0
+        for _ in 0 as usize..25 {
+            var got: i32 = 0
+            t.expect(m.get(i, hash_i32(i), &got))
+            t.expect(got == i)
+            i = i + 1
+        }
+        m.free()
+    }
+}
+
+@test
+fn removeHalfReinsert() with (t: testing.Testing) {
+    var m = empty<i32, i32>()
+    with (mem.heap()) {
+        var n: i32 = 0
+        for _ in 0 as usize..30 {
+            m.insert(n, hash_i32(n), n + 1)
+            n = n + 1
+        }
+        t.expect(m.count == 30)
+        t.expect(m.cap == 64)
+        val cap = m.cap
+        var k: i32 = 0
+        for _ in 0 as usize..15 {
+            t.expect(m.remove(k, hash_i32(k)))
+            k = k + 2
+        }
+        t.expect(m.count == 15)
+        t.expect(m.tombs == 15)
+        t.expect(m.cap == cap)
+        var odd: i32 = 1
+        for _ in 0 as usize..15 {
+            var got: i32 = 0
+            t.expect(m.get(odd, hash_i32(odd), &got))
+            t.expect(got == odd + 1)
+            odd = odd + 2
+        }
+        var even: i32 = 0
+        for _ in 0 as usize..15 {
+            var gone: i32 = 0
+            t.expect(!m.get(even, hash_i32(even), &gone))
+            even = even + 2
+        }
+        even = 0
+        for _ in 0 as usize..15 {
+            m.insert(even, hash_i32(even), even + 3)
+            even = even + 2
+        }
+        t.expect(m.count == 30)
+        t.expect(m.tombs == 0)
+        t.expect(m.cap == cap)
+        var i: i32 = 0
+        for _ in 0 as usize..30 {
+            var got: i32 = 0
+            t.expect(m.get(i, hash_i32(i), &got))
+            if i % 2 == 0 {
+                t.expect(got == i + 3)
+            } else {
+                t.expect(got == i + 1)
+            }
+            i = i + 1
+        }
+        m.free()
+    }
+}
+
+@test
+fn forcedCollisions() with (t: testing.Testing) {
+    // Hash 0 for every key. The probe is one chain, and growth still
+    // follows the live count.
+    var m = empty<i32, i32>()
+    with (mem.heap()) {
+        var n: i32 = 0
+        for _ in 0 as usize..20 {
+            m.insert(n, 0, n + 10)
+            n = n + 1
+        }
+        t.expect(m.count == 20)
+        t.expect(m.cap == 32)
+        var i: i32 = 0
+        for _ in 0 as usize..20 {
+            var got: i32 = 0
+            t.expect(m.get(i, 0, &got))
+            t.expect(got == i + 10)
+            i = i + 1
+        }
+        var missing: i32 = 1
+        t.expect(!m.get(100, 0, &missing))
+        t.expect(missing == 1)
+        m.insert(3, 0, 99)
+        t.expect(m.count == 20)
+        var overwritten: i32 = 0
+        t.expect(m.get(3, 0, &overwritten))
+        t.expect(overwritten == 99)
+        var neighbor: i32 = 0
+        t.expect(m.get(4, 0, &neighbor))
+        t.expect(neighbor == 14)
+        val cap = m.cap
+        var k: i32 = 0
+        for _ in 0 as usize..10 {
+            t.expect(m.remove(k, 0))
+            k = k + 2
+        }
+        t.expect(m.count == 10)
+        t.expect(m.tombs == 10)
+        k = 0
+        for _ in 0 as usize..10 {
+            m.insert(k, 0, k + 20)
+            k = k + 2
+        }
+        t.expect(m.count == 20)
+        t.expect(m.tombs == 0)
+        t.expect(m.cap == cap)
+        i = 0
+        for _ in 0 as usize..20 {
+            var got: i32 = 0
+            t.expect(m.get(i, 0, &got))
+            if i == 3 {
+                t.expect(got == 99)
+            } else if i % 2 == 0 {
+                t.expect(got == i + 20)
+            } else {
+                t.expect(got == i + 10)
+            }
+            i = i + 1
+        }
+        m.free()
+    }
+}
+
+@test
+fn iterationOrder() with (t: testing.Testing) {
+    var a = empty<str, i32>()
+    var b = empty<str, i32>()
+    with (mem.heap()) {
+        for i in 0 as usize..12 {
+            val key = "k${i}"
+            val h = fnv1a(key)
+            a.insert(key, h, i as i32)
+            b.insert(key, h, i as i32)
+        }
+        t.expect(a.count == 12)
+        t.expect(a.cap == b.cap)
+        t.expect(a.cap == 16)
+        var seen: i32 = 0
+        for i in 0 as usize..a.cap {
+            t.expect(a.live(i) == b.live(i))
+            if a.live(i) {
+                t.expect(a.key_at(i) == b.key_at(i))
+                t.expect(a.value_at(i) == b.value_at(i))
+                seen = seen + 1
+            }
+        }
+        t.expect(seen == 12)
+        for i in 0 as usize..a.cap {
+            t.expect(a.live(i) == b.live(i))
+            if a.live(i) {
+                t.expect(a.key_at(i) == b.key_at(i))
+            }
+        }
+        a.free()
+        b.free()
+    }
+}
+
+@test
+fn structKey() with (t: testing.Testing) {
+    var m = empty<Id, i32>()
+    with (mem.heap()) {
+        m.insert(Id(n: 1), 1, 10)
+        m.insert(Id(n: 2), 2, 20)
+        m.insert(Id(n: 1), 1, 11)
+        t.expect(m.count == 2)
+        var got: i32 = 0
+        t.expect(m.get(Id(n: 1), 1, &got))
+        t.expect(got == 11)
+        t.expect(m.get(Id(n: 2), 2, &got))
+        t.expect(got == 20)
+        var missing: i32 = 0
+        t.expect(!m.get(Id(n: 3), 3, &missing))
+        t.expect(m.remove(Id(n: 2), 2))
+        t.expect(!m.get(Id(n: 2), 2, &got))
+        t.expect(m.count == 1)
+        m.free()
+    }
+}
+
+@test
+fn helpersEmpty() with (t: testing.Testing) {
+    var m = empty<i32, i32>()
+    with (mem.heap()) {
+        var n: i32 = 0
+        m.each((k, v) -> {
+            n = n + k + v
+        })
+        t.expect(n == 0)
+        t.expect(!m.contains(0, hash_i32(0)))
+        var ks = m.keys()
+        var vs = m.values()
+        t.expect(ks.len == 0)
+        t.expect(vs.len == 0)
+        t.expect(ks.cap == 0)
+        t.expect(vs.cap == 0)
+        ks.free()
+        vs.free()
+        m.insert(1, hash_i32(1), 10)
+        t.expect(m.remove(1, hash_i32(1)))
+        t.expect(m.cap != 0)
+        t.expect(m.tombs == 1)
+        n = 0
+        m.each((k, v) -> {
+            n = n + k + v
+        })
+        t.expect(n == 0)
+        t.expect(!m.contains(1, hash_i32(1)))
+        ks = m.keys()
+        vs = m.values()
+        t.expect(ks.len == 0)
+        t.expect(vs.len == 0)
+        ks.free()
+        vs.free()
+        m.free()
+    }
+}
+
+@test
+fn helpersLiveSlots() with (t: testing.Testing) {
+    // Hash 0 puts every key in one probe chain. Slot order is the chain,
+    // and a removed key is a tombstone that each, keys, and values skip.
+    var m = empty<i32, i32>()
+    with (mem.heap()) {
+        var n: i32 = 0
+        for _ in 0 as usize..6 {
+            m.insert(n, 0, n + 10)
+            n = n + 1
+        }
+        m.insert(2, 0, 99)
+        t.expect(m.count == 6)
+        t.expect(m.remove(1, 0))
+        t.expect(m.remove(4, 0))
+        t.expect(m.count == 4)
+        t.expect(m.tombs == 2)
+        t.expect(m.contains(0, 0))
+        t.expect(m.contains(2, 0))
+        t.expect(m.contains(3, 0))
+        t.expect(m.contains(5, 0))
+        t.expect(!m.contains(1, 0))
+        t.expect(!m.contains(4, 0))
+        t.expect(!m.contains(9, 0))
+        var ks = m.keys()
+        var vs = m.values()
+        t.expect(ks.len == 4)
+        t.expect(vs.len == 4)
+        var k0: i32 = 0
+        var k1: i32 = 0
+        var k2: i32 = 0
+        var k3: i32 = 0
+        var v0: i32 = 0
+        var v1: i32 = 0
+        var v2: i32 = 0
+        var v3: i32 = 0
+        var seen: i32 = 0
+        m.each((k, v) -> {
+            if seen == 0 {
+                k0 = k
+                v0 = v
+            } else if seen == 1 {
+                k1 = k
+                v1 = v
+            } else if seen == 2 {
+                k2 = k
+                v2 = v
+            } else {
+                k3 = k
+                v3 = v
+            }
+            seen = seen + 1
+        })
+        t.expect(seen == 4)
+        var slot: usize = 0
+        var i: usize = 0
+        for slot < m.cap {
+            if m.live(slot) {
+                var want_k = m.key_at(slot)
+                var want_v = m.value_at(slot)
+                if i == 0 {
+                    t.expect(k0 == want_k)
+                    t.expect(v0 == want_v)
+                } else if i == 1 {
+                    t.expect(k1 == want_k)
+                    t.expect(v1 == want_v)
+                } else if i == 2 {
+                    t.expect(k2 == want_k)
+                    t.expect(v2 == want_v)
+                } else {
+                    t.expect(k3 == want_k)
+                    t.expect(v3 == want_v)
+                }
+                t.expect(ks.get(i) == want_k)
+                t.expect(vs.get(i) == want_v)
+                t.expect(want_k != 1)
+                t.expect(want_k != 4)
+                if want_k == 2 {
+                    t.expect(want_v == 99)
+                } else {
+                    t.expect(want_v == want_k + 10)
+                }
+                i = i + 1
+            }
+            slot = slot + 1
+        }
+        t.expect(i == 4)
+        ks.free()
+        vs.free()
+        m.free()
+    }
+}
+
+@test
+fn helpersStr() with (t: testing.Testing) {
+    var m = empty<str, i32>()
+    with (mem.heap()) {
+        m.insert("a", fnv1a("a"), 1)
+        m.insert("b", fnv1a("b"), 2)
+        m.insert("c", fnv1a("c"), 3)
+        m.insert("a", fnv1a("a"), 9)
+        t.expect(m.remove("b", fnv1a("b")))
+        t.expect(m.contains("a", fnv1a("a")))
+        t.expect(m.contains("c", fnv1a("c")))
+        t.expect(!m.contains("b", fnv1a("b")))
+        t.expect(!m.contains("z", fnv1a("z")))
+        t.expect(!m.contains("", fnv1a("")))
+        var ks = m.keys()
+        var vs = m.values()
+        t.expect(ks.len == 2)
+        t.expect(vs.len == 2)
+        var ka: str = ""
+        var kb: str = ""
+        var va: i32 = 0
+        var vb: i32 = 0
+        var n: usize = 0
+        m.each((k, v) -> {
+            if n == 0 {
+                ka = k
+                va = v
+            } else {
+                kb = k
+                vb = v
+            }
+            n = n + 1
+        })
+        t.expect(n == 2)
+        var seen: usize = 0
+        for i in 0 as usize..m.cap {
+            if m.live(i) {
+                if seen == 0 {
+                    t.expect(ka == m.key_at(i))
+                    t.expect(va == m.value_at(i))
+                    t.expect(ks.get(0) == m.key_at(i))
+                    t.expect(vs.get(0) == m.value_at(i))
+                } else {
+                    t.expect(kb == m.key_at(i))
+                    t.expect(vb == m.value_at(i))
+                    t.expect(ks.get(1) == m.key_at(i))
+                    t.expect(vs.get(1) == m.value_at(i))
+                }
+                seen = seen + 1
+            }
+        }
+        t.expect(seen == 2)
+        var found_a = false
+        var j: usize = 0
+        for j < ks.len {
+            if ks.get(j) == "a" {
+                found_a = true
+                t.expect(vs.get(j) == 9)
+            }
+            t.expect(ks.get(j) != "b")
+            j = j + 1
+        }
+        t.expect(found_a)
+        ks.free()
+        vs.free()
+        m.free()
+    }
+}
+
+@test
+fn panicSlots() with (t: testing.Testing) {
+    var m = empty<i32, i32>()
+    t.expectPanic(() -> { m.key_at(0) })
+    with (mem.heap()) {
+        m.insert(1, 1, 2)
+        t.expectPanic(() -> { m.key_at(m.cap) })
+        t.expectPanic(() -> { m.value_at(m.cap) })
+        t.expect(m.remove(1, 1))
+        t.expectPanic(() -> { m.key_at(0) })
+        m.free()
+    }
+}

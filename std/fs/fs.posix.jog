@@ -1,0 +1,134 @@
+// POSIX list, rename, exists, and cwd. opendir/readdir/closedir.
+// d_name is read through jogrt_dirent_name so this file does not
+// hard-code struct dirent. An empty path, or one that does not fit in
+// 4095 bytes plus NUL, is false for list and exists. rename returns
+// error?. A missing source is ErrNotFound (errno 2, ENOENT). Every
+// other rename failure is ErrIO. A name is copied before the next readdir.
+
+import std.c
+import std.error as errors
+import std.list as lists
+import std.mem
+
+private fn fill_path(dest: *u8, cap: usize, path: str): bool {
+    if path.len == 0 || path.len >= cap {
+        return false
+    }
+    c.memcpy(dest as *void, path.ptr as *const void, path.len)
+    dest[path.len] = 0
+    return true
+}
+
+// false means the directory could not be opened. The list is empty then.
+// Each kept name is its own block. free_names releases them.
+actual fn list(path: str): (lists.List<str>, bool) with (a: mem.Allocator) {
+    var names: lists.List<str>
+    var buf: [4096]u8
+    if !fill_path(buf[..].ptr, 4096, path) {
+        return names, false
+    }
+    val dir = c.opendir(buf[..].ptr as *const c.char)
+    if dir == null {
+        return names, false
+    }
+    for {
+        val ent = c.readdir(dir!!)
+        if ent == null {
+            break
+        }
+        val name = c.jogrt_dirent_name(ent!! as *const void?)
+        if name == null {
+            continue
+        }
+        val raw = name!! as *u8
+        push_copied(&names, raw, c.strlen(name!!))
+    }
+    c.closedir(dir!!)
+    sort_names(&names)
+    return names, true
+}
+
+// ErrNotFound means the source is missing. ErrIO means the path does
+// not fit or the OS refused, including a target that already exists.
+actual fn rename(from: str, to: str): error? {
+    var left: [4096]u8
+    var right: [4096]u8
+    if !fill_path(left[..].ptr, 4096, from) || !fill_path(right[..].ptr, 4096, to) {
+        return errors.ErrIO
+    }
+    if c.rename(left[..].ptr as *const c.char, right[..].ptr as *const c.char) == 0 {
+        return null
+    }
+    if c.jogrt_errno() == 2 {
+        return errors.ErrNotFound
+    }
+    return errors.ErrIO
+}
+
+actual fn exists(path: str): bool {
+    var buf: [4096]u8
+    if !fill_path(buf[..].ptr, 4096, path) {
+        return false
+    }
+    val fd = c.open(buf[..].ptr as *const c.char, 0)
+    if fd < 0 {
+        return false
+    }
+    c.close(fd)
+    return true
+}
+
+actual fn cwd(): (str, bool) with (a: mem.Allocator) {
+    var buf: [4096]u8
+    val p = c.getcwd(buf[..].ptr as *c.char, 4096)
+    if p == null {
+        return "", false
+    }
+    return copy_str(path_view_local(buf[..].ptr)), true
+}
+
+actual fn mkdir_one(path: str): error? {
+    var buf: [4096]u8
+    if !fill_path(buf[..].ptr, 4096, path) {
+        return errors.ErrIO
+    }
+    if c.jogrt_mkdir(buf[..].ptr as *const c.char) == 0 {
+        return null
+    }
+    // EEXIST — treat as success when the path is already a directory.
+    if exists(path) {
+        return null
+    }
+    return errors.ErrIO
+}
+
+actual fn remove(path: str): error? {
+    var buf: [4096]u8
+    if !fill_path(buf[..].ptr, 4096, path) {
+        return errors.ErrIO
+    }
+    if c.unlink(buf[..].ptr as *const c.char) == 0 {
+        return null
+    }
+    if c.rmdir(buf[..].ptr as *const c.char) == 0 {
+        return null
+    }
+    if c.jogrt_errno() == 2 {
+        return errors.ErrNotFound
+    }
+    return errors.ErrIO
+}
+
+private fn path_view_local(path: *u8): str {
+    var n: usize = 0
+    for n < 4096 {
+        if path[n] == 0 {
+            break
+        }
+        n = n + 1
+    }
+    var view = bytes()
+    view.ptr = path
+    view.len = n
+    return view
+}

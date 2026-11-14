@@ -1,20 +1,24 @@
-# JogCompiler (v2)
+# JogCompiler (Zig V2 / `develop`)
 
 Zig-hosted Jog compiler: **native linux x64 ELF** (IR→asm) and **`--target wasm32-emscripten`** (IR→C→emcc).
 
-v1 lives on branches `develop` (jogc) and `seed` (C `jog`). This branch (`v2`) is a greenfield rewrite. Design: JogDocs `design/v2/`.
+After the branch cut, **`develop`** is this Zig tip. Archived Jog self-host: **`develop-jogc`**. Branch **`v2`** may remain as an alias. C stage 0: **`seed`**. Spec layers: JogDocs `design/v2/README.md` and `design/language/Types.md`.
+
+Ships **`core/`** (prelude) and **`std/`** (importable). Discovery: `$JOG_ROOT/{core,std}` or next to the binary (`jog roots`). Checker still injects thin scalar builtins while prelude `@intrinsic` binding lands (Friction).
 
 ## Build
 
 ```
 zig build
 ./zig-out/bin/jog version
+./zig-out/bin/jog roots
 ```
 
 ## Commands
 
 ```
 jog version
+jog roots
 jog parse <path>
 jog check <path>
 jog build <path> -o <out> [--keep-asm] [--keep-c]
@@ -22,7 +26,7 @@ jog build <path> -o <out> [--keep-asm] [--keep-c]
 jog deps [path]
 ```
 
-`path` may be a `.jog` file, a directory with `jog.mod`, or a `jog.mod` file. Module sources listed in `jog.mod` (`root` + optional `source` lines) are parsed and typechecked together. `@link("lib")` and `jog.mod` `link.*` / `libdir.*` feed the linker (`-l` / `-L`; rpath on native). `link.emscripten` / `libdir.emscripten` apply only with `--target wasm32-emscripten`.
+`path` may be a `.jog` file, a directory with `jog.mod`, or a `jog.mod` file. Module sources listed in `jog.mod` (`root` + optional `source` lines) are parsed and typechecked together. `import std.*` resolves via library roots. `@link("lib")` and `jog.mod` `link.*` / `libdir.*` feed the linker (`-l` / `-L`; rpath on native). `link.emscripten` / `libdir.emscripten` apply only with `--target wasm32-emscripten`.
 
 ## Pipeline
 
@@ -61,6 +65,9 @@ zig build
 ./zig-out/bin/jog build examples/globals.jog -o out/globals && ./out/globals
 ./zig-out/bin/jog build examples/float_extern.jog -o out/float_extern && ./out/float_extern
 ./zig-out/bin/jog build examples/host_run_loop.jog -o out/host_run_loop && ./out/host_run_loop
+./zig-out/bin/jog check std/math
+./zig-out/bin/jog check std/c
+./zig-out/bin/jog build examples/std_math_smoke.jog -o out/std_math_smoke && ./out/std_math_smoke
 
 # Emscripten (JOG-90) — source emsdk first
 source ~/emsdk/emsdk_env.sh

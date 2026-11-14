@@ -1,0 +1,21 @@
+// Sets JOG_OS_PROBE_251025 with _putenv, then reads it back. The literal
+// stays valid for the process, which is what _putenv requires when it
+// does not copy.
+
+import std.c
+import std.testing
+
+extern {
+    fn _putenv(envstring: *const c.char): c.int
+}
+
+@test
+fn presentEnv() with (t: testing.Testing) {
+    t.expect(_putenv(c"JOG_OS_PROBE_251025=jog-os-value") == 0)
+    val (got, ok) = env("JOG_OS_PROBE_251025")
+    t.expect(ok)
+    t.expectEq(got, "jog-os-value")
+    val (again, ok2) = env("JOG_OS_PROBE_251025")
+    t.expect(ok2)
+    t.expectEq(again, "jog-os-value")
+}

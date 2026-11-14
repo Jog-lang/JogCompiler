@@ -1,0 +1,397 @@
+// Package std.list. List<T> is a growable array. The value is one buffer of
+// T stored by value, a length, and a capacity. The allocator is not a
+// field: new, push, insert, reserve, and free take it as a context,
+// with (a: mem.Allocator), the same way std.mem and std.io do.
+//
+// One allocation owns the element buffer. The first block holds 8
+// elements, then the capacity doubles. A request larger than that next
+// capacity uses the request. empty is the zero value: len 0, cap 0,
+// ptr null, no block. pop and clear do not free the block or the
+// elements. If a T owns memory of its own, the caller frees that.
+//
+// items() is a []T of the live prefix: ptr and len, not cap. It copies
+// nothing. An empty list, including one whose buffer is still allocated,
+// returns an empty slice. for x in xs.items() walks that slice. A later
+// growth moves the buffer and invalidates the slice.
+//
+// each and each_index walk 0 .. len and allocate nothing. map, filter,
+// and clone return a new list; the caller frees it. reverse swaps the
+// live prefix in place.
+
+import std.c
+import std.mem
+
+// ptr is null until the first allocation. len is the live count. cap is
+// how many T slots the block holds.
+struct List<T> {
+    ptr: *T?
+    len: usize
+    cap: usize
+}
+
+fn empty<T>(): List<T> {
+    return List<T>()
+}
+
+// Copies size(T) bytes. Element assignment of a wide T can drop fields
+// under stage 0, and the regions here do not overlap.
+private fn store_elem<T>(dest: *T, src: *T) {
+    c.memcpy(dest as *void, src as *const void, size(T))
+}
+
+// Copies every packed element into a new buffer. No elements means the
+// zero list and no allocation.
+fn new<T>(...T: elements): List<T> with (a: mem.Allocator) {
+    var xs = List<T>()
+    if elements.len == 0 {
+        return xs
+    }
+    xs.reserve(elements.len)
+    for i in 0 as usize..elements.len {
+        store_elem(xs.ptr!! + i, elements.ptr + i)
+    }
+    xs.len = elements.len
+    return xs
+}
+
+// Allocates a new block and copies the live bytes. The old block is not
+// freed: a List is copied by value, so another header may still point at
+// it. raw.ptr as *T is the typed pointer. bytes as []T is still rejected.
+private fn *List<T>.grow(minCap: usize) with (a: mem.Allocator) {
+    var newCap: usize = 8
+    if self.cap != 0 {
+        newCap = self.cap * 2
+    }
+    if newCap < minCap {
+        newCap = minCap
+    }
+    val (raw, err) = a.alloc(size(T) * newCap, align(T))
+    if err != null {
+        panic("out of memory")
+    }
+    val fresh = raw.ptr as *T
+    if self.len > 0 {
+        c.memcpy(fresh as *void, self.ptr!! as *const void, size(T) * self.len)
+    }
+    self.ptr = fresh as *T?
+    self.cap = newCap
+}
+
+fn *List<T>.push(...T: elements) with (a: mem.Allocator) {
+    if elements.len == 0 {
+        return
+    }
+    val need = self.len + elements.len
+    if need > self.cap {
+        self.grow(need)
+    }
+    val p = self.ptr!!
+    for i in 0 as usize..elements.len {
+        store_elem(p + self.len, elements.ptr + i)
+        self.len = self.len + 1
+    }
+}
+
+fn *List<T>.pop(): T {
+    if self.len == 0 {
+        panic("pop on empty list")
+    }
+    self.len = self.len - 1
+    return self.ptr!![self.len]
+}
+
+fn List<T>.get(i: usize): T {
+    if i >= self.len {
+        panic("index out of range")
+    }
+    return self.ptr!![i]
+}
+
+// Pointer to element i. The caller can write through it. The pointer is
+// valid until the next push, insert, reserve, or free that grows the buffer.
+fn *List<T>.at(i: usize): *T {
+    if i >= self.len {
+        panic("index out of range")
+    }
+    return self.ptr!! + i
+}
+
+fn *List<T>.set(i: usize, x: T) {
+    if i >= self.len {
+        panic("index out of range")
+    }
+    store_elem(self.ptr!! + i, &x)
+}
+
+fn *List<T>.clear() {
+    self.len = 0
+}
+
+// i == len appends. i > len panics. The tail shifts up one slot.
+fn *List<T>.insert(i: usize, x: T) with (a: mem.Allocator) {
+    if i > self.len {
+        panic("index out of range")
+    }
+    if self.len == self.cap {
+        self.grow(self.len + 1)
+    }
+    val p = self.ptr!!
+    var k = self.len
+    for k > i {
+        store_elem(p + k, p + (k - 1))
+        k = k - 1
+    }
+    store_elem(p + i, &x)
+    self.len = self.len + 1
+}
+
+// Shifts the tail down and returns the element. Does not shrink cap.
+fn *List<T>.remove(i: usize): T {
+    if i >= self.len {
+        panic("index out of range")
+    }
+    val p = self.ptr!!
+    val removed = p[i]
+    var k = i
+    for k + 1 < self.len {
+        store_elem(p + k, p + (k + 1))
+        k = k + 1
+    }
+    self.len = self.len - 1
+    return removed
+}
+
+fn *List<T>.reserve(n: usize) with (a: mem.Allocator) {
+    if self.cap >= n {
+        return
+    }
+    self.grow(n)
+}
+
+fn *List<T>.free() with (a: mem.Allocator) {
+    if self.cap == 0 {
+        return
+    }
+    var block = bytes()
+    block.ptr = self.ptr!! as *u8
+    block.len = size(T) * self.cap
+    a.free(block)
+    self.ptr = null
+    self.len = 0
+    self.cap = 0
+}
+
+// Live elements as []T, length len, not capacity. No copy.
+// An empty list is an empty slice. A later growth moves the block and
+// invalidates this slice. for x in xs.items() walks it.
+fn List<T>.items(): []T {
+    if self.len == 0 {
+        var none: []T
+        return none
+    }
+    return mem.slice(self.ptr!!, self.len)
+}
+
+// The same view as items().
+fn List<T>.slice_view(): []T {
+    return self.items()
+}
+
+/**
+ * Calls body on each live element, from index 0 through len.
+ * @self the list
+ * @param body called with the element
+ */
+fn List<T>.each(body: (T) -> ()) {
+    for i in 0 as usize..self.len {
+        body(self.get(i))
+    }
+}
+
+/**
+ * Calls body on each live element and its index, from 0 through len.
+ * @self the list
+ * @param body called with the element and the index
+ */
+fn List<T>.each_index(body: (T, usize) -> ()) {
+    for i in 0 as usize..self.len {
+        body(self.get(i), i)
+    }
+}
+
+/**
+ * A new list of f applied to each live element. Reserves len slots first.
+ * @self the list
+ * @param f maps one element
+ * @context a allocator for the result
+ * @return the mapped list. The caller frees it
+ */
+fn List<T>.map<R>(f: (T) -> R): List<R> with (a: mem.Allocator) {
+    var out = List<R>()
+    out.reserve(self.len)
+    for i in 0 as usize..self.len {
+        out.push(f(self.get(i)))
+    }
+    return out
+}
+
+/**
+ * A new list of the live elements for which pred is true, in order.
+ * @self the list
+ * @param pred kept when true
+ * @context a allocator for the result
+ * @return the filtered list. The caller frees it
+ */
+fn List<T>.filter(pred: (T) -> bool): List<T> with (a: mem.Allocator) {
+    var out = List<T>()
+    for i in 0 as usize..self.len {
+        val item = self.get(i)
+        if pred(item) {
+            out.push(item)
+        }
+    }
+    return out
+}
+
+/**
+ * Folds the live elements from the left, starting at init.
+ * @self the list
+ * @param init starting value
+ * @param f combines the accumulator and the next element
+ * @return the final accumulator
+ */
+fn List<T>.fold<R>(init: R, f: (R, T) -> R): R {
+    var acc = init
+    for i in 0 as usize..self.len {
+        acc = f(acc, self.get(i))
+    }
+    return acc
+}
+
+/**
+ * True when pred is true for any live element. An empty list is false.
+ * @self the list
+ * @param pred tested on each element
+ * @return true when one element matches
+ */
+fn List<T>.any(pred: (T) -> bool): bool {
+    for i in 0 as usize..self.len {
+        if pred(self.get(i)) {
+            return true
+        }
+    }
+    return false
+}
+
+/**
+ * True when pred is true for every live element. An empty list is true.
+ * @self the list
+ * @param pred tested on each element
+ * @return true when every element matches
+ */
+fn List<T>.all(pred: (T) -> bool): bool {
+    for i in 0 as usize..self.len {
+        if !pred(self.get(i)) {
+            return false
+        }
+    }
+    return true
+}
+
+/**
+ * The first live element for which pred is true.
+ * @self the list
+ * @param pred tested on each element
+ * @return the element and true, or a zeroed value and false when nothing matches
+ */
+fn List<T>.find(pred: (T) -> bool): (T, bool) {
+    for i in 0 as usize..self.len {
+        val item = self.get(i)
+        if pred(item) {
+            return item, true
+        }
+    }
+    // No match. A generic T has no zero value, so this is a zeroed element.
+    // The block is freed before return. The bool says to ignore the value.
+    with (mem.heap()) {
+        var slot = mem.newSlice<T>(1)
+        val missing = slot[0]
+        mem.freeSlice(slot)
+        return missing, false
+    }
+}
+
+/**
+ * A new list holding copies of the live prefix. An empty list allocates nothing.
+ * @self the list
+ * @context a allocator for the copy
+ * @return the copy. The caller frees it
+ */
+fn List<T>.clone(): List<T> with (a: mem.Allocator) {
+    var out = List<T>()
+    out.reserve(self.len)
+    for i in 0 as usize..self.len {
+        out.push(self.get(i))
+    }
+    return out
+}
+
+/**
+ * Reverses the live prefix in place. Capacity stays.
+ * @self the list
+ */
+fn *List<T>.reverse() {
+    if self.len < 2 {
+        return
+    }
+    var i: usize = 0
+    var j = self.len - 1
+    for i < j {
+        val tmp = self.get(i)
+        self.set(i, self.get(j))
+        self.set(j, tmp)
+        i = i + 1
+        j = j - 1
+    }
+}
+
+/**
+ * A pull cursor over the live prefix of a list. index is the next slot.
+ * The header is a copy, so the walk uses the len from when the cursor
+ * was built, not the capacity.
+ */
+struct ListIter<T> {
+    xs: List<T>
+    index: usize
+}
+
+/**
+ * A cursor at the first live element. The caller owns it. items stays
+ * the for-in path.
+ * @self the list
+ * @return the cursor
+ */
+fn List<T>.iter(): ListIter<T> {
+    return ListIter<T>(xs: self, index: 0)
+}
+
+/**
+ * The next live element. A finished cursor stays finished.
+ * @self the cursor
+ * @return the element and true, or a zeroed value and false when index is past len
+ */
+fn *ListIter<T>.next(): (T, bool) {
+    if self.index >= self.xs.len {
+        // A generic T has no zero value, so this is a zeroed element.
+        // The block is freed before return. The bool says to ignore the value.
+        with (mem.heap()) {
+            var slot = mem.newSlice<T>(1)
+            val missing = slot[0]
+            mem.freeSlice(slot)
+            return missing, false
+        }
+    }
+    val item = self.xs.get(self.index)
+    self.index = self.index + 1
+    return item, true
+}

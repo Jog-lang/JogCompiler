@@ -1,0 +1,56 @@
+// Package os, same as os.jog, so the tests see argc, argv, and env
+// with no import of std.os. The argument strings and the environment
+// value are views. Nothing here frees them.
+//
+// A missing name is false, not a panic. An index outside 0..argc is
+// expectPanic. The present-name case lives in the per-OS test file:
+// _putenv on Windows, setenv on POSIX.
+
+import std.testing
+
+@test
+fn arguments() with (t: testing.Testing) {
+    val n = argc()
+    t.expect(n >= 1)
+    val exe = argv(0)
+    t.expect(exe.len > 0)
+    t.expect(exe.ptr[0] != 0)
+    t.expectEq(argv(0), exe)
+    var seen: i64 = 0
+    for i in 0..n {
+        val arg = argv(i)
+        if i == 0 {
+            t.expect(arg.len > 0)
+        }
+        seen = seen + 1
+    }
+    t.expect(seen == n)
+}
+
+@test
+fn argumentPanics() with (t: testing.Testing) {
+    val n = argc()
+    t.expectPanic(() -> { argv(-1) })
+    t.expectPanic() { argv(n) }
+    t.expect(argv(0).len > 0)
+}
+
+@test
+fn missingEnv() with (t: testing.Testing) {
+    val (missing, ok) = env("JOG_OS_ABSENT_251025")
+    t.expect(!ok)
+    t.expectEq(missing, "")
+    val (blank, okb) = env("")
+    t.expect(!okb)
+    t.expectEq(blank, "")
+    var raw: [4096]u8
+    for i in 0 as usize..4096 {
+        raw[i] = 'A' as u8
+    }
+    var view = bytes()
+    view.ptr = &raw[0]
+    view.len = 4096
+    val (long, okl) = env(view)
+    t.expect(!okl)
+    t.expectEq(long, "")
+}
