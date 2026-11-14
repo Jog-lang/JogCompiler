@@ -135,6 +135,7 @@ pub const Parser = struct {
         switch (self.tok.kind) {
             .kw_type => return .{ .type_alias = try self.parseTypeAlias() },
             .kw_struct => return .{ .struct_decl = try self.parseStruct() },
+            .kw_object => return .{ .struct_decl = try self.parseObject() },
             .kw_enum => return .{ .enum_decl = try self.parseEnum() },
             .kw_import => return .{ .import_decl = try self.parseImport() },
             .kw_require => {
@@ -331,20 +332,32 @@ pub const Parser = struct {
 
     fn parseStruct(self: *Parser) ParseError!ast.StructDecl {
         try self.expect(.kw_struct);
+        return try self.parseStructBody(false);
+    }
+
+    fn parseObject(self: *Parser) ParseError!ast.StructDecl {
+        try self.expect(.kw_object);
+        // `object` has no type params in the spike.
+        return try self.parseStructBody(true);
+    }
+
+    fn parseStructBody(self: *Parser, is_object: bool) ParseError!ast.StructDecl {
         if (self.tok.kind != .ident) return error.UnexpectedToken;
         const name = self.tok.text;
         const line = self.tok.line;
         const col = self.tok.col;
         self.advance();
-        const type_params = try self.parseTypeParamList();
+        const type_params: [][]const u8 = if (is_object) &.{} else try self.parseTypeParamList();
         // `@opaque struct FILE` — empty body, no braces.
         if (self.tok.kind != .lbrace) {
+            if (is_object) return error.UnexpectedToken;
             return .{
                 .name = name,
                 .line = line,
                 .col = col,
                 .type_params = type_params,
                 .fields = &.{},
+                .is_object = false,
             };
         }
         try self.expect(.lbrace);
@@ -364,6 +377,7 @@ pub const Parser = struct {
             .col = col,
             .type_params = type_params,
             .fields = try fields.toOwnedSlice(self.allocator),
+            .is_object = is_object,
         };
     }
 

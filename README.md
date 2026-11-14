@@ -68,6 +68,7 @@ zig build
 ./zig-out/bin/jog check std/math
 ./zig-out/bin/jog check std/c
 ./zig-out/bin/jog build examples/std_math_smoke.jog -o out/std_math_smoke && ./out/std_math_smoke
+./zig-out/bin/jog build examples/object_flags.jog -o out/object_flags && ./out/object_flags
 
 # Emscripten (JOG-90) — source emsdk first
 source ~/emsdk/emsdk_env.sh

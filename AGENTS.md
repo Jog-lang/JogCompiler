@@ -13,4 +13,5 @@
 - Host: Zig 0.14+. Gate: `zig build` and `zig build test`; `jog build examples/hello.jog` must produce a runnable ELF with no C step.
 - Layout: `src/lex`, `src/parse`, `src/ast`, `src/check`, `src/ir`, `src/codegen`, `src/driver`; shipped **`core/`** and **`std/`**.
 - Discovery: `jog roots` — `$JOG_ROOT/{core,std}` or next to the binary (`<jog>/../{core,std}`), else cwd. Prefer loading the Jog prelude over growing `defineBuiltin`; keep thin Zig builtins only where IR/runtime requires.
+- `object Name { … }` singletons (JOG-96): static multi-slot storage, no heap; see JogDocs `design/language/Objects.md`.
 - Ivan writes Jog by hand unless he asked for implementation (std/core port and Zig wiring are assigned when Phase A says so). Prefer explain/review over large rewrites.

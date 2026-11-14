@@ -7,7 +7,7 @@ const link = @import("../codegen/link.zig");
 const mod = @import("../mod/mod.zig");
 const roots_mod = @import("roots.zig");
 
-pub const version_string = "jog 0.2.9-v2 (zig host, std/core roots; ir→asm→native | ir→c→emcc; LSP surfaces)";
+pub const version_string = "jog 0.2.10-v2 (zig host, object+std/core; ir→asm→native | ir→c→emcc; LSP surfaces)";
 
 pub fn cmdVersion(writer: anytype) !void {
     try writer.print("{s}\n", .{version_string});
@@ -543,7 +543,7 @@ pub fn cmdParse(allocator: std.mem.Allocator, path: []const u8, writer: anytype,
     for (unit.file.decls) |d| {
         switch (d) {
             .type_alias => |t| try writer.print("  type {s}\n", .{t.name}),
-            .struct_decl => |s| try writer.print("  struct {s}\n", .{s.name}),
+            .struct_decl => |s| try writer.print("  {s} {s}\n", .{ if (s.is_object) "object" else "struct", s.name }),
             .enum_decl => |e| try writer.print("  enum {s}\n", .{e.name}),
             .import_decl => |i| try writer.print("  import {s}\n", .{i.path}),
             .require_decl => |r| try writer.print("  require {s}\n", .{r.name}),
@@ -580,7 +580,7 @@ pub fn cmdSymbols(allocator: std.mem.Allocator, path: []const u8, json: bool, wr
         };
         const kind: []const u8 = switch (d) {
             .fn_decl, .actual_fn, .method => "function",
-            .struct_decl => "struct",
+            .struct_decl => |s| if (s.is_object) "object" else "struct",
             .enum_decl => "enum",
             .global_decl => |g| if (g.mutable) "variable" else "constant",
             .type_alias => "type",

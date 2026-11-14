@@ -44,6 +44,8 @@ pub const Op = enum {
     gload,
     /// Store package-level `var` (aux = global index, src0 = value).
     gstore,
+    /// Address of package global / object storage (aux = global index) — lea, not load.
+    gaddr,
     ret,
     jmp,
     jz,
@@ -97,6 +99,10 @@ pub const Global = struct {
     mutable: bool,
     init_bits: i64 = 0,
     is_float: bool = false,
+    /// Number of 8-byte slots in static storage (1 for scalar `var`; field count for `object`).
+    nquads: u32 = 1,
+    /// `object Name` singleton — loads of the bare name use `gaddr`.
+    is_object: bool = false,
 };
 
 pub const Program = struct {
@@ -266,6 +272,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
     var vtable_map: std.StringHashMapUnmanaged(u32) = .{};
     var globals: std.ArrayListUnmanaged(Global) = .{};
     var global_map: std.StringHashMapUnmanaged(u32) = .{};
+    var object_map: std.StringHashMapUnmanaged(u32) = .{}; // object name → global index
     var const_vals: std.StringHashMapUnmanaged(ConstVal) = .{};
 
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_print" });
@@ -303,6 +310,20 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                     try generic_structs.put(a, sd.name, sd);
                 } else {
                     try structs.put(a, sd.name, .{ .fields = sd.fields });
+                    if (sd.is_object) {
+                        // One static multi-slot instance (no heap). Zero-init BSS-like .data.
+                        const nquads: u32 = @intCast(@max(sd.fields.len, 1));
+                        const idx: u32 = @intCast(globals.items.len);
+                        try globals.append(a, .{
+                            .name = try a.dupe(u8, sd.name),
+                            .mutable = true,
+                            .init_bits = 0,
+                            .nquads = nquads,
+                            .is_object = true,
+                        });
+                        try global_map.put(a, sd.name, idx);
+                        try object_map.put(a, sd.name, idx);
+                    }
                 }
             },
             .enum_decl => |ed| {
@@ -460,7 +481,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                 .exported = fd.exported or std.mem.eql(u8, fd.name, "main"),
                 .self_type = null,
                 .pointer_recv = false,
-            }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map);
+            }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map, &object_map);
             try funcs.append(a, f);
         } else if (d == .method and d.method.body != null) {
             const md = d.method;
@@ -474,7 +495,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                 .exported = true,
                 .self_type = md.type_name,
                 .pointer_recv = md.pointer_recv,
-            }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map);
+            }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map, &object_map);
             try funcs.append(a, f);
         }
     }
@@ -487,7 +508,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
             .exported = false,
             .self_type = null,
             .pointer_recv = false,
-        }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map);
+        }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map, &object_map);
         try funcs.append(a, f);
     }
 
@@ -851,6 +872,7 @@ const Ctx = struct {
     vtable_map: *std.StringHashMapUnmanaged(u32),
     const_vals: *std.StringHashMapUnmanaged(ConstVal),
     global_map: *std.StringHashMapUnmanaged(u32),
+    object_map: *std.StringHashMapUnmanaged(u32),
     slots: *std.StringHashMapUnmanaged(u32),
     meta: *std.StringHashMapUnmanaged(SlotMeta),
     next_slot: *u32,
@@ -886,6 +908,7 @@ fn lowerFn(
     vtable_map: *std.StringHashMapUnmanaged(u32),
     const_vals: *std.StringHashMapUnmanaged(ConstVal),
     global_map: *std.StringHashMapUnmanaged(u32),
+    object_map: *std.StringHashMapUnmanaged(u32),
 ) !Func {
     var slots: std.StringHashMapUnmanaged(u32) = .{};
     var meta: std.StringHashMapUnmanaged(SlotMeta) = .{};
@@ -937,6 +960,7 @@ fn lowerFn(
         .vtable_map = vtable_map,
         .const_vals = const_vals,
         .global_map = global_map,
+        .object_map = object_map,
         .slots = &slots,
         .meta = &meta,
         .next_slot = &next_slot,
@@ -1478,7 +1502,11 @@ fn inferMetaFromExpr(ctx: *Ctx, e: *ast.Expr) ?SlotMeta {
             return .{ .kind = .struct_ptr, .type_name = sl.type_name };
         },
         .null_lit => return .{ .kind = .opt_ptr },
-        .ident => |n| return ctx.meta.get(n),
+        .ident => |n| {
+            if (ctx.meta.get(n)) |m| return m;
+            if (ctx.object_map.contains(n)) return .{ .kind = .struct_ptr, .type_name = n };
+            return null;
+        },
         .field => |f| {
             const base_tn = inferTypeNameFromExpr(ctx, f.base) orelse return null;
             const sd = ctx.structs.get(base_tn) orelse return null;
@@ -1798,6 +1826,12 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
                 } else {
                     try ctx.emit(.{ .op = .iconst, .dst = d, .aux = cv.bits });
                 }
+                return d;
+            }
+            // Object singleton: bare name is the address of static storage (no heap).
+            if (ctx.object_map.get(name)) |gi| {
+                const d = try ctx.fresh();
+                try ctx.emit(.{ .op = .gaddr, .dst = d, .aux = @intCast(gi) });
                 return d;
             }
             if (ctx.global_map.get(name)) |gi| {

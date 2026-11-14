@@ -55,10 +55,15 @@ pub fn emit(allocator: std.mem.Allocator, program: *const ir.Program, writer: an
         for (program.globals, 0..) |g, i| {
             try writer.print(".globl jog_global_{d}\n", .{i});
             try writer.print("jog_global_{d}:\n", .{i});
-            try writer.print("  .quad {d}\n", .{g.init_bits});
+            var qi: u32 = 0;
+            while (qi < g.nquads) : (qi += 1) {
+                const bits: i64 = if (qi == 0) g.init_bits else 0;
+                try writer.print("  .quad {d}\n", .{bits});
+            }
             _ = g.name;
             _ = g.mutable;
             _ = g.is_float;
+            _ = g.is_object;
         }
     }
 
@@ -197,6 +202,10 @@ fn emitInst(writer: anytype, prog: *const ir.Program, fname: []const u8, ninst: 
         .gstore => {
             try writer.print("  mov rax, qword ptr [rbp - {d}]\n", .{slot(inst.src0)});
             try writer.print("  mov qword ptr [rip + jog_global_{d}], rax\n", .{inst.aux});
+        },
+        .gaddr => {
+            try writer.print("  lea rax, [rip + jog_global_{d}]\n", .{inst.aux});
+            try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{slot(inst.dst)});
         },
         .add => {
             try writer.print("  mov rax, qword ptr [rbp - {d}]\n", .{slot(inst.src0)});

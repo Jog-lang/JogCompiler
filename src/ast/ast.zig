@@ -127,6 +127,8 @@ pub const StructDecl = struct {
     fields: []Field,
     /// `@packed` — request dense layout (byte-packed when fields are byte-sized).
     packed_attr: bool = false,
+    /// `object Name { … }` — struct body + one static singleton (JOG-96).
+    is_object: bool = false,
 };
 
 pub const InterfaceFn = struct {
