@@ -1,0 +1,13 @@
+fn answer(): i64 {
+    return 42
+}
+
+struct Point {
+    x: i64
+    y: i64
+}
+
+fn use_point(): i64 {
+    val p: Point = Point(x: 1, y: 2)
+    return p.x + p.y
+}

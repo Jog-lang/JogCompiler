@@ -45,6 +45,11 @@ pub const TypeInfo = struct {
 pub const Diagnostic = struct {
     line: u32 = 1,
     col: u32 = 1,
+    /// Exclusive end (1-based). Zero means unset (point diagnostic).
+    end_line: u32 = 0,
+    end_col: u32 = 0,
+    /// `"error"` | `"warning"` | `"info"` | `"hint"` — LSP maps these.
+    severity: []const u8 = "error",
     message: []const u8,
 };
 
@@ -60,12 +65,20 @@ fn emitDiag(
     col: u32,
     message: []const u8,
 ) !void {
-    var d: Diagnostic = .{ .line = line, .col = col, .message = message };
+    var d: Diagnostic = .{ .line = line, .col = col, .message = message, .severity = "error" };
     if (at) |e| {
         if (active_file) |f| {
             const sp = f.spanOf(e);
             d.line = sp.line;
             d.col = sp.col;
+            // Identifiers get a real end column; other exprs get a 1-char range
+            // until the parser records full end spans.
+            d.end_line = sp.line;
+            if (e.* == .ident) {
+                d.end_col = sp.col + @as(u32, @intCast(e.ident.len));
+            } else {
+                d.end_col = sp.col + 1;
+            }
         }
     }
     try diags.append(a, d);

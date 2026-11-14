@@ -1,0 +1,15 @@
+import util
+import std.math
+
+fn main() {
+    val n: i64 = answer()
+    val c: f64 = cos(0.0)
+    val p: Point = Point(x: n, y: 3)
+    print("ok\n")
+    if (c == 1.0) {
+        print("cos\n")
+    }
+    if (p.x == n) {
+        print("pt\n")
+    }
+}
