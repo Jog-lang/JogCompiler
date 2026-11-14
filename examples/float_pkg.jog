@@ -1,0 +1,14 @@
+// Package `var` f64 loads must stay floatish for * / -.
+
+var a: f64 = 0.66
+var b: f64 = 1.0
+
+fn main() {
+    b = 0.0 - b
+    val p = a * b
+    if (p == 0.0 - 0.66) {
+        print("pkg fmul ok\n")
+    } else {
+        panic("pkg fmul fail\n")
+    }
+}

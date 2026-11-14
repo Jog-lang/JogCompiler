@@ -18,6 +18,10 @@ pub const Op = enum {
     fsub,
     fmul,
     fdiv,
+    /// i64 → f64 (cvtsi2sd).
+    sitofp,
+    /// f64 → i64 trunc toward zero (cvttsd2si).
+    fptosi,
     load8,
     store8,
     eq,
@@ -481,7 +485,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                 .exported = fd.exported or std.mem.eql(u8, fd.name, "main"),
                 .self_type = null,
                 .pointer_recv = false,
-            }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map, &object_map);
+            }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map, globals.items, &object_map);
             try funcs.append(a, f);
         } else if (d == .method and d.method.body != null) {
             const md = d.method;
@@ -495,7 +499,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                 .exported = true,
                 .self_type = md.type_name,
                 .pointer_recv = md.pointer_recv,
-            }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map, &object_map);
+            }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map, globals.items, &object_map);
             try funcs.append(a, f);
         }
     }
@@ -508,7 +512,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
             .exported = false,
             .self_type = null,
             .pointer_recv = false,
-        }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map, &object_map);
+        }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map, globals.items, &object_map);
         try funcs.append(a, f);
     }
 
@@ -872,6 +876,8 @@ const Ctx = struct {
     vtable_map: *std.StringHashMapUnmanaged(u32),
     const_vals: *std.StringHashMapUnmanaged(ConstVal),
     global_map: *std.StringHashMapUnmanaged(u32),
+    /// Package `var` storage (for floatish gload typing).
+    globals: []const Global,
     object_map: *std.StringHashMapUnmanaged(u32),
     slots: *std.StringHashMapUnmanaged(u32),
     meta: *std.StringHashMapUnmanaged(SlotMeta),
@@ -908,6 +914,7 @@ fn lowerFn(
     vtable_map: *std.StringHashMapUnmanaged(u32),
     const_vals: *std.StringHashMapUnmanaged(ConstVal),
     global_map: *std.StringHashMapUnmanaged(u32),
+    globals: []const Global,
     object_map: *std.StringHashMapUnmanaged(u32),
 ) !Func {
     var slots: std.StringHashMapUnmanaged(u32) = .{};
@@ -960,6 +967,7 @@ fn lowerFn(
         .vtable_map = vtable_map,
         .const_vals = const_vals,
         .global_map = global_map,
+        .globals = globals,
         .object_map = object_map,
         .slots = &slots,
         .meta = &meta,
@@ -1783,13 +1791,25 @@ fn fieldOffset(ctx: *Ctx, base_expr: *ast.Expr, field: []const u8) LowerError!i6
     return error.UnknownName;
 }
 
+fn isFloatTypeName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "f64") or std.mem.eql(u8, name, "f32");
+}
+
 fn isFloatish(ctx: *Ctx, e: *ast.Expr) bool {
     return switch (e.*) {
         .float => true,
         .ident => |n| blk: {
             if (ctx.meta.get(n)) |m| {
-                break :blk std.mem.eql(u8, m.type_name, "f64") or std.mem.eql(u8, m.type_name, "f32");
+                break :blk isFloatTypeName(m.type_name);
             }
+            if (ctx.const_vals.get(n)) |cv| break :blk cv.is_float;
+            if (ctx.global_map.get(n)) |gi| {
+                if (gi < ctx.globals.len) break :blk ctx.globals[gi].is_float;
+            }
+            break :blk false;
+        },
+        .field => blk: {
+            if (inferMetaFromExpr(ctx, e)) |m| break :blk isFloatTypeName(m.type_name);
             break :blk false;
         },
         .binary => |b| blk: {
@@ -1798,7 +1818,7 @@ fn isFloatish(ctx: *Ctx, e: *ast.Expr) bool {
                     if (!isBuiltinScalar(tn) and ctx.structs.contains(tn)) {
                         const key = std.fmt.allocPrint(ctx.a, "{s}.{s}", .{ tn, opm }) catch break :blk false;
                         if (ctx.methods.get(key)) |mi| {
-                            if (mi.ret_name.len > 0 and (std.mem.eql(u8, mi.ret_name, "f64") or std.mem.eql(u8, mi.ret_name, "f32")))
+                            if (mi.ret_name.len > 0 and isFloatTypeName(mi.ret_name))
                                 break :blk true;
                         }
                     }
@@ -1807,9 +1827,10 @@ fn isFloatish(ctx: *Ctx, e: *ast.Expr) bool {
             break :blk isFloatish(ctx, b.left) or isFloatish(ctx, b.right);
         },
         .unary => |u| isFloatish(ctx, u.expr),
-        .cast => |c| blk: {
-            const tn = typeExprName(c.ty);
-            break :blk std.mem.eql(u8, tn, "f64") or std.mem.eql(u8, tn, "f32");
+        .cast => |c| isFloatTypeName(typeExprName(c.ty)),
+        .call => blk: {
+            if (inferMetaFromExpr(ctx, e)) |m| break :blk isFloatTypeName(m.type_name);
+            break :blk false;
         },
         else => false,
     };
@@ -2088,9 +2109,29 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
         .call => |c| return try lowerCall(ctx, c),
         .cast => |c| {
             const v = try lowerExpr(ctx, c.expr);
+            const to_name = typeExprName(c.ty);
             const to = try metaForTypeExpr(ctx.a, c.ty, ctx.structs, ctx.ifaces);
+            const src_float = isFloatish(ctx, c.expr);
+            const dst_float = isFloatTypeName(to_name);
+            // Types.md: numeric `as` is a checked convert, not a bitcast.
+            if (src_float and !dst_float) {
+                const conv = try ctx.fresh();
+                try ctx.emit(.{ .op = .fptosi, .dst = conv, .src0 = v });
+                const bits = scalarBits(to_name);
+                if (bits > 0 and bits < 64) {
+                    const d = try ctx.fresh();
+                    try ctx.emit(.{ .op = .narrow, .dst = d, .src0 = conv, .aux = bits });
+                    return d;
+                }
+                return conv;
+            }
+            if (!src_float and dst_float) {
+                const d = try ctx.fresh();
+                try ctx.emit(.{ .op = .sitofp, .dst = d, .src0 = v });
+                return d;
+            }
             // narrow ints via `as` when target bits known
-            const bits = scalarBits(typeExprName(c.ty));
+            const bits = scalarBits(to_name);
             if (bits > 0 and bits < 64) {
                 const d = try ctx.fresh();
                 try ctx.emit(.{ .op = .narrow, .dst = d, .src0 = v, .aux = bits });
