@@ -16,6 +16,20 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
+    // JOG-97: tiny C ABI façade (one export) for Jog `@link` / future in-process tools.
+    // Zig tools (JogLSP, JogBuild) should prefer Zig modules over this; see docs note.
+    const abi_mod = b.createModule(.{
+        .root_source_file = b.path("src/capi/capi.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const abi_lib = b.addLibrary(.{
+        .name = "jogc_abi",
+        .linkage = .dynamic,
+        .root_module = abi_mod,
+    });
+    b.installArtifact(abi_lib);
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {

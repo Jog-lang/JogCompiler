@@ -1,0 +1,14 @@
+// JOG-97: Jog frontend calls one symbol from libjogc_abi.so (Zig C ABI).
+// Build: zig build && jog build examples/abi_smoke.jog -o out/abi_smoke --libdir zig-out/lib
+
+@link("jogc_abi")
+extern {
+    fn jogc_abi_version(): u32
+}
+
+fn main(): i64 {
+    if jogc_abi_version() != 1 {
+        panic("abi version mismatch")
+    }
+    return 0
+}
