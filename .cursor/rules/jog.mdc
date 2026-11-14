@@ -1,0 +1,20 @@
+---
+description: Jog language rules and where the Jog docs live
+globs: **/*.jog
+alwaysApply: false
+---
+
+- Jog is documented in JogDocs:
+  Fedora `~/Documents/Projects/Jog/JogDocs` (or `/home/plague_doc/Documents/Projects/Jog/JogDocs`);
+  Windows `D:/Projects/Jog/JogDocs`.
+  Read its `AGENTS.md`, then `guide/JogQuickRef.md`, before writing or reviewing Jog code.
+- Skills canon: JogDocs `.agents/skills/` (see JogDocs `guide/UsingJogDocs.md`). This repo keeps a pointer under `.agents/skills/README.md`.
+- Std signatures: `guide/StdReference.md`. Commands and flags: `guide/Toolchain.md`.
+- `design/language/*` is the specification; `bootstrap/Friction.md` records where the compiler
+  differs. When they disagree, code must follow what the compiler accepts, and the gap goes
+  into Friction.md.
+- Verify with `jog` (`$JOG` when set; Windows often `D:/Projects/Jog/JogCompiler/build/jog.exe`):
+  `jog check`, then `jog test`.
+- Ivan writes the Jog code in JogLSP, Jog-build, JogCompiler, and JogSDL demos by hand.
+  Do not implement features there unless asked; review, explain, and point at the spec.
+
