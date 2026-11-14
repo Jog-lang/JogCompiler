@@ -11,6 +11,7 @@ pub const TokenKind = enum {
     // keywords
     kw_fn,
     kw_struct,
+    kw_object,
     kw_interface,
     kw_type,
     kw_val,
@@ -357,6 +358,7 @@ fn keyword(text: []const u8) TokenKind {
     const map = .{
         .{ "fn", TokenKind.kw_fn },
         .{ "struct", TokenKind.kw_struct },
+        .{ "object", TokenKind.kw_object },
         .{ "interface", TokenKind.kw_interface },
         .{ "type", TokenKind.kw_type },
         .{ "val", TokenKind.kw_val },

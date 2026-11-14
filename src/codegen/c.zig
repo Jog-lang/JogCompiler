@@ -44,9 +44,17 @@ pub fn emit(allocator: std.mem.Allocator, program: *const ir.Program, writer: an
     }
     try writer.writeAll("\n");
 
-    // Globals
+    // Globals (scalar or object multi-slot)
     for (program.globals, 0..) |g, i| {
-        try writer.print("int64_t jog_global_{d} = {d}; /* {s} */\n", .{ i, g.init_bits, g.name });
+        if (g.nquads <= 1) {
+            try writer.print("int64_t jog_global_{d} = {d}; /* {s} */\n", .{ i, g.init_bits, g.name });
+        } else {
+            try writer.print("int64_t jog_global_{d}[{d}] = {{ {d}", .{ i, g.nquads, g.init_bits });
+            var qi: u32 = 1;
+            while (qi < g.nquads) : (qi += 1) try writer.writeAll(", 0");
+            try writer.print(" }}; /* object {s} */\n", .{g.name});
+        }
+        _ = g.is_object;
     }
     if (program.globals.len > 0) try writer.writeAll("\n");
 
@@ -182,6 +190,7 @@ fn emitInst(writer: anytype, prog: *const ir.Program, fname: []const u8, ninst: 
         },
         .gload => try writer.print("  s[{d}] = jog_global_{d};\n", .{ inst.dst, inst.aux }),
         .gstore => try writer.print("  jog_global_{d} = s[{d}];\n", .{ inst.aux, inst.src0 }),
+        .gaddr => try writer.print("  s[{d}] = (int64_t)(intptr_t)&jog_global_{d};\n", .{ inst.dst, inst.aux }),
         .add => try writer.print("  s[{d}] = s[{d}] + s[{d}];\n", .{ inst.dst, inst.src0, inst.src1 }),
         .sub => try writer.print("  s[{d}] = s[{d}] - s[{d}];\n", .{ inst.dst, inst.src0, inst.src1 }),
         .mul => try writer.print("  s[{d}] = s[{d}] * s[{d}];\n", .{ inst.dst, inst.src0, inst.src1 }),
