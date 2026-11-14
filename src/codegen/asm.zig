@@ -246,6 +246,16 @@ fn emitInst(writer: anytype, prog: *const ir.Program, fname: []const u8, ninst: 
             try writer.print("  {s} xmm0, qword ptr [rbp - {d}]\n", .{ mop, slot(inst.src1) });
             try writer.print("  movsd qword ptr [rbp - {d}], xmm0\n", .{slot(inst.dst)});
         },
+        .sitofp => {
+            // i64 → f64 (cvtsi2sd)
+            try writer.print("  cvtsi2sd xmm0, qword ptr [rbp - {d}]\n", .{slot(inst.src0)});
+            try writer.print("  movsd qword ptr [rbp - {d}], xmm0\n", .{slot(inst.dst)});
+        },
+        .fptosi => {
+            // f64 → i64 trunc toward zero (cvttsd2si). Range/NaN panic is a follow-up.
+            try writer.print("  cvttsd2si rax, qword ptr [rbp - {d}]\n", .{slot(inst.src0)});
+            try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{slot(inst.dst)});
+        },
         .and_op, .or_op => {
             // Lowered to short-circuit control flow in IR; should not reach asm.
             try writer.writeAll("  ud2\n");

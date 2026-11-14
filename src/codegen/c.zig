@@ -212,6 +212,20 @@ fn emitInst(writer: anytype, prog: *const ir.Program, fname: []const u8, ninst: 
             try writer.print("    memcpy(&s[{d}], &r, 8);\n", .{inst.dst});
             try writer.writeAll("  }\n");
         },
+        .sitofp => {
+            try writer.writeAll("  {\n");
+            try writer.writeAll("    double r;\n");
+            try writer.print("    r = (double)s[{d}];\n", .{inst.src0});
+            try writer.print("    memcpy(&s[{d}], &r, 8);\n", .{inst.dst});
+            try writer.writeAll("  }\n");
+        },
+        .fptosi => {
+            try writer.writeAll("  {\n");
+            try writer.writeAll("    double a;\n");
+            try writer.print("    memcpy(&a, &s[{d}], 8);\n", .{inst.src0});
+            try writer.print("    s[{d}] = (int64_t)a;\n", .{inst.dst});
+            try writer.writeAll("  }\n");
+        },
         .and_op, .or_op => try writer.writeAll("  /* short-circuit lowered in IR */ abort();\n"),
         .bit_and => try writer.print("  s[{d}] = s[{d}] & s[{d}];\n", .{ inst.dst, inst.src0, inst.src1 }),
         .bit_or => try writer.print("  s[{d}] = s[{d}] | s[{d}];\n", .{ inst.dst, inst.src0, inst.src1 }),
