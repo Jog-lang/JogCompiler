@@ -124,6 +124,10 @@ pub const Parser = struct {
                     }
                 }
                 return .{ .type_alias = try self.parseTypeAlias() };
+            } else if (std.mem.eql(u8, attr, "opaque")) {
+                // `@opaque struct Name` — parse as ordinary struct (layout later).
+                const sd = try self.parseStruct();
+                return .{ .struct_decl = sd };
             } else {
                 return error.UnexpectedToken;
             }
@@ -333,6 +337,16 @@ pub const Parser = struct {
         const col = self.tok.col;
         self.advance();
         const type_params = try self.parseTypeParamList();
+        // `@opaque struct FILE` — empty body, no braces.
+        if (self.tok.kind != .lbrace) {
+            return .{
+                .name = name,
+                .line = line,
+                .col = col,
+                .type_params = type_params,
+                .fields = &.{},
+            };
+        }
         try self.expect(.lbrace);
         var fields: std.ArrayListUnmanaged(ast.Field) = .{};
         while (self.tok.kind != .rbrace and self.tok.kind != .eof) {
@@ -351,6 +365,17 @@ pub const Parser = struct {
             .type_params = type_params,
             .fields = try fields.toOwnedSlice(self.allocator),
         };
+    }
+
+    /// `= expr` → `{ return expr }` for expression-bodied fn/method.
+    fn parseExprBodyAsBlock(self: *Parser) ParseError!*ast.Block {
+        try self.expect(.eq);
+        const expr = try self.parseExpr();
+        const stmts = try self.allocator.alloc(ast.Stmt, 1);
+        stmts[0] = .{ .return_stmt = expr };
+        const block = try self.allocator.create(ast.Block);
+        block.* = .{ .stmts = stmts };
+        return block;
     }
 
     fn parseInterface(self: *Parser) ParseError!ast.Decl {
@@ -428,6 +453,8 @@ pub const Parser = struct {
         var body: ?*ast.Block = null;
         if (self.tok.kind == .lbrace) {
             body = try self.parseBlock();
+        } else if (self.tok.kind == .eq) {
+            body = try self.parseExprBodyAsBlock();
         }
         return .{
             .name = name,
@@ -454,6 +481,8 @@ pub const Parser = struct {
         var body: ?*ast.Block = null;
         if (self.tok.kind == .lbrace) {
             body = try self.parseBlock();
+        } else if (self.tok.kind == .eq) {
+            body = try self.parseExprBodyAsBlock();
         }
         return .{
             .pointer_recv = pointer_recv,
@@ -1091,6 +1120,21 @@ pub const Parser = struct {
                 else => unreachable,
             };
             self.advance();
+            // Fold `-9223372036854775808` (magnitude does not fit in i64 alone).
+            if (op == .neg and self.tok.kind == .int) {
+                const text = self.tok.text;
+                const is_hex = text.len >= 2 and text[0] == '0' and (text[1] == 'x' or text[1] == 'X');
+                if (!is_hex) {
+                    if (std.fmt.parseInt(u64, text, 10)) |mag| {
+                        if (mag == 1 << 63) {
+                            self.advance();
+                            const e = try self.allocExpr();
+                            e.* = .{ .int = std.math.minInt(i64) };
+                            return e;
+                        }
+                    } else |_| {}
+                }
+            }
             const inner = try self.parseUnary();
             const e = try self.allocExpr();
             e.* = .{ .unary = .{ .op = op, .expr = inner } };

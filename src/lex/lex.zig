@@ -309,6 +309,20 @@ pub const Lexer = struct {
                 while (self.i < self.src.len and self.src[self.i] != '\n') self.advance();
                 continue;
             }
+            // Block / doc comments: /* … */ and /** … */
+            if (c == '/' and self.i + 1 < self.src.len and self.src[self.i + 1] == '*') {
+                self.advance(); // /
+                self.advance(); // *
+                while (self.i + 1 < self.src.len) {
+                    if (self.src[self.i] == '*' and self.src[self.i + 1] == '/') {
+                        self.advance();
+                        self.advance();
+                        break;
+                    }
+                    self.advance();
+                }
+                continue;
+            }
             break;
         }
     }

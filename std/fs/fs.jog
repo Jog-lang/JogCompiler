@@ -1,0 +1,213 @@
+// Package std.fs. read_all returns (bytes, error?). write_all and rename
+// return error?. A missing file, a missing parent of a write, or a missing
+// rename source is ErrNotFound. Any other read, write, or rename failure
+// is ErrIO. exists stays bool: false is missing, not UTF-8, or not a fit,
+// and that is not an error value. list names the directory and still
+// returns bool. The Windows file uses FindFirstFileW and the POSIX file
+// uses opendir. "." and ".." are dropped. The names are then sorted here,
+// by unsigned byte value, so the order does not follow the file system.
+// join copies one path. '/' and '\\' are both separators. An empty side
+// is a copy of the other. free_str releases one block from join or from
+// a listed name. free_names releases every name and the list buffer.
+//
+// The allocator is a with (a: mem.Allocator) context. It is not stored.
+// The path must be under 4096 bytes. That limit is the path length, not
+// the file size. Reads use a 4096-byte chunk. Out of memory in join and
+// list still panics. A resize error reported by the allocator while
+// reading is returned. The std heap panics instead of reporting one.
+
+import std.c
+import std.error as errors
+import std.io
+import std.list as lists
+import std.mem
+import std.text
+
+expect fn list(path: str): (lists.List<str>, bool) with (a: mem.Allocator)
+
+// ErrNotFound means from is missing. ErrIO means the path does not fit,
+// the target already exists, or the OS refused.
+expect fn rename(from: str, to: str): error?
+
+expect fn exists(path: str): bool
+expect fn cwd(): (str, bool) with (a: mem.Allocator)
+
+// Creates one directory. ErrIO when the path does not fit or the OS
+// refuses. Succeeds when the directory already exists.
+expect fn mkdir_one(path: str): error?
+
+// Removes a file or an empty directory. ErrNotFound when missing.
+expect fn remove(path: str): error?
+
+// Creates path and any missing parents (mkdir -p). ErrIO on failure.
+fn mkdir(path: str): error? {
+    if path.len == 0 {
+        return errors.ErrIO
+    }
+    var i: usize = 0
+    if path.len >= 2 && path.ptr[1] == ':' as u8 {
+        i = 2
+    }
+    for i < path.len && is_sep(path.ptr[i]) {
+        i = i + 1
+    }
+    var k = i
+    for k < path.len {
+        if is_sep(path.ptr[k]) && k > 0 {
+            val prefix = text.slice(path, 0, k)
+            if prefix.len > 0 {
+                val err = mkdir_one(prefix)
+                if err != null {
+                    return err
+                }
+            }
+        }
+        k = k + 1
+    }
+    return mkdir_one(path)
+}
+
+// The whole file, from io.read_all. ErrNotFound means the path is missing.
+// ErrIO means another read failed. The bytes come from the Allocator
+// context. The caller frees them. A null error with empty bytes is an
+// empty file.
+fn read_all(path: str): (bytes, error?) with (a: mem.Allocator) {
+    return io.read_all(path)
+}
+
+// Creates or replaces the file, through io.write_all. ErrNotFound means
+// a parent path is missing. ErrIO means another write failed.
+fn write_all(path: str, data: bytes): error? {
+    return io.write_all(path, data)
+}
+
+private fn is_sep(b: u8): bool {
+    return b == '/' as u8 || b == '\\' as u8
+}
+
+// Releases one block from join or from a name returned by list.
+// An empty str allocates nothing and frees nothing.
+fn free_str(text: str) with (a: mem.Allocator) {
+    if text.len == 0 {
+        return
+    }
+    var block = bytes()
+    block.ptr = text.ptr as *u8
+    block.len = text.len
+    a.free(block)
+}
+
+// Copies text. An empty str allocates nothing.
+fn copy_str(s: str): str with (a: mem.Allocator) {
+    return text.clone(s)
+}
+
+// A separator already at the end of left or the start of right is kept.
+// Otherwise one '/' is inserted. Windows accepts both characters.
+fn join(left: str, right: str): str with (a: mem.Allocator) {
+    if left.len == 0 {
+        return copy_str(right)
+    }
+    if right.len == 0 {
+        return copy_str(left)
+    }
+    var extra: usize = 1
+    if is_sep(left.ptr[left.len - 1]) || is_sep(right.ptr[0]) {
+        extra = 0
+    }
+    val total = left.len + extra + right.len
+    val (raw, err) = a.alloc(total, align(u8))
+    if err != null {
+        panic("out of memory")
+    }
+    c.memcpy(raw.ptr as *void, left.ptr as *const void, left.len)
+    var at = left.len
+    if extra == 1 {
+        raw.ptr[at] = '/' as u8
+        at = at + 1
+    }
+    c.memcpy((raw.ptr + at) as *void, right.ptr as *const void, right.len)
+    return raw
+}
+
+private fn cstr_len(p: *u8, cap: usize): usize {
+    var i: usize = 0
+    for i < cap {
+        if p[i] == 0 {
+            return i
+        }
+        i = i + 1
+    }
+    return cap
+}
+
+private fn is_dot(p: *u8, n: usize): bool {
+    if n == 1 && p[0] == '.' as u8 {
+        return true
+    }
+    if n == 2 && p[0] == '.' as u8 && p[1] == '.' as u8 {
+        return true
+    }
+    return false
+}
+
+// Copies one directory entry. "." and ".." are dropped.
+fn push_copied(names: *lists.List<str>, name_ptr: *u8, n: usize) with (a: mem.Allocator) {
+    if n == 0 || is_dot(name_ptr, n) {
+        return
+    }
+    val (raw, err) = a.alloc(n, align(u8))
+    if err != null {
+        panic("out of memory")
+    }
+    c.memcpy(raw.ptr as *void, name_ptr as *const void, n)
+    val text: str = raw
+    names.push(text)
+}
+
+// Shorter first when one name is a prefix of the other.
+private fn name_before(left: str, right: str): bool {
+    var n = left.len
+    if right.len < n {
+        n = right.len
+    }
+    var i: usize = 0
+    for i < n {
+        val lb = left.ptr[i]
+        val rb = right.ptr[i]
+        if lb < rb {
+            return true
+        }
+        if rb < lb {
+            return false
+        }
+        i = i + 1
+    }
+    return left.len < right.len
+}
+
+fn sort_names(names: *lists.List<str>) {
+    var i: usize = 1
+    for i < names.len {
+        val key = names.get(i)
+        var j = i
+        for j > 0 {
+            if !name_before(key, names.get(j - 1)) {
+                break
+            }
+            names.set(j, names.get(j - 1))
+            j = j - 1
+        }
+        names.set(j, key)
+        i = i + 1
+    }
+}
+
+fn free_names(names: *lists.List<str>) with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < names.len {
+        free_str(names.get(i))
+        i = i + 1
+    }
+    names.free()
+}

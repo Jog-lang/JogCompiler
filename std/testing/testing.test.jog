@@ -1,0 +1,22 @@
+// A panic inside expectPanic is success. finish exits 1 when a check
+// recorded a failure, including an expectPanic whose body returned.
+// This file prints nothing, so it can run ahead of other packages' tests.
+// testing() is called directly: as the root module this package's path
+// is not std.testing, so a Testing context is not supplied.
+
+@test
+fn catches() {
+    var n = 1
+    testing().expectPanic(() -> { panic("boom") })
+    testing().expectPanic() { panic("again") }
+    testing().expectPanic(() -> { if n == 1 { panic("n") } })
+    testing().expectPanic(() -> {
+        testing().expectPanic(() -> { panic("inner") })
+        panic("outer")
+    })
+}
+
+@test
+fn report() {
+    finish()
+}

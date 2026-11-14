@@ -1,0 +1,17 @@
+// SDL-facing std.math / libm smoke (import + check + build).
+import std.math
+
+fn main() {
+    val c = cos(0.0)
+    val s = sin(0.0)
+    val f = floor(1.5)
+    if (c == 1.0) {
+        if (s == 0.0) {
+            if (f == 1.0) {
+                print("std.math smoke ok\n")
+                return
+            }
+        }
+    }
+    panic("std.math smoke fail\n")
+}

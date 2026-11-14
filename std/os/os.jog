@@ -1,0 +1,39 @@
+// Package std.os. argc is jogrt_argc. argv views one argument through
+// jogrt_arg_ptr, the const int8_t * form of the bytes jogrt_argv
+// returns. The runtime owns that pointer. Do not free it. A process
+// argument has no interior NUL, so the length is strlen. An index
+// outside 0..argc is a programmer error.
+//
+// env reads one variable. POSIX uses getenv. Windows uses
+// GetEnvironmentVariableW, so a value outside the ANSI code page is
+// intact. Do not free the result, and do not keep it across another
+// env call: the next call may reuse the buffer. A missing name, an
+// empty name, or a name that does not fit is ("", false), not a panic.
+
+import std.c
+
+expect fn env(name: str): (str, bool)
+
+fn argc(): i64 {
+    return c.jogrt_argc() as i64
+}
+
+fn c_view(p: *u8, n: usize): str {
+    var view = bytes()
+    view.ptr = p
+    view.len = n
+    return view
+}
+
+// i is the zero-based index. argv(0) is the program path the host passed.
+fn argv(i: i64): str {
+    val n = c.jogrt_argc() as i64
+    if i < 0 || i >= n {
+        panic("argument index out of range")
+    }
+    val p = c.jogrt_arg_ptr(i as c.int)
+    if p == null {
+        panic("argument index out of range")
+    }
+    return c_view(p!! as *u8, c.strlen(p!!))
+}

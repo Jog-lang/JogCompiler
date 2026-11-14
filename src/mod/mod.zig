@@ -193,8 +193,8 @@ pub fn parse(parent: std.mem.Allocator, text: []const u8, dir: []const u8) Error
                 .spec = try a.dupe(u8, rspec),
                 .test_only = test_only,
             });
-        } else if (std.mem.eql(u8, key, "export") or std.mem.eql(u8, key, "kind") or std.mem.eql(u8, key, "jog")) {
-            // Recognized v1 directives ignored on v2 for now.
+        } else if (std.mem.eql(u8, key, "export") or std.mem.eql(u8, key, "kind") or std.mem.eql(u8, key, "jog") or std.mem.eql(u8, key, "targets")) {
+            // Recognized v1 / std directives ignored on v2 for now (`targets` selects platform files).
             continue;
         } else {
             return error.UnknownDirective;
@@ -202,7 +202,8 @@ pub fn parse(parent: std.mem.Allocator, text: []const u8, dir: []const u8) Error
     }
 
     const mod_name = name orelse return error.MissingModule;
-    const mod_root = root orelse return error.MissingRoot;
+    // Std packages often ship only `module name` — default root to `{name}.jog`.
+    const mod_root = root orelse try std.fmt.allocPrint(a, "{s}.jog", .{mod_name});
     const mod_version = version orelse try a.dupe(u8, "0.0.0");
 
     var sources: std.ArrayListUnmanaged([]const u8) = .{};

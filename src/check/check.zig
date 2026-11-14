@@ -111,11 +111,14 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
     var fns = std.StringHashMapUnmanaged(*ast.FnDecl){};
     var methods = std.StringHashMapUnmanaged(*ast.MethodDecl){};
 
-    // builtins
+    // Transitional substrate builtins (Spec: load from core/scalar.jog). Keep thin —
+    // library APIs belong in std/; see JogDocs Friction 2026-11-14 std/core port.
     try defineBuiltin(a, &types, "byte", .{ .kind = .byte_ty, .name = "byte", .bits = 8, .unsigned = true });
     try defineBuiltin(a, &types, "u8", .{ .kind = .byte_ty, .name = "u8", .bits = 8, .unsigned = true });
+    try defineBuiltin(a, &types, "i8", .{ .kind = .byte_ty, .name = "i8", .bits = 8, .unsigned = false });
     try defineBuiltin(a, &types, "bool", .{ .kind = .bool_ty, .name = "bool", .bits = 1, .unsigned = true });
     try defineBuiltin(a, &types, "u16", .{ .kind = .u16_ty, .name = "u16", .bits = 16, .unsigned = true });
+    try defineBuiltin(a, &types, "i16", .{ .kind = .u16_ty, .name = "i16", .bits = 16, .unsigned = false });
     try defineBuiltin(a, &types, "u32", .{ .kind = .u32_ty, .name = "u32", .bits = 32, .unsigned = true });
     try defineBuiltin(a, &types, "u64", .{ .kind = .u64_ty, .name = "u64", .bits = 64, .unsigned = true });
     try defineBuiltin(a, &types, "i32", .{ .kind = .i32_ty, .name = "i32", .bits = 32, .unsigned = false });
@@ -124,6 +127,7 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
     try defineBuiltin(a, &types, "f64", .{ .kind = .f64_ty, .name = "f64", .bits = 64, .unsigned = false });
     try defineBuiltin(a, &types, "error", .{ .kind = .i64_ty, .name = "error", .bits = 64, .unsigned = false });
     try defineBuiltin(a, &types, "usize", .{ .kind = .usize_ty, .name = "usize", .bits = 64, .unsigned = true });
+    try defineBuiltin(a, &types, "isize", .{ .kind = .i64_ty, .name = "isize", .bits = 64, .unsigned = false });
     try defineBuiltin(a, &types, "str", .{ .kind = .string_ty, .name = "str" });
     try defineBuiltin(a, &types, "bytes", .{ .kind = .bytes_ty, .name = "bytes" });
     try defineBuiltin(a, &types, "void", .{ .kind = .void_ty, .name = "void" });

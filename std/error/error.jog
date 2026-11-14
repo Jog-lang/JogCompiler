@@ -1,0 +1,55 @@
+// Package std.error. ErrNotFound, ErrIO, and ErrOutOfMemory are sentinel
+// globals. Each is the address of a package-level struct that implements
+// the language error interface with message(): str. Nothing is allocated.
+// Callers compare by identity: err == ErrNotFound. null is success.
+// The tag field is storage so the global has an address. It is not a code
+// and it is not part of the comparison.
+//
+// Bounds checks, pop on an empty list, a text slice out of range, an
+// invalid code point, and alloc or new out of memory still panic. Those
+// are not these sentinels. mem.alloc and new do not return ErrOutOfMemory.
+
+// Missing file or path.
+struct NotFound {
+    tag: u8
+}
+
+// Read, write, rename, or process failure that is not a missing path
+// and not a failed spawn allocation.
+struct Io {
+    tag: u8
+}
+
+// A spawn that could not allocate. The std heap still panics.
+struct OutOfMemory {
+    tag: u8
+}
+
+// Text of ErrNotFound. The method allocates nothing.
+fn NotFound.message(): str {
+    return "not found"
+}
+
+// Text of ErrIO. The method allocates nothing.
+fn Io.message(): str {
+    return "io error"
+}
+
+// Text of ErrOutOfMemory. The method allocates nothing.
+fn OutOfMemory.message(): str {
+    return "out of memory"
+}
+
+var not_found: NotFound
+var io_error: Io
+var out_of_memory: OutOfMemory
+
+// Missing file or path. Identity compare: err == ErrNotFound.
+val ErrNotFound = &not_found
+
+// A failed read, write, rename, or process start that is not ErrNotFound
+// and not ErrOutOfMemory.
+val ErrIO = &io_error
+
+// Spawn allocation failed. mem.alloc and new still panic.
+val ErrOutOfMemory = &out_of_memory

@@ -39,6 +39,10 @@ pub fn main() !void {
         try driver.usage(stdout);
         return;
     }
+    if (std.mem.eql(u8, cmd, "roots")) {
+        try driver.cmdRoots(allocator, stdout);
+        return;
+    }
     if (std.mem.eql(u8, cmd, "parse")) {
         var path: ?[]const u8 = null;
         var modules: std.ArrayListUnmanaged(driver.ModuleMapping) = .{};
