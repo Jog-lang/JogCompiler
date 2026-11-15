@@ -18,7 +18,7 @@
 #   0x60 flags (bit0=alive, bit1=parked)  0x68 stack_base
 #   0x70 current Dispatcher pool id
 #
-# TLS (FS base → jogrt_tls[wid], 32 bytes):
+# TLS (GS base → jogrt_tls[wid], 32 bytes; GS so glibc FS TLS stays intact):
 #   0x00 wid  0x08 current (0=home/sched)  0x10 home_ctx*  0x18 yield_requeue
 # yield always hops to home first; home requeues after the rsp save (no dual-run race).
 #
@@ -72,7 +72,7 @@
 .set SYS_SCHED_YIELD, 24
 .set SYS_GETTID, 186
 .set SYS_ARCH_PRCTL, 158
-.set ARCH_SET_FS, 0x1002
+.set ARCH_SET_GS, 0x1001
 
 .set FUTEX_WAIT, 0
 .set FUTEX_WAKE, 1
@@ -228,7 +228,7 @@ jogrt_coro_entry_stub:
 
 .type jogrt_coro_trampoline, @function
 jogrt_coro_trampoline:
-  mov rax, qword ptr fs:[TLS_OFF_CUR]
+  mov rax, qword ptr gs:[TLS_OFF_CUR]
   imul rax, rax, JOGRT_CORO_SLOT
   lea rcx, [rip + jogrt_coro_slots]
   add rcx, rax
@@ -240,7 +240,7 @@ jogrt_coro_trampoline:
   # jogrt_yield (that re-reads flags and can requeue a reused slot).
   lea rdi, [rip + jogrt_slots_lock]
   call jogrt_lock
-  mov rsi, qword ptr fs:[TLS_OFF_CUR]
+  mov rsi, qword ptr gs:[TLS_OFF_CUR]
   mov rax, rsi
   imul rax, rax, JOGRT_CORO_SLOT
   lea rcx, [rip + jogrt_coro_slots]
@@ -248,7 +248,7 @@ jogrt_coro_trampoline:
   mov qword ptr [rcx + CORO_OFF_FLAGS], CORO_EXITING
   lea rdi, [rip + jogrt_slots_lock]
   call jogrt_unlock
-  mov qword ptr fs:[TLS_OFF_YRQ], rsi
+  mov qword ptr gs:[TLS_OFF_YRQ], rsi
   mfence
   jmp jogrt_switch_to_home
 .Lcoro_tramp_dead:
@@ -274,9 +274,9 @@ jogrt_tls_install:
   lea rdx, [rip + jogrt_home_ctx]
   add rdx, rax
   mov qword ptr [rcx + TLS_OFF_HOME], rdx
-  # arch_prctl(ARCH_SET_FS, tls)
+  # arch_prctl(ARCH_SET_GS, tls) — not FS (libc)
   mov eax, SYS_ARCH_PRCTL
-  mov edi, ARCH_SET_FS
+  mov edi, ARCH_SET_GS
   mov rsi, rcx
   syscall
   pop rbx
@@ -325,8 +325,8 @@ jogrt_coro_init:
   # For worker 0, use slot 0 as home so main's OS stack is saved into the main CCB
   # when switching away — match gate-1 mental model.
   lea rax, [rip + jogrt_coro_slots]
-  mov qword ptr fs:[TLS_OFF_HOME], rax
-  mov qword ptr fs:[TLS_OFF_CUR], 0
+  mov qword ptr gs:[TLS_OFF_HOME], rax
+  mov qword ptr gs:[TLS_OFF_CUR], 0
   mov qword ptr [rip + jogrt_coro_ready], 1
   pop rbx
 .Lcoro_init_done:
@@ -396,7 +396,7 @@ jogrt_pool_enqueue:
   test r13, r13
   jz .Lpenq_bad
   # Local owner push when current wid belongs to this pool.
-  mov rcx, qword ptr fs:[TLS_OFF_WID]
+  mov rcx, qword ptr gs:[TLS_OFF_WID]
   lea rax, [rip + jogrt_pool_base]
   mov rdx, qword ptr [rax + rbx * 8]       # base
   cmp rcx, rdx
@@ -434,7 +434,7 @@ jogrt_pool_enqueue:
 # → rax = current Dispatcher id (ambient if home/main)
 .type jogrt_current_disp, @function
 jogrt_current_disp:
-  mov rax, qword ptr fs:[TLS_OFF_CUR]
+  mov rax, qword ptr gs:[TLS_OFF_CUR]
   test rax, rax
   jz .Lcurdisp_amb
   imul rax, rax, JOGRT_CORO_SLOT
@@ -802,7 +802,7 @@ jogrt_dispatcher_enter:
   lea rax, [rip + jogrt_pool_nw]
   cmp qword ptr [rax + rbx * 8], 0
   je .Ldisp_enter_bad
-  mov r12, qword ptr fs:[TLS_OFF_CUR]
+  mov r12, qword ptr gs:[TLS_OFF_CUR]
   test r12, r12
   jnz .Ldisp_enter_coro
   # main/home: ambient only (OS stack of worker 0 is not migratable)
@@ -848,7 +848,7 @@ jogrt_dispatcher_enter:
   cmp rax, rbx
   je .Ldisp_enter_same
   # migrate: publish YRQ then switch home (requeue onto new pool)
-  mov qword ptr fs:[TLS_OFF_YRQ], r12
+  mov qword ptr gs:[TLS_OFF_YRQ], r12
   mfence
   pop r13
   pop r12
@@ -877,7 +877,7 @@ jogrt_dispatcher_leave:
   push r12
   push r13
   call jogrt_coro_init
-  mov r12, qword ptr fs:[TLS_OFF_CUR]
+  mov r12, qword ptr gs:[TLS_OFF_CUR]
   test r12, r12
   jnz .Ldisp_leave_coro
   mov rax, qword ptr [rip + jogrt_disp_depth]
@@ -913,7 +913,7 @@ jogrt_dispatcher_leave:
   mov qword ptr [rcx + CORO_OFF_DISP], rbx
   cmp rax, rbx
   je .Ldisp_leave_same
-  mov qword ptr fs:[TLS_OFF_YRQ], r12
+  mov qword ptr gs:[TLS_OFF_YRQ], r12
   mfence
   pop r13
   pop r12
@@ -1254,7 +1254,7 @@ jogrt_take_work:
   push r14
   push r15
   push rbp
-  mov rbx, qword ptr fs:[TLS_OFF_WID]
+  mov rbx, qword ptr gs:[TLS_OFF_WID]
   mov rdi, rbx
   call jogrt_wq_pop
   cmp rax, -1
@@ -1340,7 +1340,7 @@ jogrt_wake_one:
 
 .type jogrt_park_self, @function
 jogrt_park_self:
-  mov rcx, qword ptr fs:[TLS_OFF_WID]
+  mov rcx, qword ptr gs:[TLS_OFF_WID]
   lea rdx, [rip + jogrt_wq_park]
   mov dword ptr [rdx + rcx * 8], 1
   mfence
@@ -1357,7 +1357,7 @@ jogrt_park_self:
   mov edx, 1
   xor r10d, r10d
   syscall
-  mov rcx, qword ptr fs:[TLS_OFF_WID]
+  mov rcx, qword ptr gs:[TLS_OFF_WID]
   lea rdx, [rip + jogrt_wq_park]
   mov dword ptr [rdx + rcx * 8], 0
   mov rax, -1
@@ -1365,7 +1365,7 @@ jogrt_park_self:
 .Lpark_got:
   # undo park flag; return work in rax
   push rax
-  mov rcx, qword ptr fs:[TLS_OFF_WID]
+  mov rcx, qword ptr gs:[TLS_OFF_WID]
   lea rdx, [rip + jogrt_wq_park]
   mov dword ptr [rdx + rcx * 8], 0
   pop rax
@@ -1377,10 +1377,10 @@ jogrt_park_self:
 .type jogrt_save_ctx_ptr, @function
 # → rax = ctx* for currently running (home or slot)
 jogrt_save_ctx_ptr:
-  mov rax, qword ptr fs:[TLS_OFF_CUR]
+  mov rax, qword ptr gs:[TLS_OFF_CUR]
   test rax, rax
   jnz .Lsave_slot
-  mov rax, qword ptr fs:[TLS_OFF_HOME]
+  mov rax, qword ptr gs:[TLS_OFF_HOME]
   ret
 .Lsave_slot:
   imul rax, rax, JOGRT_CORO_SLOT
@@ -1411,7 +1411,7 @@ jogrt_switch_to_coro:
   call jogrt_unlock
   call jogrt_save_ctx_ptr
   mov r8, rax                            # save ctx
-  mov qword ptr fs:[TLS_OFF_CUR], rbx
+  mov qword ptr gs:[TLS_OFF_CUR], rbx
   imul rbx, rbx, JOGRT_CORO_SLOT
   lea rax, [rip + jogrt_coro_slots]
   add rax, rbx
@@ -1430,8 +1430,8 @@ jogrt_switch_to_coro:
 jogrt_switch_to_home:
   call jogrt_save_ctx_ptr
   mov rdi, rax
-  mov qword ptr fs:[TLS_OFF_CUR], 0
-  mov rsi, qword ptr fs:[TLS_OFF_HOME]
+  mov qword ptr gs:[TLS_OFF_CUR], 0
+  mov rsi, qword ptr gs:[TLS_OFF_HOME]
   cmp rdi, rsi
   je .Lsw_home_same
   jmp jogrt_coro_switch
@@ -1444,10 +1444,10 @@ jogrt_switch_to_home:
 # After a coro switches home, push tls.yield_requeue if set (coro already saved).
 .type jogrt_handle_requeue, @function
 jogrt_handle_requeue:
-  mov rsi, qword ptr fs:[TLS_OFF_YRQ]
+  mov rsi, qword ptr gs:[TLS_OFF_YRQ]
   test rsi, rsi
   jz .Lhrq_done
-  mov qword ptr fs:[TLS_OFF_YRQ], 0
+  mov qword ptr gs:[TLS_OFF_YRQ], 0
   # rsp already saved on home. Under lock: retire EXITING, or clear RUNNING
   # then push (never push while RUNNING / EXITING).
   push rsi
@@ -1662,13 +1662,13 @@ jogrt_go:
 .type jogrt_yield, @function
 jogrt_yield:
   call jogrt_coro_init
-  mov rax, qword ptr fs:[TLS_OFF_CUR]
+  mov rax, qword ptr gs:[TLS_OFF_CUR]
   # already home: try to run someone else, else no-op
   test rax, rax
   jz .Lyield_from_home
   # Decide requeue under slots_lock so flags cannot race with finish/reuse.
   mov rsi, rax
-  mov qword ptr fs:[TLS_OFF_YRQ], 0
+  mov qword ptr gs:[TLS_OFF_YRQ], 0
   push rsi
   lea rdi, [rip + jogrt_slots_lock]
   call jogrt_lock
@@ -1683,7 +1683,7 @@ jogrt_yield:
   test rax, CORO_PARKED
   jnz .Lyield_clear_run
   # Publish YRQ before rsp save/swap — RUNNING stays until home requeues.
-  mov qword ptr fs:[TLS_OFF_YRQ], rsi
+  mov qword ptr gs:[TLS_OFF_YRQ], rsi
   lea rdi, [rip + jogrt_slots_lock]
   call jogrt_unlock
   mfence
@@ -1709,7 +1709,7 @@ jogrt_yield:
 .type jogrt_coro_park, @function
 jogrt_coro_park:
   call jogrt_coro_init
-  mov rax, qword ptr fs:[TLS_OFF_CUR]
+  mov rax, qword ptr gs:[TLS_OFF_CUR]
   test rax, rax
   jz .Lpark_ret
   imul rax, rax, JOGRT_CORO_SLOT
@@ -1791,14 +1791,14 @@ jogrt_coro_alive:
 .type jogrt_coro_id, @function
 jogrt_coro_id:
   call jogrt_coro_init
-  mov rax, qword ptr fs:[TLS_OFF_CUR]
+  mov rax, qword ptr gs:[TLS_OFF_CUR]
   ret
 
 .globl jogrt_worker_id
 .type jogrt_worker_id, @function
 jogrt_worker_id:
   call jogrt_coro_init
-  mov rax, qword ptr fs:[TLS_OFF_WID]
+  mov rax, qword ptr gs:[TLS_OFF_WID]
   ret
 
 .globl jogrt_gettid
@@ -1820,8 +1820,8 @@ jogrt_print_tid:
   mov eax, SYS_GETTID
   syscall
   mov r12, rax
-  mov r13, qword ptr fs:[TLS_OFF_WID]
-  mov r14, qword ptr fs:[TLS_OFF_CUR]
+  mov r13, qword ptr gs:[TLS_OFF_WID]
+  mov r14, qword ptr gs:[TLS_OFF_CUR]
   lea rdi, [rip + jogrt_print_lock]
   call jogrt_lock
   lea rbx, [rip + jogrt_tid_buf]
@@ -1976,7 +1976,7 @@ jogrt_coro_drain:
   test eax, eax
   jz .Ldrain_work
   # alive<=1 and queues empty — also wait until no yield_requeue
-  cmp qword ptr fs:[TLS_OFF_YRQ], 0
+  cmp qword ptr gs:[TLS_OFF_YRQ], 0
   je .Ldrain_done
 .Ldrain_work:
   call jogrt_take_work
@@ -2005,7 +2005,7 @@ jogrt_coro_drain:
   call jogrt_queues_empty
   test eax, eax
   jz .Ldrain_work
-  cmp qword ptr fs:[TLS_OFF_YRQ], 0
+  cmp qword ptr gs:[TLS_OFF_YRQ], 0
   jne .Ldrain_work
 .Ldrain_done:
   call jogrt_wake_one

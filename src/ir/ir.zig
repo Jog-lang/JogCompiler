@@ -107,6 +107,8 @@ pub const Global = struct {
     nquads: u32 = 1,
     /// `object Name` singleton — loads of the bare name use `gaddr`.
     is_object: bool = false,
+    /// Package `var x: *byte` (or `*u8`) — index with stride 1 / upward addr like locals.
+    is_raw_byte_ptr: bool = false,
 };
 
 pub const Program = struct {
@@ -379,6 +381,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
             .global_decl => |gd| {
                 var bits: i64 = 0;
                 var is_float = false;
+                var is_raw_byte_ptr = false;
                 if (gd.init) |init| {
                     if (literalConstBits(init)) |cv| {
                         bits = cv.bits;
@@ -392,6 +395,12 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                 }
                 if (gd.ty) |te| {
                     if (isFloatTypeExpr(te)) is_float = true;
+                    // Preserve `*byte` / `*u8` so `pkg[i]` uses stride-1 upward addressing
+                    // (locals already get this via ctx.meta; package vars need Global flags).
+                    const sm = try metaForTypeExpr(a, te, &structs, &ifaces);
+                    if (sm.kind == .raw_ptr and (std.mem.eql(u8, sm.type_name, "byte") or std.mem.eql(u8, sm.type_name, "u8"))) {
+                        is_raw_byte_ptr = true;
+                    }
                 }
                 if (!gd.mutable) {
                     // Compile-time constant: fold at use sites (no storage).
@@ -404,6 +413,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                         .mutable = true,
                         .init_bits = bits,
                         .is_float = is_float,
+                        .is_raw_byte_ptr = is_raw_byte_ptr,
                     });
                     try global_map.put(a, gd.name, idx);
                 }
@@ -1519,8 +1529,12 @@ fn inferMetaFromExpr(ctx: *Ctx, e: *ast.Expr) ?SlotMeta {
                 return .{ .kind = .scalar, .type_name = "i64" };
             }
             if (ctx.global_map.get(n)) |gi| {
-                if (gi < ctx.globals.len and ctx.globals[gi].is_float)
-                    return .{ .kind = .scalar, .type_name = "f64" };
+                if (gi < ctx.globals.len) {
+                    if (ctx.globals[gi].is_raw_byte_ptr)
+                        return .{ .kind = .raw_ptr, .type_name = "byte", .elem_size = 1 };
+                    if (ctx.globals[gi].is_float)
+                        return .{ .kind = .scalar, .type_name = "f64" };
+                }
             }
             if (ctx.object_map.contains(n)) return .{ .kind = .struct_ptr, .type_name = n };
             return null;
@@ -1615,26 +1629,35 @@ fn inferTypeNameFromExpr(ctx: *Ctx, e: *ast.Expr) ?[]const u8 {
     return null;
 }
 
+fn indexBaseMeta(ctx: *Ctx, base_expr: *ast.Expr) ?SlotMeta {
+    if (base_expr.* != .ident) return null;
+    const name = base_expr.ident;
+    if (ctx.meta.get(name)) |m| return m;
+    // Package `var x: *byte` — type lives on Global, not local ctx.meta.
+    if (ctx.global_map.get(name)) |gi| {
+        if (gi < ctx.globals.len and ctx.globals[gi].is_raw_byte_ptr) {
+            return .{ .kind = .raw_ptr, .type_name = "byte", .elem_size = 1 };
+        }
+    }
+    return null;
+}
+
 fn indexLoadStoreWidth(ctx: *Ctx, base_expr: *ast.Expr) u32 {
     // 1 = byte load/store; 8 = qword.
-    if (base_expr.* == .ident) {
-        if (ctx.meta.get(base_expr.ident)) |m| {
-            if (std.mem.eql(u8, m.type_name, "byte") or std.mem.eql(u8, m.type_name, "u8") or std.mem.eql(u8, m.type_name, "bool"))
-                return 1;
-        }
+    if (indexBaseMeta(ctx, base_expr)) |m| {
+        if (std.mem.eql(u8, m.type_name, "byte") or std.mem.eql(u8, m.type_name, "u8") or std.mem.eql(u8, m.type_name, "bool"))
+            return 1;
     }
     return 8;
 }
 
 fn indexStride(ctx: *Ctx, base_expr: *ast.Expr) u32 {
     // Dense packed byte arrays / raw byte pointers use stride 1.
-    if (base_expr.* == .ident) {
-        if (ctx.meta.get(base_expr.ident)) |m| {
-            if (m.kind == .raw_ptr and (std.mem.eql(u8, m.type_name, "byte") or std.mem.eql(u8, m.type_name, "u8")))
-                return 1;
-            if (m.kind == .array_ptr and m.elem_size == 1)
-                return 1;
-        }
+    if (indexBaseMeta(ctx, base_expr)) |m| {
+        if (m.kind == .raw_ptr and (std.mem.eql(u8, m.type_name, "byte") or std.mem.eql(u8, m.type_name, "u8")))
+            return 1;
+        if (m.kind == .array_ptr and m.elem_size == 1)
+            return 1;
     }
     return 8;
 }
@@ -1645,11 +1668,9 @@ fn lowerIndexAddr(ctx: *Ctx, base_expr: *ast.Expr, index_expr: *ast.Expr) LowerE
     const idx = try lowerExpr(ctx, index_expr);
     const stride = indexStride(ctx, base_expr);
     const upward = blk: {
-        if (base_expr.* == .ident) {
-            if (ctx.meta.get(base_expr.ident)) |m| {
-                if (m.kind == .raw_ptr) break :blk true;
-                if (m.kind == .array_ptr and m.elem_size == 1) break :blk true;
-            }
+        if (indexBaseMeta(ctx, base_expr)) |m| {
+            if (m.kind == .raw_ptr) break :blk true;
+            if (m.kind == .array_ptr and m.elem_size == 1) break :blk true;
         }
         break :blk false;
     };
