@@ -1,0 +1,3 @@
+fn greet(): i32 {
+    return puts("hi")
+}

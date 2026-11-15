@@ -101,8 +101,118 @@ fn jsonEscapeAlloc(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
 
 fn pathEq(a: []const u8, b: []const u8) bool {
     if (std.mem.eql(u8, a, b)) return true;
-    // Basename fallback when relative vs absolute.
-    return std.mem.eql(u8, std.fs.path.basename(a), std.fs.path.basename(b));
+    // Relative vs absolute / realpath — never bare basename (JogSDL sdl/ vs sdl3/).
+    if (pathSuffixMatch(a, b) or pathSuffixMatch(b, a)) return true;
+    var buf_a: [std.fs.max_path_bytes]u8 = undefined;
+    var buf_b: [std.fs.max_path_bytes]u8 = undefined;
+    const ra = std.fs.cwd().realpath(a, &buf_a) catch return false;
+    const rb = std.fs.cwd().realpath(b, &buf_b) catch return false;
+    return std.mem.eql(u8, ra, rb);
+}
+
+fn pathSuffixMatch(longer: []const u8, shorter: []const u8) bool {
+    if (shorter.len == 0 or longer.len <= shorter.len) return false;
+    if (!std.mem.endsWith(u8, longer, shorter)) return false;
+    const before = longer[longer.len - shorter.len - 1];
+    return before == '/' or before == '\\';
+}
+
+/// Collect leading doc comments immediately above 1-based `line` in `src`.
+/// Supports contiguous `///` / `//` lines and a single `/** … */` (or `/* … */`) block.
+fn leadingDocs(allocator: std.mem.Allocator, src: []const u8, line: u32) ![]u8 {
+    if (line <= 1) return try allocator.dupe(u8, "");
+    var lines: std.ArrayListUnmanaged([]const u8) = .{};
+    defer lines.deinit(allocator);
+    var start: usize = 0;
+    var ln: u32 = 1;
+    while (start <= src.len and ln < line) : (ln += 1) {
+        const nl = std.mem.indexOfScalarPos(u8, src, start, '\n') orelse src.len;
+        try lines.append(allocator, src[start..nl]);
+        start = if (nl < src.len) nl + 1 else src.len + 1;
+    }
+    // lines[i] is 1-based line i+1; walk upward from line-1.
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    errdefer out.deinit(allocator);
+
+    var i: isize = @as(isize, @intCast(lines.items.len)) - 1;
+    // Skip blank lines immediately above the decl.
+    while (i >= 0) : (i -= 1) {
+        const t = std.mem.trim(u8, lines.items[@intCast(i)], " \t\r");
+        if (t.len == 0) continue;
+        break;
+    }
+    if (i < 0) return try allocator.dupe(u8, "");
+
+    const last = std.mem.trim(u8, lines.items[@intCast(i)], " \t\r");
+    // Block comment ending on this line: `*/` (possibly alone or after text).
+    if (std.mem.endsWith(u8, last, "*/")) {
+        var block: std.ArrayListUnmanaged([]const u8) = .{};
+        defer block.deinit(allocator);
+        var j = i;
+        while (j >= 0) : (j -= 1) {
+            const raw = lines.items[@intCast(j)];
+            try block.append(allocator, raw);
+            const t = std.mem.trim(u8, raw, " \t\r");
+            if (std.mem.indexOf(u8, t, "/*") != null) break;
+            if (j == 0) break;
+        }
+        // block is bottom→top; reverse for output.
+        var k: usize = block.items.len;
+        while (k > 0) {
+            k -= 1;
+            const cleaned = trimBlockCommentLine(block.items[k]);
+            if (cleaned.len == 0 and out.items.len == 0) continue;
+            if (out.items.len > 0) try out.append(allocator, '\n');
+            try out.appendSlice(allocator, cleaned);
+        }
+        return try out.toOwnedSlice(allocator);
+    }
+
+    // Contiguous // or /// lines.
+    var collected: std.ArrayListUnmanaged([]const u8) = .{};
+    defer collected.deinit(allocator);
+    var j = i;
+    while (j >= 0) : (j -= 1) {
+        const t = std.mem.trim(u8, lines.items[@intCast(j)], " \t\r");
+        if (std.mem.startsWith(u8, t, "//")) {
+            try collected.append(allocator, t);
+            continue;
+        }
+        if (t.len == 0) break; // blank ends the block once comments started
+        break; // attribute / other code
+    }
+    var k: usize = collected.items.len;
+    while (k > 0) {
+        k -= 1;
+        var body = collected.items[k];
+        if (std.mem.startsWith(u8, body, "///")) {
+            body = body[3..];
+        } else if (std.mem.startsWith(u8, body, "//")) {
+            body = body[2..];
+        }
+        if (body.len > 0 and body[0] == ' ') body = body[1..];
+        if (out.items.len > 0) try out.append(allocator, '\n');
+        try out.appendSlice(allocator, body);
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn trimBlockCommentLine(raw: []const u8) []const u8 {
+    var t = std.mem.trim(u8, raw, " \t\r");
+    if (std.mem.startsWith(u8, t, "/**")) {
+        t = t[3..];
+    } else if (std.mem.startsWith(u8, t, "/*")) {
+        t = t[2..];
+    }
+    if (std.mem.endsWith(u8, t, "*/")) {
+        t = t[0 .. t.len - 2];
+    }
+    t = std.mem.trim(u8, t, " \t");
+    if (t.len > 0 and t[0] == '*') {
+        t = t[1..];
+        if (t.len > 0 and t[0] == ' ') t = t[1..];
+    }
+    return t;
 }
 
 fn findFileIndex(unit: *const driver.Unit, query_path: []const u8) ?usize {
@@ -826,8 +936,23 @@ fn emitHover(allocator: std.mem.Allocator, unit: *const driver.Unit, query_path:
     const contents = if (sym.detail.len > 0) sym.detail else kindStr(sym.kind);
     const esc = try jsonEscapeAlloc(allocator, contents);
     defer allocator.free(esc);
+    // Docs from the declaration's own source (may differ from the query file).
+    var docs_owned: ?[]u8 = null;
+    defer if (docs_owned) |d| allocator.free(d);
+    const decl_fi = findFileIndex(unit, loc.file) orelse fi;
+    const docs = blk: {
+        const scraped = try leadingDocs(allocator, fileSrc(unit, decl_fi), loc.line);
+        docs_owned = scraped;
+        break :blk scraped;
+    };
     try writer.writeAll("{\"ok\":true,\"contents\":");
     try writer.writeAll(esc);
+    if (docs.len > 0) {
+        const docs_esc = try jsonEscapeAlloc(allocator, docs);
+        defer allocator.free(docs_esc);
+        try writer.writeAll(",\"docs\":");
+        try writer.writeAll(docs_esc);
+    }
     try writer.writeAll(",");
     try writer.print(
         \\"file":{s},"line":{d},"column":{d},"end_line":{d},"end_column":{d},"kind":"{s}"

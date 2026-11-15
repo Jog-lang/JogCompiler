@@ -1,0 +1,4 @@
+@link("c")
+extern {
+    fn puts(s: *byte): i32
+}

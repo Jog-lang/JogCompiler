@@ -44,17 +44,56 @@ fn stripLspTmpSuffix(path: []const u8) []const u8 {
     return path;
 }
 
+/// True when `a` and `b` name the same source file.
+/// Accepts exact equality, realpath equality, or one path as a `/`-bounded suffix of the other
+/// (relative vs absolute). Never matches on bare basename alone — JogSDL flat merge has many
+/// `sdl/<cat>/<cat>.jog` ↔ `sdl3/<cat>/<cat>.jog` pairs that share a leaf name.
+fn sameSourcePath(a: []const u8, b: []const u8) bool {
+    if (std.mem.eql(u8, a, b)) return true;
+    if (pathSuffixMatch(a, b) or pathSuffixMatch(b, a)) return true;
+    var buf_a: [std.fs.max_path_bytes]u8 = undefined;
+    var buf_b: [std.fs.max_path_bytes]u8 = undefined;
+    const ra = std.fs.cwd().realpath(a, &buf_a) catch return false;
+    const rb = std.fs.cwd().realpath(b, &buf_b) catch return false;
+    return std.mem.eql(u8, ra, rb);
+}
+
+fn pathSuffixMatch(longer: []const u8, shorter: []const u8) bool {
+    if (shorter.len == 0 or longer.len <= shorter.len) return false;
+    if (!std.mem.endsWith(u8, longer, shorter)) return false;
+    const before = longer[longer.len - shorter.len - 1];
+    return before == '/' or before == '\\';
+}
+
+fn jogModExists(dir: []const u8) bool {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const joined = if (dir.len == 0 or std.mem.eql(u8, dir, "."))
+        "jog.mod"
+    else blk: {
+        const n = std.fmt.bufPrint(&buf, "{s}/jog.mod", .{dir}) catch return false;
+        break :blk n;
+    };
+    std.fs.cwd().access(joined, .{}) catch return false;
+    return true;
+}
+
 fn findModuleDirUp(allocator: std.mem.Allocator, start_file: []const u8) !?[]u8 {
-    var dir = std.fs.path.dirname(start_file) orelse return null;
+    // Relative paths like `sdl/init/init.jog` walk `sdl/init` → `sdl` then stop
+    // (`dirname("sdl")` is null). Still probe cwd so `./jog.mod` is found.
+    var dir_opt = std.fs.path.dirname(start_file);
     while (true) {
-        const mod_path = try std.fs.path.join(allocator, &.{ dir, "jog.mod" });
-        defer allocator.free(mod_path);
-        if (std.fs.cwd().access(mod_path, .{})) |_| {
-            return try allocator.dupe(u8, dir);
-        } else |_| {}
-        const parent = std.fs.path.dirname(dir) orelse return null;
-        if (std.mem.eql(u8, parent, dir)) return null;
-        dir = parent;
+        if (dir_opt) |dir| {
+            if (jogModExists(dir)) return try allocator.dupe(u8, dir);
+            const parent = std.fs.path.dirname(dir);
+            if (parent == null or std.mem.eql(u8, parent.?, dir)) {
+                if (jogModExists(".")) return try allocator.dupe(u8, ".");
+                return null;
+            }
+            dir_opt = parent;
+        } else {
+            if (jogModExists(".")) return try allocator.dupe(u8, ".");
+            return null;
+        }
     }
 }
 
@@ -467,9 +506,9 @@ fn loadModuleWithOverride(
         const read_path = blk: {
             if (override_real) |real| {
                 if (override_read) |alt| {
-                    if (std.mem.eql(u8, p, real)) break :blk alt;
-                    // Also match by basename when paths differ only by relative/absolute form.
-                    if (std.mem.eql(u8, std.fs.path.basename(p), std.fs.path.basename(real))) break :blk alt;
+                    // Full-path identity only — basename matching would swap sibling
+                    // `sdl/foo.jog` and `sdl3/foo.jog` in flat-merge modules (JogSDL).
+                    if (sameSourcePath(p, real)) break :blk alt;
                 }
             }
             break :blk p;
