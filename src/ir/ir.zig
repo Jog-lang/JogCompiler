@@ -239,6 +239,8 @@ const FnInfo = struct {
     ret_name: []const u8 = "",
     /// Full return slot meta (preserves `*T` as raw_ptr/struct_ptr); null if void/unknown.
     ret_meta: ?SlotMeta = null,
+    /// Index of `...T: name` among value params (not counting contexts/self), or null.
+    pack_index: ?u8 = null,
 };
 
 const Ambient = struct {
@@ -251,10 +253,12 @@ const SlotKind = enum { scalar, struct_ptr, iface_ptr, opt_ptr, raw_ptr, array_p
 const SlotMeta = struct {
     kind: SlotKind,
     type_name: []const u8 = "",
-    /// Element count when `kind == .array_ptr`.
+    /// Element count when `kind == .array_ptr` and length is compile-time.
     array_len: u64 = 0,
     /// Element stride in bytes (1 for byte/u8, 8 otherwise).
     elem_size: u32 = 8,
+    /// When set, runtime length for pack/`[]T` for-in (companion slot holding usize).
+    len_slot: u32 = none,
 };
 
 pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.CheckResult) !Program {
@@ -444,11 +448,12 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                     }
                     try fn_infos.put(a, fd.name, .{
                         .mangled = fd.name,
-                        .nparams = @intCast(fd.params.len),
+                        .nparams = @intCast(fd.params.len + (if (packParamIndex(fd.params) != null) @as(usize, 1) else 0)),
                         .contexts = fd.contexts,
                         .exported = fd.exported or std.mem.eql(u8, fd.name, "main"),
                         .ret_name = ret_name,
                         .ret_meta = ret_meta,
+                        .pack_index = packParamIndex(fd.params),
                     });
                 }
             },
@@ -990,6 +995,25 @@ fn lowerFn(
         });
     }
     for (fl.params) |p| {
+        if (p.is_pack) {
+            // Pack arrives as (ptr, len); local is array_ptr with runtime len_slot.
+            const ptr_slot = next_slot;
+            next_slot += 1;
+            const len_slot = next_slot;
+            next_slot += 1;
+            try slots.put(a, p.name, ptr_slot);
+            const elem = blk: {
+                if (p.ty.* == .slice_view) break :blk typeExprName(p.ty.slice_view.elem);
+                break :blk typeExprName(p.ty);
+            };
+            try meta.put(a, p.name, .{
+                .kind = .array_ptr,
+                .type_name = elem,
+                .elem_size = 8,
+                .len_slot = len_slot,
+            });
+            continue;
+        }
         const slot = next_slot;
         next_slot += 1;
         try slots.put(a, p.name, slot);
@@ -1788,27 +1812,35 @@ fn lowerForIn(ctx: *Ctx, fs: ast.ForInStmt) LowerError!void {
         }
         return;
     }
-    // Array for-in: for x in xs
+    // Array / pack for-in: for x in xs
     const base = try lowerExpr(ctx, fs.iter);
     var alen: u64 = 0;
+    var runtime_len: ?u32 = null;
     if (fs.iter.* == .ident) {
         if (ctx.meta.get(fs.iter.ident)) |m| {
-            if (m.kind == .array_ptr) alen = m.array_len;
+            if (m.kind == .array_ptr) {
+                if (m.array_len > 0) alen = m.array_len;
+                if (m.len_slot != none) runtime_len = m.len_slot;
+            }
         }
     } else if (fs.iter.* == .array_lit) {
         alen = fs.iter.array_lit.elems.len;
     }
-    if (alen == 0) return error.TypeError;
+    if (alen == 0 and runtime_len == null) return error.TypeError;
     const iv = try ctx.fresh();
     try ctx.emit(.{ .op = .iconst, .dst = iv, .aux = 0 });
     const head: i64 = @intCast(ctx.insts.items.len);
     const lim = try ctx.fresh();
-    try ctx.emit(.{ .op = .iconst, .dst = lim, .aux = @intCast(alen) });
+    if (runtime_len) |ls| {
+        try ctx.emit(.{ .op = .copy, .dst = lim, .src0 = ls });
+    } else {
+        try ctx.emit(.{ .op = .iconst, .dst = lim, .aux = @intCast(alen) });
+    }
     const cmp = try ctx.fresh();
     try ctx.emit(.{ .op = .lt, .dst = cmp, .src0 = iv, .src1 = lim });
     const jz_i = ctx.insts.items.len;
     try ctx.emit(.{ .op = .jz, .src0 = cmp, .aux = 0 });
-    // elem = load(base - iv*stride)
+    // elem = load(base - iv*stride) — stack arrays / pack buffers grow downward from lea
     const scale = try ctx.fresh();
     try ctx.emit(.{ .op = .iconst, .dst = scale, .aux = 8 });
     const off = try ctx.fresh();
@@ -1839,6 +1871,13 @@ fn lowerForIn(ctx: *Ctx, fs: ast.ForInStmt) LowerError!void {
         const ji = ctx.continue_jmps.pop().?;
         ctx.insts.items[ji].aux = cont_pos;
     }
+}
+
+fn packParamIndex(params: []ast.Param) ?u8 {
+    for (params, 0..) |p, i| {
+        if (p.is_pack) return @intCast(i);
+    }
+    return null;
 }
 
 fn fieldOffset(ctx: *Ctx, base_expr: *ast.Expr, field: []const u8) LowerError!i64 {
@@ -2700,10 +2739,48 @@ fn lowerFnCall(ctx: *Ctx, fi: FnInfo, args: []*ast.Expr, with_args: []*ast.Expr)
         } else return error.TooManyArgs;
     }
 
-    if (args.len + arity > max_call_args) return error.TooManyArgs;
-    for (args) |arg| {
-        arg_slots[arity] = try lowerExpr(ctx, arg);
+    if (fi.pack_index) |pi| {
+        const fixed: usize = pi;
+        if (args.len < fixed) return error.TooManyArgs;
+        if (fixed + arity > max_call_args) return error.TooManyArgs;
+        var i: usize = 0;
+        while (i < fixed) : (i += 1) {
+            arg_slots[arity] = try lowerExpr(ctx, args[i]);
+            arity += 1;
+        }
+        const pack_n = args.len - fixed;
+        // Stack buffer of pack_n slots (same layout as `[N]T` locals).
+        const first = try ctx.fresh();
+        try ctx.emit(.{ .op = .iconst, .dst = first, .aux = 0 });
+        var j: usize = 1;
+        while (j < pack_n) : (j += 1) {
+            const s = try ctx.fresh();
+            try ctx.emit(.{ .op = .iconst, .dst = s, .aux = 0 });
+        }
+        const ptr = try ctx.fresh();
+        try ctx.emit(.{ .op = .lea_slot, .dst = ptr, .src0 = first });
+        var k: usize = 0;
+        while (k < pack_n) : (k += 1) {
+            const val = try lowerExpr(ctx, args[fixed + k]);
+            const addr = try ctx.fresh();
+            const off = try ctx.fresh();
+            try ctx.emit(.{ .op = .iconst, .dst = off, .aux = @intCast(k * 8) });
+            try ctx.emit(.{ .op = .sub, .dst = addr, .src0 = ptr, .src1 = off });
+            try ctx.emit(.{ .op = .store, .src0 = addr, .src1 = val });
+        }
+        const len = try ctx.fresh();
+        try ctx.emit(.{ .op = .iconst, .dst = len, .aux = @intCast(pack_n) });
+        if (arity + 2 > max_call_args) return error.TooManyArgs;
+        arg_slots[arity] = ptr;
         arity += 1;
+        arg_slots[arity] = len;
+        arity += 1;
+    } else {
+        if (args.len + arity > max_call_args) return error.TooManyArgs;
+        for (args) |arg| {
+            arg_slots[arity] = try lowerExpr(ctx, arg);
+            arity += 1;
+        }
     }
 
     const cid = ctx.callee_map.get(fi.mangled) orelse return error.UnknownName;
