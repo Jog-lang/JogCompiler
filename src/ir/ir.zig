@@ -1169,6 +1169,26 @@ fn ensureTupleStruct(a: std.mem.Allocator, structs: *std.StringHashMapUnmanaged(
     return name;
 }
 
+/// `[]T` / `[]const T` → synthetic `__Slice_T` with `{ ptr: *T, len: i64 }`.
+fn ensureSliceStruct(
+    a: std.mem.Allocator,
+    structs: *std.StringHashMapUnmanaged(StructInfo),
+    elem: *ast.TypeExpr,
+) ![]const u8 {
+    const en = try mangleTupleElem(a, elem);
+    const name = try std.fmt.allocPrint(a, "__Slice_{s}", .{en});
+    if (structs.contains(name)) return name;
+    const ptr_ty = try a.create(ast.TypeExpr);
+    ptr_ty.* = .{ .pointer = try cloneTypeExpr(a, elem) };
+    const len_ty = try a.create(ast.TypeExpr);
+    len_ty.* = .{ .name = "i64" };
+    var fields: std.ArrayListUnmanaged(ast.Field) = .{};
+    try fields.append(a, .{ .name = "ptr", .ty = ptr_ty });
+    try fields.append(a, .{ .name = "len", .ty = len_ty });
+    try structs.put(a, name, .{ .fields = try fields.toOwnedSlice(a) });
+    return name;
+}
+
 fn opMethodSymbol(a: std.mem.Allocator, name: []const u8) ![]const u8 {
     // `op+` → `op_add` for ELF-safe symbols; method lookup key stays `Type.op+`.
     if (!std.mem.startsWith(u8, name, "op") or name.len < 3) return name;
@@ -1272,9 +1292,9 @@ fn metaForTypeExpr(a: std.mem.Allocator, te: *ast.TypeExpr, structs: *std.String
             return .{ .kind = .struct_ptr, .type_name = name };
         },
         .slice_view => |sv| {
-            // Views are {ptr,len} — treat as raw_ptr to elem for index ops.
-            const en = typeExprName(sv.elem);
-            return .{ .kind = .raw_ptr, .type_name = en };
+            // Views are `{ ptr, len }` — synthetic struct so `.ptr` / `.len` lower.
+            const name = try ensureSliceStruct(a, structs, sv.elem);
+            return .{ .kind = .struct_ptr, .type_name = name };
         },
         else => return .{ .kind = .scalar },
     }
@@ -1369,6 +1389,24 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
         .var_decl => |vd| {
             var sm: SlotMeta = .{ .kind = .scalar };
             if (vd.ty) |t| sm = try metaForTypeExpr(ctx.a, t, ctx.structs, ctx.ifaces);
+            // `var s: []T` — stack-allocate `{ptr,len}` and take its address (like `[2]i64`).
+            if (vd.ty) |t| {
+                if (t.* == .slice_view) {
+                    const first = try ctx.fresh();
+                    try ctx.emit(.{ .op = .iconst, .dst = first, .aux = 0 });
+                    const second = try ctx.fresh();
+                    try ctx.emit(.{ .op = .iconst, .dst = second, .aux = 0 });
+                    const ptr = try ctx.fresh();
+                    try ctx.emit(.{ .op = .lea_slot, .dst = ptr, .src0 = first });
+                    try ctx.slots.put(ctx.a, vd.name, ptr);
+                    try ctx.meta.put(ctx.a, vd.name, sm);
+                    if (vd.init) |init| {
+                        const v = try lowerExpr(ctx, init);
+                        try ctx.emit(.{ .op = .copy, .dst = ptr, .src0 = v });
+                    }
+                    return;
+                }
+            }
             if (sm.kind == .array_ptr and sm.array_len > 0) {
                 const is_byte = std.mem.eql(u8, sm.type_name, "byte") or std.mem.eql(u8, sm.type_name, "u8") or std.mem.eql(u8, sm.type_name, "bool");
                 if (is_byte) {
