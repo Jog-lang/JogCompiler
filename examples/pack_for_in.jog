@@ -1,0 +1,19 @@
+// Pack params: call-site materialization + for-in over ...T: flags.
+fn or_flags(...i32: flags): i32 {
+    var acc: i32 = 0
+    for f in flags {
+        acc = acc | f
+    }
+    return acc
+}
+fn main() {
+    val empty = or_flags()
+    val x = or_flags(1, 2, 4)
+    if empty == 0 {
+        if x == 7 {
+            print("pack for-in ok\n")
+            return
+        }
+    }
+    panic("pack for-in fail\n")
+}

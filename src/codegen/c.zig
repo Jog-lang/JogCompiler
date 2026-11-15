@@ -272,7 +272,7 @@ fn emitInst(writer: anytype, prog: *const ir.Program, fname: []const u8, ninst: 
             try writer.print("    int64_t (*fp)() = (int64_t(*)())(intptr_t)s[{d}];\n", .{inst.src0});
             try writer.writeAll("    int64_t r = fp(");
             var i: u8 = 0;
-            while (i < inst.arity and i < 8) : (i += 1) {
+            while (i < inst.arity and i < ir.max_call_args) : (i += 1) {
                 if (i > 0) try writer.writeAll(", ");
                 try writer.print("s[{d}]", .{inst.args[i]});
             }
@@ -330,10 +330,10 @@ fn emitCall(writer: anytype, prog: *const ir.Program, inst: ir.Inst, _: bool) !v
             try writer.writeAll("    r = ((intptr_t(*)(");
         }
         var i: u8 = 0;
-        while (i < inst.arity and i < 8) : (i += 1) {
+        while (i < inst.arity and i < ir.max_call_args) : (i += 1) {
             if (i > 0) try writer.writeAll(", ");
-            const is_f = (callee.float_args & (@as(u8, 1) << @intCast(i))) != 0;
-            const is_w = (callee.wide_args & (@as(u8, 1) << @intCast(i))) != 0;
+            const is_f = (callee.float_args & (@as(u16, 1) << @intCast(i))) != 0;
+            const is_w = (callee.wide_args & (@as(u16, 1) << @intCast(i))) != 0;
             if (is_f) {
                 try writer.writeAll("double");
             } else if (is_w) {
@@ -344,10 +344,10 @@ fn emitCall(writer: anytype, prog: *const ir.Program, inst: ir.Inst, _: bool) !v
         }
         try writer.print(")){s})(", .{callee.name});
         i = 0;
-        while (i < inst.arity and i < 8) : (i += 1) {
+        while (i < inst.arity and i < ir.max_call_args) : (i += 1) {
             if (i > 0) try writer.writeAll(", ");
-            const is_f = (callee.float_args & (@as(u8, 1) << @intCast(i))) != 0;
-            const is_w = (callee.wide_args & (@as(u8, 1) << @intCast(i))) != 0;
+            const is_f = (callee.float_args & (@as(u16, 1) << @intCast(i))) != 0;
+            const is_w = (callee.wide_args & (@as(u16, 1) << @intCast(i))) != 0;
             if (is_f) {
                 try writer.print("*(double*)&s[{d}]", .{inst.args[i]});
             } else if (is_w) {
@@ -424,7 +424,7 @@ fn emitCall(writer: anytype, prog: *const ir.Program, inst: ir.Inst, _: bool) !v
         try writer.writeAll("    int64_t r = ");
         try writer.print("{s}(", .{callee.name});
         var i: u8 = 0;
-        while (i < inst.arity and i < 8) : (i += 1) {
+        while (i < inst.arity and i < ir.max_call_args) : (i += 1) {
             if (i > 0) try writer.writeAll(", ");
             // Pass pointers/ints as int64_t; C default promotions + emcc handle ABI.
             try writer.print("s[{d}]", .{inst.args[i]});

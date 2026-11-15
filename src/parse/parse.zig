@@ -206,7 +206,7 @@ pub const Parser = struct {
                 } };
             },
             .kw_fn => {
-                // method: fn *Type.name or fn Type.name
+                // method: fn [*]? Type [ <T,…> ] . name  (Grammar receiver)
                 const save_i = self.lx.i;
                 const save_line = self.lx.line;
                 const save_col = self.lx.col;
@@ -220,9 +220,10 @@ pub const Parser = struct {
                 if (self.tok.kind == .ident) {
                     const type_name = self.tok.text;
                     self.advance();
+                    const recv_tparams = try self.parseTypeParamList();
                     if (self.tok.kind == .dot) {
                         self.advance();
-                        return .{ .method = try self.parseMethodRest(pointer_recv, type_name) };
+                        return .{ .method = try self.parseMethodRest(pointer_recv, type_name, recv_tparams) };
                     }
                 }
                 // rewind to parse as plain fn
@@ -363,12 +364,17 @@ pub const Parser = struct {
         try self.expect(.lbrace);
         var fields: std.ArrayListUnmanaged(ast.Field) = .{};
         while (self.tok.kind != .rbrace and self.tok.kind != .eof) {
+            var is_private = false;
+            if (self.tok.kind == .kw_private) {
+                is_private = true;
+                self.advance();
+            }
             if (self.tok.kind != .ident) return error.UnexpectedToken;
             const fname = self.tok.text;
             self.advance();
             try self.expect(.colon);
             const ty = try self.parseTypeExpr();
-            try fields.append(self.allocator, .{ .name = fname, .ty = ty });
+            try fields.append(self.allocator, .{ .name = fname, .ty = ty, .is_private = is_private });
         }
         try self.expect(.rbrace);
         return .{
@@ -407,20 +413,33 @@ pub const Parser = struct {
             }
             return .{ .interface_fn = .{ .name = name, .params = params, .ret = ret } };
         }
+        // Spec form `interface Name { … }` and legacy `interface struct Name { … }`.
         if (self.tok.kind == .kw_struct) {
             self.advance();
-            if (self.tok.kind != .ident) return error.UnexpectedToken;
-            const name = self.tok.text;
-            self.advance();
-            try self.expect(.lbrace);
-            var methods: std.ArrayListUnmanaged(ast.MethodSig) = .{};
-            while (self.tok.kind != .rbrace and self.tok.kind != .eof) {
-                try methods.append(self.allocator, try self.parseMethodSig());
-            }
-            try self.expect(.rbrace);
-            return .{ .interface_struct = .{ .name = name, .methods = try methods.toOwnedSlice(self.allocator) } };
         }
-        return error.UnexpectedToken;
+        if (self.tok.kind != .ident) return error.UnexpectedToken;
+        const name = self.tok.text;
+        self.advance();
+        try self.expect(.lbrace);
+        var methods: std.ArrayListUnmanaged(ast.MethodSig) = .{};
+        while (self.tok.kind != .rbrace and self.tok.kind != .eof) {
+            // Spec also allows `val`/`var` property requirements and embeds — accept `fn` methods for now.
+            if (self.tok.kind == .kw_fn) {
+                try methods.append(self.allocator, try self.parseMethodSig());
+                continue;
+            }
+            // Skip unsupported property/embed lines until a following `fn` or `}` (subset).
+            if (self.tok.kind == .kw_val or self.tok.kind == .kw_var or self.tok.kind == .ident) {
+                // Consume until newline-ish: read tokens until we see `fn` or `}`.
+                while (self.tok.kind != .kw_fn and self.tok.kind != .rbrace and self.tok.kind != .eof) {
+                    self.advance();
+                }
+                continue;
+            }
+            return error.UnexpectedToken;
+        }
+        try self.expect(.rbrace);
+        return .{ .interface_struct = .{ .name = name, .methods = try methods.toOwnedSlice(self.allocator) } };
     }
 
     fn parseMethodSig(self: *Parser) ParseError!ast.MethodSig {
@@ -434,12 +453,13 @@ pub const Parser = struct {
         const name = self.tok.text;
         self.advance();
         const params = try self.parseParamList();
-        const contexts = try self.parseContextClause();
+        // Grammar: [ ":" type ] [ contextClause ]
         var ret: ?*ast.TypeExpr = null;
         if (self.tok.kind == .colon) {
             self.advance();
             ret = try self.parseTypeExpr();
         }
+        const contexts = try self.parseContextClause();
         return .{
             .pointer_recv = pointer_recv,
             .name = name,
@@ -458,11 +478,22 @@ pub const Parser = struct {
         self.advance();
         const type_params = try self.parseTypeParamList();
         const params = try self.parseParamList();
-        const contexts = try self.parseContextClause();
+        // Grammar: [ ":" type ] [ contextClause ] fnBody — also accept legacy
+        // `with` before `: type` for existing v2 examples.
         var ret: ?*ast.TypeExpr = null;
-        if (self.tok.kind == .colon) {
-            self.advance();
-            ret = try self.parseTypeExpr();
+        var contexts: []ast.ContextParam = &.{};
+        if (self.tok.kind == .kw_with) {
+            contexts = try self.parseContextClause();
+            if (self.tok.kind == .colon) {
+                self.advance();
+                ret = try self.parseTypeExpr();
+            }
+        } else {
+            if (self.tok.kind == .colon) {
+                self.advance();
+                ret = try self.parseTypeExpr();
+            }
+            contexts = try self.parseContextClause();
         }
         var body: ?*ast.Block = null;
         if (self.tok.kind == .lbrace) {
@@ -483,14 +514,28 @@ pub const Parser = struct {
         };
     }
 
-    fn parseMethodRest(self: *Parser, pointer_recv: bool, type_name: []const u8) ParseError!ast.MethodDecl {
+    fn parseMethodRest(self: *Parser, pointer_recv: bool, type_name: []const u8, recv_tparams: [][]const u8) ParseError!ast.MethodDecl {
         const name = try self.parseMethodName();
+        // Grammar: fnName [ typeParams ] — e.g. List<T>.map<R>
+        const method_tparams = try self.parseTypeParamList();
+        var all_tp: std.ArrayListUnmanaged([]const u8) = .{};
+        try all_tp.appendSlice(self.allocator, recv_tparams);
+        try all_tp.appendSlice(self.allocator, method_tparams);
         const params = try self.parseParamList();
-        const contexts = try self.parseContextClause();
         var ret: ?*ast.TypeExpr = null;
-        if (self.tok.kind == .colon) {
-            self.advance();
-            ret = try self.parseTypeExpr();
+        var contexts: []ast.ContextParam = &.{};
+        if (self.tok.kind == .kw_with) {
+            contexts = try self.parseContextClause();
+            if (self.tok.kind == .colon) {
+                self.advance();
+                ret = try self.parseTypeExpr();
+            }
+        } else {
+            if (self.tok.kind == .colon) {
+                self.advance();
+                ret = try self.parseTypeExpr();
+            }
+            contexts = try self.parseContextClause();
         }
         var body: ?*ast.Block = null;
         if (self.tok.kind == .lbrace) {
@@ -501,6 +546,7 @@ pub const Parser = struct {
         return .{
             .pointer_recv = pointer_recv,
             .type_name = type_name,
+            .type_params = try all_tp.toOwnedSlice(self.allocator),
             .name = name,
             .params = params,
             .contexts = contexts,
@@ -558,6 +604,8 @@ pub const Parser = struct {
             }
             if (self.tok.kind == .comma) {
                 self.advance();
+                // Grammar: typeParam { "," typeParam } with optional trailing comma.
+                if (self.tok.kind == .gt) break;
                 continue;
             }
             break;
@@ -574,6 +622,8 @@ pub const Parser = struct {
             try args.append(self.allocator, try self.parseTypeExpr());
             if (self.tok.kind == .comma) {
                 self.advance();
+                // Grammar typeArgs allows trailing comma before `>`.
+                if (self.tok.kind == .gt) break;
                 continue;
             }
             break;
@@ -587,6 +637,39 @@ pub const Parser = struct {
         var params: std.ArrayListUnmanaged(ast.Param) = .{};
         if (self.tok.kind != .rparen) {
             while (true) {
+                // Pack: `...T: name` (must be last). Bare `...` is C variadic in extern only.
+                if (self.tok.kind == .ellipsis) {
+                    self.advance();
+                    if (self.tok.kind == .rparen or self.tok.kind == .comma) {
+                        // Bare `...` — C variadic; leave as sentinel empty-name pack for extern.
+                        try params.append(self.allocator, .{
+                            .name = "...",
+                            .ty = blk: {
+                                const t = try self.allocator.create(ast.TypeExpr);
+                                t.* = .{ .name = "void" };
+                                break :blk t;
+                            },
+                            .is_pack = true,
+                        });
+                        if (self.tok.kind == .comma) self.advance();
+                        break;
+                    }
+                    const elem_ty = try self.parseTypeExpr();
+                    try self.expect(.colon);
+                    if (self.tok.kind != .ident) return error.UnexpectedToken;
+                    const name = self.tok.text;
+                    self.advance();
+                    // Local type is []elem — wrap as slice_view.
+                    const slice_ty = try self.allocator.create(ast.TypeExpr);
+                    slice_ty.* = .{ .slice_view = .{ .elem = elem_ty, .is_const = false } };
+                    try params.append(self.allocator, .{ .name = name, .ty = slice_ty, .is_pack = true });
+                    if (self.tok.kind == .comma) {
+                        self.advance();
+                        // Pack must be last — anything after is an error at check time; reject here too.
+                        if (self.tok.kind != .rparen) return error.UnexpectedToken;
+                    }
+                    break;
+                }
                 if (self.tok.kind != .ident) return error.UnexpectedToken;
                 const name = self.tok.text;
                 self.advance();
@@ -595,6 +678,8 @@ pub const Parser = struct {
                 try params.append(self.allocator, .{ .name = name, .ty = ty });
                 if (self.tok.kind == .comma) {
                     self.advance();
+                    // Grammar paramList / fnParams: optional trailing comma before `)`.
+                    if (self.tok.kind == .rparen) break;
                     continue;
                 }
                 break;
@@ -615,6 +700,8 @@ pub const Parser = struct {
                 try contexts.append(self.allocator, try self.parseContextParam());
                 if (self.tok.kind == .comma) {
                     self.advance();
+                    // Grammar contextClause: optional trailing comma before `)`.
+                    if (self.tok.kind == .rparen) break;
                     continue;
                 }
                 break;
@@ -696,24 +783,54 @@ pub const Parser = struct {
         if (self.tok.kind == .lparen) {
             self.advance();
             var elems: std.ArrayListUnmanaged(*ast.TypeExpr) = .{};
-            try elems.append(self.allocator, try self.parseTypeExpr());
-            if (self.tok.kind != .comma) {
-                // Single `(T)` is just grouping.
-                try self.expect(.rparen);
-                return elems.items[0];
-            }
-            while (self.tok.kind == .comma) {
-                self.advance();
+            if (self.tok.kind != .rparen) {
                 try elems.append(self.allocator, try self.parseTypeExpr());
+                while (self.tok.kind == .comma) {
+                    self.advance();
+                    // Trailing comma before `)` in tuple / fn-type params.
+                    if (self.tok.kind == .rparen) break;
+                    try elems.append(self.allocator, try self.parseTypeExpr());
+                }
             }
             try self.expect(.rparen);
+            // Grammar fnType: (…) -> type
+            if (self.tok.kind == .arrow) {
+                self.advance();
+                const ret = try self.parseTypeExpr();
+                var params: std.ArrayListUnmanaged(ast.Param) = .{};
+                for (elems.items) |et| {
+                    try params.append(self.allocator, .{ .name = "", .ty = et });
+                }
+                const ift = try self.allocator.create(ast.IfaceFnType);
+                ift.* = .{ .params = try params.toOwnedSlice(self.allocator), .ret = ret };
+                const ty = try self.allocator.create(ast.TypeExpr);
+                ty.* = .{ .iface_fn = ift };
+                return ty;
+            }
+            if (elems.items.len == 0) {
+                // Unit type `()`.
+                const ty = try self.allocator.create(ast.TypeExpr);
+                ty.* = .{ .tuple = &.{} };
+                return ty;
+            }
+            if (elems.items.len == 1) {
+                // Single `(T)` is just grouping.
+                return elems.items[0];
+            }
             const ty = try self.allocator.create(ast.TypeExpr);
             ty.* = .{ .tuple = try elems.toOwnedSlice(self.allocator) };
             return ty;
         }
         if (self.tok.kind != .ident) return error.UnexpectedToken;
-        const name = self.tok.text;
+        // Grammar: qualifiedName = IDENT { "." IDENT } [ typeArgs ]
+        var name = self.tok.text;
         self.advance();
+        while (self.tok.kind == .dot) {
+            self.advance();
+            if (self.tok.kind != .ident) return error.UnexpectedToken;
+            name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ name, self.tok.text });
+            self.advance();
+        }
         const targs = try self.parseTypeArgList();
         const ty = try self.allocator.create(ast.TypeExpr);
         if (targs.len == 0) {
@@ -788,8 +905,19 @@ pub const Parser = struct {
             },
             .kw_return => {
                 self.advance();
-                if (self.tok.kind == .rbrace) return .{ .return_stmt = null };
-                return .{ .return_stmt = try self.parseExpr() };
+                if (self.tok.kind == .rbrace or self.tok.kind == .semicolon) return .{ .return_stmt = null };
+                // Grammar: return [ expr { "," expr } ] — bare commas build a tuple.
+                const first = try self.parseExpr();
+                if (self.tok.kind != .comma) return .{ .return_stmt = first };
+                var elems: std.ArrayListUnmanaged(*ast.Expr) = .{};
+                try elems.append(self.allocator, first);
+                while (self.tok.kind == .comma) {
+                    self.advance();
+                    try elems.append(self.allocator, try self.parseExpr());
+                }
+                const tup = try self.allocExpr();
+                tup.* = .{ .tuple = try elems.toOwnedSlice(self.allocator) };
+                return .{ .return_stmt = tup };
             },
             .kw_panic => {
                 self.advance();
@@ -815,7 +943,17 @@ pub const Parser = struct {
                 var else_b: ?*ast.Block = null;
                 if (self.tok.kind == .kw_else) {
                     self.advance();
-                    else_b = try self.parseBlock();
+                    // Grammar ifExpr: else ( ifExpr | block ). `else if` → one-stmt block.
+                    if (self.tok.kind == .kw_if) {
+                        const inner = try self.parseStmt();
+                        const wrap = try self.allocator.create(ast.Block);
+                        const stmts = try self.allocator.alloc(ast.Stmt, 1);
+                        stmts[0] = inner;
+                        wrap.* = .{ .stmts = stmts };
+                        else_b = wrap;
+                    } else {
+                        else_b = try self.parseBlock();
+                    }
                 }
                 return .{ .if_stmt = .{ .cond = cond, .then_block = then_b, .else_block = else_b } };
             },
@@ -1182,6 +1320,8 @@ pub const Parser = struct {
                         try args.append(self.allocator, try self.parseExpr());
                         if (self.tok.kind == .comma) {
                             self.advance();
+                            // Grammar argList: optional trailing comma before `)`.
+                            if (self.tok.kind == .rparen) break;
                             continue;
                         }
                         break;
@@ -1202,6 +1342,7 @@ pub const Parser = struct {
                         try wargs.append(self.allocator, try self.parseExpr());
                         if (self.tok.kind == .comma) {
                             self.advance();
+                            if (self.tok.kind == .rparen) break;
                             continue;
                         }
                         break;
@@ -1259,6 +1400,7 @@ pub const Parser = struct {
                         try args.append(self.allocator, try self.parseExpr());
                         if (self.tok.kind == .comma) {
                             self.advance();
+                            if (self.tok.kind == .rparen) break;
                             continue;
                         }
                         break;
@@ -1290,6 +1432,13 @@ pub const Parser = struct {
                 const c = try self.allocExpr();
                 c.* = .{ .is_type = .{ .expr = e, .ty = ty } };
                 e = c;
+                continue;
+            }
+            if (self.tok.kind == .bang_bang) {
+                self.advance();
+                const fu = try self.allocExpr();
+                fu.* = .{ .force_unwrap = e };
+                e = fu;
                 continue;
             }
             break;
@@ -1385,6 +1534,7 @@ pub const Parser = struct {
                                 try args.append(self.allocator, try self.parseExpr());
                                 if (self.tok.kind == .comma) {
                                     self.advance();
+                                    if (self.tok.kind == .rparen) break;
                                     continue;
                                 }
                                 break;

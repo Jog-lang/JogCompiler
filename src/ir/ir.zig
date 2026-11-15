@@ -70,8 +70,11 @@ pub const Inst = struct {
     src1: u32 = none,
     aux: i64 = 0,
     arity: u8 = 0,
-    args: [8]u32 = .{none} ** 8,
+    /// Up to 16 call args (SysV: 6 GPRs + stack). Was 8; SDL and packs need more.
+    args: [16]u32 = .{none} ** 16,
 };
+
+pub const max_call_args: usize = 16;
 
 pub const Func = struct {
     name: []const u8,
@@ -89,9 +92,9 @@ pub const Callee = struct {
     /// SysV float return (xmm0) — set for `extern` f32/f64 returns.
     float_ret: bool = false,
     /// Bit i set ⇒ argument i is f32/f64 (xmm classification for `extern`).
-    float_args: u8 = 0,
+    float_args: u16 = 0,
     /// Bit i set ⇒ argument i is i64/u64 (wasm32 needs real i64, not intptr_t).
-    wide_args: u8 = 0,
+    wide_args: u16 = 0,
     /// `extern` return is i64/u64 (wasm32 i64, not intptr_t).
     wide_ret: bool = false,
     /// `extern` with no return type — wasm32 void vs i32 signature.
@@ -141,11 +144,11 @@ fn isFloatTypeExpr(te: *ast.TypeExpr) bool {
     };
 }
 
-fn floatArgMask(params: []ast.Param) u8 {
-    var mask: u8 = 0;
+fn floatArgMask(params: []ast.Param) u16 {
+    var mask: u16 = 0;
     for (params, 0..) |p, i| {
-        if (i >= 8) break;
-        if (isFloatTypeExpr(p.ty)) mask |= @as(u8, 1) << @intCast(i);
+        if (i >= max_call_args) break;
+        if (isFloatTypeExpr(p.ty)) mask |= @as(u16, 1) << @intCast(i);
     }
     return mask;
 }
@@ -157,11 +160,11 @@ fn isWideIntTypeExpr(te: *ast.TypeExpr) bool {
     };
 }
 
-fn wideArgMask(params: []ast.Param) u8 {
-    var mask: u8 = 0;
+fn wideArgMask(params: []ast.Param) u16 {
+    var mask: u16 = 0;
     for (params, 0..) |p, i| {
-        if (i >= 8) break;
-        if (isWideIntTypeExpr(p.ty)) mask |= @as(u8, 1) << @intCast(i);
+        if (i >= max_call_args) break;
+        if (isWideIntTypeExpr(p.ty)) mask |= @as(u16, 1) << @intCast(i);
     }
     return mask;
 }
@@ -236,6 +239,8 @@ const FnInfo = struct {
     ret_name: []const u8 = "",
     /// Full return slot meta (preserves `*T` as raw_ptr/struct_ptr); null if void/unknown.
     ret_meta: ?SlotMeta = null,
+    /// Index of `...T: name` among value params (not counting contexts/self), or null.
+    pack_index: ?u8 = null,
 };
 
 const Ambient = struct {
@@ -248,10 +253,12 @@ const SlotKind = enum { scalar, struct_ptr, iface_ptr, opt_ptr, raw_ptr, array_p
 const SlotMeta = struct {
     kind: SlotKind,
     type_name: []const u8 = "",
-    /// Element count when `kind == .array_ptr`.
+    /// Element count when `kind == .array_ptr` and length is compile-time.
     array_len: u64 = 0,
     /// Element stride in bytes (1 for byte/u8, 8 otherwise).
     elem_size: u32 = 8,
+    /// When set, runtime length for pack/`[]T` for-in (companion slot holding usize).
+    len_slot: u32 = none,
 };
 
 pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.CheckResult) !Program {
@@ -441,11 +448,12 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                     }
                     try fn_infos.put(a, fd.name, .{
                         .mangled = fd.name,
-                        .nparams = @intCast(fd.params.len),
+                        .nparams = @intCast(fd.params.len + (if (packParamIndex(fd.params) != null) @as(usize, 1) else 0)),
                         .contexts = fd.contexts,
                         .exported = fd.exported or std.mem.eql(u8, fd.name, "main"),
                         .ret_name = ret_name,
                         .ret_meta = ret_meta,
+                        .pack_index = packParamIndex(fd.params),
                     });
                 }
             },
@@ -570,7 +578,7 @@ fn resolveRetName(a: std.mem.Allocator, structs: *std.StringHashMapUnmanaged(Str
     return switch (te.*) {
         .name => |n| n,
         .named_app => |na| try mangleNamedApp(a, na.name, na.args),
-        .tuple => |elems| try ensureTupleStruct(a, structs, elems.len),
+        .tuple => |elems| try ensureTupleStructFromTypes(a, structs, elems),
         .optional => |inner| try resolveRetName(a, structs, inner),
         .pointer, .pointer_const => |inner| try resolveRetName(a, structs, inner),
         .array => |arr| try resolveRetName(a, structs, arr.elem),
@@ -674,6 +682,7 @@ fn ensureGenericFn(
         try params.append(a, .{
             .name = p.name,
             .ty = try substTypeExpr(a, p.ty, tmpl.type_params, args),
+            .is_pack = p.is_pack,
         });
     }
     var ret: ?*ast.TypeExpr = null;
@@ -798,6 +807,7 @@ fn walkExprInstantiate(
             try walkTypeInstantiate(a, it.ty, generic_structs, structs);
             try walkExprInstantiate(a, it.expr, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
         },
+        .force_unwrap => |inner| try walkExprInstantiate(a, inner, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized),
         else => {},
     }
 }
@@ -805,7 +815,7 @@ fn walkExprInstantiate(
 fn walkTypeInstantiate(a: std.mem.Allocator, te: *ast.TypeExpr, generic_structs: *std.StringHashMapUnmanaged(ast.StructDecl), structs: *std.StringHashMapUnmanaged(StructInfo)) !void {
     switch (te.*) {
         .named_app => |na| _ = try ensureGenericStruct(a, generic_structs, structs, na.name, na.args),
-        .tuple => |elems| _ = try ensureTupleStruct(a, structs, elems.len),
+        .tuple => |elems| _ = try ensureTupleStructFromTypes(a, structs, elems),
         .optional, .pointer, .pointer_const => |inner| try walkTypeInstantiate(a, inner, generic_structs, structs),
         .array => |arr| try walkTypeInstantiate(a, arr.elem, generic_structs, structs),
         else => {},
@@ -985,6 +995,25 @@ fn lowerFn(
         });
     }
     for (fl.params) |p| {
+        if (p.is_pack) {
+            // Pack arrives as (ptr, len); local is array_ptr with runtime len_slot.
+            const ptr_slot = next_slot;
+            next_slot += 1;
+            const len_slot = next_slot;
+            next_slot += 1;
+            try slots.put(a, p.name, ptr_slot);
+            const elem = blk: {
+                if (p.ty.* == .slice_view) break :blk typeExprName(p.ty.slice_view.elem);
+                break :blk typeExprName(p.ty);
+            };
+            try meta.put(a, p.name, .{
+                .kind = .array_ptr,
+                .type_name = elem,
+                .elem_size = 8,
+                .len_slot = len_slot,
+            });
+            continue;
+        }
         const slot = next_slot;
         next_slot += 1;
         try slots.put(a, p.name, slot);
@@ -1036,13 +1065,19 @@ fn lowerFn(
 
 fn typeExprName(te: *ast.TypeExpr) []const u8 {
     return switch (te.*) {
-        .name => |n| n,
-        .named_app => |na| na.name, // caller should prefer mangleNamedApp
+        .name => |n| typeNameLeaf(n),
+        .named_app => |na| typeNameLeaf(na.name), // caller should prefer mangleNamedApp
         .pointer, .pointer_const, .optional => |inner| typeExprName(inner),
         .array => |arr| typeExprName(arr.elem),
         .tuple => "__Tup",
         else => "",
     };
+}
+
+/// `pkg.Name` → `Name` for flattened import merge / ambient matching.
+fn typeNameLeaf(n: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, n, '.')) |dot| return n[dot + 1 ..];
+    return n;
 }
 
 fn mangleTypeArgName(te: *ast.TypeExpr) []const u8 {
@@ -1072,6 +1107,51 @@ fn mangleNamedApp(a: std.mem.Allocator, name: []const u8, args: []*ast.TypeExpr)
 
 fn tupleStructName(a: std.mem.Allocator, n: usize) ![]const u8 {
     return try std.fmt.allocPrint(a, "__Tup{d}", .{n});
+}
+
+fn mangleTupleElem(a: std.mem.Allocator, te: *ast.TypeExpr) ![]const u8 {
+    return switch (te.*) {
+        .name => |n| try a.dupe(u8, typeNameLeaf(n)),
+        .named_app => |na| try mangleNamedApp(a, na.name, na.args),
+        .optional => |inner| try std.fmt.allocPrint(a, "Opt{s}", .{try mangleTupleElem(a, inner)}),
+        .pointer, .pointer_const => |inner| try std.fmt.allocPrint(a, "P{s}", .{try mangleTupleElem(a, inner)}),
+        .array => |arr| try std.fmt.allocPrint(a, "A{s}", .{try mangleTupleElem(a, arr.elem)}),
+        .tuple => |elems| blk: {
+            var buf: std.ArrayListUnmanaged(u8) = .{};
+            try buf.appendSlice(a, "Tup");
+            for (elems) |e| {
+                try buf.append(a, '_');
+                try buf.appendSlice(a, try mangleTupleElem(a, e));
+            }
+            break :blk try buf.toOwnedSlice(a);
+        },
+        else => try a.dupe(u8, "X"),
+    };
+}
+
+/// Typed product `(T, U, …)` → `__Tup_T_OptU` with real field types (not all-i64).
+fn ensureTupleStructFromTypes(
+    a: std.mem.Allocator,
+    structs: ?*std.StringHashMapUnmanaged(StructInfo),
+    elems: []*ast.TypeExpr,
+) ![]const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    try buf.appendSlice(a, "__Tup");
+    for (elems) |e| {
+        try buf.append(a, '_');
+        try buf.appendSlice(a, try mangleTupleElem(a, e));
+    }
+    const name = try buf.toOwnedSlice(a);
+    if (structs) |st| {
+        if (st.contains(name)) return name;
+        var fields: std.ArrayListUnmanaged(ast.Field) = .{};
+        for (elems, 0..) |e, i| {
+            const fname = try std.fmt.allocPrint(a, "_{d}", .{i});
+            try fields.append(a, .{ .name = fname, .ty = try cloneTypeExpr(a, e) });
+        }
+        try st.put(a, name, .{ .fields = try fields.toOwnedSlice(a) });
+    }
+    return name;
 }
 
 fn ensureTupleStruct(a: std.mem.Allocator, structs: *std.StringHashMapUnmanaged(StructInfo), n: usize) ![]const u8 {
@@ -1188,7 +1268,7 @@ fn metaForTypeExpr(a: std.mem.Allocator, te: *ast.TypeExpr, structs: *std.String
             return metaForTypeName(mangled, ifaces);
         },
         .tuple => |elems| {
-            const name = try ensureTupleStruct(a, structs, elems.len);
+            const name = try ensureTupleStructFromTypes(a, structs, elems);
             return .{ .kind = .struct_ptr, .type_name = name };
         },
         .slice_view => |sv| {
@@ -1266,10 +1346,11 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
         .destructure => |ds| {
             const tup = try lowerExpr(ctx, ds.init);
             const tn = blk: {
-                if (inferMetaFromExpr(ctx, ds.init)) |m| break :blk m.type_name;
+                if (inferMetaFromExpr(ctx, ds.init)) |m| {
+                    if (m.type_name.len > 0) break :blk m.type_name;
+                }
                 break :blk try ensureTupleStruct(ctx.a, ctx.structs, ds.names.len);
             };
-            _ = try ensureTupleStruct(ctx.a, ctx.structs, ds.names.len);
             const sd = ctx.structs.get(tn) orelse return error.UnknownName;
             for (ds.names, 0..) |n, i| {
                 if (i >= sd.fields.len) return error.TypeError;
@@ -1281,7 +1362,8 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
                 const slot = try ctx.fresh();
                 try ctx.emit(.{ .op = .load, .dst = slot, .src0 = addr });
                 try ctx.slots.put(ctx.a, n, slot);
-                try ctx.meta.put(ctx.a, n, .{ .kind = .scalar, .type_name = "i64" });
+                const sm = try metaForTypeExpr(ctx.a, sd.fields[i].ty, ctx.structs, ctx.ifaces);
+                try ctx.meta.put(ctx.a, n, sm);
             }
         },
         .var_decl => |vd| {
@@ -1585,10 +1667,7 @@ fn inferMetaFromExpr(ctx: *Ctx, e: *ast.Expr) ?SlotMeta {
             const sd = ctx.structs.get(base_tn) orelse return null;
             for (sd.fields) |fld| {
                 if (std.mem.eql(u8, fld.name, f.name)) {
-                    const ftn = typeExprName(fld.ty);
-                    if (ctx.structs.contains(ftn)) return .{ .kind = .struct_ptr, .type_name = ftn };
-                    if (isBuiltinScalar(ftn)) return .{ .kind = .scalar, .type_name = ftn };
-                    return .{ .kind = .struct_ptr, .type_name = ftn };
+                    return metaForTypeExpr(ctx.a, fld.ty, ctx.structs, ctx.ifaces) catch null;
                 }
             }
             return null;
@@ -1777,27 +1856,35 @@ fn lowerForIn(ctx: *Ctx, fs: ast.ForInStmt) LowerError!void {
         }
         return;
     }
-    // Array for-in: for x in xs
+    // Array / pack for-in: for x in xs
     const base = try lowerExpr(ctx, fs.iter);
     var alen: u64 = 0;
+    var runtime_len: ?u32 = null;
     if (fs.iter.* == .ident) {
         if (ctx.meta.get(fs.iter.ident)) |m| {
-            if (m.kind == .array_ptr) alen = m.array_len;
+            if (m.kind == .array_ptr) {
+                if (m.array_len > 0) alen = m.array_len;
+                if (m.len_slot != none) runtime_len = m.len_slot;
+            }
         }
     } else if (fs.iter.* == .array_lit) {
         alen = fs.iter.array_lit.elems.len;
     }
-    if (alen == 0) return error.TypeError;
+    if (alen == 0 and runtime_len == null) return error.TypeError;
     const iv = try ctx.fresh();
     try ctx.emit(.{ .op = .iconst, .dst = iv, .aux = 0 });
     const head: i64 = @intCast(ctx.insts.items.len);
     const lim = try ctx.fresh();
-    try ctx.emit(.{ .op = .iconst, .dst = lim, .aux = @intCast(alen) });
+    if (runtime_len) |ls| {
+        try ctx.emit(.{ .op = .copy, .dst = lim, .src0 = ls });
+    } else {
+        try ctx.emit(.{ .op = .iconst, .dst = lim, .aux = @intCast(alen) });
+    }
     const cmp = try ctx.fresh();
     try ctx.emit(.{ .op = .lt, .dst = cmp, .src0 = iv, .src1 = lim });
     const jz_i = ctx.insts.items.len;
     try ctx.emit(.{ .op = .jz, .src0 = cmp, .aux = 0 });
-    // elem = load(base - iv*stride)
+    // elem = load(base - iv*stride) — stack arrays / pack buffers grow downward from lea
     const scale = try ctx.fresh();
     try ctx.emit(.{ .op = .iconst, .dst = scale, .aux = 8 });
     const off = try ctx.fresh();
@@ -1828,6 +1915,13 @@ fn lowerForIn(ctx: *Ctx, fs: ast.ForInStmt) LowerError!void {
         const ji = ctx.continue_jmps.pop().?;
         ctx.insts.items[ji].aux = cont_pos;
     }
+}
+
+fn packParamIndex(params: []ast.Param) ?u8 {
+    for (params, 0..) |p, i| {
+        if (p.is_pack) return @intCast(i);
+    }
+    return null;
 }
 
 fn fieldOffset(ctx: *Ctx, base_expr: *ast.Expr, field: []const u8) LowerError!i64 {
@@ -2064,6 +2158,29 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
                 .deref => try ctx.emit(.{ .op = .load, .dst = d, .src0 = v }),
             }
             return d;
+        },
+        .force_unwrap => |inner| {
+            // Optional is a nullable pointer/value; !! panics on null then yields the bits.
+            const v = try lowerExpr(ctx, inner);
+            const ok = try ctx.fresh();
+            try ctx.emit(.{ .op = .copy, .dst = ok, .src0 = v });
+            const jz_i = ctx.insts.items.len;
+            try ctx.emit(.{ .op = .jz, .src0 = ok, .aux = 0 });
+            const jmp_ok = ctx.insts.items.len;
+            try ctx.emit(.{ .op = .jmp, .aux = 0 });
+            const panic_pos: i64 = @intCast(ctx.insts.items.len);
+            ctx.insts.items[jz_i].aux = panic_pos;
+            const msg = try ctx.a.dupe(u8, "force unwrap of null\n");
+            const sidx: i64 = @intCast(ctx.strings.items.len);
+            try ctx.strings.append(ctx.a, msg);
+            const ptr = try ctx.fresh();
+            try ctx.emit(.{ .op = .saddr, .dst = ptr, .aux = sidx });
+            const sl = try ctx.fresh();
+            try ctx.emit(.{ .op = .slen, .dst = sl, .aux = sidx });
+            try ctx.emit(.{ .op = .panic, .src0 = ptr, .src1 = sl });
+            const end_pos: i64 = @intCast(ctx.insts.items.len);
+            ctx.insts.items[jmp_ok].aux = end_pos;
+            return v;
         },
         .index => |ix| {
             try maybeBoundsCheck(ctx, ix.base, ix.index);
@@ -2379,9 +2496,37 @@ fn scalarBits(name: []const u8) i64 {
     return 0;
 }
 
+fn layoutSizeOfName(name: []const u8) i64 {
+    const leaf = typeNameLeaf(name);
+    if (std.mem.eql(u8, leaf, "u8") or std.mem.eql(u8, leaf, "i8") or std.mem.eql(u8, leaf, "byte") or std.mem.eql(u8, leaf, "bool") or std.mem.eql(u8, leaf, "char"))
+        return 1;
+    if (std.mem.eql(u8, leaf, "u16") or std.mem.eql(u8, leaf, "i16")) return 2;
+    if (std.mem.eql(u8, leaf, "u32") or std.mem.eql(u8, leaf, "i32") or std.mem.eql(u8, leaf, "f32") or std.mem.eql(u8, leaf, "int"))
+        return 4;
+    // pointers, 64-bit scalars, unknown named types: 8 for now
+    return 8;
+}
+
+fn layoutAlignOfName(name: []const u8) i64 {
+    return layoutSizeOfName(name); // power-of-two scalars; pointers 8
+}
+
 fn lowerCall(ctx: *Ctx, c: ast.Call) LowerError!u32 {
     if (c.callee.* == .ident) {
         const name = c.callee.ident;
+        if (std.mem.eql(u8, name, "size") or std.mem.eql(u8, name, "align")) {
+            if (c.args.len != 1) return error.TypeError;
+            const arg = c.args[0];
+            const tname = blk: {
+                if (arg.* == .ident) break :blk arg.ident;
+                if (inferTypeNameFromExpr(ctx, arg)) |tn| break :blk tn;
+                break :blk "i64";
+            };
+            const n: i64 = if (std.mem.eql(u8, name, "size")) layoutSizeOfName(tname) else layoutAlignOfName(tname);
+            const d = try ctx.fresh();
+            try ctx.emit(.{ .op = .iconst, .dst = d, .aux = n });
+            return d;
+        }
         if (std.mem.eql(u8, name, "print")) {
             if (c.args.len != 1) return error.TooManyArgs;
             const ptr, const len = try lowerPrintArgs(ctx, c.args[0]);
@@ -2597,6 +2742,17 @@ fn lowerCall(ctx: *Ctx, c: ast.Call) LowerError!u32 {
         }
     }
     if (c.callee.* == .field) {
+        // `pkg.fn(...)` after `import std.pkg` — flattened merge exposes `fn` unqualified.
+        // When the base is an unresolved ident (import alias), look up the free function.
+        if (c.callee.field.base.* == .ident) {
+            const base_name = c.callee.field.base.ident;
+            const is_local = ctx.meta.contains(base_name) or ctx.global_map.contains(base_name) or ctx.object_map.contains(base_name) or ctx.const_vals.contains(base_name);
+            if (!is_local) {
+                if (ctx.fn_infos.get(c.callee.field.name)) |fi| {
+                    return try lowerFnCall(ctx, fi, c.args, c.with_args);
+                }
+            }
+        }
         const base = try lowerExpr(ctx, c.callee.field.base);
         return try lowerMethodOrIfaceCall(ctx, c.callee.field.base, base, c.callee.field.name, c.args, c.with_args);
     }
@@ -2604,7 +2760,7 @@ fn lowerCall(ctx: *Ctx, c: ast.Call) LowerError!u32 {
 }
 
 fn lowerFnCall(ctx: *Ctx, fi: FnInfo, args: []*ast.Expr, with_args: []*ast.Expr) LowerError!u32 {
-    var arg_slots: [8]u32 = .{none} ** 8;
+    var arg_slots: [16]u32 = .{none} ** 16;
     var arity: u8 = 0;
 
     // resolve contexts: explicit with_args first, else ambient
@@ -2627,10 +2783,48 @@ fn lowerFnCall(ctx: *Ctx, fi: FnInfo, args: []*ast.Expr, with_args: []*ast.Expr)
         } else return error.TooManyArgs;
     }
 
-    if (args.len + arity > 8) return error.TooManyArgs;
-    for (args) |arg| {
-        arg_slots[arity] = try lowerExpr(ctx, arg);
+    if (fi.pack_index) |pi| {
+        const fixed: usize = pi;
+        if (args.len < fixed) return error.TooManyArgs;
+        if (fixed + arity > max_call_args) return error.TooManyArgs;
+        var i: usize = 0;
+        while (i < fixed) : (i += 1) {
+            arg_slots[arity] = try lowerExpr(ctx, args[i]);
+            arity += 1;
+        }
+        const pack_n = args.len - fixed;
+        // Stack buffer of pack_n slots (same layout as `[N]T` locals).
+        const first = try ctx.fresh();
+        try ctx.emit(.{ .op = .iconst, .dst = first, .aux = 0 });
+        var j: usize = 1;
+        while (j < pack_n) : (j += 1) {
+            const s = try ctx.fresh();
+            try ctx.emit(.{ .op = .iconst, .dst = s, .aux = 0 });
+        }
+        const ptr = try ctx.fresh();
+        try ctx.emit(.{ .op = .lea_slot, .dst = ptr, .src0 = first });
+        var k: usize = 0;
+        while (k < pack_n) : (k += 1) {
+            const val = try lowerExpr(ctx, args[fixed + k]);
+            const addr = try ctx.fresh();
+            const off = try ctx.fresh();
+            try ctx.emit(.{ .op = .iconst, .dst = off, .aux = @intCast(k * 8) });
+            try ctx.emit(.{ .op = .sub, .dst = addr, .src0 = ptr, .src1 = off });
+            try ctx.emit(.{ .op = .store, .src0 = addr, .src1 = val });
+        }
+        const len = try ctx.fresh();
+        try ctx.emit(.{ .op = .iconst, .dst = len, .aux = @intCast(pack_n) });
+        if (arity + 2 > max_call_args) return error.TooManyArgs;
+        arg_slots[arity] = ptr;
         arity += 1;
+        arg_slots[arity] = len;
+        arity += 1;
+    } else {
+        if (args.len + arity > max_call_args) return error.TooManyArgs;
+        for (args) |arg| {
+            arg_slots[arity] = try lowerExpr(ctx, arg);
+            arity += 1;
+        }
     }
 
     const cid = ctx.callee_map.get(fi.mangled) orelse return error.UnknownName;
@@ -2744,7 +2938,7 @@ fn lowerMethodOrIfaceCall(
     const mi = ctx.methods.get(key) orelse return error.UnknownName;
     const cid = ctx.callee_map.get(mi.mangled) orelse return error.UnknownName;
 
-    var arg_slots: [8]u32 = .{none} ** 8;
+    var arg_slots: [16]u32 = .{none} ** 16;
     var arity: u8 = 0;
     // contexts on methods (rare in demos)
     for (mi.contexts) |cx| {
@@ -2755,7 +2949,7 @@ fn lowerMethodOrIfaceCall(
     }
     arg_slots[arity] = base_slot;
     arity += 1;
-    if (args.len + arity > 8) return error.TooManyArgs;
+    if (args.len + arity > max_call_args) return error.TooManyArgs;
     for (args) |arg| {
         arg_slots[arity] = try lowerExpr(ctx, arg);
         arity += 1;
@@ -2800,10 +2994,10 @@ fn lowerIfaceMethod(ctx: *Ctx, fat: u32, method: []const u8, args: []*ast.Expr) 
     const fnptr = try ctx.fresh();
     try ctx.emit(.{ .op = .load, .dst = fnptr, .src0 = fpp });
 
-    var arg_slots: [8]u32 = .{none} ** 8;
+    var arg_slots: [16]u32 = .{none} ** 16;
     arg_slots[0] = data;
     var arity: u8 = 1;
-    if (args.len + 1 > 8) return error.TooManyArgs;
+    if (args.len + 1 > max_call_args) return error.TooManyArgs;
     for (args) |arg| {
         arg_slots[arity] = try lowerExpr(ctx, arg);
         arity += 1;
