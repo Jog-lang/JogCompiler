@@ -1,0 +1,19 @@
+// Untyped locals from Jog `*T` returns must keep raw_ptr meta (same path as extern).
+
+fn take_ptr(p: *byte): *byte {
+    return p
+}
+
+fn main() {
+    val buf = alloc(4)
+    buf[0] = 11
+    buf[1] = 22
+    buf[2] = 33
+    buf[3] = 44
+    val state = take_ptr(buf)
+    if (state[0] == 11 && state[1] == 22 && state[2] == 33 && state[3] == 44) {
+        print("ptr fn ret ok\n")
+    } else {
+        panic("ptr fn ret fail\n")
+    }
+}

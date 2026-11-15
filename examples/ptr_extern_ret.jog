@@ -1,0 +1,27 @@
+// Untyped locals from `*T` extern returns must keep raw_ptr meta (byte stride 1).
+// Regression for JOG-112 (SDL_GetKeyboardState / KeyboardIsDown without `*byte` annotation).
+
+extern {
+    fn memcpy(dest: *byte, src: *byte, n: i64): *byte
+}
+
+fn main() {
+    val src = alloc(4)
+    val dst = alloc(4)
+    src[0] = 7
+    src[1] = 8
+    src[2] = 9
+    src[3] = 10
+    // No `*byte` annotation — must not infer scalar `byte` (wrong imul $8 index).
+    val p = memcpy(dst, src, 4)
+    if (p[0] == 7 && p[1] == 8 && p[2] == 9 && p[3] == 10) {
+        print("ptr extern ret ok\n")
+    } else {
+        panic("ptr extern ret fail\n")
+    }
+    if (dst[0] == 7 && dst[3] == 10) {
+        print("ptr extern dest ok\n")
+    } else {
+        panic("ptr extern dest fail\n")
+    }
+}
