@@ -1,0 +1,18 @@
+// Numeric `as` converts (Types.md), not bitcast.
+
+fn main() {
+    val f: f64 = 2.5
+    val n = f as i64
+    if (n == 2) {
+        print("as f64->i64 ok\n")
+    } else {
+        panic("as f64->i64 fail\n")
+    }
+    val x: i64 = 100
+    val g = x as f64
+    if (g == 100.0) {
+        print("as i64->f64 ok\n")
+    } else {
+        panic("as i64->f64 fail\n")
+    }
+}

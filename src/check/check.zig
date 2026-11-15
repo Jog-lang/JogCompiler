@@ -45,6 +45,11 @@ pub const TypeInfo = struct {
 pub const Diagnostic = struct {
     line: u32 = 1,
     col: u32 = 1,
+    /// Exclusive end (1-based). Zero means unset (point diagnostic).
+    end_line: u32 = 0,
+    end_col: u32 = 0,
+    /// `"error"` | `"warning"` | `"info"` | `"hint"` — LSP maps these.
+    severity: []const u8 = "error",
     message: []const u8,
 };
 
@@ -60,12 +65,20 @@ fn emitDiag(
     col: u32,
     message: []const u8,
 ) !void {
-    var d: Diagnostic = .{ .line = line, .col = col, .message = message };
+    var d: Diagnostic = .{ .line = line, .col = col, .message = message, .severity = "error" };
     if (at) |e| {
         if (active_file) |f| {
             const sp = f.spanOf(e);
             d.line = sp.line;
             d.col = sp.col;
+            // Identifiers get a real end column; other exprs get a 1-char range
+            // until the parser records full end spans.
+            d.end_line = sp.line;
+            if (e.* == .ident) {
+                d.end_col = sp.col + @as(u32, @intCast(e.ident.len));
+            } else {
+                d.end_col = sp.col + 1;
+            }
         }
     }
     try diags.append(a, d);
@@ -287,6 +300,14 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
         if (md.ret) |r| _ = try resolveTypeExpr(a, &types, r, &diags);
         for (md.params) |p| _ = try resolveTypeExpr(a, &types, p.ty, &diags);
         if (md.body) |body| {
+            // Bind receiver type params (`fn *List<T>.grow`) like fn generics.
+            var bound_tp: std.ArrayListUnmanaged([]const u8) = .{};
+            for (md.type_params) |tp| {
+                const tpi = try a.create(TypeInfo);
+                tpi.* = .{ .kind = .named, .name = tp };
+                try types.put(a, tp, tpi);
+                try bound_tp.append(a, tp);
+            }
             // synthesize self param for receiver
             var params_with_self: std.ArrayListUnmanaged(ast.Param) = .{};
             const self_ty = try a.create(ast.TypeExpr);
@@ -300,6 +321,7 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
             try params_with_self.append(a, .{ .name = "self", .ty = self_ty });
             for (md.params) |p| try params_with_self.append(a, p);
             try checkFunctionBody(a, &types, &fns, &structs, &methods, try params_with_self.toOwnedSlice(a), md.contexts, body, &diags, &globals_scope);
+            for (bound_tp.items) |tp| _ = types.remove(tp);
         }
     }
 
@@ -325,6 +347,57 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
     return result;
 }
 
+/// Resolve `Name` or `pkg.Name` (import-qualified). Flattened import merge registers
+/// the short name; Grammar qualifiedName keeps the package prefix in the AST.
+fn lookupTypeName(types: *std.StringHashMapUnmanaged(*TypeInfo), n: []const u8) ?*TypeInfo {
+    if (types.get(n)) |t| return t;
+    if (std.mem.lastIndexOfScalar(u8, n, '.')) |dot| {
+        return types.get(n[dot + 1 ..]);
+    }
+    return null;
+}
+
+/// Private fields are only readable/writable as `self.<name>` inside methods.
+/// Struct literals may still initialize them (construction).
+fn checkPrivateFieldAccess(
+    a: std.mem.Allocator,
+    structs: *std.StringHashMapUnmanaged(*ast.StructDecl),
+    diags: *std.ArrayListUnmanaged(Diagnostic),
+    base: *const ast.Expr,
+    base_t: *TypeInfo,
+    field_name: []const u8,
+) !void {
+    const sd_name = blk: {
+        if (base_t.kind == .struct_ty) break :blk base_t.name;
+        if (base_t.kind == .pointer) {
+            if (base_t.pointee) |po| {
+                if (po.kind == .struct_ty) break :blk po.name;
+            }
+        }
+        return;
+    };
+    const sd = structs.get(sd_name) orelse return;
+    var is_private = false;
+    for (sd.fields) |fld| {
+        if (std.mem.eql(u8, fld.name, field_name)) {
+            is_private = fld.is_private;
+            break;
+        }
+    }
+    if (!is_private) return;
+    const allowed = base.* == .ident and std.mem.eql(u8, base.ident, "self");
+    if (!allowed) {
+        try emitDiag(
+            a,
+            diags,
+            base,
+            1,
+            1,
+            try std.fmt.allocPrint(a, "private field '{s}' is only accessible as self.{s}", .{ field_name, field_name }),
+        );
+    }
+}
+
 fn defineBuiltin(a: std.mem.Allocator, types: *std.StringHashMapUnmanaged(*TypeInfo), name: []const u8, info: TypeInfo) !void {
     const ti = try a.create(TypeInfo);
     ti.* = info;
@@ -339,7 +412,7 @@ fn resolveTypeExpr(
 ) CheckError!*TypeInfo {
     switch (te.*) {
         .name => |n| {
-            if (types.get(n)) |t| return t;
+            if (lookupTypeName(types, n)) |t| return t;
             try emitDiag(a, diags, null, 1, 1, try std.fmt.allocPrint(a, "unknown type '{s}'", .{n}));
             const bad = try a.create(TypeInfo);
             bad.* = .{ .kind = .named, .name = n };
@@ -385,7 +458,7 @@ fn resolveTypeExpr(
             }
             const mangled = try buf.toOwnedSlice(a);
             if (types.get(mangled)) |t| return t;
-            if (types.get(na.name)) |t| return t;
+            if (lookupTypeName(types, na.name)) |t| return t;
             const ti = try a.create(TypeInfo);
             ti.* = .{ .kind = .struct_ty, .name = mangled };
             try types.put(a, mangled, ti);
@@ -537,7 +610,8 @@ fn checkStmt(
                 _ = try checkExpr(a, types, fns, structs, methods, scope, ix.index, diags);
                 _ = try checkExpr(a, types, fns, structs, methods, scope, as.value, diags);
             } else if (as.field) |fa| {
-                _ = try checkExpr(a, types, fns, structs, methods, scope, fa.base, diags);
+                const base_t = try checkExpr(a, types, fns, structs, methods, scope, fa.base, diags);
+                try checkPrivateFieldAccess(a, structs, diags, fa.base, base_t, fa.name);
                 _ = try checkExpr(a, types, fns, structs, methods, scope, as.value, diags);
             } else {
                 const v = lookupVar(scope, as.name) orelse {
@@ -681,6 +755,15 @@ fn checkExpr(
                 for (c.with_args) |w| _ = try checkExpr(a, types, fns, structs, methods, scope, w, diags);
                 return try voidType(a);
             }
+            // Builtins size(T) / align(T): type arg spelled as expr; result usize.
+            if (c.callee.* == .ident and (std.mem.eql(u8, c.callee.ident, "size") or std.mem.eql(u8, c.callee.ident, "align"))) {
+                if (c.args.len != 1) {
+                    try emitDiag(a, diags, e, 1, 1, try std.fmt.allocPrint(a, "{s} takes one type argument", .{c.callee.ident}));
+                } else {
+                    _ = try checkExpr(a, types, fns, structs, methods, scope, c.args[0], diags);
+                }
+                return types.get("usize").?;
+            }
             if (c.callee.* == .ident and std.mem.eql(u8, c.callee.ident, "alloc")) {
                 for (c.args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
                 const ti = try a.create(TypeInfo);
@@ -770,6 +853,18 @@ fn checkExpr(
                 }
             }
             if (c.callee.* == .field) {
+                // `pkg.fn(...)` after import — flattened merge; base is alias, not a value.
+                if (c.callee.field.base.* == .ident) {
+                    const base_name = c.callee.field.base.ident;
+                    if (lookupVar(scope, base_name) == null) {
+                        if (fns.get(c.callee.field.name)) |fd| {
+                            for (c.args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
+                            for (c.with_args) |w| _ = try checkExpr(a, types, fns, structs, methods, scope, w, diags);
+                            if (fd.ret) |r| return try resolveTypeExpr(a, types, r, diags);
+                            return try voidType(a);
+                        }
+                    }
+                }
                 const base_t = try checkExpr(a, types, fns, structs, methods, scope, c.callee.field.base, diags);
                 for (c.args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
                 for (c.with_args) |w| _ = try checkExpr(a, types, fns, structs, methods, scope, w, diags);
@@ -805,6 +900,7 @@ fn checkExpr(
                 if (structs.get(base.name)) |sd| {
                     for (sd.fields) |fld| {
                         if (std.mem.eql(u8, fld.name, f.name)) {
+                            try checkPrivateFieldAccess(a, structs, diags, f.base, base, f.name);
                             return try resolveTypeExpr(a, types, fld.ty, diags);
                         }
                     }
@@ -816,6 +912,7 @@ fn checkExpr(
                         if (structs.get(po.name)) |sd| {
                             for (sd.fields) |fld| {
                                 if (std.mem.eql(u8, fld.name, f.name)) {
+                                    try checkPrivateFieldAccess(a, structs, diags, f.base, base, f.name);
                                     return try resolveTypeExpr(a, types, fld.ty, diags);
                                 }
                             }
@@ -944,6 +1041,14 @@ fn checkExpr(
             _ = try checkExpr(a, types, fns, structs, methods, scope, it.expr, diags);
             _ = try resolveTypeExpr(a, types, it.ty, diags);
             return types.get("bool").?;
+        },
+        .force_unwrap => |inner| {
+            const t = try checkExpr(a, types, fns, structs, methods, scope, inner, diags);
+            if (t.kind == .optional) {
+                return t.pointee orelse try voidType(a);
+            }
+            // Non-optional: accept (no-op unwrap) for pointer-ish values.
+            return t;
         },
     }
 }

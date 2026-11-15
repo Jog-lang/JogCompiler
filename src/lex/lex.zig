@@ -11,6 +11,7 @@ pub const TokenKind = enum {
     // keywords
     kw_fn,
     kw_struct,
+    kw_object,
     kw_interface,
     kw_type,
     kw_val,
@@ -55,6 +56,7 @@ pub const TokenKind = enum {
     shl,
     shr,
     arrow, // ->
+    ellipsis, // ...
     dotdot, // ..
     pluseq,
     minuseq,
@@ -82,6 +84,7 @@ pub const TokenKind = enum {
     lt,
     gt,
     bang,
+    bang_bang, // !!
     question,
 };
 
@@ -177,6 +180,11 @@ pub const Lexer = struct {
             self.advance();
             return .{ .kind = .neq, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
         }
+        if (c == '!' and self.i + 1 < self.src.len and self.src[self.i + 1] == '!') {
+            self.advance();
+            self.advance();
+            return .{ .kind = .bang_bang, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+        }
         if (c == '&' and self.i + 1 < self.src.len and self.src[self.i + 1] == '&') {
             self.advance();
             self.advance();
@@ -211,6 +219,13 @@ pub const Lexer = struct {
             self.advance();
             self.advance();
             return .{ .kind = .arrow, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+        }
+        // `...` before `..` so three dots are not `..` plus a leftover `.`.
+        if (c == '.' and self.i + 2 < self.src.len and self.src[self.i + 1] == '.' and self.src[self.i + 2] == '.') {
+            self.advance();
+            self.advance();
+            self.advance();
+            return .{ .kind = .ellipsis, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
         }
         if (c == '.' and self.i + 1 < self.src.len and self.src[self.i + 1] == '.') {
             self.advance();
@@ -357,6 +372,7 @@ fn keyword(text: []const u8) TokenKind {
     const map = .{
         .{ "fn", TokenKind.kw_fn },
         .{ "struct", TokenKind.kw_struct },
+        .{ "object", TokenKind.kw_object },
         .{ "interface", TokenKind.kw_interface },
         .{ "type", TokenKind.kw_type },
         .{ "val", TokenKind.kw_val },

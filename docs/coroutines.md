@@ -60,10 +60,19 @@ zig build
 
 Rare single-`tid` under light load on gate-2 pool demos is valid. Treat hangs / lost wakeups as failures.
 
+## wasm32-emscripten
+
+No x86_64 stack switch / `clone` workers. `runtime/emscripten/jogrt.c`:
+
+- `go` / `spawn` — **run-to-completion** on the current stack (`fn(arg)` then return). Serial; correct for non-yielding band workers.
+- `yield` / stackful park — still **abort**. Full cooperative M:N needs Asyncify, JSPI, or Wasm stack-switching.
+- `dispatcher_*` — opaque non-null handles; no OS threads / steal.
+- Example: `examples/emscripten_go_rtc.jog`.
+
 ## Limits (not in this step)
 
 - No `go { }` blocks / captures, no `Scope`, no `Task` / join.
 - Fixed max 32 coro slots, 16 workers, 4 Dispatcher pools; stacks via `mmap` (not charged to `alloc`).
 - Chase-Lev arrays are fixed-capacity (no grow); full queue panics.
 - IO pool shrink-beyond-min is deferred (grow only for now).
-- Freestanding linux x64 only.
+- Freestanding linux x64 only (emscripten: RTC `go` only; see above).

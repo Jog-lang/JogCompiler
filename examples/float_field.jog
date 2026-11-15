@@ -1,0 +1,23 @@
+// Struct f64 fields must use float arithmetic (fadd), not integer add.
+
+struct V {
+    x: f64
+    y: f64
+}
+
+fn V.add(o: V): V {
+    return V(x: self.x + o.x, y: self.y + o.y)
+}
+
+fn main() {
+    val a = V(x: 1.0, y: 0.5)
+    val b = V(x: 2.0, y: 0.25)
+    val c = a.add(b)
+    if (c.x == 3.0) {
+        if (c.y == 0.75) {
+            print("field fadd ok\n")
+            return
+        }
+    }
+    panic("field fadd fail\n")
+}

@@ -298,6 +298,99 @@ pub fn main() !void {
         try driver.cmdDepsOpts(allocator, path, stdout, flags, include_test);
         return;
     }
+    if (std.mem.eql(u8, cmd, "ide")) {
+        const ide = @import("driver/ide.zig");
+        const sub = args.next() orelse {
+            try stderr.writeAll("ide: missing subcommand (hover|definition|complete|references|symbols)\n");
+            std.process.exit(2);
+        };
+        const mode: ide.Mode = blk: {
+            if (std.mem.eql(u8, sub, "hover")) break :blk .hover;
+            if (std.mem.eql(u8, sub, "definition")) break :blk .definition;
+            if (std.mem.eql(u8, sub, "complete")) break :blk .complete;
+            if (std.mem.eql(u8, sub, "references")) break :blk .references;
+            if (std.mem.eql(u8, sub, "symbols")) break :blk .symbols;
+            try stderr.print("ide: unknown subcommand {s}\n", .{sub});
+            std.process.exit(2);
+        };
+        var path: ?[]const u8 = null;
+        var line: u32 = 1;
+        var column: u32 = 1;
+        var include_test = false;
+        var modules: std.ArrayListUnmanaged(driver.ModuleMapping) = .{};
+        defer {
+            for (modules.items) |m| {
+                allocator.free(m.name);
+                allocator.free(m.dir);
+            }
+            modules.deinit(allocator);
+        }
+        while (args.next()) |a| {
+            if (std.mem.eql(u8, a, "--line")) {
+                const v = args.next() orelse {
+                    try stderr.writeAll("ide: --line needs a number\n");
+                    std.process.exit(2);
+                };
+                line = std.fmt.parseInt(u32, v, 10) catch {
+                    try stderr.writeAll("ide: --line needs a number\n");
+                    std.process.exit(2);
+                };
+            } else if (std.mem.startsWith(u8, a, "--line=")) {
+                line = std.fmt.parseInt(u32, a["--line=".len..], 10) catch {
+                    try stderr.writeAll("ide: --line needs a number\n");
+                    std.process.exit(2);
+                };
+            } else if (std.mem.eql(u8, a, "--column")) {
+                const v = args.next() orelse {
+                    try stderr.writeAll("ide: --column needs a number\n");
+                    std.process.exit(2);
+                };
+                column = std.fmt.parseInt(u32, v, 10) catch {
+                    try stderr.writeAll("ide: --column needs a number\n");
+                    std.process.exit(2);
+                };
+            } else if (std.mem.startsWith(u8, a, "--column=")) {
+                column = std.fmt.parseInt(u32, a["--column=".len..], 10) catch {
+                    try stderr.writeAll("ide: --column needs a number\n");
+                    std.process.exit(2);
+                };
+            } else if (std.mem.eql(u8, a, "--test")) {
+                include_test = true;
+            } else if (std.mem.eql(u8, a, "--module")) {
+                const v = args.next() orelse {
+                    try stderr.writeAll("ide: --module needs name=dir\n");
+                    std.process.exit(2);
+                };
+                const m = parseModuleFlag(allocator, v) catch {
+                    try stderr.writeAll("ide: --module needs name=dir\n");
+                    std.process.exit(2);
+                };
+                try modules.append(allocator, m);
+            } else if (std.mem.startsWith(u8, a, "--module=")) {
+                const m = parseModuleFlag(allocator, a["--module=".len..]) catch {
+                    try stderr.writeAll("ide: --module needs name=dir\n");
+                    std.process.exit(2);
+                };
+                try modules.append(allocator, m);
+            } else if (std.mem.startsWith(u8, a, "-")) {
+                try stderr.print("ide: unknown flag {s}\n", .{a});
+                std.process.exit(2);
+            } else if (path == null) {
+                path = a;
+            } else {
+                try stderr.print("ide: unexpected arg {s}\n", .{a});
+                std.process.exit(2);
+            }
+        }
+        try ide.run(allocator, mode, path orelse {
+            try stderr.writeAll("ide: missing file\n");
+            std.process.exit(2);
+        }, line, column, stdout, .{
+            .modules = modules.items,
+            .include_test_requires = include_test,
+        });
+        return;
+    }
 
     try stderr.print("unknown command: {s}\n", .{cmd});
     try driver.usage(stderr);
@@ -309,4 +402,5 @@ test {
     _ = @import("check/check.zig");
     _ = @import("codegen/asm.zig");
     _ = @import("mod/mod.zig");
+    _ = @import("driver/ide.zig");
 }

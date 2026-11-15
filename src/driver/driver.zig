@@ -7,7 +7,7 @@ const link = @import("../codegen/link.zig");
 const mod = @import("../mod/mod.zig");
 const roots_mod = @import("roots.zig");
 
-pub const version_string = "jog 0.2.9-v2 (zig host, std/core roots; ir→asm→native | ir→c→emcc; LSP surfaces)";
+pub const version_string = "jog 0.2.11-v2 (zig host, object+std/core; ir→asm→native | ir→c→emcc; jog ide JSON)";
 
 pub fn cmdVersion(writer: anytype) !void {
     try writer.print("{s}\n", .{version_string});
@@ -44,17 +44,56 @@ fn stripLspTmpSuffix(path: []const u8) []const u8 {
     return path;
 }
 
+/// True when `a` and `b` name the same source file.
+/// Accepts exact equality, realpath equality, or one path as a `/`-bounded suffix of the other
+/// (relative vs absolute). Never matches on bare basename alone — JogSDL flat merge has many
+/// `sdl/<cat>/<cat>.jog` ↔ `sdl3/<cat>/<cat>.jog` pairs that share a leaf name.
+fn sameSourcePath(a: []const u8, b: []const u8) bool {
+    if (std.mem.eql(u8, a, b)) return true;
+    if (pathSuffixMatch(a, b) or pathSuffixMatch(b, a)) return true;
+    var buf_a: [std.fs.max_path_bytes]u8 = undefined;
+    var buf_b: [std.fs.max_path_bytes]u8 = undefined;
+    const ra = std.fs.cwd().realpath(a, &buf_a) catch return false;
+    const rb = std.fs.cwd().realpath(b, &buf_b) catch return false;
+    return std.mem.eql(u8, ra, rb);
+}
+
+fn pathSuffixMatch(longer: []const u8, shorter: []const u8) bool {
+    if (shorter.len == 0 or longer.len <= shorter.len) return false;
+    if (!std.mem.endsWith(u8, longer, shorter)) return false;
+    const before = longer[longer.len - shorter.len - 1];
+    return before == '/' or before == '\\';
+}
+
+fn jogModExists(dir: []const u8) bool {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const joined = if (dir.len == 0 or std.mem.eql(u8, dir, "."))
+        "jog.mod"
+    else blk: {
+        const n = std.fmt.bufPrint(&buf, "{s}/jog.mod", .{dir}) catch return false;
+        break :blk n;
+    };
+    std.fs.cwd().access(joined, .{}) catch return false;
+    return true;
+}
+
 fn findModuleDirUp(allocator: std.mem.Allocator, start_file: []const u8) !?[]u8 {
-    var dir = std.fs.path.dirname(start_file) orelse return null;
+    // Relative paths like `sdl/init/init.jog` walk `sdl/init` → `sdl` then stop
+    // (`dirname("sdl")` is null). Still probe cwd so `./jog.mod` is found.
+    var dir_opt = std.fs.path.dirname(start_file);
     while (true) {
-        const mod_path = try std.fs.path.join(allocator, &.{ dir, "jog.mod" });
-        defer allocator.free(mod_path);
-        if (std.fs.cwd().access(mod_path, .{})) |_| {
-            return try allocator.dupe(u8, dir);
-        } else |_| {}
-        const parent = std.fs.path.dirname(dir) orelse return null;
-        if (std.mem.eql(u8, parent, dir)) return null;
-        dir = parent;
+        if (dir_opt) |dir| {
+            if (jogModExists(dir)) return try allocator.dupe(u8, dir);
+            const parent = std.fs.path.dirname(dir);
+            if (parent == null or std.mem.eql(u8, parent.?, dir)) {
+                if (jogModExists(".")) return try allocator.dupe(u8, ".");
+                return null;
+            }
+            dir_opt = parent;
+        } else {
+            if (jogModExists(".")) return try allocator.dupe(u8, ".");
+            return null;
+        }
     }
 }
 
@@ -64,6 +103,8 @@ pub const Unit = struct {
     file: ast.File,
     /// Owned source buffers (one per input file).
     srcs: [][]u8,
+    /// Absolute or load-time paths parallel to `srcs` / `parts` (or single-file path).
+    paths: [][]u8,
     /// Per-file ASTs when multi-file; empty for single-file.
     parts: []ast.File,
     /// Merged decls slice owned by `allocator` when parts.len > 0.
@@ -82,6 +123,8 @@ pub const Unit = struct {
         }
         for (self.srcs) |s| self.allocator.free(s);
         self.allocator.free(self.srcs);
+        for (self.paths) |p| self.allocator.free(p);
+        self.allocator.free(self.paths);
     }
 };
 
@@ -98,7 +141,11 @@ fn loadSingle(allocator: std.mem.Allocator, path: []const u8, modules: []const M
     var seen: std.StringHashMapUnmanaged(void) = .{};
     defer seen.deinit(allocator);
 
-    const root = try allocator.dupe(u8, path);
+    // JogLSP may pass `<file>.jog-lsp-tmp`: read that buffer, but treat the
+    // logical `.jog` path as the graph key (imports resolve next to it).
+    const logical_root = stripLspTmpSuffix(path);
+    const root_read = path;
+    const root = try allocator.dupe(u8, logical_root);
     try pending.append(allocator, root);
     try seen.put(allocator, root, {});
 
@@ -106,6 +153,11 @@ fn loadSingle(allocator: std.mem.Allocator, path: []const u8, modules: []const M
     errdefer {
         for (srcs.items) |s| allocator.free(s);
         srcs.deinit(allocator);
+    }
+    var paths: std.ArrayListUnmanaged([]u8) = .{};
+    errdefer {
+        for (paths.items) |p| allocator.free(p);
+        paths.deinit(allocator);
     }
     var parts: std.ArrayListUnmanaged(ast.File) = .{};
     errdefer {
@@ -118,8 +170,13 @@ fn loadSingle(allocator: std.mem.Allocator, path: []const u8, modules: []const M
     var qi: usize = 0;
     while (qi < pending.items.len) : (qi += 1) {
         const cur = pending.items[qi];
-        const src = try std.fs.cwd().readFileAlloc(allocator, cur, 16 * 1024 * 1024);
+        const read_path = blk: {
+            if (qi == 0 and !std.mem.eql(u8, logical_root, root_read)) break :blk root_read;
+            break :blk cur;
+        };
+        const src = try std.fs.cwd().readFileAlloc(allocator, read_path, 16 * 1024 * 1024);
         try srcs.append(allocator, src);
+        try paths.append(allocator, try allocator.dupe(u8, cur));
         const file = try parse.Parser.parseFile(allocator, src);
         try decls.appendSlice(allocator, file.decls);
         for (file.decls) |d| {
@@ -159,24 +216,27 @@ fn loadSingle(allocator: std.mem.Allocator, path: []const u8, modules: []const M
         // Single file, no imports pulled — same shape as before.
         decls.deinit(allocator);
         const srcs_slice = try srcs.toOwnedSlice(allocator);
+        const paths_slice = try paths.toOwnedSlice(allocator);
         const parts_owned = try parts.toOwnedSlice(allocator);
         const file = parts_owned[0];
         allocator.free(parts_owned);
         return .{
             .file = file,
             .srcs = srcs_slice,
+            .paths = paths_slice,
             .parts = &[_]ast.File{},
             .merged_decls = null,
             .allocator = allocator,
         };
     }
 
-    return finishMergedUnit(allocator, &srcs, &parts, &decls);
+    return finishMergedUnit(allocator, &srcs, &paths, &parts, &decls);
 }
 
 fn finishMergedUnit(
     allocator: std.mem.Allocator,
     srcs: *std.ArrayListUnmanaged([]u8),
+    paths: *std.ArrayListUnmanaged([]u8),
     parts: *std.ArrayListUnmanaged(ast.File),
     decls: *std.ArrayListUnmanaged(ast.Decl),
 ) !Unit {
@@ -197,6 +257,7 @@ fn finishMergedUnit(
     return .{
         .file = file,
         .srcs = try srcs.toOwnedSlice(allocator),
+        .paths = try paths.toOwnedSlice(allocator),
         .parts = parts_slice,
         .merged_decls = merged,
         .allocator = allocator,
@@ -423,6 +484,11 @@ fn loadModuleWithOverride(
         for (srcs.items) |s| allocator.free(s);
         srcs.deinit(allocator);
     }
+    var paths: std.ArrayListUnmanaged([]u8) = .{};
+    errdefer {
+        for (paths.items) |pp| allocator.free(pp);
+        paths.deinit(allocator);
+    }
     var parts: std.ArrayListUnmanaged(ast.File) = .{};
     errdefer {
         for (parts.items) |*p| p.deinit();
@@ -440,9 +506,9 @@ fn loadModuleWithOverride(
         const read_path = blk: {
             if (override_real) |real| {
                 if (override_read) |alt| {
-                    if (std.mem.eql(u8, p, real)) break :blk alt;
-                    // Also match by basename when paths differ only by relative/absolute form.
-                    if (std.mem.eql(u8, std.fs.path.basename(p), std.fs.path.basename(real))) break :blk alt;
+                    // Full-path identity only — basename matching would swap sibling
+                    // `sdl/foo.jog` and `sdl3/foo.jog` in flat-merge modules (JogSDL).
+                    if (sameSourcePath(p, real)) break :blk alt;
                 }
             }
             break :blk p;
@@ -452,6 +518,7 @@ fn loadModuleWithOverride(
             std.process.exit(1);
         };
         try srcs.append(allocator, src);
+        try paths.append(allocator, try allocator.dupe(u8, p));
         const file = parse.Parser.parseFile(allocator, src) catch |err| {
             try writer.print("parse error ({s}): {s}\n", .{ read_path, @errorName(err) });
             std.process.exit(1);
@@ -489,7 +556,7 @@ fn loadModuleWithOverride(
         try parts.append(allocator, file);
     }
 
-    return finishMergedUnit(allocator, &srcs, &parts, &decls);
+    return finishMergedUnit(allocator, &srcs, &paths, &parts, &decls);
 }
 
 pub fn loadPath(allocator: std.mem.Allocator, path: []const u8, writer: anytype) !Unit {
@@ -521,17 +588,39 @@ pub fn loadPathOpts(allocator: std.mem.Allocator, path: []const u8, writer: anyt
     };
 }
 
-/// One JSON object per line (v1 LSP contract).
-fn writeDiag(allocator: std.mem.Allocator, writer: anytype, file: []const u8, line: u32, column: u32, severity: []const u8, message: []const u8) !void {
+/// One JSON object per line (v1 LSP contract). Emits `end_line`/`end_column` when set.
+fn writeDiag(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    file: []const u8,
+    line: u32,
+    column: u32,
+    end_line: u32,
+    end_column: u32,
+    severity: []const u8,
+    message: []const u8,
+) !void {
     var buf: std.ArrayListUnmanaged(u8) = .{};
     defer buf.deinit(allocator);
-    try std.json.stringify(.{
-        .file = file,
-        .line = line,
-        .column = column,
-        .severity = severity,
-        .message = message,
-    }, .{}, buf.writer(allocator));
+    if (end_line != 0 and end_column != 0) {
+        try std.json.stringify(.{
+            .file = file,
+            .line = line,
+            .column = column,
+            .end_line = end_line,
+            .end_column = end_column,
+            .severity = severity,
+            .message = message,
+        }, .{}, buf.writer(allocator));
+    } else {
+        try std.json.stringify(.{
+            .file = file,
+            .line = line,
+            .column = column,
+            .severity = severity,
+            .message = message,
+        }, .{}, buf.writer(allocator));
+    }
     try writer.writeAll(buf.items);
     try writer.writeAll("\n");
 }
@@ -543,7 +632,7 @@ pub fn cmdParse(allocator: std.mem.Allocator, path: []const u8, writer: anytype,
     for (unit.file.decls) |d| {
         switch (d) {
             .type_alias => |t| try writer.print("  type {s}\n", .{t.name}),
-            .struct_decl => |s| try writer.print("  struct {s}\n", .{s.name}),
+            .struct_decl => |s| try writer.print("  {s} {s}\n", .{ if (s.is_object) "object" else "struct", s.name }),
             .enum_decl => |e| try writer.print("  enum {s}\n", .{e.name}),
             .import_decl => |i| try writer.print("  import {s}\n", .{i.path}),
             .require_decl => |r| try writer.print("  require {s}\n", .{r.name}),
@@ -580,7 +669,7 @@ pub fn cmdSymbols(allocator: std.mem.Allocator, path: []const u8, json: bool, wr
         };
         const kind: []const u8 = switch (d) {
             .fn_decl, .actual_fn, .method => "function",
-            .struct_decl => "struct",
+            .struct_decl => |s| if (s.is_object) "object" else "struct",
             .enum_decl => "enum",
             .global_decl => |g| if (g.mutable) "variable" else "constant",
             .type_alias => "type",
@@ -630,9 +719,9 @@ pub fn cmdCheck(allocator: std.mem.Allocator, path: []const u8, diag_json: bool,
     if (!result.ok) {
         for (result.diagnostics) |d| {
             if (diag_json) {
-                try writeDiag(allocator, writer, path, d.line, d.col, "error", d.message);
+                try writeDiag(allocator, writer, path, d.line, d.col, d.end_line, d.end_col, d.severity, d.message);
             } else {
-                try writer.print("error: {s}\n", .{d.message});
+                try writer.print("{s}: {s}\n", .{ d.severity, d.message });
             }
         }
         std.process.exit(1);
@@ -788,6 +877,9 @@ pub fn usage(writer: anytype) !void {
         \\  version                 print version
         \\  parse <path>            parse and list declarations
         \\  symbols [--json] <path> document symbols (LSP)
+        \\  ide <hover|definition|complete|references|symbols>
+        \\      [--line N] [--column N] [--test] [--module name=dir]... <path>
+        \\                          JSON IDE queries (JogLSP); line/column 1-based
         \\  check [--diag=json] [--test] [--module name=dir]... <path>
         \\                          typecheck subset (JSON diags for LSP)
         \\  build <path> -o OUT [--keep-asm] [--keep-c]
@@ -805,6 +897,8 @@ pub fn usage(writer: anytype) !void {
         \\
         \\path may be a .jog file, a directory with jog.mod, or a jog.mod file.
         \\std/core: $JOG_ROOT/{std,core} or <jog>/../{std,core} (see `jog roots`).
+        \\Unsaved buffers: pass `<realpath>.jog-lsp-tmp` (same override as check).
         \\
     );
 }
+

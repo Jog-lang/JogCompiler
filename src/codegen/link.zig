@@ -254,33 +254,36 @@ fn absPath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return try std.fs.path.join(allocator, &.{ cwd, path });
 }
 
+fn runtimeLooksValid(allocator: std.mem.Allocator, rt: []const u8) !bool {
+    const main_s = try std.fs.path.join(allocator, &.{ rt, "linux_x64.s" });
+    defer allocator.free(main_s);
+    std.fs.cwd().access(main_s, .{}) catch {
+        // Absolute / non-cwd paths: try absolute access.
+        std.fs.accessAbsolute(main_s, .{}) catch return false;
+        return true;
+    };
+    return true;
+}
+
 fn findRuntimeDir(allocator: std.mem.Allocator) ![]u8 {
-    const candidates = [_][]const u8{
-        "runtime",
-        "../runtime",
-        "/home/plague_doc/Documents/Projects/Jog/JogCompiler-v2/runtime",
-    };
-    for (candidates) |c| {
-        var dir = std.fs.cwd().openDir(c, .{}) catch continue;
-        dir.close();
-        const main_s = try std.fs.path.join(allocator, &.{ c, "linux_x64.s" });
-        defer allocator.free(main_s);
-        std.fs.cwd().access(main_s, .{}) catch continue;
-        return try allocator.dupe(u8, c);
-    }
+    // Prefer the runtime next to this jog binary (worktree-safe), then cwd.
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const exe = std.fs.selfExePath(&buf) catch {
-        std.debug.print("jog: runtime/ not found (cwd has no runtime/linux_x64.s)\n", .{});
-        std.process.exit(1);
-    };
-    const dir = std.fs.path.dirname(exe) orelse ".";
-    const near = try std.fs.path.join(allocator, &.{ dir, "../../runtime" });
-    defer allocator.free(near);
-    const near_s = try std.fs.path.join(allocator, &.{ near, "linux_x64.s" });
-    defer allocator.free(near_s);
-    std.fs.cwd().access(near_s, .{}) catch {
-        const near2 = try std.fs.path.join(allocator, &.{ dir, "../runtime" });
-        return near2;
-    };
-    return try allocator.dupe(u8, near);
+    if (std.fs.selfExePath(&buf)) |exe| {
+        const dir = std.fs.path.dirname(exe) orelse ".";
+        const near_paths = [_][]const u8{ "../../runtime", "../runtime" };
+        for (near_paths) |rel| {
+            const near = try std.fs.path.join(allocator, &.{ dir, rel });
+            errdefer allocator.free(near);
+            if (try runtimeLooksValid(allocator, near)) return near;
+            allocator.free(near);
+        }
+    } else |_| {}
+
+    const cwd_candidates = [_][]const u8{ "runtime", "../runtime" };
+    for (cwd_candidates) |c| {
+        if (try runtimeLooksValid(allocator, c)) return try allocator.dupe(u8, c);
+    }
+
+    std.debug.print("jog: runtime/ not found (checked next to jog and cwd)\n", .{});
+    std.process.exit(1);
 }

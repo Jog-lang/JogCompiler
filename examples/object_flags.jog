@@ -1,0 +1,27 @@
+// JOG-96: object singleton — SDL/flags-shaped package state (no heap).
+
+object App {
+    running: i64
+    ticks: i64
+    flags: i64
+}
+
+fn App.tick() {
+    App.ticks = App.ticks + 1
+}
+
+fn App.setRunning(v: i64) {
+    App.running = v
+}
+
+fn main() {
+    App.flags = 1
+    App.setRunning(1)
+    App.tick()
+    App.tick()
+    if (App.running == 1 && App.ticks == 2 && App.flags == 1) {
+        print("object flags ok\n")
+    } else {
+        panic("object flags fail\n")
+    }
+}
