@@ -216,6 +216,8 @@ const MethodInfo = struct {
     ncontexts: u32,
     contexts: []ast.ContextParam,
     ret_name: []const u8 = "",
+    /// Full return slot meta (preserves `*T` as raw_ptr/struct_ptr); null if void/unknown.
+    ret_meta: ?SlotMeta = null,
 };
 
 const IfaceInfo = struct {
@@ -228,7 +230,10 @@ const FnInfo = struct {
     contexts: []ast.ContextParam,
     exported: bool,
     /// Return type name when a named struct/scalar; empty if void/unknown.
+    /// For pointers this is the pointee name (see `ret_meta` for pointer-ness).
     ret_name: []const u8 = "",
+    /// Full return slot meta (preserves `*T` as raw_ptr/struct_ptr); null if void/unknown.
+    ret_meta: ?SlotMeta = null,
 };
 
 const Ambient = struct {
@@ -365,13 +370,18 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                         .void_ret = ef.ret == null,
                     });
                     var ret_name: []const u8 = "";
-                    if (ef.ret) |r| ret_name = try resolveRetName(a, &structs, r);
+                    var ret_meta: ?SlotMeta = null;
+                    if (ef.ret) |r| {
+                        ret_name = try resolveRetName(a, &structs, r);
+                        ret_meta = try metaForTypeExpr(a, r, &structs, &ifaces);
+                    }
                     try fn_infos.put(a, ef.name, .{
                         .mangled = ef.name,
                         .nparams = @intCast(ef.params.len),
                         .contexts = &[_]ast.ContextParam{},
                         .exported = false,
                         .ret_name = ret_name,
+                        .ret_meta = ret_meta,
                     });
                     program.needs_libc = true;
                 }
@@ -414,13 +424,18 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                 } else if (fd.body != null) {
                     try internCallee(a, &callees, &callee_map, .{ .kind = .jog_fn, .name = fd.name });
                     var ret_name: []const u8 = "";
-                    if (fd.ret) |r| ret_name = try resolveRetName(a, &structs, r);
+                    var ret_meta: ?SlotMeta = null;
+                    if (fd.ret) |r| {
+                        ret_name = try resolveRetName(a, &structs, r);
+                        ret_meta = try metaForTypeExpr(a, r, &structs, &ifaces);
+                    }
                     try fn_infos.put(a, fd.name, .{
                         .mangled = fd.name,
                         .nparams = @intCast(fd.params.len),
                         .contexts = fd.contexts,
                         .exported = fd.exported or std.mem.eql(u8, fd.name, "main"),
                         .ret_name = ret_name,
+                        .ret_meta = ret_meta,
                     });
                 }
             },
@@ -430,13 +445,18 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                     const kind: CalleeKind = if (std.mem.startsWith(u8, ef.name, "jogrt_")) .runtime else .jog_fn;
                     try internCallee(a, &callees, &callee_map, .{ .kind = kind, .name = ef.name });
                     var ret_name: []const u8 = "";
-                    if (ef.ret) |r| ret_name = try resolveRetName(a, &structs, r);
+                    var ret_meta: ?SlotMeta = null;
+                    if (ef.ret) |r| {
+                        ret_name = try resolveRetName(a, &structs, r);
+                        ret_meta = try metaForTypeExpr(a, r, &structs, &ifaces);
+                    }
                     try fn_infos.put(a, ef.name, .{
                         .mangled = ef.name,
                         .nparams = @intCast(ef.params.len),
                         .contexts = &[_]ast.ContextParam{},
                         .exported = false,
                         .ret_name = ret_name,
+                        .ret_meta = ret_meta,
                     });
                 }
             },
@@ -447,7 +467,11 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                     const key = try std.fmt.allocPrint(a, "{s}.{s}", .{ md.type_name, md.name });
                     try internCallee(a, &callees, &callee_map, .{ .kind = .jog_fn, .name = mangled });
                     var mret: []const u8 = "";
-                    if (md.ret) |r| mret = try resolveRetName(a, &structs, r);
+                    var mret_meta: ?SlotMeta = null;
+                    if (md.ret) |r| {
+                        mret = try resolveRetName(a, &structs, r);
+                        mret_meta = try metaForTypeExpr(a, r, &structs, &ifaces);
+                    }
                     try methods.put(a, key, .{
                         .mangled = mangled,
                         .pointer_recv = md.pointer_recv,
@@ -457,6 +481,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                         .ncontexts = @intCast(md.contexts.len),
                         .contexts = md.contexts,
                         .ret_name = mret,
+                        .ret_meta = mret_meta,
                     });
                 }
             },
@@ -655,13 +680,20 @@ fn ensureGenericFn(
     try specialized.append(a, fd);
     try internCallee(a, callees, callee_map, .{ .kind = .jog_fn, .name = mangled });
     var ret_name: []const u8 = "";
-    if (ret) |r| ret_name = try resolveRetName(a, structs, r);
+    var ret_meta: ?SlotMeta = null;
+    if (ret) |r| {
+        ret_name = try resolveRetName(a, structs, r);
+        // No iface map here; scalar/struct pointer meta still correct for common cases.
+        var empty_ifaces: std.StringHashMapUnmanaged(IfaceInfo) = .{};
+        ret_meta = try metaForTypeExpr(a, r, structs, &empty_ifaces);
+    }
     try fn_infos.put(a, mangled, .{
         .mangled = mangled,
         .nparams = @intCast(fd.params.len),
         .contexts = fd.contexts,
         .exported = false,
         .ret_name = ret_name,
+        .ret_meta = ret_meta,
     });
     // Also alias under call lookup: lowerCall will mangle at site.
 }
@@ -1500,6 +1532,15 @@ fn slotNameOf(_: *Ctx, _: u32) []const u8 {
     return "";
 }
 
+/// Prefer stored return meta (keeps `*T` as raw_ptr); fall back to name-only heuristic.
+fn metaFromCallRet(ctx: *Ctx, ret_meta: ?SlotMeta, ret_name: []const u8) ?SlotMeta {
+    if (ret_meta) |m| return m;
+    if (ret_name.len == 0) return null;
+    if (ctx.structs.contains(ret_name))
+        return .{ .kind = .struct_ptr, .type_name = ret_name };
+    return .{ .kind = .scalar, .type_name = ret_name };
+}
+
 fn inferMetaFromExpr(ctx: *Ctx, e: *ast.Expr) ?SlotMeta {
     switch (e.*) {
         .struct_lit => |sl| {
@@ -1545,11 +1586,7 @@ fn inferMetaFromExpr(ctx: *Ctx, e: *ast.Expr) ?SlotMeta {
                     if (!isBuiltinScalar(tn) and ctx.structs.contains(tn)) {
                         const key = std.fmt.allocPrint(ctx.a, "{s}.{s}", .{ tn, opm }) catch return null;
                         if (ctx.methods.get(key)) |mi| {
-                            if (mi.ret_name.len > 0) {
-                                if (ctx.structs.contains(mi.ret_name))
-                                    return .{ .kind = .struct_ptr, .type_name = mi.ret_name };
-                                return .{ .kind = .scalar, .type_name = mi.ret_name };
-                            }
+                            if (metaFromCallRet(ctx, mi.ret_meta, mi.ret_name)) |m| return m;
                         }
                     }
                 }
@@ -1573,31 +1610,19 @@ fn inferMetaFromExpr(ctx: *Ctx, e: *ast.Expr) ?SlotMeta {
                     const mangled = mangleNamedApp(ctx.a, c.callee.ident, c.type_args) catch "";
                     if (mangled.len > 0) {
                         if (ctx.fn_infos.get(mangled)) |fi| {
-                            if (fi.ret_name.len > 0) {
-                                if (ctx.structs.contains(fi.ret_name))
-                                    return .{ .kind = .struct_ptr, .type_name = fi.ret_name };
-                                return .{ .kind = .scalar, .type_name = fi.ret_name };
-                            }
+                            if (metaFromCallRet(ctx, fi.ret_meta, fi.ret_name)) |m| return m;
                         }
                     }
                 }
                 if (ctx.fn_infos.get(c.callee.ident)) |fi| {
-                    if (fi.ret_name.len > 0) {
-                        if (ctx.structs.contains(fi.ret_name))
-                            return .{ .kind = .struct_ptr, .type_name = fi.ret_name };
-                        return .{ .kind = .scalar, .type_name = fi.ret_name };
-                    }
+                    if (metaFromCallRet(ctx, fi.ret_meta, fi.ret_name)) |m| return m;
                 }
             }
             if (c.callee.* == .field) {
                 const base_tn = inferTypeNameFromExpr(ctx, c.callee.field.base) orelse "";
                 const key = std.fmt.allocPrint(ctx.a, "{s}.{s}", .{ base_tn, c.callee.field.name }) catch return .{ .kind = .raw_ptr };
                 if (ctx.methods.get(key)) |mi| {
-                    if (mi.ret_name.len > 0) {
-                        if (ctx.structs.contains(mi.ret_name))
-                            return .{ .kind = .struct_ptr, .type_name = mi.ret_name };
-                        return .{ .kind = .scalar, .type_name = mi.ret_name };
-                    }
+                    if (metaFromCallRet(ctx, mi.ret_meta, mi.ret_name)) |m| return m;
                 }
             }
             return .{ .kind = .raw_ptr };
