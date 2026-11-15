@@ -118,6 +118,8 @@ pub const TypeAlias = struct {
 pub const Field = struct {
     name: []const u8,
     ty: *TypeExpr,
+    /// `private name: T` — readable/writable only as `self.name` in methods.
+    is_private: bool = false,
 };
 
 pub const StructDecl = struct {

@@ -357,6 +357,47 @@ fn lookupTypeName(types: *std.StringHashMapUnmanaged(*TypeInfo), n: []const u8) 
     return null;
 }
 
+/// Private fields are only readable/writable as `self.<name>` inside methods.
+/// Struct literals may still initialize them (construction).
+fn checkPrivateFieldAccess(
+    a: std.mem.Allocator,
+    structs: *std.StringHashMapUnmanaged(*ast.StructDecl),
+    diags: *std.ArrayListUnmanaged(Diagnostic),
+    base: *const ast.Expr,
+    base_t: *TypeInfo,
+    field_name: []const u8,
+) !void {
+    const sd_name = blk: {
+        if (base_t.kind == .struct_ty) break :blk base_t.name;
+        if (base_t.kind == .pointer) {
+            if (base_t.pointee) |po| {
+                if (po.kind == .struct_ty) break :blk po.name;
+            }
+        }
+        return;
+    };
+    const sd = structs.get(sd_name) orelse return;
+    var is_private = false;
+    for (sd.fields) |fld| {
+        if (std.mem.eql(u8, fld.name, field_name)) {
+            is_private = fld.is_private;
+            break;
+        }
+    }
+    if (!is_private) return;
+    const allowed = base.* == .ident and std.mem.eql(u8, base.ident, "self");
+    if (!allowed) {
+        try emitDiag(
+            a,
+            diags,
+            base,
+            1,
+            1,
+            try std.fmt.allocPrint(a, "private field '{s}' is only accessible as self.{s}", .{ field_name, field_name }),
+        );
+    }
+}
+
 fn defineBuiltin(a: std.mem.Allocator, types: *std.StringHashMapUnmanaged(*TypeInfo), name: []const u8, info: TypeInfo) !void {
     const ti = try a.create(TypeInfo);
     ti.* = info;
@@ -569,7 +610,8 @@ fn checkStmt(
                 _ = try checkExpr(a, types, fns, structs, methods, scope, ix.index, diags);
                 _ = try checkExpr(a, types, fns, structs, methods, scope, as.value, diags);
             } else if (as.field) |fa| {
-                _ = try checkExpr(a, types, fns, structs, methods, scope, fa.base, diags);
+                const base_t = try checkExpr(a, types, fns, structs, methods, scope, fa.base, diags);
+                try checkPrivateFieldAccess(a, structs, diags, fa.base, base_t, fa.name);
                 _ = try checkExpr(a, types, fns, structs, methods, scope, as.value, diags);
             } else {
                 const v = lookupVar(scope, as.name) orelse {
@@ -858,6 +900,7 @@ fn checkExpr(
                 if (structs.get(base.name)) |sd| {
                     for (sd.fields) |fld| {
                         if (std.mem.eql(u8, fld.name, f.name)) {
+                            try checkPrivateFieldAccess(a, structs, diags, f.base, base, f.name);
                             return try resolveTypeExpr(a, types, fld.ty, diags);
                         }
                     }
@@ -869,6 +912,7 @@ fn checkExpr(
                         if (structs.get(po.name)) |sd| {
                             for (sd.fields) |fld| {
                                 if (std.mem.eql(u8, fld.name, f.name)) {
+                                    try checkPrivateFieldAccess(a, structs, diags, f.base, base, f.name);
                                     return try resolveTypeExpr(a, types, fld.ty, diags);
                                 }
                             }

@@ -578,7 +578,7 @@ fn resolveRetName(a: std.mem.Allocator, structs: *std.StringHashMapUnmanaged(Str
     return switch (te.*) {
         .name => |n| n,
         .named_app => |na| try mangleNamedApp(a, na.name, na.args),
-        .tuple => |elems| try ensureTupleStruct(a, structs, elems.len),
+        .tuple => |elems| try ensureTupleStructFromTypes(a, structs, elems),
         .optional => |inner| try resolveRetName(a, structs, inner),
         .pointer, .pointer_const => |inner| try resolveRetName(a, structs, inner),
         .array => |arr| try resolveRetName(a, structs, arr.elem),
@@ -815,7 +815,7 @@ fn walkExprInstantiate(
 fn walkTypeInstantiate(a: std.mem.Allocator, te: *ast.TypeExpr, generic_structs: *std.StringHashMapUnmanaged(ast.StructDecl), structs: *std.StringHashMapUnmanaged(StructInfo)) !void {
     switch (te.*) {
         .named_app => |na| _ = try ensureGenericStruct(a, generic_structs, structs, na.name, na.args),
-        .tuple => |elems| _ = try ensureTupleStruct(a, structs, elems.len),
+        .tuple => |elems| _ = try ensureTupleStructFromTypes(a, structs, elems),
         .optional, .pointer, .pointer_const => |inner| try walkTypeInstantiate(a, inner, generic_structs, structs),
         .array => |arr| try walkTypeInstantiate(a, arr.elem, generic_structs, structs),
         else => {},
@@ -1109,6 +1109,51 @@ fn tupleStructName(a: std.mem.Allocator, n: usize) ![]const u8 {
     return try std.fmt.allocPrint(a, "__Tup{d}", .{n});
 }
 
+fn mangleTupleElem(a: std.mem.Allocator, te: *ast.TypeExpr) ![]const u8 {
+    return switch (te.*) {
+        .name => |n| try a.dupe(u8, typeNameLeaf(n)),
+        .named_app => |na| try mangleNamedApp(a, na.name, na.args),
+        .optional => |inner| try std.fmt.allocPrint(a, "Opt{s}", .{try mangleTupleElem(a, inner)}),
+        .pointer, .pointer_const => |inner| try std.fmt.allocPrint(a, "P{s}", .{try mangleTupleElem(a, inner)}),
+        .array => |arr| try std.fmt.allocPrint(a, "A{s}", .{try mangleTupleElem(a, arr.elem)}),
+        .tuple => |elems| blk: {
+            var buf: std.ArrayListUnmanaged(u8) = .{};
+            try buf.appendSlice(a, "Tup");
+            for (elems) |e| {
+                try buf.append(a, '_');
+                try buf.appendSlice(a, try mangleTupleElem(a, e));
+            }
+            break :blk try buf.toOwnedSlice(a);
+        },
+        else => try a.dupe(u8, "X"),
+    };
+}
+
+/// Typed product `(T, U, …)` → `__Tup_T_OptU` with real field types (not all-i64).
+fn ensureTupleStructFromTypes(
+    a: std.mem.Allocator,
+    structs: ?*std.StringHashMapUnmanaged(StructInfo),
+    elems: []*ast.TypeExpr,
+) ![]const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    try buf.appendSlice(a, "__Tup");
+    for (elems) |e| {
+        try buf.append(a, '_');
+        try buf.appendSlice(a, try mangleTupleElem(a, e));
+    }
+    const name = try buf.toOwnedSlice(a);
+    if (structs) |st| {
+        if (st.contains(name)) return name;
+        var fields: std.ArrayListUnmanaged(ast.Field) = .{};
+        for (elems, 0..) |e, i| {
+            const fname = try std.fmt.allocPrint(a, "_{d}", .{i});
+            try fields.append(a, .{ .name = fname, .ty = try cloneTypeExpr(a, e) });
+        }
+        try st.put(a, name, .{ .fields = try fields.toOwnedSlice(a) });
+    }
+    return name;
+}
+
 fn ensureTupleStruct(a: std.mem.Allocator, structs: *std.StringHashMapUnmanaged(StructInfo), n: usize) ![]const u8 {
     const name = try tupleStructName(a, n);
     if (structs.contains(name)) return name;
@@ -1223,7 +1268,7 @@ fn metaForTypeExpr(a: std.mem.Allocator, te: *ast.TypeExpr, structs: *std.String
             return metaForTypeName(mangled, ifaces);
         },
         .tuple => |elems| {
-            const name = try ensureTupleStruct(a, structs, elems.len);
+            const name = try ensureTupleStructFromTypes(a, structs, elems);
             return .{ .kind = .struct_ptr, .type_name = name };
         },
         .slice_view => |sv| {
@@ -1301,10 +1346,11 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
         .destructure => |ds| {
             const tup = try lowerExpr(ctx, ds.init);
             const tn = blk: {
-                if (inferMetaFromExpr(ctx, ds.init)) |m| break :blk m.type_name;
+                if (inferMetaFromExpr(ctx, ds.init)) |m| {
+                    if (m.type_name.len > 0) break :blk m.type_name;
+                }
                 break :blk try ensureTupleStruct(ctx.a, ctx.structs, ds.names.len);
             };
-            _ = try ensureTupleStruct(ctx.a, ctx.structs, ds.names.len);
             const sd = ctx.structs.get(tn) orelse return error.UnknownName;
             for (ds.names, 0..) |n, i| {
                 if (i >= sd.fields.len) return error.TypeError;
@@ -1316,7 +1362,8 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
                 const slot = try ctx.fresh();
                 try ctx.emit(.{ .op = .load, .dst = slot, .src0 = addr });
                 try ctx.slots.put(ctx.a, n, slot);
-                try ctx.meta.put(ctx.a, n, .{ .kind = .scalar, .type_name = "i64" });
+                const sm = try metaForTypeExpr(ctx.a, sd.fields[i].ty, ctx.structs, ctx.ifaces);
+                try ctx.meta.put(ctx.a, n, sm);
             }
         },
         .var_decl => |vd| {
@@ -1620,10 +1667,7 @@ fn inferMetaFromExpr(ctx: *Ctx, e: *ast.Expr) ?SlotMeta {
             const sd = ctx.structs.get(base_tn) orelse return null;
             for (sd.fields) |fld| {
                 if (std.mem.eql(u8, fld.name, f.name)) {
-                    const ftn = typeExprName(fld.ty);
-                    if (ctx.structs.contains(ftn)) return .{ .kind = .struct_ptr, .type_name = ftn };
-                    if (isBuiltinScalar(ftn)) return .{ .kind = .scalar, .type_name = ftn };
-                    return .{ .kind = .struct_ptr, .type_name = ftn };
+                    return metaForTypeExpr(ctx.a, fld.ty, ctx.structs, ctx.ifaces) catch null;
                 }
             }
             return null;

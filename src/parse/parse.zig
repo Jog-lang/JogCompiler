@@ -364,12 +364,17 @@ pub const Parser = struct {
         try self.expect(.lbrace);
         var fields: std.ArrayListUnmanaged(ast.Field) = .{};
         while (self.tok.kind != .rbrace and self.tok.kind != .eof) {
+            var is_private = false;
+            if (self.tok.kind == .kw_private) {
+                is_private = true;
+                self.advance();
+            }
             if (self.tok.kind != .ident) return error.UnexpectedToken;
             const fname = self.tok.text;
             self.advance();
             try self.expect(.colon);
             const ty = try self.parseTypeExpr();
-            try fields.append(self.allocator, .{ .name = fname, .ty = ty });
+            try fields.append(self.allocator, .{ .name = fname, .ty = ty, .is_private = is_private });
         }
         try self.expect(.rbrace);
         return .{
