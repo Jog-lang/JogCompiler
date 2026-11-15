@@ -15,7 +15,8 @@ void *jogrt_alloc(int64_t nbytes);
 void jogrt_host_run_loop(int64_t (*tick)(void));
 void jog_host_run_loop(int64_t (*tick)(void));
 
-/* Stubs for symbols the IR always registers; abort if a wasm demo uses them. */
+/* go/spawn: run-to-completion on the current stack (no stackful switch).
+   yield() still aborts — full M:N needs Asyncify/JSPI/stack-switching. */
 void jogrt_spawn(void *fn, void *arg);
 void jogrt_dispatcher_stub(void);
 void jogrt_go(void *fn, void *arg);
@@ -26,9 +27,9 @@ int64_t jogrt_coro_id(void);
 void jogrt_coro_park(void);
 void jogrt_coro_unpark(int64_t id);
 void *jogrt_dispatcher_single(void);
-void *jogrt_dispatcher_pool(void);
+void *jogrt_dispatcher_pool(int64_t n);
 void *jogrt_dispatcher_new(int64_t n);
-void *jogrt_dispatcher_get(void);
+void *jogrt_dispatcher_get(int64_t id);
 void *jogrt_dispatcher_io(void);
 void jogrt_dispatcher_enter(void *d);
 void jogrt_dispatcher_leave(void);
