@@ -1,0 +1,19 @@
+// wasm32-emscripten: go run-to-completion (no yield). Bands must not yield.
+// Build: jog build examples/emscripten_go_rtc.jog --target wasm32-emscripten -o out/go_rtc.html
+// Node:  node out/go_rtc.js   → a\nb\ndone\n
+
+fn band_a(arg: *byte) {
+    print("a\n")
+}
+
+fn band_b(arg: *byte) {
+    print("b\n")
+}
+
+fn main() {
+    dispatcher_pool(2)
+    go(band_a, null)
+    go(band_b, null)
+    coro_drain()
+    print("done\n")
+}

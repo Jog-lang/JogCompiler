@@ -7,7 +7,9 @@ Slots stay `int64_t`; extern calls cast through wasm32-friendly `intptr_t` /
 `int64_t` / `double` / `void` based on the Jog `extern` signature (`wide_args`,
 `wide_ret`, `void_ret`, `float_*`). Runtime: `runtime/emscripten/jogrt.c` +
 `jogrt_mainloop.c` (`jog_host_run_loop` → `emscripten_set_main_loop`).
-Output: `.html` / `.js` / `.wasm`. Coroutines/`go` abort (no stack switch).
+Output: `.html` / `.js` / `.wasm`. `go`/`spawn` run-to-completion on the current
+stack (serial; enough for non-yielding workers). `yield` / stackful switch still
+aborts (no Asyncify/JSPI yet).
 
 ## Jog ABI v0
 

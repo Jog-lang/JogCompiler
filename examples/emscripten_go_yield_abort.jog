@@ -1,0 +1,11 @@
+// Expect abort: yield needs stackful switch (not RTC).
+fn a(arg: *byte) {
+    print("a1\n")
+    yield()
+    print("a2\n")
+}
+fn main() {
+    go(a, null)
+    coro_drain()
+    print("done\n")
+}
