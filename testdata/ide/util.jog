@@ -1,7 +1,13 @@
+/// The answer to everything.
 fn answer(): i64 {
     return 42
 }
 
+/**
+ * 2D point for member-complete smoke.
+ * @param x horizontal
+ * @param y vertical
+ */
 struct Point {
     x: i64
     y: i64
