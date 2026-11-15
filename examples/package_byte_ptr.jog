@@ -1,0 +1,22 @@
+// Package `var buf: *byte` must index like a local *byte (stride 1, upward).
+// Regression: without Global.is_raw_byte_ptr, pkg[i] used base-i*8 qword stores.
+
+var buf: *byte = null
+
+fn main() {
+    buf = alloc(8)
+    if (buf == null) {
+        panic("alloc failed\n")
+    }
+    buf[0] = 1
+    buf[1] = 2
+    buf[2] = 3
+    buf[3] = 4
+    buf[7] = 9
+    val s = (buf[0] & 255) + (buf[1] & 255) + (buf[2] & 255) + (buf[3] & 255) + (buf[7] & 255)
+    if (s == 19) {
+        print("package byte ptr ok\n")
+    } else {
+        panic("package byte ptr fail\n")
+    }
+}
