@@ -300,6 +300,14 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
         if (md.ret) |r| _ = try resolveTypeExpr(a, &types, r, &diags);
         for (md.params) |p| _ = try resolveTypeExpr(a, &types, p.ty, &diags);
         if (md.body) |body| {
+            // Bind receiver type params (`fn *List<T>.grow`) like fn generics.
+            var bound_tp: std.ArrayListUnmanaged([]const u8) = .{};
+            for (md.type_params) |tp| {
+                const tpi = try a.create(TypeInfo);
+                tpi.* = .{ .kind = .named, .name = tp };
+                try types.put(a, tp, tpi);
+                try bound_tp.append(a, tp);
+            }
             // synthesize self param for receiver
             var params_with_self: std.ArrayListUnmanaged(ast.Param) = .{};
             const self_ty = try a.create(ast.TypeExpr);
@@ -313,6 +321,7 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
             try params_with_self.append(a, .{ .name = "self", .ty = self_ty });
             for (md.params) |p| try params_with_self.append(a, p);
             try checkFunctionBody(a, &types, &fns, &structs, &methods, try params_with_self.toOwnedSlice(a), md.contexts, body, &diags, &globals_scope);
+            for (bound_tp.items) |tp| _ = types.remove(tp);
         }
     }
 
@@ -338,6 +347,16 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
     return result;
 }
 
+/// Resolve `Name` or `pkg.Name` (import-qualified). Flattened import merge registers
+/// the short name; Grammar qualifiedName keeps the package prefix in the AST.
+fn lookupTypeName(types: *std.StringHashMapUnmanaged(*TypeInfo), n: []const u8) ?*TypeInfo {
+    if (types.get(n)) |t| return t;
+    if (std.mem.lastIndexOfScalar(u8, n, '.')) |dot| {
+        return types.get(n[dot + 1 ..]);
+    }
+    return null;
+}
+
 fn defineBuiltin(a: std.mem.Allocator, types: *std.StringHashMapUnmanaged(*TypeInfo), name: []const u8, info: TypeInfo) !void {
     const ti = try a.create(TypeInfo);
     ti.* = info;
@@ -352,7 +371,7 @@ fn resolveTypeExpr(
 ) CheckError!*TypeInfo {
     switch (te.*) {
         .name => |n| {
-            if (types.get(n)) |t| return t;
+            if (lookupTypeName(types, n)) |t| return t;
             try emitDiag(a, diags, null, 1, 1, try std.fmt.allocPrint(a, "unknown type '{s}'", .{n}));
             const bad = try a.create(TypeInfo);
             bad.* = .{ .kind = .named, .name = n };
@@ -398,7 +417,7 @@ fn resolveTypeExpr(
             }
             const mangled = try buf.toOwnedSlice(a);
             if (types.get(mangled)) |t| return t;
-            if (types.get(na.name)) |t| return t;
+            if (lookupTypeName(types, na.name)) |t| return t;
             const ti = try a.create(TypeInfo);
             ti.* = .{ .kind = .struct_ty, .name = mangled };
             try types.put(a, mangled, ti);
@@ -694,6 +713,15 @@ fn checkExpr(
                 for (c.with_args) |w| _ = try checkExpr(a, types, fns, structs, methods, scope, w, diags);
                 return try voidType(a);
             }
+            // Builtins size(T) / align(T): type arg spelled as expr; result usize.
+            if (c.callee.* == .ident and (std.mem.eql(u8, c.callee.ident, "size") or std.mem.eql(u8, c.callee.ident, "align"))) {
+                if (c.args.len != 1) {
+                    try emitDiag(a, diags, e, 1, 1, try std.fmt.allocPrint(a, "{s} takes one type argument", .{c.callee.ident}));
+                } else {
+                    _ = try checkExpr(a, types, fns, structs, methods, scope, c.args[0], diags);
+                }
+                return types.get("usize").?;
+            }
             if (c.callee.* == .ident and std.mem.eql(u8, c.callee.ident, "alloc")) {
                 for (c.args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
                 const ti = try a.create(TypeInfo);
@@ -783,6 +811,18 @@ fn checkExpr(
                 }
             }
             if (c.callee.* == .field) {
+                // `pkg.fn(...)` after import — flattened merge; base is alias, not a value.
+                if (c.callee.field.base.* == .ident) {
+                    const base_name = c.callee.field.base.ident;
+                    if (lookupVar(scope, base_name) == null) {
+                        if (fns.get(c.callee.field.name)) |fd| {
+                            for (c.args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
+                            for (c.with_args) |w| _ = try checkExpr(a, types, fns, structs, methods, scope, w, diags);
+                            if (fd.ret) |r| return try resolveTypeExpr(a, types, r, diags);
+                            return try voidType(a);
+                        }
+                    }
+                }
                 const base_t = try checkExpr(a, types, fns, structs, methods, scope, c.callee.field.base, diags);
                 for (c.args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
                 for (c.with_args) |w| _ = try checkExpr(a, types, fns, structs, methods, scope, w, diags);
@@ -957,6 +997,14 @@ fn checkExpr(
             _ = try checkExpr(a, types, fns, structs, methods, scope, it.expr, diags);
             _ = try resolveTypeExpr(a, types, it.ty, diags);
             return types.get("bool").?;
+        },
+        .force_unwrap => |inner| {
+            const t = try checkExpr(a, types, fns, structs, methods, scope, inner, diags);
+            if (t.kind == .optional) {
+                return t.pointee orelse try voidType(a);
+            }
+            // Non-optional: accept (no-op unwrap) for pointer-ish values.
+            return t;
         },
     }
 }

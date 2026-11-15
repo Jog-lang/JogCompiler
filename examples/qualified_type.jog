@@ -1,0 +1,7 @@
+// Parse-only: mem.Allocator spelling (check needs import merge).
+fn uses_qual(a: mem.Allocator): i32 with (b: mem.Allocator) {
+    return 0
+}
+fn main() {
+    print("qualified type parse ok\n")
+}

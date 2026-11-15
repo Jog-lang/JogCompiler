@@ -70,8 +70,11 @@ pub const Inst = struct {
     src1: u32 = none,
     aux: i64 = 0,
     arity: u8 = 0,
-    args: [8]u32 = .{none} ** 8,
+    /// Up to 16 call args (SysV: 6 GPRs + stack). Was 8; SDL and packs need more.
+    args: [16]u32 = .{none} ** 16,
 };
+
+pub const max_call_args: usize = 16;
 
 pub const Func = struct {
     name: []const u8,
@@ -89,9 +92,9 @@ pub const Callee = struct {
     /// SysV float return (xmm0) — set for `extern` f32/f64 returns.
     float_ret: bool = false,
     /// Bit i set ⇒ argument i is f32/f64 (xmm classification for `extern`).
-    float_args: u8 = 0,
+    float_args: u16 = 0,
     /// Bit i set ⇒ argument i is i64/u64 (wasm32 needs real i64, not intptr_t).
-    wide_args: u8 = 0,
+    wide_args: u16 = 0,
     /// `extern` return is i64/u64 (wasm32 i64, not intptr_t).
     wide_ret: bool = false,
     /// `extern` with no return type — wasm32 void vs i32 signature.
@@ -141,11 +144,11 @@ fn isFloatTypeExpr(te: *ast.TypeExpr) bool {
     };
 }
 
-fn floatArgMask(params: []ast.Param) u8 {
-    var mask: u8 = 0;
+fn floatArgMask(params: []ast.Param) u16 {
+    var mask: u16 = 0;
     for (params, 0..) |p, i| {
-        if (i >= 8) break;
-        if (isFloatTypeExpr(p.ty)) mask |= @as(u8, 1) << @intCast(i);
+        if (i >= max_call_args) break;
+        if (isFloatTypeExpr(p.ty)) mask |= @as(u16, 1) << @intCast(i);
     }
     return mask;
 }
@@ -157,11 +160,11 @@ fn isWideIntTypeExpr(te: *ast.TypeExpr) bool {
     };
 }
 
-fn wideArgMask(params: []ast.Param) u8 {
-    var mask: u8 = 0;
+fn wideArgMask(params: []ast.Param) u16 {
+    var mask: u16 = 0;
     for (params, 0..) |p, i| {
-        if (i >= 8) break;
-        if (isWideIntTypeExpr(p.ty)) mask |= @as(u8, 1) << @intCast(i);
+        if (i >= max_call_args) break;
+        if (isWideIntTypeExpr(p.ty)) mask |= @as(u16, 1) << @intCast(i);
     }
     return mask;
 }
@@ -674,6 +677,7 @@ fn ensureGenericFn(
         try params.append(a, .{
             .name = p.name,
             .ty = try substTypeExpr(a, p.ty, tmpl.type_params, args),
+            .is_pack = p.is_pack,
         });
     }
     var ret: ?*ast.TypeExpr = null;
@@ -798,6 +802,7 @@ fn walkExprInstantiate(
             try walkTypeInstantiate(a, it.ty, generic_structs, structs);
             try walkExprInstantiate(a, it.expr, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
         },
+        .force_unwrap => |inner| try walkExprInstantiate(a, inner, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized),
         else => {},
     }
 }
@@ -1036,13 +1041,19 @@ fn lowerFn(
 
 fn typeExprName(te: *ast.TypeExpr) []const u8 {
     return switch (te.*) {
-        .name => |n| n,
-        .named_app => |na| na.name, // caller should prefer mangleNamedApp
+        .name => |n| typeNameLeaf(n),
+        .named_app => |na| typeNameLeaf(na.name), // caller should prefer mangleNamedApp
         .pointer, .pointer_const, .optional => |inner| typeExprName(inner),
         .array => |arr| typeExprName(arr.elem),
         .tuple => "__Tup",
         else => "",
     };
+}
+
+/// `pkg.Name` → `Name` for flattened import merge / ambient matching.
+fn typeNameLeaf(n: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, n, '.')) |dot| return n[dot + 1 ..];
+    return n;
 }
 
 fn mangleTypeArgName(te: *ast.TypeExpr) []const u8 {
@@ -2065,6 +2076,29 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
             }
             return d;
         },
+        .force_unwrap => |inner| {
+            // Optional is a nullable pointer/value; !! panics on null then yields the bits.
+            const v = try lowerExpr(ctx, inner);
+            const ok = try ctx.fresh();
+            try ctx.emit(.{ .op = .copy, .dst = ok, .src0 = v });
+            const jz_i = ctx.insts.items.len;
+            try ctx.emit(.{ .op = .jz, .src0 = ok, .aux = 0 });
+            const jmp_ok = ctx.insts.items.len;
+            try ctx.emit(.{ .op = .jmp, .aux = 0 });
+            const panic_pos: i64 = @intCast(ctx.insts.items.len);
+            ctx.insts.items[jz_i].aux = panic_pos;
+            const msg = try ctx.a.dupe(u8, "force unwrap of null\n");
+            const sidx: i64 = @intCast(ctx.strings.items.len);
+            try ctx.strings.append(ctx.a, msg);
+            const ptr = try ctx.fresh();
+            try ctx.emit(.{ .op = .saddr, .dst = ptr, .aux = sidx });
+            const sl = try ctx.fresh();
+            try ctx.emit(.{ .op = .slen, .dst = sl, .aux = sidx });
+            try ctx.emit(.{ .op = .panic, .src0 = ptr, .src1 = sl });
+            const end_pos: i64 = @intCast(ctx.insts.items.len);
+            ctx.insts.items[jmp_ok].aux = end_pos;
+            return v;
+        },
         .index => |ix| {
             try maybeBoundsCheck(ctx, ix.base, ix.index);
             const addr = try lowerIndexAddr(ctx, ix.base, ix.index);
@@ -2379,9 +2413,37 @@ fn scalarBits(name: []const u8) i64 {
     return 0;
 }
 
+fn layoutSizeOfName(name: []const u8) i64 {
+    const leaf = typeNameLeaf(name);
+    if (std.mem.eql(u8, leaf, "u8") or std.mem.eql(u8, leaf, "i8") or std.mem.eql(u8, leaf, "byte") or std.mem.eql(u8, leaf, "bool") or std.mem.eql(u8, leaf, "char"))
+        return 1;
+    if (std.mem.eql(u8, leaf, "u16") or std.mem.eql(u8, leaf, "i16")) return 2;
+    if (std.mem.eql(u8, leaf, "u32") or std.mem.eql(u8, leaf, "i32") or std.mem.eql(u8, leaf, "f32") or std.mem.eql(u8, leaf, "int"))
+        return 4;
+    // pointers, 64-bit scalars, unknown named types: 8 for now
+    return 8;
+}
+
+fn layoutAlignOfName(name: []const u8) i64 {
+    return layoutSizeOfName(name); // power-of-two scalars; pointers 8
+}
+
 fn lowerCall(ctx: *Ctx, c: ast.Call) LowerError!u32 {
     if (c.callee.* == .ident) {
         const name = c.callee.ident;
+        if (std.mem.eql(u8, name, "size") or std.mem.eql(u8, name, "align")) {
+            if (c.args.len != 1) return error.TypeError;
+            const arg = c.args[0];
+            const tname = blk: {
+                if (arg.* == .ident) break :blk arg.ident;
+                if (inferTypeNameFromExpr(ctx, arg)) |tn| break :blk tn;
+                break :blk "i64";
+            };
+            const n: i64 = if (std.mem.eql(u8, name, "size")) layoutSizeOfName(tname) else layoutAlignOfName(tname);
+            const d = try ctx.fresh();
+            try ctx.emit(.{ .op = .iconst, .dst = d, .aux = n });
+            return d;
+        }
         if (std.mem.eql(u8, name, "print")) {
             if (c.args.len != 1) return error.TooManyArgs;
             const ptr, const len = try lowerPrintArgs(ctx, c.args[0]);
@@ -2597,6 +2659,17 @@ fn lowerCall(ctx: *Ctx, c: ast.Call) LowerError!u32 {
         }
     }
     if (c.callee.* == .field) {
+        // `pkg.fn(...)` after `import std.pkg` — flattened merge exposes `fn` unqualified.
+        // When the base is an unresolved ident (import alias), look up the free function.
+        if (c.callee.field.base.* == .ident) {
+            const base_name = c.callee.field.base.ident;
+            const is_local = ctx.meta.contains(base_name) or ctx.global_map.contains(base_name) or ctx.object_map.contains(base_name) or ctx.const_vals.contains(base_name);
+            if (!is_local) {
+                if (ctx.fn_infos.get(c.callee.field.name)) |fi| {
+                    return try lowerFnCall(ctx, fi, c.args, c.with_args);
+                }
+            }
+        }
         const base = try lowerExpr(ctx, c.callee.field.base);
         return try lowerMethodOrIfaceCall(ctx, c.callee.field.base, base, c.callee.field.name, c.args, c.with_args);
     }
@@ -2604,7 +2677,7 @@ fn lowerCall(ctx: *Ctx, c: ast.Call) LowerError!u32 {
 }
 
 fn lowerFnCall(ctx: *Ctx, fi: FnInfo, args: []*ast.Expr, with_args: []*ast.Expr) LowerError!u32 {
-    var arg_slots: [8]u32 = .{none} ** 8;
+    var arg_slots: [16]u32 = .{none} ** 16;
     var arity: u8 = 0;
 
     // resolve contexts: explicit with_args first, else ambient
@@ -2627,7 +2700,7 @@ fn lowerFnCall(ctx: *Ctx, fi: FnInfo, args: []*ast.Expr, with_args: []*ast.Expr)
         } else return error.TooManyArgs;
     }
 
-    if (args.len + arity > 8) return error.TooManyArgs;
+    if (args.len + arity > max_call_args) return error.TooManyArgs;
     for (args) |arg| {
         arg_slots[arity] = try lowerExpr(ctx, arg);
         arity += 1;
@@ -2744,7 +2817,7 @@ fn lowerMethodOrIfaceCall(
     const mi = ctx.methods.get(key) orelse return error.UnknownName;
     const cid = ctx.callee_map.get(mi.mangled) orelse return error.UnknownName;
 
-    var arg_slots: [8]u32 = .{none} ** 8;
+    var arg_slots: [16]u32 = .{none} ** 16;
     var arity: u8 = 0;
     // contexts on methods (rare in demos)
     for (mi.contexts) |cx| {
@@ -2755,7 +2828,7 @@ fn lowerMethodOrIfaceCall(
     }
     arg_slots[arity] = base_slot;
     arity += 1;
-    if (args.len + arity > 8) return error.TooManyArgs;
+    if (args.len + arity > max_call_args) return error.TooManyArgs;
     for (args) |arg| {
         arg_slots[arity] = try lowerExpr(ctx, arg);
         arity += 1;
@@ -2800,10 +2873,10 @@ fn lowerIfaceMethod(ctx: *Ctx, fat: u32, method: []const u8, args: []*ast.Expr) 
     const fnptr = try ctx.fresh();
     try ctx.emit(.{ .op = .load, .dst = fnptr, .src0 = fpp });
 
-    var arg_slots: [8]u32 = .{none} ** 8;
+    var arg_slots: [16]u32 = .{none} ** 16;
     arg_slots[0] = data;
     var arity: u8 = 1;
-    if (args.len + 1 > 8) return error.TooManyArgs;
+    if (args.len + 1 > max_call_args) return error.TooManyArgs;
     for (args) |arg| {
         arg_slots[arity] = try lowerExpr(ctx, arg);
         arity += 1;

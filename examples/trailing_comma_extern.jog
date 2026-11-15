@@ -1,0 +1,11 @@
+// Trailing commas in param lists (Grammar paramList / fnParams).
+type int = i32
+extern {
+    fn demo(
+        a: int,
+        b: int,
+    ): int
+}
+fn main() {
+    print("trailing comma ok\n")
+}

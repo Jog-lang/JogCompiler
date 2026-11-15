@@ -56,6 +56,7 @@ pub const TokenKind = enum {
     shl,
     shr,
     arrow, // ->
+    ellipsis, // ...
     dotdot, // ..
     pluseq,
     minuseq,
@@ -83,6 +84,7 @@ pub const TokenKind = enum {
     lt,
     gt,
     bang,
+    bang_bang, // !!
     question,
 };
 
@@ -178,6 +180,11 @@ pub const Lexer = struct {
             self.advance();
             return .{ .kind = .neq, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
         }
+        if (c == '!' and self.i + 1 < self.src.len and self.src[self.i + 1] == '!') {
+            self.advance();
+            self.advance();
+            return .{ .kind = .bang_bang, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+        }
         if (c == '&' and self.i + 1 < self.src.len and self.src[self.i + 1] == '&') {
             self.advance();
             self.advance();
@@ -212,6 +219,13 @@ pub const Lexer = struct {
             self.advance();
             self.advance();
             return .{ .kind = .arrow, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+        }
+        // `...` before `..` so three dots are not `..` plus a leftover `.`.
+        if (c == '.' and self.i + 2 < self.src.len and self.src[self.i + 1] == '.' and self.src[self.i + 2] == '.') {
+            self.advance();
+            self.advance();
+            self.advance();
+            return .{ .kind = .ellipsis, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
         }
         if (c == '.' and self.i + 1 < self.src.len and self.src[self.i + 1] == '.') {
             self.advance();

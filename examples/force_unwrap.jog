@@ -1,0 +1,10 @@
+fn main() {
+    val p: *i64? = null
+    // non-null path
+    var x: i64 = 7
+    val q: *i64? = &x
+    val v = q!!
+    if v == &x {
+        print("force unwrap ok\n")
+    }
+}

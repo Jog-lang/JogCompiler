@@ -40,6 +40,8 @@ pub const IfaceFnType = struct {
 pub const Param = struct {
     name: []const u8,
     ty: *TypeExpr,
+    /// True for `...T: name` — local type is `[]T` (Grammar pack).
+    is_pack: bool = false,
 };
 
 pub const ContextParam = struct {
@@ -174,6 +176,8 @@ pub const FnDecl = struct {
 pub const MethodDecl = struct {
     pointer_recv: bool,
     type_name: []const u8,
+    /// From receiver `List<T>` / method-level generics (Grammar receiver typeParams).
+    type_params: [][]const u8 = &.{},
     name: []const u8,
     params: []Param,
     contexts: []ContextParam,
@@ -296,6 +300,8 @@ pub const Expr = union(enum) {
     array_lit: ArrayLit,
     /// `"a ${x} b"` interpolation pieces (string/expr alternating).
     interp: Interp,
+    /// Postfix `e!!` — force-unwrap optional (Grammar postfixOp).
+    force_unwrap: *Expr,
 };
 
 pub const Range = struct {
