@@ -1,0 +1,3 @@
+fn hello_n(): i64 {
+    return 1
+}

@@ -190,6 +190,7 @@ fn loadSingle(allocator: std.mem.Allocator, path: []const u8, modules: []const M
                 const owned = try allocator.dupe(u8, resolved);
                 try seen.put(allocator, owned, {});
                 try pending.append(allocator, owned);
+                try enqueuePackageSiblings(allocator, &pending, &seen, owned);
                 try enqueuePlatformSiblings(allocator, &pending, &seen, owned);
             } else if (d == .require_decl) {
                 const req = d.require_decl;
@@ -276,33 +277,29 @@ fn resolveImportPath(
         if (try roots_mod.resolveStdImport(allocator, lib_roots.std_root, import_path)) |p| return p;
     }
 
-    // `mod.leaf` → look in mapped module dir first when `mod` is a mapping name.
+    // First segment = required module name → package path under that module dir.
     if (std.mem.indexOfScalar(u8, import_path, '.')) |dot| {
         const head = import_path[0..dot];
-        const leaf = import_path[dot + 1 ..];
+        const rest = import_path[dot + 1 ..];
         for (modules) |m| {
-            if (std.mem.eql(u8, m.name, head)) {
-                // Prefer `leaf.jog`, then replace remaining dots with `/`.
-                const simple = try std.fmt.allocPrint(allocator, "{s}.jog", .{leaf});
-                defer allocator.free(simple);
-                const joined = try std.fs.path.join(allocator, &.{ m.dir, simple });
-                if (std.fs.cwd().access(joined, .{})) |_| return joined else |_| {
-                    allocator.free(joined);
-                }
-                var path_buf: std.ArrayListUnmanaged(u8) = .{};
-                defer path_buf.deinit(allocator);
-                var it = std.mem.splitScalar(u8, leaf, '.');
-                var first = true;
-                while (it.next()) |part| {
-                    if (!first) try path_buf.append(allocator, '/');
-                    first = false;
-                    try path_buf.appendSlice(allocator, part);
-                }
-                try path_buf.appendSlice(allocator, ".jog");
-                return try std.fs.path.join(allocator, &.{ m.dir, path_buf.items });
-            }
+            if (!std.mem.eql(u8, m.name, head)) continue;
+            if (try resolvePackageEntry(allocator, m.dir, rest)) |p| return p;
+        }
+    } else {
+        // Bare `import greeter` → root package entry of mapped module `greeter`.
+        for (modules) |m| {
+            if (!std.mem.eql(u8, m.name, import_path)) continue;
+            if (try resolveModuleEntry(allocator, m.dir, m.name)) |p| return p;
+            if (try resolvePackageEntry(allocator, m.dir, m.name)) |p| return p;
         }
     }
+
+    // Local package under the requiring module: walk up to jog.mod, then package path.
+    if (try findModuleDirUp(allocator, from_file)) |mod_dir| {
+        defer allocator.free(mod_dir);
+        if (try resolvePackageEntry(allocator, mod_dir, import_path)) |p| return p;
+    }
+
     const dir = std.fs.path.dirname(from_file) orelse ".";
     var leaf = import_path;
     if (std.mem.lastIndexOfScalar(u8, import_path, '.')) |dot| {
@@ -312,6 +309,69 @@ fn resolveImportPath(
     defer allocator.free(name);
     const joined = try std.fs.path.join(allocator, &.{ dir, name });
     return joined;
+}
+
+/// Resolve `a.b.c` under `module_dir` to a `.jog` file (Go-style package layout).
+fn resolvePackageEntry(allocator: std.mem.Allocator, module_dir: []const u8, package_path: []const u8) !?[]u8 {
+    if (package_path.len == 0) return null;
+    var parts: std.ArrayListUnmanaged([]const u8) = .{};
+    defer parts.deinit(allocator);
+    var it = std.mem.splitScalar(u8, package_path, '.');
+    while (it.next()) |p| {
+        if (p.len == 0) continue;
+        try parts.append(allocator, p);
+    }
+    if (parts.items.len == 0) return null;
+
+    // `foo/bar/bar.jog` (package folder + folder-named file)
+    const leaf = parts.items[parts.items.len - 1];
+    var nest: std.ArrayListUnmanaged(u8) = .{};
+    defer nest.deinit(allocator);
+    try nest.appendSlice(allocator, module_dir);
+    for (parts.items) |p| {
+        try nest.append(allocator, std.fs.path.sep);
+        try nest.appendSlice(allocator, p);
+    }
+    try nest.append(allocator, std.fs.path.sep);
+    try nest.appendSlice(allocator, leaf);
+    try nest.appendSlice(allocator, ".jog");
+    const nested = try allocator.dupe(u8, nest.items);
+    if (std.fs.cwd().access(nested, .{})) |_| return nested else |_| {
+        allocator.free(nested);
+    }
+
+    // `foo/bar.jog` (flat file along the path)
+    var flat: std.ArrayListUnmanaged(u8) = .{};
+    defer flat.deinit(allocator);
+    try flat.appendSlice(allocator, module_dir);
+    for (parts.items) |p| {
+        try flat.append(allocator, std.fs.path.sep);
+        try flat.appendSlice(allocator, p);
+    }
+    try flat.appendSlice(allocator, ".jog");
+    const flat_path = try allocator.dupe(u8, flat.items);
+    if (std.fs.cwd().access(flat_path, .{})) |_| return flat_path else |_| {
+        allocator.free(flat_path);
+    }
+
+    // Any `.jog` in the package directory (first by name).
+    var pkg_dir_buf: std.ArrayListUnmanaged(u8) = .{};
+    defer pkg_dir_buf.deinit(allocator);
+    try pkg_dir_buf.appendSlice(allocator, module_dir);
+    for (parts.items) |p| {
+        try pkg_dir_buf.append(allocator, std.fs.path.sep);
+        try pkg_dir_buf.appendSlice(allocator, p);
+    }
+    var pkg_dir = std.fs.cwd().openDir(pkg_dir_buf.items, .{ .iterate = true }) catch return null;
+    defer pkg_dir.close();
+    var dit = pkg_dir.iterate();
+    while (dit.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".jog")) continue;
+        if (std.mem.endsWith(u8, entry.name, ".test.jog")) continue;
+        return try std.fs.path.join(allocator, &.{ pkg_dir_buf.items, entry.name });
+    }
+    return null;
 }
 
 /// When loading `foo.jog`, also queue `foo.posix.jog` / `foo.linux.jog` if present (std platform files).
@@ -332,6 +392,46 @@ fn enqueuePlatformSiblings(
         const owned = try allocator.dupe(u8, cand);
         try seen.put(allocator, owned, {});
         try pending.append(allocator, owned);
+    }
+}
+
+/// Load every `.jog` in the same package folder (Go-style package = folder).
+fn enqueuePackageSiblings(
+    allocator: std.mem.Allocator,
+    pending: *std.ArrayListUnmanaged([]const u8),
+    seen: *std.StringHashMapUnmanaged(void),
+    path: []const u8,
+) !void {
+    const dir = std.fs.path.dirname(path) orelse return;
+    var d = std.fs.cwd().openDir(dir, .{ .iterate = true }) catch return;
+    defer d.close();
+    var it = d.iterate();
+    while (it.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".jog")) continue;
+        if (std.mem.endsWith(u8, entry.name, ".test.jog")) continue;
+        const cand = try std.fs.path.join(allocator, &.{ dir, entry.name });
+        defer allocator.free(cand);
+        if (seen.contains(cand)) continue;
+        std.fs.cwd().access(cand, .{}) catch continue;
+        const owned = try allocator.dupe(u8, cand);
+        try seen.put(allocator, owned, {});
+        try pending.append(allocator, owned);
+    }
+}
+
+fn appendPackageSiblings(allocator: std.mem.Allocator, path_list: *std.ArrayListUnmanaged([]const u8), path: []const u8) !void {
+    const dir = std.fs.path.dirname(path) orelse return;
+    var d = std.fs.cwd().openDir(dir, .{ .iterate = true }) catch return;
+    defer d.close();
+    var it = d.iterate();
+    while (it.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".jog")) continue;
+        if (std.mem.endsWith(u8, entry.name, ".test.jog")) continue;
+        const cand = try std.fs.path.join(allocator, &.{ dir, entry.name });
+        defer allocator.free(cand);
+        try appendUniquePath(path_list, allocator, cand);
     }
 }
 
@@ -445,13 +545,18 @@ fn loadModuleWithOverride(
         if (!already) {
             try map_buf.append(allocator, .{ .name = req.name, .dir = dep_dir });
         }
-        // Merge dependency sources (path require or mapped module).
+        // Legacy flat-merge: only when the dependency still uses per-file `source` lists.
+        // Directory `source` / `kind library` modules are imported via `--module` + `import`.
         if (mod.isModulePath(dep_dir)) {
             var dep_man = mod.loadFromPath(allocator, dep_dir) catch |err| {
                 try writer.print("require {s}: jog.mod error: {s}\n", .{ req.name, @errorName(err) });
                 std.process.exit(1);
             };
             defer dep_man.deinit();
+            if (mod.usesPackageLayout(&dep_man)) {
+                // Package mode: do not merge; imports resolve through the mapping.
+                continue;
+            }
             const dep_paths = mod.resolveSourcePaths(allocator, &dep_man) catch |err| {
                 try writer.print("require {s}: {s}\n", .{ req.name, @errorName(err) });
                 std.process.exit(1);
@@ -533,6 +638,7 @@ fn loadModuleWithOverride(
             defer allocator.free(resolved);
             std.fs.cwd().access(resolved, .{}) catch continue;
             try appendUniquePath(&path_list, allocator, resolved);
+            try appendPackageSiblings(allocator, &path_list, resolved);
             // Platform siblings for std packages (c.posix.jog, …).
             if (!std.mem.endsWith(u8, resolved, ".jog")) continue;
             const base = resolved[0 .. resolved.len - ".jog".len];

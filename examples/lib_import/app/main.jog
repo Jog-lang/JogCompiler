@@ -1,0 +1,9 @@
+import greeter.greeter
+
+fn main() {
+    if (greet_answer() == 42) {
+        print("lib import ok\n")
+    } else {
+        panic("lib import fail\n")
+    }
+}

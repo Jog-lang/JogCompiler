@@ -33,12 +33,20 @@ pub const RequireSpec = struct {
     test_only: bool,
 };
 
+pub const Kind = enum { executable, library };
+
 /// Minimal jog.mod: module, version, root, optional source / link / libdir / require lines.
 pub const Manifest = struct {
     name: []const u8,
     version: []const u8,
-    /// Paths relative to the module directory; root first, then source lines (deduped).
+    kind: Kind,
+    /// Paths relative to the module directory; root first (when present), then source lines.
+    /// Entries may be `.jog` files (legacy flat list) or directories (package trees).
     sources: []const []const u8,
+    /// `export <package path>` lines (library). Empty means export every package.
+    exports: []const []const u8,
+    /// True when at least one `source` line names a directory (package mode).
+    has_dir_sources: bool,
     /// From `link` / `link.<os|emscripten>` — filter with `linksFor`.
     links: []const LinkEntry,
     /// From `libdir` / `libdir.<os|emscripten>` — filter with `libdirsFor`.
@@ -145,7 +153,9 @@ pub fn parse(parent: std.mem.Allocator, text: []const u8, dir: []const u8) Error
     var name: ?[]const u8 = null;
     var version: ?[]const u8 = null;
     var root: ?[]const u8 = null;
+    var kind: Kind = .executable;
     var extras: std.ArrayListUnmanaged([]const u8) = .{};
+    var exports_list: std.ArrayListUnmanaged([]const u8) = .{};
     var links: std.ArrayListUnmanaged(LinkEntry) = .{};
     var libdir_entries: std.ArrayListUnmanaged(LibdirEntry) = .{};
     var requires: std.ArrayListUnmanaged(RequireSpec) = .{};
@@ -169,8 +179,19 @@ pub fn parse(parent: std.mem.Allocator, text: []const u8, dir: []const u8) Error
         } else if (std.mem.eql(u8, key, "root")) {
             if (root != null) return error.DuplicateRoot;
             root = try a.dupe(u8, firstWord(value));
+        } else if (std.mem.eql(u8, key, "kind")) {
+            const k = firstWord(value);
+            if (std.mem.eql(u8, k, "library")) {
+                kind = .library;
+            } else if (std.mem.eql(u8, k, "executable")) {
+                kind = .executable;
+            } else {
+                return error.UnknownDirective;
+            }
         } else if (std.mem.eql(u8, key, "source")) {
             try extras.append(a, try a.dupe(u8, firstWord(value)));
+        } else if (std.mem.eql(u8, key, "export")) {
+            try exports_list.append(a, try a.dupe(u8, firstWord(value)));
         } else if (std.mem.eql(u8, key, "link")) {
             try links.append(a, .{ .lib = try a.dupe(u8, firstWord(value)), .target = .any });
         } else if (std.mem.startsWith(u8, key, "link.")) {
@@ -193,8 +214,8 @@ pub fn parse(parent: std.mem.Allocator, text: []const u8, dir: []const u8) Error
                 .spec = try a.dupe(u8, rspec),
                 .test_only = test_only,
             });
-        } else if (std.mem.eql(u8, key, "export") or std.mem.eql(u8, key, "kind") or std.mem.eql(u8, key, "jog") or std.mem.eql(u8, key, "targets")) {
-            // Recognized v1 / std directives ignored on v2 for now (`targets` selects platform files).
+        } else if (std.mem.eql(u8, key, "jog") or std.mem.eql(u8, key, "targets")) {
+            // Accepted; platform selection / compiler version checked elsewhere.
             continue;
         } else {
             return error.UnknownDirective;
@@ -202,12 +223,31 @@ pub fn parse(parent: std.mem.Allocator, text: []const u8, dir: []const u8) Error
     }
 
     const mod_name = name orelse return error.MissingModule;
-    // Std packages often ship only `module name` — default root to `{name}.jog`.
-    const mod_root = root orelse try std.fmt.allocPrint(a, "{s}.jog", .{mod_name});
     const mod_version = version orelse try a.dupe(u8, "0.0.0");
 
+    // Directory `source` lines: path does not end in `.jog` (or exists as a directory).
+    // Per-file lists keep the legacy `.jog` suffix.
+    var has_dir_sources = false;
+    for (extras.items) |s| {
+        if (!std.mem.endsWith(u8, s, ".jog")) {
+            has_dir_sources = true;
+            break;
+        }
+        const joined = try std.fs.path.join(a, &.{ dir, s });
+        const st = std.fs.cwd().statFile(joined) catch continue;
+        if (st.kind == .directory) {
+            has_dir_sources = true;
+            break;
+        }
+    }
+
     var sources: std.ArrayListUnmanaged([]const u8) = .{};
-    try sources.append(a, mod_root);
+    if (root) |r| {
+        try sources.append(a, r);
+    } else if (!has_dir_sources) {
+        // Std packages / legacy modules often ship only `module name` — default `{name}.jog`.
+        try sources.append(a, try std.fmt.allocPrint(a, "{s}.jog", .{mod_name}));
+    }
     for (extras.items) |s| {
         if (containsPath(sources.items, s)) continue;
         try sources.append(a, s);
@@ -229,7 +269,10 @@ pub fn parse(parent: std.mem.Allocator, text: []const u8, dir: []const u8) Error
     return .{
         .name = mod_name,
         .version = mod_version,
+        .kind = kind,
         .sources = try sources.toOwnedSlice(a),
+        .exports = try exports_list.toOwnedSlice(a),
+        .has_dir_sources = has_dir_sources,
         .links = links_slice,
         .libdir_entries = libdirs_slice,
         .requires = try requires.toOwnedSlice(a),
@@ -255,7 +298,9 @@ pub fn resolveRequireDir(allocator: std.mem.Allocator, m: *const Manifest, spec:
     return try std.fs.path.join(allocator, &.{ m.dir, spec });
 }
 
-/// Join module dir + relative sources. Caller frees each path and the slice.
+/// Join module dir + relative sources, expanding directory `source` trees into `.jog` files.
+/// Skips `*.test.jog`, hidden names, `out/`, and nested modules (subfolders with their own `jog.mod`).
+/// Caller frees each path and the slice.
 pub fn resolveSourcePaths(allocator: std.mem.Allocator, m: *const Manifest) Error![][]const u8 {
     var out: std.ArrayListUnmanaged([]const u8) = .{};
     errdefer {
@@ -264,9 +309,41 @@ pub fn resolveSourcePaths(allocator: std.mem.Allocator, m: *const Manifest) Erro
     }
     for (m.sources) |rel| {
         const joined = try std.fs.path.join(allocator, &.{ m.dir, rel });
-        try out.append(allocator, joined);
+        const st = std.fs.cwd().statFile(joined) catch {
+            // Keep missing file paths (legacy root defaults); loader reports read errors.
+            try out.append(allocator, joined);
+            continue;
+        };
+        if (st.kind == .directory) {
+            defer allocator.free(joined);
+            try walkJogSources(allocator, &out, joined);
+        } else {
+            try out.append(allocator, joined);
+        }
     }
     return try out.toOwnedSlice(allocator);
+}
+
+/// True when this dependency should not be flat-merged into the consumer.
+/// Directory `source` trees use real imports + `--module`; legacy per-file lists still flat-merge.
+pub fn usesPackageLayout(m: *const Manifest) bool {
+    return m.has_dir_sources;
+}
+
+/// Whether outsiders may import `package_path` (dot path relative to the module root).
+pub fn isExported(m: *const Manifest, package_path: []const u8) bool {
+    if (m.kind != .library) return true;
+    if (m.exports.len == 0) return true;
+    // Root package (empty / module name) is always exported when any export lines exist.
+    if (package_path.len == 0 or std.mem.eql(u8, package_path, m.name)) return true;
+    for (m.exports) |e| {
+        if (std.mem.eql(u8, e, package_path)) return true;
+        // `export sdl` covers `sdl.window`.
+        if (std.mem.startsWith(u8, package_path, e) and package_path.len > e.len and package_path[e.len] == '.') {
+            return true;
+        }
+    }
+    return false;
 }
 
 /// Resolve libdir entries relative to the module directory. Caller frees.
@@ -284,6 +361,57 @@ pub fn resolveLibdirs(allocator: std.mem.Allocator, m: *const Manifest) Error![]
         }
     }
     return try out.toOwnedSlice(allocator);
+}
+
+fn walkJogSources(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged([]const u8), abs_dir: []const u8) Error!void {
+    var dir = std.fs.cwd().openDir(abs_dir, .{ .iterate = true }) catch return error.MissingJogMod;
+    defer dir.close();
+
+    // Nested module: skip this tree (parent pack/loader should require it separately).
+    if (dir.access("jog.mod", .{})) |_| {
+        // Only skip when this is NOT the module root being expanded as a source dir.
+        // Source dirs themselves are never the module root (jog.mod lives above them).
+        // If a *subdir* has jog.mod we skip when recursing — handled below per entry.
+    } else |_| {}
+
+    var it = dir.iterate();
+    while (it.next() catch return error.MissingJogMod) |entry| {
+        if (entry.name.len == 0 or entry.name[0] == '.') continue;
+        if (std.mem.eql(u8, entry.name, "out")) continue;
+        const child = try std.fs.path.join(allocator, &.{ abs_dir, entry.name });
+        errdefer allocator.free(child);
+        switch (entry.kind) {
+            .directory => {
+                // Nested module → skip entire subtree.
+                const nested_mod = try std.fs.path.join(allocator, &.{ child, "jog.mod" });
+                defer allocator.free(nested_mod);
+                if (std.fs.cwd().access(nested_mod, .{})) |_| {
+                    allocator.free(child);
+                    continue;
+                } else |_| {}
+                try walkJogSources(allocator, out, child);
+                allocator.free(child);
+            },
+            .file => {
+                if (!std.mem.endsWith(u8, entry.name, ".jog")) {
+                    allocator.free(child);
+                    continue;
+                }
+                if (std.mem.endsWith(u8, entry.name, ".test.jog")) {
+                    allocator.free(child);
+                    continue;
+                }
+                // OS-suffixed files other than always-loaded ones are still included;
+                // platform filtering is unchanged elsewhere (enqueuePlatformSiblings).
+                if (containsPath(out.items, child)) {
+                    allocator.free(child);
+                    continue;
+                }
+                try out.append(allocator, child);
+            },
+            else => allocator.free(child),
+        }
+    }
 }
 
 fn appendUnique(list: *std.ArrayListUnmanaged([]const u8), a: std.mem.Allocator, word: []const u8) !void {
@@ -384,6 +512,8 @@ test "link and libdir lines" {
     try std.testing.expectEqualStrings("SDL3", m.link_libs[0]);
     try std.testing.expectEqual(@as(usize, 1), m.libdirs.len);
     try std.testing.expectEqualStrings("./prefix/lib64", m.libdirs[0]);
+    try std.testing.expectEqual(@as(usize, 1), m.exports.len);
+    try std.testing.expectEqualStrings("sdl", m.exports[0]);
 
     const em_libs = try m.linksFor(std.testing.allocator, "emscripten");
     defer {
@@ -401,4 +531,51 @@ test "link and libdir lines" {
     try std.testing.expectEqual(@as(usize, 1), em_dirs.len);
     // path.join may keep a `./` segment from the relative libdir entry.
     try std.testing.expect(std.mem.endsWith(u8, em_dirs[0], "prefix-emscripten/lib"));
+}
+
+test "kind library and source dirs without default root" {
+    const text =
+        \\module greeter
+        \\version 0.1.0
+        \\kind library
+        \\source greeter
+        \\export greeter
+        \\
+    ;
+    // Use a path that won't accidentally be a real directory named greeter under cwd.
+    var m = try parse(std.testing.allocator, text, "/tmp/no_such_greeter_mod");
+    defer m.deinit();
+    try std.testing.expect(m.kind == .library);
+    try std.testing.expectEqual(@as(usize, 1), m.sources.len);
+    try std.testing.expectEqualStrings("greeter", m.sources[0]);
+    try std.testing.expect(isExported(&m, "greeter"));
+    try std.testing.expect(!isExported(&m, "internal"));
+}
+
+test "resolveSourcePaths expands package directories" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("pkgs/hello");
+    try tmp.dir.makePath("pkgs/util");
+    try tmp.dir.writeFile(.{ .sub_path = "jog.mod", .data = "module pkg_dirs\nsource pkgs\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "pkgs/hello/hello.jog", .data = "fn hello_n(): i64 { return 1 }\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "pkgs/util/util.jog", .data = "fn util_n(): i64 { return 2 }\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "pkgs/util/util.test.jog", .data = "fn t() {}\n" });
+    try tmp.dir.makePath("pkgs/nested");
+    try tmp.dir.writeFile(.{ .sub_path = "pkgs/nested/jog.mod", .data = "module nested\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "pkgs/nested/skip.jog", .data = "fn skip() {}\n" });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs = try tmp.dir.realpath(".", &path_buf);
+    const text = try tmp.dir.readFileAlloc(std.testing.allocator, "jog.mod", 1024);
+    defer std.testing.allocator.free(text);
+    var m = try parse(std.testing.allocator, text, abs);
+    defer m.deinit();
+    try std.testing.expect(m.has_dir_sources);
+    const paths = try resolveSourcePaths(std.testing.allocator, &m);
+    defer {
+        for (paths) |p| std.testing.allocator.free(p);
+        std.testing.allocator.free(paths);
+    }
+    try std.testing.expectEqual(@as(usize, 2), paths.len);
 }

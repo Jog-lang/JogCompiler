@@ -1,0 +1,10 @@
+import pkgs.hello
+import pkgs.util
+
+fn main() {
+    if (hello_n() + util_n() == 3) {
+        print("pkg dirs ok\n")
+    } else {
+        panic("pkg dirs fail\n")
+    }
+}
