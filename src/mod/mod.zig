@@ -292,6 +292,11 @@ pub fn isPathSpec(spec: []const u8) bool {
     return false;
 }
 
+/// True when a path/`require` spec names a `.jogz` archive (compiler never opens these).
+pub fn isJogzSpec(spec: []const u8) bool {
+    return std.ascii.endsWithIgnoreCase(spec, ".jogz");
+}
+
 /// Resolve a path require relative to the requiring module dir. Caller frees.
 pub fn resolveRequireDir(allocator: std.mem.Allocator, m: *const Manifest, spec: []const u8) Error![]u8 {
     if (std.fs.path.isAbsolute(spec)) return try allocator.dupe(u8, spec);
@@ -493,6 +498,9 @@ test "require path lines" {
     try std.testing.expect(m.requires[1].test_only);
     try std.testing.expect(isPathSpec("../util"));
     try std.testing.expect(!isPathSpec("1.2.3"));
+    try std.testing.expect(isJogzSpec("../deps/jog_sdl-0.1.0.jogz"));
+    try std.testing.expect(isJogzSpec("C:\\cache\\lib.JOGZ"));
+    try std.testing.expect(!isJogzSpec("../util"));
 }
 
 test "link and libdir lines" {

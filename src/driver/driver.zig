@@ -552,26 +552,46 @@ fn loadModuleWithOverride(
     for (manifest.requires) |req| {
         if (req.test_only and !opts.include_test_requires) continue;
         var dep_dir: []const u8 = undefined;
-        if (mod.isPathSpec(req.spec)) {
-            const resolved = mod.resolveRequireDir(allocator, &manifest, req.spec) catch |err| {
-                try writer.print("require {s}: {s}\n", .{ req.name, @errorName(err) });
-                std.process.exit(1);
-            };
-            try owned_dirs.append(allocator, resolved);
-            dep_dir = resolved;
-        } else {
-            var found: ?[]const u8 = null;
-            for (opts.modules) |m| {
-                if (std.mem.eql(u8, m.name, req.name)) {
-                    found = m.dir;
-                    break;
-                }
+        // Prefer an explicit `--module` mapping (jog-build unpacks `.jogz` into the cache).
+        var cli_dir: ?[]const u8 = null;
+        for (opts.modules) |m| {
+            if (std.mem.eql(u8, m.name, req.name)) {
+                cli_dir = m.dir;
+                break;
             }
-            if (found == null) {
+        }
+        if (mod.isPathSpec(req.spec)) {
+            if (mod.isJogzSpec(req.spec)) {
+                if (cli_dir) |d| {
+                    dep_dir = d;
+                } else {
+                    try writer.print(
+                        "require {s}: .jogz archive needs jog-build resolve (or --module {s}=<cache>/mod/{s}/<ver>/src); jog never opens archives\n",
+                        .{ req.name, req.name, req.name },
+                    );
+                    std.process.exit(1);
+                }
+            } else {
+                const resolved = mod.resolveRequireDir(allocator, &manifest, req.spec) catch |err| {
+                    try writer.print("require {s}: {s}\n", .{ req.name, @errorName(err) });
+                    std.process.exit(1);
+                };
+                try owned_dirs.append(allocator, resolved);
+                dep_dir = if (cli_dir) |d| d else resolved;
+            }
+        } else {
+            if (cli_dir == null) {
                 try writer.print("require {s}: missing --module {s}=<dir> (version requires need a mapping)\n", .{ req.name, req.name });
                 std.process.exit(1);
             }
-            dep_dir = found.?;
+            dep_dir = cli_dir.?;
+        }
+        if (mod.isJogzSpec(dep_dir)) {
+            try writer.print(
+                "require {s}: --module points at a .jogz; pass the unpacked cache src dir (jog-build deps --flags)\n",
+                .{req.name},
+            );
+            std.process.exit(1);
         }
         // Record mapping for import resolution.
         var already = false;
@@ -982,7 +1002,8 @@ pub fn cmdDeps(allocator: std.mem.Allocator, path: []const u8, writer: anytype) 
     try cmdDepsOpts(allocator, path, writer, false, false);
 }
 
-/// `flags`: emit `--module=name=absdir` lines (LSP / jog-build deps --flags).
+/// `flags`: emit `--module=name=absdir` lines for **path-folder** requires (LSP fallback).
+/// Skips `.jogz` archives — use `jog-build deps --flags` for those (Packages contract).
 /// `include_test`: also emit mappings for `require.test`.
 pub fn cmdDepsOpts(allocator: std.mem.Allocator, path: []const u8, writer: anytype, flags: bool, include_test: bool) !void {
     var manifest = mod.loadFromPath(allocator, path) catch |err| {
@@ -992,16 +1013,18 @@ pub fn cmdDepsOpts(allocator: std.mem.Allocator, path: []const u8, writer: anyty
     defer manifest.deinit();
 
     if (flags) {
-        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const cwd = std.fs.cwd().realpath(".", &cwd_buf) catch ".";
         for (manifest.requires) |req| {
             if (req.test_only and !include_test) continue;
             if (!mod.isPathSpec(req.spec)) continue;
+            // Archives are jog-build's job; never emit `--module=name=/path/to.jogz`.
+            if (mod.isJogzSpec(req.spec)) continue;
             const rel = mod.resolveRequireDir(allocator, &manifest, req.spec) catch continue;
             defer allocator.free(rel);
+            if (mod.isJogzSpec(rel)) continue;
             const abs = std.fs.cwd().realpathAlloc(allocator, rel) catch try allocator.dupe(u8, rel);
             defer allocator.free(abs);
-            _ = cwd;
+            // Only emit directory (or jog.mod) mappings the compiler can load.
+            if (!mod.isModulePath(abs)) continue;
             try writer.print("--module={s}={s}\n", .{ req.name, abs });
         }
         return;
@@ -1039,7 +1062,8 @@ pub fn usage(writer: anytype) !void {
         \\                          @link / jog.mod link.* → -l; libdir → -L (+ rpath native)
         \\                          jog.mod require path| --module for deps
         \\  deps [--flags] [--test] [path]
-        \\                          source paths, or --module flags for LSP
+        \\                          source paths, or path-folder --module flags
+        \\                          (.jogz → jog-build deps --flags)
         \\  roots                   print std/core discovery ($JOG_ROOT or next to jog)
         \\  help                    this message
         \\
