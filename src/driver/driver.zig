@@ -192,6 +192,19 @@ fn loadSingle(allocator: std.mem.Allocator, path: []const u8, modules: []const M
                 try pending.append(allocator, owned);
                 try enqueuePackageSiblings(allocator, &pending, &seen, owned);
                 try enqueuePlatformSiblings(allocator, &pending, &seen, owned);
+                // Also pull full mapped module trees (see appendMappedModuleSources).
+                var tmp_list: std.ArrayListUnmanaged([]const u8) = .{};
+                defer {
+                    for (tmp_list.items) |x| allocator.free(x);
+                    tmp_list.deinit(allocator);
+                }
+                try appendMappedModuleSources(allocator, &tmp_list, modules, imp.path);
+                for (tmp_list.items) |p| {
+                    if (seen.contains(p)) continue;
+                    const o = try allocator.dupe(u8, p);
+                    try seen.put(allocator, o, {});
+                    try pending.append(allocator, o);
+                }
             } else if (d == .require_decl) {
                 const req = d.require_decl;
                 var resolved: ?[]u8 = null;
@@ -435,6 +448,32 @@ fn appendPackageSiblings(allocator: std.mem.Allocator, path_list: *std.ArrayList
     }
 }
 
+/// If `import_path` starts with a mapped module name, append that module's discovered sources.
+fn appendMappedModuleSources(
+    allocator: std.mem.Allocator,
+    path_list: *std.ArrayListUnmanaged([]const u8),
+    modules: []const ModuleMapping,
+    import_path: []const u8,
+) !void {
+    const head = blk: {
+        if (std.mem.indexOfScalar(u8, import_path, '.')) |dot| break :blk import_path[0..dot];
+        break :blk import_path;
+    };
+    for (modules) |m| {
+        if (!std.mem.eql(u8, m.name, head)) continue;
+        var dep_man = mod.loadFromPath(allocator, m.dir) catch return;
+        defer dep_man.deinit();
+        if (!mod.usesPackageLayout(&dep_man)) return;
+        const paths = mod.resolveSourcePaths(allocator, &dep_man) catch return;
+        defer {
+            for (paths) |p| allocator.free(p);
+            allocator.free(paths);
+        }
+        for (paths) |p| try appendUniquePath(path_list, allocator, p);
+        return;
+    }
+}
+
 /// `require foo` → sibling `foo.jog`, `foo/root.jog`, or `foo/main.jog`.
 fn resolveRequirePath(allocator: std.mem.Allocator, from_file: []const u8, name: []const u8) !?[]u8 {
     const dir = std.fs.path.dirname(from_file) orelse ".";
@@ -639,6 +678,9 @@ fn loadModuleWithOverride(
             std.fs.cwd().access(resolved, .{}) catch continue;
             try appendUniquePath(&path_list, allocator, resolved);
             try appendPackageSiblings(allocator, &path_list, resolved);
+            // Migration: importing any package of a mapped directory-source module
+            // loads that module's full source tree (flattened merge still used for names).
+            try appendMappedModuleSources(allocator, &path_list, modules, imp.path);
             // Platform siblings for std packages (c.posix.jog, …).
             if (!std.mem.endsWith(u8, resolved, ".jog")) continue;
             const base = resolved[0 .. resolved.len - ".jog".len];

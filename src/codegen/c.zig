@@ -34,12 +34,16 @@ pub fn emit(allocator: std.mem.Allocator, program: *const ir.Program, writer: an
     try writer.writeAll("\n");
 
     // Forward decls for Jog functions (and exports). `main` is C `int` for emcc.
+    // Jog fns are emitted as jog_fn_<name> so idiomatic wrappers named like
+    // libc (malloc/strchr/…) do not collide with <stdlib.h>/<string.h>.
     for (program.funcs) |f| {
         if (std.mem.eql(u8, f.name, "main")) {
             try writer.writeAll("int main(void);\n");
             continue;
         }
-        try writer.print("int64_t {s}(", .{mangle(f.name)});
+        try writer.writeAll("int64_t ");
+        try writeJogFnName(writer, f.name);
+        try writer.writeAll("(");
         var pi: u32 = 0;
         while (pi < f.nparams) : (pi += 1) {
             if (pi > 0) try writer.writeAll(", ");
@@ -69,7 +73,8 @@ pub fn emit(allocator: std.mem.Allocator, program: *const ir.Program, writer: an
         try writer.print("static void *jog_vt_{d}[] = {{", .{i});
         for (vt.methods, 0..) |m, mi| {
             if (mi > 0) try writer.writeAll(", ");
-            try writer.print("(void*){s}", .{m});
+            try writer.writeAll("(void*)");
+            try writeJogFnName(writer, m);
         }
         try writer.writeAll("};\n");
         _ = vt.symbol;
@@ -102,7 +107,9 @@ pub fn emit(allocator: std.mem.Allocator, program: *const ir.Program, writer: an
         if (is_main) {
             try writer.writeAll("int main(void) {\n");
         } else {
-            try writer.print("int64_t {s}(", .{mangle(f.name)});
+            try writer.writeAll("int64_t ");
+            try writeJogFnName(writer, f.name);
+            try writer.writeAll("(");
             var pi: u32 = 0;
             while (pi < f.nparams) : (pi += 1) {
                 if (pi > 0) try writer.writeAll(", ");
@@ -136,6 +143,12 @@ fn mangle(name: []const u8) []const u8 {
     return name;
 }
 
+/// C symbol for a Jog function. Prefix avoids collisions with libc headers we
+/// include (JogSDL idiomatic stdinc wrappers are named malloc/strchr/…).
+fn writeJogFnName(writer: anytype, name: []const u8) !void {
+    try writer.print("jog_fn_{s}", .{name});
+}
+
 /// Libc symbols whose prototypes live in headers we already include.
 /// Emitting `extern intptr_t name()` conflicts with the real C decls under emcc.
 fn isLibcHeaderSymbol(name: []const u8) bool {
@@ -144,6 +157,10 @@ fn isLibcHeaderSymbol(name: []const u8) bool {
         "malloc",  "free",    "calloc",  "realloc", "abort",   "exit",
         "fopen",   "fclose",  "fread",   "fwrite",  "fprintf", "printf",
         "snprintf","write",   "read",    "close",   "lseek",
+        "strdup",  "strndup", "strchr",  "strrchr", "strstr",  "memcmp",
+        "strcpy",  "strncpy", "strcat",  "strncat", "atoi",    "atol",
+        "qsort",   "bsearch", "abs",     "labs",    "putchar", "puts",
+        "getchar", "getc",    "putc",    "fgetc",   "fputc",
     };
     for (names) |n| {
         if (std.mem.eql(u8, name, n)) return true;
@@ -174,7 +191,13 @@ fn emitInst(writer: anytype, prog: *const ir.Program, fname: []const u8, ninst: 
             if (inst.aux < 0) {
                 const cid: usize = @intCast(-1 - inst.aux);
                 const callee = prog.callees[cid];
-                try writer.print("  s[{d}] = (int64_t)(intptr_t)(void*){s};\n", .{ inst.dst, callee.name });
+                if (callee.kind == .jog_fn) {
+                    try writer.print("  s[{d}] = (int64_t)(intptr_t)(void*)", .{inst.dst});
+                    try writeJogFnName(writer, callee.name);
+                    try writer.writeAll(";\n");
+                } else {
+                    try writer.print("  s[{d}] = (int64_t)(intptr_t)(void*){s};\n", .{ inst.dst, callee.name });
+                }
             } else {
                 try writer.print("  s[{d}] = (int64_t)(intptr_t)(void*)jog_str_{d};\n", .{ inst.dst, inst.aux });
             }
@@ -422,7 +445,12 @@ fn emitCall(writer: anytype, prog: *const ir.Program, inst: ir.Inst, _: bool) !v
     } else {
         // Generic int64_t call (Jog fn, most externs, remaining runtime).
         try writer.writeAll("    int64_t r = ");
-        try writer.print("{s}(", .{callee.name});
+        if (callee.kind == .jog_fn) {
+            try writeJogFnName(writer, callee.name);
+            try writer.writeAll("(");
+        } else {
+            try writer.print("{s}(", .{callee.name});
+        }
         var i: u8 = 0;
         while (i < inst.arity and i < ir.max_call_args) : (i += 1) {
             if (i > 0) try writer.writeAll(", ");
