@@ -15,20 +15,41 @@ pub fn emit(allocator: std.mem.Allocator, program: *const ir.Program, writer: an
     try writer.writeAll("#include <unistd.h>\n");
     try writer.writeAll("#include \"jogrt.h\"\n\n");
 
-    // Extern prototypes use intptr_t so wasm32 (emcc) matches C/SDL ABI
-    // (i32 pointers/ints). Float edges use double. Slots stay int64_t.
-    // Skip libc names already declared by <stdlib.h>/<string.h> (included above)
-    // — redeclarations as intptr_t() conflict under emcc.
+    // Extern prototypes must match wasm32 ABI (no K&R empty lists): a wrong
+    // return/arg width becomes signature_mismatch_* → unreachable at runtime.
+    // Skip libc names already declared by headers we include above.
     for (program.callees) |c| {
         if (c.kind != .extern_c) continue;
         if (isLibcHeaderSymbol(c.name)) continue;
         if (c.float_ret) {
             try writer.print("extern double {s}(", .{c.name});
+        } else if (c.void_ret) {
+            try writer.print("extern void {s}(", .{c.name});
+        } else if (c.wide_ret) {
+            try writer.print("extern int64_t {s}(", .{c.name});
         } else {
             try writer.print("extern intptr_t {s}(", .{c.name});
         }
-        // Arity unknown at decl time for all call sites; emit a permissive
-        // K&R-style empty param list and cast at each call.
+        if (c.nparams == 0) {
+            try writer.writeAll("void");
+        } else {
+            var pi: u8 = 0;
+            while (pi < c.nparams) : (pi += 1) {
+                if (pi > 0) try writer.writeAll(", ");
+                const is_f = (c.float_args & (@as(u16, 1) << @intCast(pi))) != 0;
+                const is_w = (c.wide_args & (@as(u16, 1) << @intCast(pi))) != 0;
+                const is_p = (c.ptr_args & (@as(u16, 1) << @intCast(pi))) != 0;
+                if (is_f) {
+                    try writer.writeAll("double");
+                } else if (is_w) {
+                    try writer.writeAll("int64_t");
+                } else if (is_p) {
+                    try writer.writeAll("void*");
+                } else {
+                    try writer.writeAll("intptr_t");
+                }
+            }
+        }
         try writer.writeAll(");\n");
     }
     try writer.writeAll("\n");
@@ -337,44 +358,32 @@ fn emitCall(writer: anytype, prog: *const ir.Program, inst: ir.Inst, _: bool) !v
     const callee = prog.callees[cid];
     try writer.writeAll("  {\n");
     if (callee.kind == .extern_c) {
-        // wasm32 ABI: pointers/i32 → intptr_t; i64/u64 → int64_t; floats → double;
-        // void returns call without capturing a result.
+        // Call by name — never bitcast the function pointer. On wasm32, casting
+        // e.g. write(int,void*,size_t) to (intptr_t,intptr_t,int64_t)->int64_t
+        // becomes LLVM's .Lwrite_bitcast_invalid → unreachable in the browser.
+        // Prototypes (libc headers we include, or K&R extern decls) convert args.
         const void_ret = callee.void_ret and !callee.float_ret;
         if (callee.float_ret) {
             try writer.writeAll("    double r;\n");
-            try writer.writeAll("    r = ((double(*)(");
+            try writer.print("    r = {s}(", .{callee.name});
         } else if (void_ret) {
-            try writer.writeAll("    ((void(*)(");
-        } else if (callee.wide_ret) {
-            try writer.writeAll("    int64_t r;\n");
-            try writer.writeAll("    r = ((int64_t(*)(");
+            try writer.print("    {s}(", .{callee.name});
         } else {
-            try writer.writeAll("    intptr_t r;\n");
-            try writer.writeAll("    r = ((intptr_t(*)(");
+            try writer.writeAll("    int64_t r;\n");
+            try writer.print("    r = (int64_t){s}(", .{callee.name});
         }
         var i: u8 = 0;
         while (i < inst.arity and i < ir.max_call_args) : (i += 1) {
             if (i > 0) try writer.writeAll(", ");
             const is_f = (callee.float_args & (@as(u16, 1) << @intCast(i))) != 0;
             const is_w = (callee.wide_args & (@as(u16, 1) << @intCast(i))) != 0;
-            if (is_f) {
-                try writer.writeAll("double");
-            } else if (is_w) {
-                try writer.writeAll("int64_t");
-            } else {
-                try writer.writeAll("intptr_t");
-            }
-        }
-        try writer.print(")){s})(", .{callee.name});
-        i = 0;
-        while (i < inst.arity and i < ir.max_call_args) : (i += 1) {
-            if (i > 0) try writer.writeAll(", ");
-            const is_f = (callee.float_args & (@as(u16, 1) << @intCast(i))) != 0;
-            const is_w = (callee.wide_args & (@as(u16, 1) << @intCast(i))) != 0;
+            const is_p = (callee.ptr_args & (@as(u16, 1) << @intCast(i))) != 0;
             if (is_f) {
                 try writer.print("*(double*)&s[{d}]", .{inst.args[i]});
             } else if (is_w) {
                 try writer.print("s[{d}]", .{inst.args[i]});
+            } else if (is_p) {
+                try writer.print("(void*)(intptr_t)s[{d}]", .{inst.args[i]});
             } else {
                 try writer.print("(intptr_t)s[{d}]", .{inst.args[i]});
             }
@@ -386,7 +395,7 @@ fn emitCall(writer: anytype, prog: *const ir.Program, inst: ir.Inst, _: bool) !v
             } else if (void_ret) {
                 try writer.print("    s[{d}] = 0;\n", .{inst.dst});
             } else {
-                try writer.print("    s[{d}] = (int64_t)r;\n", .{inst.dst});
+                try writer.print("    s[{d}] = r;\n", .{inst.dst});
             }
         } else if (!void_ret) {
             try writer.writeAll("    (void)r;\n");

@@ -1,0 +1,14 @@
+// Regression: libc write with Jog u64 count must not fn-ptr-bitcast under emcc.
+// Casting write to (intptr_t,intptr_t,int64_t)->int64_t becomes .Lwrite_bitcast_invalid
+// → RuntimeError: unreachable in the browser (JogEngine timing_log_line).
+// Build: jog build examples/emscripten_write_u64.jog --target wasm32-emscripten -o out/write_u64.html
+// Run:   node out/write_u64.js
+
+extern {
+    fn write(fd: i32, buf: *byte, count: u64): i64
+}
+
+fn main() {
+    val msg = c"write_u64 ok\n"
+    write(1, msg, 13)
+}

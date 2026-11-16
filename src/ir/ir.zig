@@ -95,10 +95,14 @@ pub const Callee = struct {
     float_args: u16 = 0,
     /// Bit i set ⇒ argument i is i64/u64 (wasm32 needs real i64, not intptr_t).
     wide_args: u16 = 0,
+    /// Bit i set ⇒ argument i is a pointer / `*byte` (C emit needs void* cast under prototypes).
+    ptr_args: u16 = 0,
     /// `extern` return is i64/u64 (wasm32 i64, not intptr_t).
     wide_ret: bool = false,
     /// `extern` with no return type — wasm32 void vs i32 signature.
     void_ret: bool = false,
+    /// Declared arity for C prototype emit (`extern` only; 0 ⇒ `(void)`).
+    nparams: u8 = 0,
 };
 
 pub const Global = struct {
@@ -165,6 +169,23 @@ fn wideArgMask(params: []ast.Param) u16 {
     for (params, 0..) |p, i| {
         if (i >= max_call_args) break;
         if (isWideIntTypeExpr(p.ty)) mask |= @as(u16, 1) << @intCast(i);
+    }
+    return mask;
+}
+
+fn isPtrTypeExpr(te: *ast.TypeExpr) bool {
+    return switch (te.*) {
+        .pointer, .pointer_const => true,
+        .name => |n| std.mem.eql(u8, n, "raw_ptr") or std.mem.eql(u8, n, "str") or std.mem.eql(u8, n, "bytes"),
+        else => false,
+    };
+}
+
+fn ptrArgMask(params: []ast.Param) u16 {
+    var mask: u16 = 0;
+    for (params, 0..) |p, i| {
+        if (i >= max_call_args) break;
+        if (isPtrTypeExpr(p.ty)) mask |= @as(u16, 1) << @intCast(i);
     }
     return mask;
 }
@@ -375,8 +396,10 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                         .float_ret = fret,
                         .float_args = floatArgMask(ef.params),
                         .wide_args = wideArgMask(ef.params),
+                        .ptr_args = ptrArgMask(ef.params),
                         .wide_ret = wret,
                         .void_ret = ef.ret == null,
+                        .nparams = @intCast(@min(ef.params.len, max_call_args)),
                     });
                     var ret_name: []const u8 = "";
                     var ret_meta: ?SlotMeta = null;
