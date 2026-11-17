@@ -1,0 +1,27 @@
+// &struct_var must yield the struct data pointer (slot is already struct_ptr), not lea of the slot.
+struct Point {
+    x: i64
+    y: i64
+}
+
+fn read_x(p: *byte): i64 {
+    // Point.x at offset 0
+    val b0 = p[0] & 255
+    val b1 = p[1] & 255
+    val b2 = p[2] & 255
+    val b3 = p[3] & 255
+    val b4 = p[4] & 255
+    val b5 = p[5] & 255
+    val b6 = p[6] & 255
+    val b7 = p[7] & 255
+    return b0 + (b1 << 8) + (b2 << 16) + (b3 << 24) + (b4 << 32) + (b5 << 40) + (b6 << 48) + (b7 << 56)
+}
+
+fn main() {
+    var pt: Point = Point(x: 42, y: 99)
+    val p: *byte = &pt
+    if (read_x(p) != 42) {
+        panic("addr_struct_ffi bad\n")
+    }
+    print("addr_struct_ffi ok\n")
+}

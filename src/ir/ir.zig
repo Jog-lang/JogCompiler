@@ -2200,9 +2200,10 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
                 const name = u.expr.ident;
                 const d = try ctx.fresh();
                 if (ctx.slots.get(name)) |slot| {
-                    // Array names already hold a pointer; &arr is the same pointer.
+                    // Array / struct / iface slots already hold a data pointer; &x is that pointer
+                    // (LEA of the slot would pass a **T to C and break SDL createinfo / FRect FFI).
                     if (ctx.meta.get(name)) |m| {
-                        if (m.kind == .array_ptr) {
+                        if (m.kind == .array_ptr or m.kind == .struct_ptr or m.kind == .iface_ptr) {
                             try ctx.emit(.{ .op = .copy, .dst = d, .src0 = slot });
                             return d;
                         }
