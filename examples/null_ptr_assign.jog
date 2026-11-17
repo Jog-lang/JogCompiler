@@ -1,0 +1,29 @@
+// Local + package *byte null init / reassign (GPU Friction / Texture.lock family).
+var pkg_ptr: *byte = null
+
+fn main() {
+    pkg_ptr = null
+    if (pkg_ptr != null) {
+        panic("pkg should be null\n")
+    }
+
+    var local_ptr: *byte = null
+    if (local_ptr != null) {
+        panic("local should be null\n")
+    }
+    local_ptr = alloc(8)
+    if (local_ptr == null) {
+        panic("alloc failed\n")
+    }
+    local_ptr = null
+    if (local_ptr != null) {
+        panic("local reassign null failed\n")
+    }
+
+    pkg_ptr = alloc(8)
+    if (pkg_ptr == null) {
+        panic("pkg alloc failed\n")
+    }
+    pkg_ptr = null
+    print("null_ptr_assign ok\n")
+}
