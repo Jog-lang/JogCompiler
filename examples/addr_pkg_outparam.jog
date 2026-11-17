@@ -1,0 +1,39 @@
+// Package &ident → **byte / *u32 for C out-params (swapchain / Texture.lock family).
+// Proves lower emits gaddr; SDL writes through the pointer at runtime.
+var out_ptr: *byte = null
+var out_w: u32 = 0
+var out_h: u32 = 0
+
+fn sink_dptr(pp: **byte): i64 {
+    if (pp == null) {
+        return 0
+    }
+    return 1
+}
+
+fn sink_u32(p: *u32): i64 {
+    if (p == null) {
+        return 0
+    }
+    return 1
+}
+
+fn main() {
+    if (sink_dptr(&out_ptr) != 1) {
+        panic("addr out_ptr failed\n")
+    }
+    if (sink_u32(&out_w) != 1) {
+        panic("addr out_w failed\n")
+    }
+    if (sink_u32(&out_h) != 1) {
+        panic("addr out_h failed\n")
+    }
+    // Local *byte null init + & for the same out-param shape.
+    var local_out: *byte = null
+    if (sink_dptr(&local_out) != 1) {
+        panic("addr local_out failed\n")
+    }
+    local_out = null
+    out_ptr = null
+    print("addr_pkg_outparam ok\n")
+}

@@ -1074,6 +1074,8 @@ fn canAssign(from: *TypeInfo, to: *TypeInfo) bool {
     if (from.bits > 0 and to.bits > 0 and from.unsigned and to.unsigned and from.bits <= to.bits) return true;
     // pointer to optional pointer / raw
     if (from.kind == .pointer and to.kind == .pointer) return true;
+    // null literal → any pointer (C-nullable *T / **T; package init already allowed this)
+    if (from.kind == .optional and std.mem.eql(u8, from.name, "null") and to.kind == .pointer) return true;
     // interface / named struct
     if (from.kind == .struct_ty and to.kind == .iface_struct) return true;
     if (from.kind == .pointer and to.kind == .iface_struct) return true;

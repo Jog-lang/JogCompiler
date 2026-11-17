@@ -2194,6 +2194,33 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
             return d;
         },
         .unary => |u| {
+            // Address-of: resolve lvalue before evaluating operand (package &ident → gaddr).
+            if (u.op == .addr) {
+                if (u.expr.* != .ident) return error.TypeError;
+                const name = u.expr.ident;
+                const d = try ctx.fresh();
+                if (ctx.slots.get(name)) |slot| {
+                    // Array names already hold a pointer; &arr is the same pointer.
+                    if (ctx.meta.get(name)) |m| {
+                        if (m.kind == .array_ptr) {
+                            try ctx.emit(.{ .op = .copy, .dst = d, .src0 = slot });
+                            return d;
+                        }
+                    }
+                    try ctx.emit(.{ .op = .lea_slot, .dst = d, .src0 = slot });
+                    return d;
+                }
+                if (ctx.global_map.get(name)) |gi| {
+                    try ctx.emit(.{ .op = .gaddr, .dst = d, .aux = @intCast(gi) });
+                    return d;
+                }
+                if (ctx.object_map.get(name)) |gi| {
+                    try ctx.emit(.{ .op = .gaddr, .dst = d, .aux = @intCast(gi) });
+                    return d;
+                }
+                std.debug.print("lower UnknownName addr: {s}\n", .{name});
+                return error.UnknownName;
+            }
             const v = try lowerExpr(ctx, u.expr);
             const d = try ctx.fresh();
             switch (u.op) {
@@ -2204,18 +2231,7 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
                     try ctx.emit(.{ .op = .iconst, .dst = z, .aux = 0 });
                     try ctx.emit(.{ .op = .eq, .dst = d, .src0 = v, .src1 = z });
                 },
-                .addr => {
-                    if (u.expr.* != .ident) return error.TypeError;
-                    const slot = ctx.slots.get(u.expr.ident) orelse return error.UnknownName;
-                    // Array names already hold a pointer; &arr is the same pointer.
-                    if (ctx.meta.get(u.expr.ident)) |m| {
-                        if (m.kind == .array_ptr) {
-                            try ctx.emit(.{ .op = .copy, .dst = d, .src0 = slot });
-                            return d;
-                        }
-                    }
-                    try ctx.emit(.{ .op = .lea_slot, .dst = d, .src0 = slot });
-                },
+                .addr => unreachable,
                 .deref => try ctx.emit(.{ .op = .load, .dst = d, .src0 = v }),
             }
             return d;
