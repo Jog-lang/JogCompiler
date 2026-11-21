@@ -1,0 +1,19 @@
+// Process argc/argv via runtime jogrt_argc / jogrt_arg_ptr (Wave 4 Friction).
+// Prefer these until the full std.c / std.os package port is clean on v2.
+
+extern {
+    fn jogrt_argc(): i64
+    fn jogrt_arg_ptr(i: i32): *byte
+}
+
+fn main() {
+    val n = jogrt_argc()
+    if (n < 1) {
+        panic("argc BAD\n")
+    }
+    val p = jogrt_arg_ptr(0)
+    if (p == null) {
+        panic("argv0 BAD\n")
+    }
+    print("os argv ok\n")
+}

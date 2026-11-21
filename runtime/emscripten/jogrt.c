@@ -5,6 +5,21 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Emscripten: argc/argv from main; captured if host sets them. */
+static int64_t jogrt_argc_val = 0;
+static char **jogrt_argv_base = 0;
+
+int64_t jogrt_argc(void) { return jogrt_argc_val; }
+const char *jogrt_arg_ptr(int i) {
+    if (i < 0 || (int64_t)i >= jogrt_argc_val || !jogrt_argv_base) return NULL;
+    return jogrt_argv_base[i];
+}
+void jogrt_set_args(int argc, char **argv) {
+    jogrt_argc_val = argc;
+    jogrt_argv_base = argv;
+}
+
+
 #define JOGRT_HEAP_SIZE (4 * 1024 * 1024)
 #define JOGRT_RET_ARENA_SIZE (1 * 1024 * 1024)
 

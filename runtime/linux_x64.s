@@ -18,8 +18,37 @@ jogrt_ret_arena:
   .zero JOGRT_RET_ARENA_SIZE
 jogrt_ret_ptr:
   .zero 8
+# Process args (captured at main entry from CRT or freestanding _start).
+.globl jogrt_argc_val
+jogrt_argc_val:
+  .zero 8
+.globl jogrt_argv_base
+jogrt_argv_base:
+  .zero 8
 
 .text
+
+.globl jogrt_argc
+.type jogrt_argc, @function
+jogrt_argc:
+  mov rax, qword ptr [rip + jogrt_argc_val]
+  ret
+
+.globl jogrt_arg_ptr
+.type jogrt_arg_ptr, @function
+jogrt_arg_ptr:
+  # rdi = index; return argv[i] or null
+  mov rax, qword ptr [rip + jogrt_argc_val]
+  cmp rdi, rax
+  jae 1f
+  test rdi, rdi
+  js 1f
+  mov rax, qword ptr [rip + jogrt_argv_base]
+  mov rax, qword ptr [rax + rdi * 8]
+  ret
+1:
+  xor eax, eax
+  ret
 
 .globl jogrt_print
 .type jogrt_print, @function
