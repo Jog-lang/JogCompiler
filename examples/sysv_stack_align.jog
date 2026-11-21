@@ -1,0 +1,24 @@
+// SysV: 7th stack arg must leave callee rsp%16==8 (pad outgoing spill to 16 bytes).
+// Pure Jog smoke: seven f64 args + nested Jog call (same stack-arg lower path).
+
+fn nested_sum(x: i64): i64 {
+    return x + 1
+}
+
+fn seven(a: f64, b: f64, c: f64, d: f64, e: f64, f: f64, g: f64): i64 {
+    // Force a nested call while the 7th arg spill is live on this frame.
+    val n = nested_sum(7)
+    if (a + b + c + d + e + f + g == 28.0) {
+        return n
+    }
+    return 0
+}
+
+fn main() {
+    val r = seven(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0)
+    if (r == 8) {
+        print("sysv stack align ok\n")
+    } else {
+        panic("sysv stack align BAD\n")
+    }
+}

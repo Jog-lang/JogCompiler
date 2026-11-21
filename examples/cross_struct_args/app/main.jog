@@ -1,0 +1,13 @@
+import cross_lib.render
+
+fn main() {
+    val ren = Renderer(id: 1)
+    val src = FRect(x: 0.0, y: 0.0, w: 3.0, h: 4.0)
+    val dst = FRect(x: 1.0, y: 2.0, w: 5.0, h: 6.0)
+    val n = ren.draw_texture_rect(src, dst)
+    if (n == 8) {
+        print("cross struct args ok\n")
+    } else {
+        panic("cross struct args BAD\n")
+    }
+}

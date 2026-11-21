@@ -1,0 +1,42 @@
+// Interface values storable in package var / field / array (Wave 1 Friction).
+
+interface struct Ticker {
+    fn tick(n: i64): i64
+}
+
+struct Clock {
+    base: i64
+}
+
+fn *Clock.tick(n: i64): i64 {
+    return self.base + n
+}
+
+struct Holder {
+    s: Ticker
+}
+
+var g_sys: Ticker = null
+
+fn main() {
+    val c = Clock(base: 10)
+    val s: Ticker = c as Ticker
+    g_sys = s
+    if (g_sys.tick(3) != 13) {
+        panic("package iface BAD\n")
+    }
+    val h = Holder(s: s)
+    if (h.s.tick(4) != 14) {
+        panic("field iface BAD\n")
+    }
+    // Typed array of iface — assign element then method-call through index.
+    var arr: [1]Ticker
+    arr[0] = s
+    if (arr[0].tick(5) != 15) {
+        panic("array iface BAD\n")
+    }
+    if (size(Ticker) != 8) {
+        panic("iface size BAD\n")
+    }
+    print("iface store ok\n")
+}

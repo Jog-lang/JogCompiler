@@ -1,0 +1,33 @@
+// Struct returns use a circular ret arena — many returns must not OOM the 4 MiB bump.
+
+struct Hit {
+    x: i64
+    y: i64
+    z: i64
+}
+
+fn cast(i: i64): Hit {
+    return Hit(x: i, y: i + 1, z: i + 2)
+}
+
+fn main() {
+    var i: i64 = 0
+    var sum: i64 = 0
+    while (i < 300000) {
+        val h = cast(i)
+        sum = sum + h.x + h.y + h.z
+        i = i + 1
+    }
+    val cp = alloc_checkpoint()
+    val p = alloc(64)
+    alloc_reset(cp)
+    if (sum > 0) {
+        if (p != null) {
+            print("struct ret arena ok\n")
+        } else {
+            panic("struct ret arena BAD null\n")
+        }
+    } else {
+        panic("struct ret arena BAD sum\n")
+    }
+}

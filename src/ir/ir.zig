@@ -116,6 +116,8 @@ pub const Global = struct {
     is_object: bool = false,
     /// Package `var x: *byte` (or `*u8`) — index with stride 1 / upward addr like locals.
     is_raw_byte_ptr: bool = false,
+    /// Package `var x: SomeIface` — one-word ptr-to-fat; recover `iface_ptr` meta at use sites.
+    iface_type_name: []const u8 = "",
 };
 
 pub const Program = struct {
@@ -317,6 +319,11 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_print" });
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_panic" });
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_alloc" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_ret_alloc" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_alloc_reset" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_alloc_checkpoint" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_f32_bits" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_f32_from_bits" });
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_spawn" });
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_dispatcher_stub" });
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_go" });
@@ -422,6 +429,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                 var bits: i64 = 0;
                 var is_float = false;
                 var is_raw_byte_ptr = false;
+                var iface_type_name: []const u8 = "";
                 if (gd.init) |init| {
                     if (literalConstBits(init)) |cv| {
                         bits = cv.bits;
@@ -441,6 +449,9 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                     if (sm.kind == .raw_ptr and (std.mem.eql(u8, sm.type_name, "byte") or std.mem.eql(u8, sm.type_name, "u8"))) {
                         is_raw_byte_ptr = true;
                     }
+                    if (sm.kind == .iface_ptr and sm.type_name.len > 0) {
+                        iface_type_name = try a.dupe(u8, sm.type_name);
+                    }
                 }
                 if (!gd.mutable) {
                     // Compile-time constant: fold at use sites (no storage).
@@ -454,6 +465,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                         .init_bits = bits,
                         .is_float = is_float,
                         .is_raw_byte_ptr = is_raw_byte_ptr,
+                        .iface_type_name = iface_type_name,
                     });
                     try global_map.put(a, gd.name, idx);
                 }
@@ -1716,6 +1728,8 @@ fn inferMetaFromExpr(ctx: *Ctx, e: *ast.Expr) ?SlotMeta {
                 if (gi < ctx.globals.len) {
                     if (ctx.globals[gi].is_raw_byte_ptr)
                         return .{ .kind = .raw_ptr, .type_name = "byte", .elem_size = 1 };
+                    if (ctx.globals[gi].iface_type_name.len > 0)
+                        return .{ .kind = .iface_ptr, .type_name = ctx.globals[gi].iface_type_name };
                     if (ctx.globals[gi].is_float)
                         return .{ .kind = .scalar, .type_name = "f64" };
                 }
@@ -1729,6 +1743,19 @@ fn inferMetaFromExpr(ctx: *Ctx, e: *ast.Expr) ?SlotMeta {
             for (sd.fields) |fld| {
                 if (std.mem.eql(u8, fld.name, f.name)) {
                     return metaForTypeExpr(ctx.a, fld.ty, ctx.structs, ctx.ifaces) catch null;
+                }
+            }
+            return null;
+        },
+        .index => |ix| {
+            // Element of `[N]Iface` / `[N]Struct` — recover iface/struct meta for method calls.
+            if (inferMetaFromExpr(ctx, ix.base)) |bm| {
+                if (bm.kind == .array_ptr and bm.type_name.len > 0) {
+                    if (ctx.ifaces.contains(bm.type_name))
+                        return .{ .kind = .iface_ptr, .type_name = bm.type_name };
+                    if (ctx.structs.contains(bm.type_name))
+                        return .{ .kind = .struct_ptr, .type_name = bm.type_name };
+                    return .{ .kind = .scalar, .type_name = bm.type_name, .elem_size = bm.elem_size };
                 }
             }
             return null;
@@ -2513,7 +2540,7 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
             const size: i64 = @intCast(sd.fields.len * 8);
             const sz = try ctx.fresh();
             try ctx.emit(.{ .op = .iconst, .dst = sz, .aux = if (size == 0) 8 else size });
-            const cid = ctx.callee_map.get("jogrt_alloc").?;
+            const cid = ctx.callee_map.get("jogrt_ret_alloc").?;
             const ptr = try ctx.fresh();
             var allo = Inst{ .op = .call, .dst = ptr, .aux = cid, .arity = 1 };
             allo.args[0] = sz;
@@ -2540,7 +2567,8 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
             }
             const sz = try ctx.fresh();
             try ctx.emit(.{ .op = .iconst, .dst = sz, .aux = if (size == 0) 8 else size });
-            const cid = ctx.callee_map.get("jogrt_alloc").?;
+            // Circular ret arena — hot-path struct returns no longer OOM the 4 MiB bump.
+            const cid = ctx.callee_map.get("jogrt_ret_alloc").?;
             const ptr = try ctx.fresh();
             var allo = Inst{ .op = .call, .dst = ptr, .aux = cid, .arity = 1 };
             allo.args[0] = sz;
@@ -2624,6 +2652,46 @@ fn lowerCall(ctx: *Ctx, c: ast.Call) LowerError!u32 {
             const d = try ctx.fresh();
             var inst = Inst{ .op = .call, .dst = d, .aux = cid, .arity = 1 };
             inst.args[0] = sz;
+            try ctx.emit(inst);
+            return d;
+        }
+        // Freeable bump arena (struct-return Friction): checkpoint/reset between frames.
+        if (std.mem.eql(u8, name, "alloc_checkpoint")) {
+            if (c.args.len != 0) return error.TooManyArgs;
+            const cid = ctx.callee_map.get("jogrt_alloc_checkpoint").?;
+            const d = try ctx.fresh();
+            try ctx.emit(.{ .op = .call, .dst = d, .aux = cid, .arity = 0 });
+            return d;
+        }
+        if (std.mem.eql(u8, name, "alloc_reset")) {
+            if (c.args.len != 1) return error.TooManyArgs;
+            const cp = try lowerExpr(ctx, c.args[0]);
+            const cid = ctx.callee_map.get("jogrt_alloc_reset").?;
+            var inst = Inst{ .op = .call, .dst = none, .aux = cid, .arity = 1 };
+            inst.args[0] = cp;
+            try ctx.emit(inst);
+            const d = try ctx.fresh();
+            try ctx.emit(.{ .op = .iconst, .dst = d, .aux = 0 });
+            return d;
+        }
+        // Native f32 bitcast helpers (drop host libf32bits).
+        if (std.mem.eql(u8, name, "f32_bits") or std.mem.eql(u8, name, "jog_f32_bits")) {
+            if (c.args.len != 1) return error.TooManyArgs;
+            const v = try lowerExpr(ctx, c.args[0]);
+            const cid = ctx.callee_map.get("jogrt_f32_bits").?;
+            const d = try ctx.fresh();
+            var inst = Inst{ .op = .call, .dst = d, .aux = cid, .arity = 1 };
+            inst.args[0] = v;
+            try ctx.emit(inst);
+            return d;
+        }
+        if (std.mem.eql(u8, name, "f32_from_bits")) {
+            if (c.args.len != 1) return error.TooManyArgs;
+            const v = try lowerExpr(ctx, c.args[0]);
+            const cid = ctx.callee_map.get("jogrt_f32_from_bits").?;
+            const d = try ctx.fresh();
+            var inst = Inst{ .op = .call, .dst = d, .aux = cid, .arity = 1 };
+            inst.args[0] = v;
             try ctx.emit(inst);
             return d;
         }
@@ -3000,8 +3068,12 @@ fn lowerMethodOrIfaceCall(
     const concrete = inferTypeNameFromExpr(ctx, base_expr) orelse
         (if (base_expr.* == .ident) (ctx.meta.get(base_expr.ident) orelse SlotMeta{ .kind = .scalar }).type_name else "");
 
-    // iface value?
-    if (base_expr.* == .ident) {
+    // iface value? (local meta, package global, field/index via inferMetaFromExpr)
+    if (inferMetaFromExpr(ctx, base_expr)) |m| {
+        if (m.kind == .iface_ptr) {
+            return try lowerIfaceMethod(ctx, base_slot, method, args);
+        }
+    } else if (base_expr.* == .ident) {
         if (ctx.meta.get(base_expr.ident)) |m| {
             if (m.kind == .iface_ptr) {
                 return try lowerIfaceMethod(ctx, base_slot, method, args);

@@ -6,9 +6,12 @@
 #include <string.h>
 
 #define JOGRT_HEAP_SIZE (4 * 1024 * 1024)
+#define JOGRT_RET_ARENA_SIZE (1 * 1024 * 1024)
 
 static unsigned char jogrt_heap[JOGRT_HEAP_SIZE];
 static size_t jogrt_heap_used = 0;
+static unsigned char jogrt_ret_arena[JOGRT_RET_ARENA_SIZE];
+static size_t jogrt_ret_used = 0;
 
 void jogrt_print(const void *ptr, int64_t len) {
     if (ptr == NULL || len <= 0) return;
@@ -32,6 +35,49 @@ void *jogrt_alloc(int64_t nbytes) {
     }
     void *p = jogrt_heap + jogrt_heap_used;
     jogrt_heap_used += n;
+    return p;
+}
+
+int64_t jogrt_alloc_checkpoint(void) {
+    return (int64_t)jogrt_heap_used;
+}
+
+void jogrt_alloc_reset(int64_t checkpoint) {
+    if (checkpoint < 0) checkpoint = 0;
+    if ((size_t)checkpoint > JOGRT_HEAP_SIZE) checkpoint = (int64_t)JOGRT_HEAP_SIZE;
+    jogrt_heap_used = (size_t)checkpoint;
+}
+
+/* f64 bits in an int64 slot → f32 bit pattern (matches native jog_f32_bits). */
+uint32_t jog_f32_bits(double d) {
+    float f = (float)d;
+    uint32_t u;
+    memcpy(&u, &f, sizeof u);
+    return u;
+}
+
+uint32_t jogrt_f32_bits(int64_t bits) {
+    double d;
+    memcpy(&d, &bits, sizeof d);
+    return jog_f32_bits(d);
+}
+
+int64_t jogrt_f32_from_bits(uint32_t u) {
+    float f;
+    memcpy(&f, &u, sizeof f);
+    double d = (double)f;
+    int64_t out;
+    memcpy(&out, &d, sizeof out);
+    return out;
+}
+
+void *jogrt_ret_alloc(int64_t nbytes) {
+    if (nbytes < 0) nbytes = 0;
+    size_t n = (size_t)((nbytes + 7) & ~((int64_t)7));
+    if (n > JOGRT_RET_ARENA_SIZE) n = JOGRT_RET_ARENA_SIZE;
+    if (jogrt_ret_used + n > JOGRT_RET_ARENA_SIZE) jogrt_ret_used = 0;
+    void *p = jogrt_ret_arena + jogrt_ret_used;
+    jogrt_ret_used += n;
     return p;
 }
 
