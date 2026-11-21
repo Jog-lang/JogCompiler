@@ -11,6 +11,13 @@ jogrt_heap:
   .zero JOGRT_HEAP_SIZE
 jogrt_heap_ptr:
   .zero 8
+# Circular arena for by-value struct/tuple temps + returns (avoids bump OOM on hot paths).
+# Pointers are only valid until the ring wraps; fine for immediate field use / sret-style temps.
+.set JOGRT_RET_ARENA_SIZE, 1048576
+jogrt_ret_arena:
+  .zero JOGRT_RET_ARENA_SIZE
+jogrt_ret_ptr:
+  .zero 8
 
 .text
 
@@ -60,6 +67,84 @@ jogrt_alloc:
   lea rdi, [rip + jogrt_oom_msg]
   mov esi, jogrt_oom_msg_len
   call jogrt_panic
+
+# Freeable bump: return current watermark (pass to jogrt_alloc_reset).
+.globl jogrt_alloc_checkpoint
+.type jogrt_alloc_checkpoint, @function
+jogrt_alloc_checkpoint:
+  lea rcx, [rip + jogrt_heap_ptr]
+  mov rax, qword ptr [rcx]
+  test rax, rax
+  jnz 1f
+  lea rax, [rip + jogrt_heap]
+1:
+  ret
+
+# Reset bump to checkpoint (0 / null ⇒ base of heap). LIFO only; dangling ptrs after reset.
+.globl jogrt_alloc_reset
+.type jogrt_alloc_reset, @function
+jogrt_alloc_reset:
+  lea rcx, [rip + jogrt_heap_ptr]
+  test rdi, rdi
+  jnz 1f
+  lea rdi, [rip + jogrt_heap]
+1:
+  mov qword ptr [rcx], rdi
+  xor eax, eax
+  ret
+
+# f64 → IEEE-754 binary32 bits. C/SysV extern: arg in xmm0.
+.globl jog_f32_bits
+.type jog_f32_bits, @function
+jog_f32_bits:
+  cvtsd2ss xmm0, xmm0
+  movd eax, xmm0
+  ret
+
+# Same convert when the f64 bit pattern arrives in a Jog GPR slot (rdi).
+.globl jogrt_f32_bits
+.type jogrt_f32_bits, @function
+jogrt_f32_bits:
+  movq xmm0, rdi
+  cvtsd2ss xmm0, xmm0
+  movd eax, xmm0
+  ret
+
+# IEEE-754 binary32 bits in edi → f64 bits in rax (Jog float slot).
+.globl jogrt_f32_from_bits
+.type jogrt_f32_from_bits, @function
+jogrt_f32_from_bits:
+  movd xmm0, edi
+  cvtss2sd xmm0, xmm0
+  movq rax, xmm0
+  ret
+
+# Allocate from the circular struct-return arena (wraps; no OOM panic).
+.globl jogrt_ret_alloc
+.type jogrt_ret_alloc, @function
+jogrt_ret_alloc:
+  lea rcx, [rip + jogrt_ret_ptr]
+  mov rax, qword ptr [rcx]
+  test rax, rax
+  jnz 1f
+  lea rax, [rip + jogrt_ret_arena]
+1:
+  add rdi, 7
+  and rdi, -8
+  mov rdx, rax
+  add rax, rdi
+  lea rsi, [rip + jogrt_ret_arena]
+  add rsi, JOGRT_RET_ARENA_SIZE
+  cmp rax, rsi
+  jbe 2f
+  # wrap
+  lea rax, [rip + jogrt_ret_arena]
+  mov rdx, rax
+  add rax, rdi
+2:
+  mov qword ptr [rcx], rax
+  mov rax, rdx
+  ret
 
 .globl jogrt_dispatcher_stub
 .type jogrt_dispatcher_stub, @function

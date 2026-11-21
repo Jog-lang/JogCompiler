@@ -341,7 +341,10 @@ fn emitInst(writer: anytype, prog: *const ir.Program, fname: []const u8, ninst: 
                         gi += 1;
                     } else stack_bytes += 8;
                 }
+                // SysV: before `call`, rsp must be 16-byte aligned so the callee sees rsp%16==8.
+                // Pad outgoing spill (e.g. one 8-byte 7th arg) up to a 16-byte multiple.
                 if (stack_bytes > 0) {
+                    stack_bytes = (stack_bytes + 15) & ~@as(u32, 15);
                     try writer.print("  sub rsp, {d}\n", .{stack_bytes});
                 }
                 // Second pass: fill regs and stack (stack args left-to-right at [rsp+0], [rsp+8], …).
@@ -384,7 +387,9 @@ fn emitInst(writer: anytype, prog: *const ir.Program, fname: []const u8, ninst: 
                 const regs = [_][]const u8{ "rdi", "rsi", "rdx", "rcx", "r8", "r9" };
                 var stack_bytes: u32 = 0;
                 if (inst.arity > regs.len) stack_bytes = (@as(u32, inst.arity) - @as(u32, @intCast(regs.len))) * 8;
+                // SysV: pad outgoing stack args so rsp stays 16-byte aligned before `call`.
                 if (stack_bytes > 0) {
+                    stack_bytes = (stack_bytes + 15) & ~@as(u32, 15);
                     try writer.print("  sub rsp, {d}\n", .{stack_bytes});
                 }
                 var i: u8 = 0;
@@ -411,6 +416,7 @@ fn emitInst(writer: anytype, prog: *const ir.Program, fname: []const u8, ninst: 
             var stack_bytes: u32 = 0;
             if (inst.arity > regs.len) stack_bytes = (@as(u32, inst.arity) - @as(u32, @intCast(regs.len))) * 8;
             if (stack_bytes > 0) {
+                stack_bytes = (stack_bytes + 15) & ~@as(u32, 15);
                 try writer.print("  sub rsp, {d}\n", .{stack_bytes});
             }
             var i: u8 = 0;

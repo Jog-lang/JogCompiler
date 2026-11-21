@@ -1,0 +1,14 @@
+// Multi-f64 extern ABI + 7th stack arg pad.
+@link("hypot7")
+extern {
+    fn hypot7(a: f64, b: f64, c: f64, d: f64, e: f64, f: f64, g: f64): f64
+}
+
+fn main() {
+    val r = hypot7(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0)
+    if (r == 28.0) {
+        print("multi f64 extern ok\n")
+    } else {
+        panic("multi f64 extern BAD\n")
+    }
+}

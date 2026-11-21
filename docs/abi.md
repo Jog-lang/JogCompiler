@@ -20,13 +20,20 @@ For scalars and pointers, Jog↔Jog calls use the **System V AMD64** convention:
 - Callee-saved: `rbx`, `r12`–`r15`, `rbp`
 - Stack 16-byte aligned before `call`
 
-Aggregates / multi-value returns are not defined yet.
+Aggregates are represented as pointers to field slots. Struct/tuple literals
+allocate from a **circular 1 MiB ret arena** (`jogrt_ret_alloc`) so hot-path
+returns do not exhaust the 4 MiB `jogrt_alloc` bump. Long-lived buffers still
+use `alloc` / `jogrt_alloc`; demos may call `alloc_checkpoint` / `alloc_reset`
+to reclaim the bump (LIFO). Nested C calls with stack args pad the outgoing
+spill to a 16-byte multiple so callee `rsp % 16 == 8` (SysV).
 
 ## C ABI / `extern`
 
 `extern { fn name(...): T }` declares a **C SysV** symbol. The compiler emits `.extern name`. Integer/pointer args use `rdi`…`r9`; **`f32`/`f64` args and returns use `xmm0`…** (System V AMD64). Linking pulls in libc when any extern is present (`zig cc` without `-nostdlib`).
 
 Jog↔Jog float calls still pass bit patterns in GPRs (internal convention). Only `extern` uses the xmm SysV path.
+
+Builtins `f32_bits(f64) → u32` / `f32_from_bits(u32) → f64` (and runtime `jog_f32_bits` for C) provide IEEE-754 binary32 bitcasts so demos can drop host `libf32bits`.
 
 ## `export fn` / `@export`
 

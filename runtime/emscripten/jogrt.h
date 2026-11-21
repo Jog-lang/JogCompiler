@@ -9,6 +9,12 @@ extern "C" {
 void jogrt_print(const void *ptr, int64_t len);
 void jogrt_panic(const void *ptr, int64_t len);
 void *jogrt_alloc(int64_t nbytes);
+int64_t jogrt_alloc_checkpoint(void);
+void jogrt_alloc_reset(int64_t checkpoint);
+uint32_t jog_f32_bits(double d);
+uint32_t jogrt_f32_bits(int64_t bits);
+int64_t jogrt_f32_from_bits(uint32_t u);
+void *jogrt_ret_alloc(int64_t nbytes);
 
 /* Returning mainloop: tick returns 0 to stop. On Emscripten this hooks
    emscripten_set_main_loop and does not return until cancelled. */

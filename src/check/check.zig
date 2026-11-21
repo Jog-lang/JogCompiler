@@ -770,6 +770,23 @@ fn checkExpr(
                 ti.* = .{ .kind = .pointer, .name = "ptr", .pointee = types.get("byte") };
                 return ti;
             }
+            if (c.callee.* == .ident and std.mem.eql(u8, c.callee.ident, "alloc_checkpoint")) {
+                return types.get("i64").?;
+            }
+            if (c.callee.* == .ident and std.mem.eql(u8, c.callee.ident, "alloc_reset")) {
+                for (c.args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
+                return try voidType(a);
+            }
+            if (c.callee.* == .ident and (std.mem.eql(u8, c.callee.ident, "f32_bits") or
+                std.mem.eql(u8, c.callee.ident, "jog_f32_bits")))
+            {
+                for (c.args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
+                return types.get("u32") orelse types.get("i64").?;
+            }
+            if (c.callee.* == .ident and std.mem.eql(u8, c.callee.ident, "f32_from_bits")) {
+                for (c.args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
+                return types.get("f64").?;
+            }
             if (c.callee.* == .ident and std.mem.eql(u8, c.callee.ident, "spawn")) {
                 for (c.args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
                 return try voidType(a);

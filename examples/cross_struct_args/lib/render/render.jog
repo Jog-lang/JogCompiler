@@ -1,0 +1,15 @@
+// Library side — multi by-value struct method.
+struct FRect {
+    x: f64
+    y: f64
+    w: f64
+    h: f64
+}
+
+struct Renderer {
+    id: i64
+}
+
+fn *Renderer.draw_texture_rect(src: FRect, dst: FRect): i64 {
+    return (src.w + dst.w) as i64
+}
