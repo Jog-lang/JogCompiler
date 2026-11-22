@@ -53,6 +53,8 @@ pub const TokenKind = enum {
     tilde,
     lte,
     gte,
+    /// `<=>` three-way compare (method `op<=>`).
+    spaceship,
     shl,
     shr,
     arrow, // ->
@@ -194,6 +196,12 @@ pub const Lexer = struct {
             self.advance();
             self.advance();
             return .{ .kind = .pipepipe, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+        }
+        if (c == '<' and self.i + 2 < self.src.len and self.src[self.i + 1] == '=' and self.src[self.i + 2] == '>') {
+            self.advance();
+            self.advance();
+            self.advance();
+            return .{ .kind = .spaceship, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
         }
         if (c == '<' and self.i + 1 < self.src.len and self.src[self.i + 1] == '=') {
             self.advance();

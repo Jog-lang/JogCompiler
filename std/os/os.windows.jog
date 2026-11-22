@@ -2,6 +2,7 @@
 // Stack `buf[..].ptr` is not lowered yet (Friction); use malloc buffers.
 
 import std.c
+import std.list
 import std.mem
 import std.text
 
@@ -155,4 +156,16 @@ actual fn exe_path(): (str, bool) {
     val s = c.copyCStr(utf8 as *const c.char)
     c.free(utf8_raw!!)
     return s, true
+}
+
+// Full GetEnvironmentStringsW walk is deferred (Friction); empty list for now.
+actual fn environ(): list.List<str> {
+    return list.empty<str>()
+}
+
+actual fn free_environ(xs: list.List<str>) {
+    with (mem.heap()) {
+        var owned = xs
+        owned.free()
+    }
 }

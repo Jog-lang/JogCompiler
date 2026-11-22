@@ -428,9 +428,10 @@ pub const Parser = struct {
                 try methods.append(self.allocator, try self.parseMethodSig());
                 continue;
             }
-            // Skip unsupported property/embed lines until a following `fn` or `}` (subset).
-            if (self.tok.kind == .kw_val or self.tok.kind == .kw_var or self.tok.kind == .ident) {
-                // Consume until newline-ish: read tokens until we see `fn` or `}`.
+            // Skip unsupported property/embed/type-set lines (`~i8 | ~i16`, …) until `fn` or `}`.
+            if (self.tok.kind == .kw_val or self.tok.kind == .kw_var or self.tok.kind == .ident or
+                self.tok.kind == .tilde or self.tok.kind == .pipe)
+            {
                 while (self.tok.kind != .kw_fn and self.tok.kind != .rbrace and self.tok.kind != .eof) {
                     self.advance();
                 }
@@ -449,9 +450,7 @@ pub const Parser = struct {
             pointer_recv = true;
             self.advance();
         }
-        if (self.tok.kind != .ident) return error.UnexpectedToken;
-        const name = self.tok.text;
-        self.advance();
+        const name = try self.parseMethodName();
         const params = try self.parseParamList();
         // Grammar: [ ":" type ] [ contextClause ]
         var ret: ?*ast.TypeExpr = null;
@@ -571,6 +570,7 @@ pub const Parser = struct {
                 .gt => ">",
                 .lte => "<=",
                 .gte => ">=",
+                .spaceship => "<=>",
                 .amp => "&",
                 .pipe => "|",
                 .caret => "^",
@@ -596,11 +596,16 @@ pub const Parser = struct {
             if (self.tok.kind != .ident) return error.UnexpectedToken;
             try params.append(self.allocator, self.tok.text);
             self.advance();
-            // Optional constraint `T: Iface`
+            // Optional constraint `T: Iface` or `T: pkg.Iface`
             if (self.tok.kind == .colon) {
                 self.advance();
                 if (self.tok.kind != .ident) return error.UnexpectedToken;
-                self.advance(); // constraint name recorded lightly on FnDecl later via parseFn
+                self.advance();
+                while (self.tok.kind == .dot) {
+                    self.advance();
+                    if (self.tok.kind != .ident) return error.UnexpectedToken;
+                    self.advance();
+                }
             }
             if (self.tok.kind == .comma) {
                 self.advance();
@@ -1313,6 +1318,24 @@ pub const Parser = struct {
                 pending_targs = targs;
             }
             if (self.tok.kind == .lparen) {
+                // `size(T)` / `align(T)` take a type, including `Slot<K,V>` — not a value expr
+                // (`Slot < K` would parse as comparison). Encode the type as call type_args.
+                const size_align = e.* == .ident and (std.mem.eql(u8, e.ident, "size") or std.mem.eql(u8, e.ident, "align"));
+                if (size_align and pending_targs.len == 0) {
+                    self.advance();
+                    const ty = try self.parseTypeExpr();
+                    try self.expect(.rparen);
+                    var targs: std.ArrayListUnmanaged(*ast.TypeExpr) = .{};
+                    try targs.append(self.allocator, ty);
+                    const call = try self.allocExpr();
+                    call.* = .{ .call = .{
+                        .callee = e,
+                        .args = &.{},
+                        .type_args = try targs.toOwnedSlice(self.allocator),
+                    } };
+                    e = call;
+                    continue;
+                }
                 self.advance();
                 var args: std.ArrayListUnmanaged(*ast.Expr) = .{};
                 if (self.tok.kind != .rparen) {

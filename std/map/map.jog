@@ -29,6 +29,8 @@
 import std.cmp
 import std.list
 import std.mem
+// Brings `str.op==` (content equality) into flattened merge for str keys.
+import std.text
 
 // Zeroed memory is an empty slot. alloc returns zeroed bytes.
 private val slot_empty: u8 = 0
@@ -140,7 +142,7 @@ private fn *Map<K, V>.grow() with (a: mem.Allocator) {
 // An existing key keeps its slot, its hash, and its stored key. The
 // value is replaced and count stays put.
 fn *Map<K, V>.insert(key: K, hash: u32, value: V) with (a: mem.Allocator) {
-    if (self.count + self.tombs + 1) * 4 > self.cap * 3 {
+    if ((self.count + self.tombs + 1) * 4 > self.cap * 3) {
         self.grow()
     }
     val (i, found) = self.find(key, hash)

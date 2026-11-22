@@ -31,6 +31,9 @@ jogrt_argc_val:
 .globl jogrt_argv_base
 jogrt_argv_base:
   .zero 8
+.globl jogrt_envp_base
+jogrt_envp_base:
+  .zero 8
 
 .text
 
@@ -54,6 +57,12 @@ jogrt_arg_ptr:
   ret
 1:
   xor eax, eax
+  ret
+
+.globl jogrt_environ
+.type jogrt_environ, @function
+jogrt_environ:
+  mov rax, qword ptr [rip + jogrt_envp_base]
   ret
 
 .globl jogrt_print

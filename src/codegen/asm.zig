@@ -22,10 +22,11 @@ pub fn emit(allocator: std.mem.Allocator, program: *const ir.Program, writer: an
             try writer.print(".type {s}, @function\n", .{mangle(f.name)});
         }
         try writer.print("{s}:\n", .{mangle(f.name)});
-        // Capture process argc/argv at `main` entry (CRT or freestanding _start pass them in rdi/rsi).
+        // Capture process argc/argv/envp at `main` entry (CRT / freestanding _start).
         if (std.mem.eql(u8, f.name, "main")) {
             try writer.writeAll("  mov qword ptr [rip + jogrt_argc_val], rdi\n");
             try writer.writeAll("  mov qword ptr [rip + jogrt_argv_base], rsi\n");
+            try writer.writeAll("  mov qword ptr [rip + jogrt_envp_base], rdx\n");
         }
         // prologue
         try writer.writeAll("  push rbp\n");
