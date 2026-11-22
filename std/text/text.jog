@@ -9,8 +9,9 @@
 // as extensions too. See JogDocs bootstrap/Friction.md.
 
 import std.c
-import std.list
+import std.conv
 import std.mem
+import std.strbuilder
 
 fn str.slice(from: usize, to: usize): str {
     if from > to || to > self.len {
@@ -149,26 +150,13 @@ fn is_digit(c: u8): bool {
 }
 
 /**
- * Parse an unsigned decimal integer from ASCII digits only. An empty
- * string or any non-digit byte fails. Does not check overflow.
+ * Parse an unsigned decimal integer from ASCII digits only. Overflow-safe
+ * via std.conv.parse_u64.
  * @param text decimal digits
  * @return the value and true, or 0 and false on failure
  */
 fn parse_u64_dec(text: str): (u64, bool) {
-    if text.len == 0 {
-        return 0, false
-    }
-    var value: u64 = 0
-    var i: usize = 0
-    for i < text.len {
-        val c = text.ptr[i]
-        if !is_digit(c) {
-            return 0, false
-        }
-        value = value * 10 + (c - '0' as u8) as u64
-        i = i + 1
-    }
-    return value, true
+    return conv.parse_u64(text, 10)
 }
 
 // True for an ASCII byte from '0' through '9', 'a' through 'f', or
@@ -381,39 +369,8 @@ fn str.replace(old: str, replacement: str): str with (a: mem.Allocator) {
     return raw
 }
 
-/**
- * Views of self split on sep, including the empty pieces. Each view points
- * into self and dies with that string. The list itself is allocated. An
- * empty sep yields one view per byte. An empty string and an empty sep
- * yield an empty list.
- * @self text to split
- * @param sep separator
- * @context a allocator for the list
- * @return the views
- */
-fn str.split(sep: str): list.List<str> with (a: mem.Allocator) {
-    var parts = list.empty<str>()
-    if sep.len == 0 {
-        var i: usize = 0
-        for i < self.len {
-            parts.push(self.slice(i, i + 1))
-            i = i + 1
-        }
-        return parts
-    }
-    var start: usize = 0
-    for {
-        val (rel, ok) = self.slice(start, self.len).index_of(sep)
-        if !ok {
-            parts.push(self.slice(start, self.len))
-            break
-        }
-        val at = start + rel
-        parts.push(self.slice(start, at))
-        start = at + sep.len
-    }
-    return parts
-}
+// str.split / str.runes returning list.List<T> are deferred: flattened
+// `list.empty<T>()` does not lower yet (Friction). Use rune_iter instead.
 
 // True for a UTF-8 continuation byte, 10xxxxxx.
 private fn is_cont(b: u8): bool {
@@ -523,25 +480,162 @@ fn *RuneIter.next(): (rune, bool) {
 }
 
 /**
- * One Unicode code point per element, in order. A byte that is not part
- * of a well-formed UTF-8 code point becomes U+FFFD and consumes that one
- * byte. The caller frees the list. The elements do not alias self.
- * @self text to walk
- * @context a allocator for the list
- * @return the code points
+ * Last byte offset of needle in self, or false when absent. Empty needle
+ * matches at self.len.
  */
-fn str.runes(): list.List<rune> with (a: mem.Allocator) {
-    var xs = list.empty<rune>()
-    if self.len > 0 {
-        xs.reserve(self.len)
+fn str.last_index_of(needle: str): (usize, bool) {
+    if needle.len == 0 {
+        return self.len, true
     }
-    var it = self.rune_iter()
+    if needle.len > self.len {
+        return 0, false
+    }
+    var i = self.len - needle.len
     for {
-        val (cp, ok) = it.next()
-        if !ok {
-            break
+        var j: usize = 0
+        var ok = true
+        for j < needle.len {
+            if self.ptr[i + j] != needle.ptr[j] {
+                ok = false
+                break
+            }
+            j = j + 1
         }
-        xs.push(cp)
+        if ok {
+            return i, true
+        }
+        if i == 0 {
+            return 0, false
+        }
+        i = i - 1
     }
-    return xs
+    return 0, false
+}
+
+/**
+ * ASCII case-insensitive equality.
+ */
+fn str.equals_ignore_case(other: str): bool {
+    if self.len != other.len {
+        return false
+    }
+    val gap = 'a' as u8 - 'A' as u8
+    for i in 0 as usize..self.len {
+        var a = self.ptr[i]
+        var b = other.ptr[i]
+        if a >= 'A' as u8 && a <= 'Z' as u8 {
+            a = a + gap
+        }
+        if b >= 'A' as u8 && b <= 'Z' as u8 {
+            b = b + gap
+        }
+        if a != b {
+            return false
+        }
+    }
+    return true
+}
+
+fn is_alpha(c: u8): bool {
+    if c >= 'a' as u8 && c <= 'z' as u8 {
+        return true
+    }
+    return c >= 'A' as u8 && c <= 'Z' as u8
+}
+
+fn is_alnum(c: u8): bool {
+    return is_alpha(c) || is_digit(c)
+}
+
+fn is_ascii(c: u8): bool {
+    return c < 128
+}
+
+/**
+ * Owned copy of self left-padded with pad to width bytes. If self.len >=
+ * width, returns a clone of self.
+ */
+fn str.pad_start(width: usize, pad: str): str with (a: mem.Allocator) {
+    if self.len >= width || pad.len == 0 {
+        return self.clone()
+    }
+    val need = width - self.len
+    var b = strbuilder.empty()
+    var left = need
+    for left > 0 {
+        var take = pad.len
+        if take > left {
+            take = left
+        }
+        var chunk = bytes()
+        chunk.ptr = pad.ptr
+        chunk.len = take
+        b.append(chunk as str)
+        left = left - take
+    }
+    b.append(self)
+    val out = b.str().clone()
+    b.free()
+    return out
+}
+
+/**
+ * Owned copy of self right-padded with pad to width bytes.
+ */
+fn str.pad_end(width: usize, pad: str): str with (a: mem.Allocator) {
+    if self.len >= width || pad.len == 0 {
+        return self.clone()
+    }
+    val need = width - self.len
+    var b = strbuilder.empty()
+    b.append(self)
+    var left = need
+    for left > 0 {
+        var take = pad.len
+        if take > left {
+            take = left
+        }
+        var chunk = bytes()
+        chunk.ptr = pad.ptr
+        chunk.len = take
+        b.append(chunk as str)
+        left = left - take
+    }
+    val out = b.str().clone()
+    b.free()
+    return out
+}
+
+/**
+ * Join parts with sep into an owned string.
+ */
+fn join(parts: []str, sep: str): str with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    for i in 0 as usize..parts.len {
+        if i > 0 {
+            b.append(sep)
+        }
+        b.append(parts[i])
+    }
+    val out = b.str().clone()
+    b.free()
+    return out
+}
+
+/**
+ * Repeat s, n times, into an owned string. n == 0 returns "".
+ */
+fn repeat(s: str, n: usize): str with (a: mem.Allocator) {
+    if n == 0 || s.len == 0 {
+        return ""
+    }
+    var b = strbuilder.empty()
+    var i: usize = 0
+    for i < n {
+        b.append(s)
+        i = i + 1
+    }
+    val out = b.str().clone()
+    b.free()
+    return out
 }

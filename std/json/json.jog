@@ -1,0 +1,699 @@
+// Package std.json. RFC 8259 Value tree. Arrays and objects use a small
+// growable header (not std.list/std.map — those generics do not yet lower
+// for package imports; see Friction). Strings and number literals are
+// owned; release frees the tree once.
+
+import std.c
+import std.conv
+import std.mem
+import std.strbuilder
+import std.text
+
+val kind_null: u8 = 0
+val kind_bool: u8 = 1
+val kind_num: u8 = 2
+val kind_str: u8 = 3
+val kind_arr: u8 = 4
+val kind_obj: u8 = 5
+
+val json_max_depth: usize = 64
+
+struct Value {
+    kind: u8
+    flag: bool
+    int_ok: bool
+    int_val: i64
+    text: str
+    // Array / object children (object also uses keys).
+    items_ptr: *Value?
+    items_len: usize
+    items_cap: usize
+    keys_ptr: *str?
+    keys_len: usize
+    keys_cap: usize
+}
+
+struct Parser {
+    buf: str
+    at: usize
+    depth: usize
+}
+
+fn null_(): Value {
+    return Value()
+}
+
+fn bool_(v: bool): Value {
+    var out = Value()
+    out.kind = kind_bool
+    out.flag = v
+    return out
+}
+
+fn int_(n: i64): Value {
+    var out = Value()
+    out.kind = kind_num
+    out.int_ok = true
+    out.int_val = n
+    out.text = ""
+    return out
+}
+
+fn string_owned(text: str): Value {
+    var out = Value()
+    out.kind = kind_str
+    out.text = text
+    return out
+}
+
+fn string_(text: str): Value with (a: mem.Allocator) {
+    return string_owned(text.clone())
+}
+
+fn array_(): Value {
+    var out = Value()
+    out.kind = kind_arr
+    return out
+}
+
+fn object_(): Value {
+    var out = Value()
+    out.kind = kind_obj
+    return out
+}
+
+private fn free_str(s: str) with (a: mem.Allocator) {
+    if s.len == 0 {
+        return
+    }
+    var block = bytes()
+    block.ptr = s.ptr as *u8
+    block.len = s.len
+    a.free(block)
+}
+
+private fn *Value.grow_items(need: usize) with (a: mem.Allocator) {
+    if need <= self.items_cap {
+        return
+    }
+    var new_cap: usize = 4
+    if self.items_cap != 0 {
+        new_cap = self.items_cap * 2
+    }
+    if new_cap < need {
+        new_cap = need
+    }
+    val (raw, err) = a.alloc(size(Value) * new_cap, align(Value))
+    if err != null {
+        panic("out of memory")
+    }
+    val fresh = raw.ptr as *Value
+    if self.items_len > 0 {
+        c.memcpy(fresh as *void, self.items_ptr!! as *const void, size(Value) * self.items_len)
+    }
+    if self.items_cap > 0 {
+        var block = bytes()
+        block.ptr = self.items_ptr!! as *u8
+        block.len = size(Value) * self.items_cap
+        a.free(block)
+    }
+    self.items_ptr = fresh as *Value?
+    self.items_cap = new_cap
+}
+
+private fn *Value.grow_keys(need: usize) with (a: mem.Allocator) {
+    if need <= self.keys_cap {
+        return
+    }
+    var new_cap: usize = 4
+    if self.keys_cap != 0 {
+        new_cap = self.keys_cap * 2
+    }
+    if new_cap < need {
+        new_cap = need
+    }
+    val (raw, err) = a.alloc(size(str) * new_cap, align(str))
+    if err != null {
+        panic("out of memory")
+    }
+    val fresh = raw.ptr as *str
+    if self.keys_len > 0 {
+        c.memcpy(fresh as *void, self.keys_ptr!! as *const void, size(str) * self.keys_len)
+    }
+    if self.keys_cap > 0 {
+        var block = bytes()
+        block.ptr = self.keys_ptr!! as *u8
+        block.len = size(str) * self.keys_cap
+        a.free(block)
+    }
+    self.keys_ptr = fresh as *str?
+    self.keys_cap = new_cap
+}
+
+fn *Value.push(elem: Value) with (a: mem.Allocator) {
+    self.grow_items(self.items_len + 1)
+    self.items_ptr!![self.items_len] = elem
+    self.items_len = self.items_len + 1
+}
+
+fn *Value.put(key: str, value: Value) with (a: mem.Allocator) {
+    self.grow_keys(self.keys_len + 1)
+    self.grow_items(self.items_len + 1)
+    self.keys_ptr!![self.keys_len] = key.clone()
+    self.keys_len = self.keys_len + 1
+    self.items_ptr!![self.items_len] = value
+    self.items_len = self.items_len + 1
+}
+
+private fn str_eq(a: str, b: str): bool {
+    if a.len != b.len {
+        return false
+    }
+    var i: usize = 0
+    for i < a.len {
+        if a.ptr[i] != b.ptr[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn *Value.get(key: str): (Value, bool) {
+    if self.kind != kind_obj {
+        return Value(), false
+    }
+    var i = self.keys_len
+    for i > 0 {
+        i = i - 1
+        if str_eq(self.keys_ptr!![i], key) {
+            return self.items_ptr!![i], true
+        }
+    }
+    return Value(), false
+}
+
+fn *Value.release() with (a: mem.Allocator) {
+    if self.kind == kind_str {
+        free_str(self.text)
+        self.text = ""
+    } else if self.kind == kind_num {
+        if self.text.len > 0 {
+            free_str(self.text)
+            self.text = ""
+        }
+    }
+    var i: usize = 0
+    for i < self.keys_len {
+        free_str(self.keys_ptr!![i])
+        i = i + 1
+    }
+    if self.items_ptr != null {
+        i = 0
+        for i < self.items_len {
+            val base = self.items_ptr!! as *u8
+            val p = (base + size(Value) * i) as *Value
+            p.release()
+            i = i + 1
+        }
+        if self.items_cap > 0 {
+            var block = bytes()
+            block.ptr = self.items_ptr!! as *u8
+            block.len = size(Value) * self.items_cap
+            a.free(block)
+        }
+    }
+    if self.keys_ptr != null && self.keys_cap > 0 {
+        var block = bytes()
+        block.ptr = self.keys_ptr!! as *u8
+        block.len = size(str) * self.keys_cap
+        a.free(block)
+    }
+    self.items_ptr = null
+    self.items_len = 0
+    self.items_cap = 0
+    self.keys_ptr = null
+    self.keys_len = 0
+    self.keys_cap = 0
+    self.kind = kind_null
+}
+
+// Builder is passed by value so `out.append` lowers as a *StrBuilder method
+// on a local (pointer-typed `*StrBuilder` params do not yet resolve methods).
+fn stringify(v: *Value): str with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    if v.kind == kind_null {
+        b.append("null")
+    } else if v.kind == kind_bool {
+        if v.flag {
+            b.append("true")
+        } else {
+            b.append("false")
+        }
+    } else if v.kind == kind_num {
+        // Prefer int_val: `text` may be a dangling header copy (str fields
+        // are stored as an 8-byte pointer under the current ABI — Friction).
+        if v.int_ok {
+            b.append_int(v.int_val, 10)
+        } else if v.text.len > 0 {
+            b.append(v.text)
+        } else {
+            b.append("0")
+        }
+    } else if v.kind == kind_str {
+        b.append("\"")
+        b.append(v.text)
+        b.append("\"")
+    } else if v.kind == kind_arr {
+        b.append("[")
+        var i: usize = 0
+        for i < v.items_len {
+            if i > 0 {
+                b.append(",")
+            }
+            var elem = v.items_ptr!![i]
+            val piece = stringify(&elem)
+            b.append(piece)
+            free_str(piece)
+            i = i + 1
+        }
+        b.append("]")
+    } else {
+        b.append("{")
+        var i: usize = 0
+        for i < v.keys_len {
+            if i > 0 {
+                b.append(",")
+            }
+            b.append("\"")
+            b.append(v.keys_ptr!![i])
+            b.append("\":")
+            var elem = v.items_ptr!![i]
+            val piece = stringify(&elem)
+            b.append(piece)
+            free_str(piece)
+            i = i + 1
+        }
+        b.append("}")
+    }
+    val out = b.str().clone()
+    b.free()
+    return out
+}
+
+fn hex_char(d: u32): u8 {
+    if d < 10 {
+        return (('0' as u32) + d) as u8
+    }
+    return (('a' as u32) + (d - 10)) as u8
+}
+
+
+fn hex_digit(ch: u8): (u32, bool) {
+    if text.is_digit(ch) {
+        return (ch as u32) - ('0' as u32), true
+    }
+    if ch >= 'a' as u8 && ch <= 'f' as u8 {
+        return (ch as u32) - ('a' as u32) + 10, true
+    }
+    if ch >= 'A' as u8 && ch <= 'F' as u8 {
+        return (ch as u32) - ('A' as u32) + 10, true
+    }
+    return 0, false
+}
+
+fn *Parser.peek(): (u8, bool) {
+    if self.at >= self.buf.len {
+        return 0, false
+    }
+    return self.buf.ptr[self.at], true
+}
+
+fn *Parser.skip() {
+    for self.at < self.buf.len {
+        val ch = self.buf.ptr[self.at]
+        if ch != ' ' as u8 && ch != '\t' as u8 && ch != '\n' as u8 && ch != '\r' as u8 {
+            return
+        }
+        self.at = self.at + 1
+    }
+}
+
+fn *Parser.eat(ch: u8): bool {
+    val (got, ok) = self.peek()
+    if !ok || got != ch {
+        return false
+    }
+    self.at = self.at + 1
+    return true
+}
+
+fn *Parser.read_hex4(): (i64, bool) {
+    var cp: i64 = 0
+    var k: usize = 0
+    for k < 4 {
+        val (ch, ok) = self.peek()
+        if !ok {
+            return 0, false
+        }
+        val (d, dok) = hex_digit(ch)
+        if !dok {
+            return 0, false
+        }
+        self.at = self.at + 1
+        cp = (cp * 16) + (d as i64)
+        k = k + 1
+    }
+    return cp, true
+}
+
+fn pair_cp(high: i64, low: i64): i64 {
+    return 0x10000 + ((high - 0xD800) * 1024) + (low - 0xDC00)
+}
+
+fn *Parser.parse_string(): (str, bool) with (a: mem.Allocator) {
+    if !self.eat('"' as u8) {
+        return "", false
+    }
+    var built = strbuilder.empty()
+    for {
+        val (ch, ok) = self.peek()
+        if !ok {
+            built.free()
+            return "", false
+        }
+        self.at = self.at + 1
+        if ch == '"' as u8 {
+            val owned = built.str().clone()
+            built.free()
+            return owned, true
+        }
+        if ch == '\\' as u8 {
+            val (esc, eok) = self.peek()
+            if !eok {
+                built.free()
+                return "", false
+            }
+            self.at = self.at + 1
+            if esc == '"' as u8 || esc == '\\' as u8 || esc == '/' as u8 {
+                built.append_byte(esc)
+            } else if esc == 'b' as u8 {
+                built.append_byte(0x08)
+            } else if esc == 'f' as u8 {
+                built.append_byte(0x0C)
+            } else if esc == 'n' as u8 {
+                built.append_byte('\n' as u8)
+            } else if esc == 'r' as u8 {
+                built.append_byte('\r' as u8)
+            } else if esc == 't' as u8 {
+                built.append_byte('\t' as u8)
+            } else if esc == 'u' as u8 {
+                val (cp, cok) = self.read_hex4()
+                if !cok || cp < 0 || cp > 0x10FFFF {
+                    built.free()
+                    return "", false
+                }
+                if cp >= 0xD800 && cp <= 0xDBFF {
+                    if !self.eat('\\' as u8) || !self.eat('u' as u8) {
+                        built.free()
+                        return "", false
+                    }
+                    val (low, lok) = self.read_hex4()
+                    if !lok || low < 0xDC00 || low > 0xDFFF {
+                        built.free()
+                        return "", false
+                    }
+                    built.append_char(pair_cp(cp, low))
+                } else if cp >= 0xDC00 && cp <= 0xDFFF {
+                    built.free()
+                    return "", false
+                } else {
+                    built.append_char(cp)
+                }
+            } else {
+                built.free()
+                return "", false
+            }
+        } else if ch < 0x20 {
+            built.free()
+            return "", false
+        } else {
+            built.append_byte(ch)
+        }
+    }
+}
+
+fn *Parser.parse_literal(word: str): bool {
+    for i in 0 as usize..word.len {
+        val (ch, ok) = self.peek()
+        if !ok || ch != word.ptr[i] {
+            return false
+        }
+        self.at = self.at + 1
+    }
+    return true
+}
+
+fn *Parser.source(): str {
+    var view = bytes()
+    if self.buf.len == 0 {
+        return ""
+    }
+    view.ptr = self.buf.ptr
+    view.len = self.buf.len
+    return view
+}
+
+fn view_range(s: str, from: usize, to: usize): str {
+    var view = bytes()
+    view.ptr = s.ptr + from
+    view.len = to - from
+    return view
+}
+
+fn *Parser.scan_number(): (Value, bool) with (a: mem.Allocator) {
+    val start = self.at
+    var integer = true
+    self.eat('-' as u8)
+    val (first, fok) = self.peek()
+    if !fok || first < '0' as u8 || first > '9' as u8 {
+        return Value(), false
+    }
+    self.at = self.at + 1
+    if first == '0' as u8 {
+        val (next, nok) = self.peek()
+        if nok && next >= '0' as u8 && next <= '9' as u8 {
+            return Value(), false
+        }
+    } else {
+        for {
+            val (ch, ok) = self.peek()
+            if !ok || ch < '0' as u8 || ch > '9' as u8 {
+                break
+            }
+            self.at = self.at + 1
+        }
+    }
+    val (dot, dok) = self.peek()
+    if dok && dot == '.' as u8 {
+        integer = false
+        self.at = self.at + 1
+        var saw = false
+        for {
+            val (ch, ok) = self.peek()
+            if !ok || ch < '0' as u8 || ch > '9' as u8 {
+                break
+            }
+            saw = true
+            self.at = self.at + 1
+        }
+        if !saw {
+            return Value(), false
+        }
+    }
+    val (exp, eok) = self.peek()
+    if eok && (exp == 'e' as u8 || exp == 'E' as u8) {
+        integer = false
+        self.at = self.at + 1
+        val (sign, sok) = self.peek()
+        if sok && (sign == '+' as u8 || sign == '-' as u8) {
+            self.at = self.at + 1
+        }
+        var saw = false
+        for {
+            val (ch, ok) = self.peek()
+            if !ok || ch < '0' as u8 || ch > '9' as u8 {
+                break
+            }
+            saw = true
+            self.at = self.at + 1
+        }
+        if !saw {
+            return Value(), false
+        }
+    }
+    val literal = view_range(self.source(), start, self.at)
+    var out = Value()
+    out.kind = kind_num
+    out.text = literal.clone()
+    if integer {
+        val (n, ok) = conv.parse_i64(out.text, 10)
+        out.int_ok = ok
+        out.int_val = n
+    }
+    return out, true
+}
+
+fn *Parser.parse_array(): (Value, bool) with (a: mem.Allocator) {
+    self.at = self.at + 1
+    var arr = array_()
+    self.skip()
+    val (ch, ok) = self.peek()
+    if ok && ch == ']' as u8 {
+        self.at = self.at + 1
+        return arr, true
+    }
+    for {
+        val (elem, eok) = self.parse_value()
+        if !eok {
+            arr.release()
+            return Value(), false
+        }
+        arr.push(elem)
+        self.skip()
+        val (n, nok) = self.peek()
+        if nok && n == ',' as u8 {
+            self.at = self.at + 1
+            self.skip()
+            continue
+        }
+        if nok && n == ']' as u8 {
+            self.at = self.at + 1
+            return arr, true
+        }
+        arr.release()
+        return Value(), false
+    }
+}
+
+fn *Parser.parse_object(): (Value, bool) with (a: mem.Allocator) {
+    self.at = self.at + 1
+    var obj = object_()
+    self.skip()
+    val (ch, ok) = self.peek()
+    if ok && ch == '}' as u8 {
+        self.at = self.at + 1
+        return obj, true
+    }
+    for {
+        val (key, kok) = self.parse_string()
+        if !kok {
+            obj.release()
+            return Value(), false
+        }
+        self.skip()
+        if !self.eat(':' as u8) {
+            free_str(key)
+            obj.release()
+            return Value(), false
+        }
+        self.skip()
+        val (value, vok) = self.parse_value()
+        if !vok {
+            free_str(key)
+            obj.release()
+            return Value(), false
+        }
+        obj.grow_keys(obj.keys_len + 1)
+        obj.grow_items(obj.items_len + 1)
+        obj.keys_ptr!![obj.keys_len] = key
+        obj.keys_len = obj.keys_len + 1
+        obj.items_ptr!![obj.items_len] = value
+        obj.items_len = obj.items_len + 1
+        self.skip()
+        val (n, nok) = self.peek()
+        if nok && n == ',' as u8 {
+            self.at = self.at + 1
+            self.skip()
+            continue
+        }
+        if nok && n == '}' as u8 {
+            self.at = self.at + 1
+            return obj, true
+        }
+        obj.release()
+        return Value(), false
+    }
+}
+
+fn *Parser.parse_any(): (Value, bool) with (a: mem.Allocator) {
+    self.skip()
+    val (ch, ok) = self.peek()
+    if !ok {
+        return Value(), false
+    }
+    if ch == '{' as u8 {
+        return self.parse_object()
+    }
+    if ch == '[' as u8 {
+        return self.parse_array()
+    }
+    if ch == '"' as u8 {
+        val (text, sok) = self.parse_string()
+        if !sok {
+            return Value(), false
+        }
+        return string_owned(text), true
+    }
+    if ch == 't' as u8 {
+        if !self.parse_literal("true") {
+            return Value(), false
+        }
+        return bool_(true), true
+    }
+    if ch == 'f' as u8 {
+        if !self.parse_literal("false") {
+            return Value(), false
+        }
+        return bool_(false), true
+    }
+    if ch == 'n' as u8 {
+        if !self.parse_literal("null") {
+            return Value(), false
+        }
+        return null_(), true
+    }
+    if ch == '-' as u8 || (ch >= '0' as u8 && ch <= '9' as u8) {
+        return self.scan_number()
+    }
+    return Value(), false
+}
+
+fn *Parser.parse_value(): (Value, bool) with (a: mem.Allocator) {
+    if self.depth >= json_max_depth {
+        return Value(), false
+    }
+    self.depth = self.depth + 1
+    val (value, ok) = self.parse_any()
+    self.depth = self.depth - 1
+    return value, ok
+}
+
+fn parse(text: str): (Value, bool) with (a: mem.Allocator) {
+    var p = Parser()
+    p.buf = text
+    p.skip()
+    if p.at >= p.buf.len {
+        return Value(), false
+    }
+    var (value, ok) = p.parse_value()
+    if !ok {
+        return Value(), false
+    }
+    p.skip()
+    if p.at != p.buf.len {
+        value.release()
+        return Value(), false
+    }
+    return value, true
+}

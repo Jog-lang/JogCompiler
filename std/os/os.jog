@@ -1,7 +1,18 @@
-// Package std.os — argc/argv for jog-v2 (env is platform actual).
+// Package std.os — argc/argv, env, and process parameters.
+// env/setenv/unsetenv/pid/hostname/exe_path are expect/actual.
+// home/temp_dir use env. exit is core.
+// hostname/exe_path return error-arena copies (no with on expect yet).
+
 import std.c
+import std.mem
+import std.text
 
 expect fn env(name: str): (str, bool)
+expect fn setenv(name: str, value: str): bool
+expect fn unsetenv(name: str): bool
+expect fn pid(): i64
+expect fn hostname(): (str, bool)
+expect fn exe_path(): (str, bool)
 
 fn argc(): i64 {
     return c.jogrt_argc() as i64
@@ -25,4 +36,39 @@ fn argv(i: i64): str {
     }
     val raw = p as *u8
     return c_view(raw, c.strlen(p as *const c.char))
+}
+
+fn exit(code: i32) {
+    // libc exit — jogrt_exit is not in the linux runtime yet (Friction).
+    c.exit(code as c.int)
+}
+
+/**
+ * $HOME or USERPROFILE via env. View lifetime matches env().
+ */
+fn home(): (str, bool) {
+    val (v, ok) = env("HOME")
+    if ok {
+        return v, true
+    }
+    return env("USERPROFILE")
+}
+
+/**
+ * Temp directory: TMPDIR, TEMP, TMP, or "/tmp".
+ */
+fn temp_dir(): (str, bool) {
+    val (a1, ok1) = env("TMPDIR")
+    if ok1 && a1.len > 0 {
+        return a1, true
+    }
+    val (a2, ok2) = env("TEMP")
+    if ok2 && a2.len > 0 {
+        return a2, true
+    }
+    val (a3, ok3) = env("TMP")
+    if ok3 && a3.len > 0 {
+        return a3, true
+    }
+    return "/tmp", true
 }

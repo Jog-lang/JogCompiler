@@ -143,6 +143,8 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
     try defineBuiltin(a, &types, "isize", .{ .kind = .i64_ty, .name = "isize", .bits = 64, .unsigned = false });
     try defineBuiltin(a, &types, "str", .{ .kind = .string_ty, .name = "str" });
     try defineBuiltin(a, &types, "bytes", .{ .kind = .bytes_ty, .name = "bytes" });
+    // Unicode scalar value (UTF-32 code point); used by std.text rune helpers.
+    try defineBuiltin(a, &types, "rune", .{ .kind = .u32_ty, .name = "rune", .bits = 32, .unsigned = true });
     try defineBuiltin(a, &types, "void", .{ .kind = .void_ty, .name = "void" });
     // Opaque pool handle (i64-sized); with (Dispatcher) migrates stackful coros (gate 3).
     try defineBuiltin(a, &types, "Dispatcher", .{ .kind = .i64_ty, .name = "Dispatcher", .bits = 64, .unsigned = false });
@@ -293,21 +295,34 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
     var mit = methods.iterator();
     while (mit.next()) |e| {
         const md = e.value_ptr.*;
-        if (structs.get(md.type_name) == null) {
+        // Builtins (`str`, `i64`, …) may carry methods; only reject unknown names.
+        if (structs.get(md.type_name) == null and types.get(md.type_name) == null) {
             try emitDiag(a, &diags, null, 1, 1, try std.fmt.allocPrint(a, "method on unknown type '{s}'", .{md.type_name}));
         }
-        for (md.contexts) |ctx| _ = try resolveTypeExpr(a, &types, ctx.ty, &diags);
-        if (md.ret) |r| _ = try resolveTypeExpr(a, &types, r, &diags);
-        for (md.params) |p| _ = try resolveTypeExpr(a, &types, p.ty, &diags);
-        if (md.body) |body| {
-            // Bind receiver type params (`fn *List<T>.grow`) like fn generics.
-            var bound_tp: std.ArrayListUnmanaged([]const u8) = .{};
-            for (md.type_params) |tp| {
+        // Bind receiver/struct type params before resolving param/ret types.
+        var bound_tp: std.ArrayListUnmanaged([]const u8) = .{};
+        for (md.type_params) |tp| {
+            if (!types.contains(tp)) {
                 const tpi = try a.create(TypeInfo);
                 tpi.* = .{ .kind = .named, .name = tp };
                 try types.put(a, tp, tpi);
                 try bound_tp.append(a, tp);
             }
+        }
+        if (structs.get(md.type_name)) |sd| {
+            for (sd.type_params) |tp| {
+                if (!types.contains(tp)) {
+                    const tpi = try a.create(TypeInfo);
+                    tpi.* = .{ .kind = .named, .name = tp };
+                    try types.put(a, tp, tpi);
+                    try bound_tp.append(a, tp);
+                }
+            }
+        }
+        for (md.contexts) |ctx| _ = try resolveTypeExpr(a, &types, ctx.ty, &diags);
+        if (md.ret) |r| _ = try resolveTypeExpr(a, &types, r, &diags);
+        for (md.params) |p| _ = try resolveTypeExpr(a, &types, p.ty, &diags);
+        if (md.body) |body| {
             // synthesize self param for receiver
             var params_with_self: std.ArrayListUnmanaged(ast.Param) = .{};
             const self_ty = try a.create(ast.TypeExpr);
@@ -321,8 +336,8 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
             try params_with_self.append(a, .{ .name = "self", .ty = self_ty });
             for (md.params) |p| try params_with_self.append(a, p);
             try checkFunctionBody(a, &types, &fns, &structs, &methods, try params_with_self.toOwnedSlice(a), md.contexts, body, &diags, &globals_scope);
-            for (bound_tp.items) |tp| _ = types.remove(tp);
         }
+        for (bound_tp.items) |tp| _ = types.remove(tp);
     }
 
     // structural: each interface struct method must exist on candidate structs (report only)
@@ -413,6 +428,12 @@ fn resolveTypeExpr(
     switch (te.*) {
         .name => |n| {
             if (lookupTypeName(types, n)) |t| return t;
+            // Pointer TypeInfo uses the display name "ptr"; never a source type spelling.
+            if (std.mem.eql(u8, n, "ptr") or std.mem.eql(u8, n, "const_ptr")) {
+                const ti = try a.create(TypeInfo);
+                ti.* = .{ .kind = .pointer, .name = n, .pointee = types.get("byte") };
+                return ti;
+            }
             try emitDiag(a, diags, null, 1, 1, try std.fmt.allocPrint(a, "unknown type '{s}'", .{n}));
             const bad = try a.create(TypeInfo);
             bad.* = .{ .kind = .named, .name = n };
@@ -755,6 +776,23 @@ fn checkExpr(
                 for (c.with_args) |w| _ = try checkExpr(a, types, fns, structs, methods, scope, w, diags);
                 return try voidType(a);
             }
+            // Builtin bytes(): empty mutable byte slice header.
+            if (c.callee.* == .ident and std.mem.eql(u8, c.callee.ident, "bytes")) {
+                if (c.args.len != 0) {
+                    try emitDiag(a, diags, e, 1, 1, "bytes() takes no arguments");
+                }
+                return types.get("bytes").?;
+            }
+            // Zero-value struct constructor: `StrBuilder()` when Name is a struct type.
+            if (c.callee.* == .ident and c.args.len == 0 and c.type_args.len == 0) {
+                if (structs.get(c.callee.ident)) |sd| {
+                    _ = sd;
+                    if (types.get(c.callee.ident)) |t| return t;
+                    const ti = try a.create(TypeInfo);
+                    ti.* = .{ .kind = .struct_ty, .name = c.callee.ident };
+                    return ti;
+                }
+            }
             // Builtins size(T) / align(T): type arg spelled as expr; result usize.
             if (c.callee.* == .ident and (std.mem.eql(u8, c.callee.ident, "size") or std.mem.eql(u8, c.callee.ident, "align"))) {
                 if (c.args.len != 1) {
@@ -913,6 +951,17 @@ fn checkExpr(
         .field => |f| {
             const base = try checkExpr(a, types, fns, structs, methods, scope, f.base, diags);
             if (base.kind == .enum_ty) return base;
+            // Slice headers: str / bytes expose .ptr and .len (usize), not i64.
+            if (base.kind == .string_ty or base.kind == .bytes_ty) {
+                if (std.mem.eql(u8, f.name, "len")) {
+                    return types.get("usize").?;
+                }
+                if (std.mem.eql(u8, f.name, "ptr")) {
+                    const ti = try a.create(TypeInfo);
+                    ti.* = .{ .kind = .pointer, .name = "ptr", .pointee = types.get("u8") };
+                    return ti;
+                }
+            }
             if (base.kind == .struct_ty) {
                 if (structs.get(base.name)) |sd| {
                     for (sd.fields) |fld| {
@@ -983,7 +1032,7 @@ fn checkExpr(
             }
             // narrowing int constant fold check
             if (c.expr.* == .int and to.bits > 0 and to.bits < 64) {
-                const max: i64 = (@as(i64, 1) << @intCast(to.bits)) - 1;
+                const max: i128 = (@as(i128, 1) << @intCast(to.bits)) - 1;
                 if (c.expr.int < 0 or c.expr.int > max) {
                     try emitDiag(a, diags, e, 1, 1, "integer constant does not fit in cast target");
                 }
@@ -1079,6 +1128,8 @@ fn voidType(a: std.mem.Allocator) !*TypeInfo {
 /// Implicit assign: widen ints, same type, optional wrap, iface structural later
 fn canAssign(from: *TypeInfo, to: *TypeInfo) bool {
     if (from.kind == to.kind and std.mem.eql(u8, from.name, to.name)) return true;
+    // Generic type params are placeholders in the check subset.
+    if (from.kind == .named or to.kind == .named) return true;
     if (to.kind == .optional) {
         if (from.kind == .optional) return true;
         if (from.kind == .pointer or from.kind == .struct_ty) return true;

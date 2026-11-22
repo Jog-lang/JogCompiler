@@ -14,6 +14,10 @@ pub const Op = enum {
     mul,
     div,
     rem,
+    /// Unsigned 64-bit division (for u64/usize/…).
+    udiv,
+    /// Unsigned 64-bit remainder.
+    urem,
     fadd,
     fsub,
     fmul,
@@ -28,6 +32,9 @@ pub const Op = enum {
     ne,
     lt,
     le,
+    /// Unsigned comparisons (u64 magnitudes ≥ 2^63).
+    ult,
+    ule,
     and_op,
     or_op,
     bit_and,
@@ -118,6 +125,8 @@ pub const Global = struct {
     is_raw_byte_ptr: bool = false,
     /// Package `var x: SomeIface` — one-word ptr-to-fat; recover `iface_ptr` meta at use sites.
     iface_type_name: []const u8 = "",
+    /// Declared type leaf name when known (`Malloc`, `i64`, …) for `&global` iface coerce.
+    type_name: []const u8 = "",
 };
 
 pub const Program = struct {
@@ -192,9 +201,25 @@ fn ptrArgMask(params: []ast.Param) u16 {
     return mask;
 }
 
+/// Pack an integer literal into the 64-bit `iconst` bit pattern.
+/// Signed values use two's complement; u64-only magnitudes (2^63..2^64-1)
+/// use the same bits as the unsigned value.
+fn intLiteralBits(n: i128) ?i64 {
+    if (n >= std.math.minInt(i64) and n <= std.math.maxInt(i64)) {
+        return @intCast(n);
+    }
+    if (n >= 0 and n <= std.math.maxInt(u64)) {
+        return @bitCast(@as(u64, @intCast(n)));
+    }
+    return null;
+}
+
 fn literalConstBits(e: *ast.Expr) ?ConstVal {
     return switch (e.*) {
-        .int => |n| .{ .bits = n, .is_float = false },
+        .int => |n| blk: {
+            const bits = intLiteralBits(n) orelse break :blk null;
+            break :blk .{ .bits = bits, .is_float = false };
+        },
         .float => |n| .{ .bits = @bitCast(n), .is_float = true },
         .unary => |u| blk: {
             if (u.op == .neg) {
@@ -430,6 +455,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                 var is_float = false;
                 var is_raw_byte_ptr = false;
                 var iface_type_name: []const u8 = "";
+                var type_name: []const u8 = "";
                 if (gd.init) |init| {
                     if (literalConstBits(init)) |cv| {
                         bits = cv.bits;
@@ -452,6 +478,8 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                     if (sm.kind == .iface_ptr and sm.type_name.len > 0) {
                         iface_type_name = try a.dupe(u8, sm.type_name);
                     }
+                    const leaf = typeExprName(te);
+                    if (leaf.len > 0) type_name = try a.dupe(u8, leaf);
                 }
                 if (!gd.mutable) {
                     // Compile-time constant: fold at use sites (no storage).
@@ -466,6 +494,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                         .is_float = is_float,
                         .is_raw_byte_ptr = is_raw_byte_ptr,
                         .iface_type_name = iface_type_name,
+                        .type_name = type_name,
                     });
                     try global_map.put(a, gd.name, idx);
                 }
@@ -563,6 +592,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                 .exported = fd.exported or std.mem.eql(u8, fd.name, "main"),
                 .self_type = null,
                 .pointer_recv = false,
+                .ret_iface = retIfaceName(&ifaces, fd.ret),
             }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map, globals.items, &object_map);
             try funcs.append(a, f);
         } else if (d == .method and d.method.body != null) {
@@ -577,6 +607,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                 .exported = true,
                 .self_type = md.type_name,
                 .pointer_recv = md.pointer_recv,
+                .ret_iface = retIfaceName(&ifaces, md.ret),
             }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map, globals.items, &object_map);
             try funcs.append(a, f);
         }
@@ -590,6 +621,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
             .exported = false,
             .self_type = null,
             .pointer_recv = false,
+            .ret_iface = retIfaceName(&ifaces, fd.ret),
         }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map, globals.items, &object_map);
         try funcs.append(a, f);
     }
@@ -948,6 +980,8 @@ const FnLower = struct {
     exported: bool,
     self_type: ?[]const u8,
     pointer_recv: bool,
+    /// When set, `return` values are coerced to this interface fat pointer.
+    ret_iface: ?[]const u8 = null,
 };
 
 const Ctx = struct {
@@ -976,6 +1010,8 @@ const Ctx = struct {
     /// Indices of `jmp` insts from `continue`; patched to loop head.
     continue_jmps: *std.ArrayListUnmanaged(usize),
     defer_stack: *std.ArrayListUnmanaged(std.ArrayListUnmanaged(DeferItem)),
+    /// When set, `return` values are coerced to this interface fat pointer.
+    ret_iface: ?[]const u8 = null,
 
     fn fresh(self: *Ctx) !u32 {
         const s = self.next_slot.*;
@@ -1004,6 +1040,7 @@ fn lowerFn(
     globals: []const Global,
     object_map: *std.StringHashMapUnmanaged(u32),
 ) !Func {
+    std.debug.print("lowerFn:{s}\n", .{fl.name});
     var slots: std.StringHashMapUnmanaged(u32) = .{};
     var meta: std.StringHashMapUnmanaged(SlotMeta) = .{};
     var next_slot: u32 = 0;
@@ -1083,8 +1120,12 @@ fn lowerFn(
         .break_jmps = &break_jmps,
         .continue_jmps = &continue_jmps,
         .defer_stack = &defer_stack,
+        .ret_iface = fl.ret_iface,
     };
-    try lowerBlock(&ctx, fl.body);
+    lowerBlock(&ctx, fl.body) catch |err| {
+        std.debug.print("lowerFn body fail {s}: {s}\n", .{ fl.name, @errorName(err) });
+        return err;
+    };
     if (insts.items.len == 0 or insts.items[insts.items.len - 1].op != .ret) {
         try emitAllDefers(&ctx);
         try ctx.emit(.{ .op = .ret, .src0 = none });
@@ -1107,6 +1148,14 @@ fn typeExprName(te: *ast.TypeExpr) []const u8 {
         .tuple => "__Tup",
         else => "",
     };
+}
+
+fn retIfaceName(ifaces: *std.StringHashMapUnmanaged(IfaceInfo), ret: ?*ast.TypeExpr) ?[]const u8 {
+    const te = ret orelse return null;
+    const n = typeExprName(te);
+    if (n.len == 0) return null;
+    if (!ifaces.contains(n)) return null;
+    return n;
 }
 
 /// `pkg.Name` → `Name` for flattened import merge / ambient matching.
@@ -1317,7 +1366,18 @@ fn metaForTypeExpr(a: std.mem.Allocator, te: *ast.TypeExpr, structs: *std.String
                 .elem_size = es,
             };
         },
-        .name => |n| return metaForTypeName(n, ifaces),
+        .name => |n| {
+            // Named `str` / `bytes` are slice headers (`{ ptr, len }`), not scalars.
+            // Keep the nominal type_name so `str.method` lookup works; fieldOffset
+            // maps the name to `__Slice_byte` for `.ptr` / `.len`.
+            if (std.mem.eql(u8, n, "str") or std.mem.eql(u8, n, "bytes")) {
+                const elem = try a.create(ast.TypeExpr);
+                elem.* = .{ .name = "byte" };
+                _ = try ensureSliceStruct(a, structs, elem);
+                return .{ .kind = .struct_ptr, .type_name = n };
+            }
+            return metaForTypeName(n, ifaces);
+        },
         .named_app => |na| {
             const mangled = try mangleNamedApp(a, na.name, na.args);
             return metaForTypeName(mangled, ifaces);
@@ -1484,19 +1544,51 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
                 }
                 return;
             }
-            const slot = try ctx.fresh();
-            try ctx.slots.put(ctx.a, vd.name, slot);
             if (vd.init) |init| {
                 const v = try lowerExpr(ctx, init);
-                try ctx.emit(.{ .op = .copy, .dst = slot, .src0 = v });
                 if (vd.ty == null) {
                     if (ctx.meta.get(slotNameOf(ctx, v))) |m| sm = m;
                     // struct lit / alloc leave meta on temp — copy from init kind via peek
                     sm = inferMetaFromExpr(ctx, init) orelse sm;
                 }
-            } else {
-                try ctx.emit(.{ .op = .iconst, .dst = slot, .aux = 0 });
+                // Struct / slice headers from `jogrt_ret_alloc` are ephemeral.
+                // Copy into a durable heap block (upward layout matches fieldOffset).
+                if (sm.kind == .struct_ptr and sm.type_name.len > 0) {
+                    if (ctx.structs.get(sm.type_name)) |sd| {
+                        const nbytes: i64 = @intCast(if (sd.fields.len == 0) @as(usize, 8) else sd.fields.len * 8);
+                        const sz = try ctx.fresh();
+                        try ctx.emit(.{ .op = .iconst, .dst = sz, .aux = nbytes });
+                        const cid = ctx.callee_map.get("jogrt_alloc").?;
+                        const ptr = try ctx.fresh();
+                        var allo = Inst{ .op = .call, .dst = ptr, .aux = cid, .arity = 1 };
+                        allo.args[0] = sz;
+                        try ctx.emit(allo);
+                        var fi: usize = 0;
+                        while (fi < sd.fields.len) : (fi += 1) {
+                            const src_addr = try ctx.fresh();
+                            const dst_addr = try ctx.fresh();
+                            const off_s = try ctx.fresh();
+                            const tmp = try ctx.fresh();
+                            try ctx.emit(.{ .op = .iconst, .dst = off_s, .aux = @intCast(fi * 8) });
+                            try ctx.emit(.{ .op = .add, .dst = src_addr, .src0 = v, .src1 = off_s });
+                            try ctx.emit(.{ .op = .load, .dst = tmp, .src0 = src_addr });
+                            try ctx.emit(.{ .op = .add, .dst = dst_addr, .src0 = ptr, .src1 = off_s });
+                            try ctx.emit(.{ .op = .store, .src0 = dst_addr, .src1 = tmp });
+                        }
+                        try ctx.slots.put(ctx.a, vd.name, ptr);
+                        try ctx.meta.put(ctx.a, vd.name, sm);
+                        return;
+                    }
+                }
+                const slot = try ctx.fresh();
+                try ctx.slots.put(ctx.a, vd.name, slot);
+                try ctx.emit(.{ .op = .copy, .dst = slot, .src0 = v });
+                try ctx.meta.put(ctx.a, vd.name, sm);
+                return;
             }
+            const slot = try ctx.fresh();
+            try ctx.slots.put(ctx.a, vd.name, slot);
+            try ctx.emit(.{ .op = .iconst, .dst = slot, .aux = 0 });
             try ctx.meta.put(ctx.a, vd.name, sm);
         },
         .assign => |as| {
@@ -1548,7 +1640,10 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
             if (as.index) |ix| {
                 const addr = try lowerIndexAddr(ctx, ix.base, ix.index);
                 try maybeBoundsCheck(ctx, ix.base, ix.index);
-                if (indexLoadStoreWidth(ctx, ix.base) == 1) {
+                if (indexElemBytes(ctx, ix.base)) |nbytes| {
+                    // `v` is a pointer to a multi-word value — copy into the slot.
+                    try emitWordCopy(ctx, addr, v, nbytes);
+                } else if (indexLoadStoreWidth(ctx, ix.base) == 1) {
                     try ctx.emit(.{ .op = .store8, .src0 = addr, .src1 = v });
                 } else {
                     try ctx.emit(.{ .op = .store, .src0 = addr, .src1 = v });
@@ -1571,7 +1666,34 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
         },
         .expr => |e| _ = try lowerExpr(ctx, e),
         .return_stmt => |re| {
-            const ret_slot: u32 = if (re) |e| try lowerExpr(ctx, e) else none;
+            var ret_slot: u32 = if (re) |e| try lowerExpr(ctx, e) else none;
+            if (re != null and ret_slot != none) {
+                if (ctx.ret_iface) |iface| {
+                    const concrete = if (re) |e| (inferTypeNameFromExpr(ctx, e) orelse "") else "";
+                    // `&heap_value` / concrete value returned as iface — build fat pointer.
+                    if (concrete.len > 0 and !std.mem.eql(u8, concrete, iface)) {
+                        ret_slot = try coerceToIface(ctx, ret_slot, concrete, iface);
+                    } else if (concrete.len == 0 or std.mem.eql(u8, concrete, iface)) {
+                        // `return &heap_value` — recover concrete from the global's declared type.
+                        if (re) |e| {
+                            if (e.* == .unary and e.unary.op == .addr and e.unary.expr.* == .ident) {
+                                const gname = e.unary.expr.ident;
+                                const inner = blk: {
+                                    if (inferTypeNameFromExpr(ctx, e.unary.expr)) |tn| break :blk tn;
+                                    if (ctx.global_map.get(gname)) |gi| {
+                                        if (gi < ctx.globals.len and ctx.globals[gi].type_name.len > 0)
+                                            break :blk ctx.globals[gi].type_name;
+                                    }
+                                    break :blk "";
+                                };
+                                if (inner.len > 0 and !std.mem.eql(u8, inner, iface)) {
+                                    ret_slot = try coerceToIface(ctx, ret_slot, inner, iface);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             // Heuristic error path: non-null return of optional/error.
             var error_path = false;
             if (re) |e| {
@@ -1738,7 +1860,13 @@ fn inferMetaFromExpr(ctx: *Ctx, e: *ast.Expr) ?SlotMeta {
             return null;
         },
         .field => |f| {
-            const base_tn = inferTypeNameFromExpr(ctx, f.base) orelse return null;
+            var base_tn = inferTypeNameFromExpr(ctx, f.base) orelse return null;
+            // Nominal `str`/`bytes` → `__Slice_byte` for field types (`.ptr` is `*byte`).
+            if (std.mem.eql(u8, base_tn, "str") or std.mem.eql(u8, base_tn, "bytes")) {
+                const elem = ctx.a.create(ast.TypeExpr) catch return null;
+                elem.* = .{ .name = "byte" };
+                base_tn = ensureSliceStruct(ctx.a, ctx.structs, elem) catch return null;
+            }
             const sd = ctx.structs.get(base_tn) orelse return null;
             for (sd.fields) |fld| {
                 if (std.mem.eql(u8, fld.name, f.name)) {
@@ -1748,9 +1876,9 @@ fn inferMetaFromExpr(ctx: *Ctx, e: *ast.Expr) ?SlotMeta {
             return null;
         },
         .index => |ix| {
-            // Element of `[N]Iface` / `[N]Struct` — recover iface/struct meta for method calls.
+            // Element of `[N]Iface` / `[N]Struct` / `*T` — recover meta for method calls.
             if (inferMetaFromExpr(ctx, ix.base)) |bm| {
-                if (bm.kind == .array_ptr and bm.type_name.len > 0) {
+                if ((bm.kind == .array_ptr or bm.kind == .raw_ptr) and bm.type_name.len > 0) {
                     if (ctx.ifaces.contains(bm.type_name))
                         return .{ .kind = .iface_ptr, .type_name = bm.type_name };
                     if (ctx.structs.contains(bm.type_name))
@@ -1778,6 +1906,15 @@ fn inferMetaFromExpr(ctx: *Ctx, e: *ast.Expr) ?SlotMeta {
             return .{ .kind = .scalar, .type_name = "i64" };
         },
         .call => |c| {
+            if (c.callee.* == .ident and std.mem.eql(u8, c.callee.ident, "bytes")) {
+                const elem = ctx.a.create(ast.TypeExpr) catch return null;
+                elem.* = .{ .name = "byte" };
+                const sn = ensureSliceStruct(ctx.a, ctx.structs, elem) catch return null;
+                return .{ .kind = .struct_ptr, .type_name = sn };
+            }
+            if (c.callee.* == .ident and c.args.len == 0 and c.type_args.len == 0 and ctx.structs.contains(c.callee.ident)) {
+                return .{ .kind = .struct_ptr, .type_name = c.callee.ident };
+            }
             if (c.callee.* == .ident and std.mem.eql(u8, c.callee.ident, "alloc"))
                 return .{ .kind = .raw_ptr, .type_name = "byte" };
             if (c.callee.* == .ident and (std.mem.eql(u8, c.callee.ident, "dispatcher_pool") or
@@ -1800,16 +1937,71 @@ fn inferMetaFromExpr(ctx: *Ctx, e: *ast.Expr) ?SlotMeta {
                 }
             }
             if (c.callee.* == .field) {
-                const base_tn = inferTypeNameFromExpr(ctx, c.callee.field.base) orelse "";
+                // `pkg.fn(...)` after import — same flatten rule as lowerCall.
+                if (c.callee.field.base.* == .ident) {
+                    const base_name = c.callee.field.base.ident;
+                    const is_local = ctx.meta.contains(base_name) or ctx.global_map.contains(base_name) or
+                        ctx.object_map.contains(base_name) or ctx.const_vals.contains(base_name);
+                    if (!is_local) {
+                        if (ctx.fn_infos.get(c.callee.field.name)) |fi| {
+                            if (metaFromCallRet(ctx, fi.ret_meta, fi.ret_name)) |m| return m;
+                        }
+                    }
+                }
+                var base_tn = inferTypeNameFromExpr(ctx, c.callee.field.base) orelse "";
+                if (std.mem.eql(u8, base_tn, "__Slice_byte")) base_tn = "str";
                 const key = std.fmt.allocPrint(ctx.a, "{s}.{s}", .{ base_tn, c.callee.field.name }) catch return .{ .kind = .raw_ptr };
                 if (ctx.methods.get(key)) |mi| {
                     if (metaFromCallRet(ctx, mi.ret_meta, mi.ret_name)) |m| return m;
+                }
+                if (std.mem.eql(u8, base_tn, "str")) {
+                    const alt = std.fmt.allocPrint(ctx.a, "bytes.{s}", .{c.callee.field.name}) catch return .{ .kind = .raw_ptr };
+                    if (ctx.methods.get(alt)) |mi| {
+                        if (metaFromCallRet(ctx, mi.ret_meta, mi.ret_name)) |m| return m;
+                    }
+                }
+                // Interface method: ret type lives on the iface sig, not methods map.
+                if (base_tn.len > 0) {
+                    if (ctx.ifaces.get(base_tn)) |iface| {
+                        for (iface.methods) |ms| {
+                            if (std.mem.eql(u8, ms.name, c.callee.field.name)) {
+                                if (ms.ret) |r| {
+                                    return metaForTypeExpr(ctx.a, r, ctx.structs, ctx.ifaces) catch null;
+                                }
+                                return null;
+                            }
+                        }
+                    }
                 }
             }
             return .{ .kind = .raw_ptr };
         },
         .cast => |c| return metaForTypeExpr(ctx.a, c.ty, ctx.structs, ctx.ifaces) catch null,
         .tuple => |elems| return .{ .kind = .struct_ptr, .type_name = ensureTupleStruct(ctx.a, ctx.structs, elems.len) catch return null },
+        .string => {
+            const elem = ctx.a.create(ast.TypeExpr) catch return null;
+            elem.* = .{ .name = "byte" };
+            _ = ensureSliceStruct(ctx.a, ctx.structs, elem) catch return null;
+            // Nominal `str` so method calls (`s.starts_with`) resolve.
+            return .{ .kind = .struct_ptr, .type_name = "str" };
+        },
+        .force_unwrap => |inner| {
+            // `p!!` on `*T?` → `*T` meta so `p!![i]` uses byte stride when T is u8/byte.
+            if (inferMetaFromExpr(ctx, inner)) |m| {
+                if (m.kind == .opt_ptr) {
+                    const es: u32 = if (std.mem.eql(u8, m.type_name, "byte") or
+                        std.mem.eql(u8, m.type_name, "u8") or
+                        std.mem.eql(u8, m.type_name, "bool")) 1 else 8;
+                    if (ctx.ifaces.contains(m.type_name))
+                        return .{ .kind = .iface_ptr, .type_name = m.type_name };
+                    if (isBuiltinScalar(m.type_name) or std.mem.eql(u8, m.type_name, "void"))
+                        return .{ .kind = .raw_ptr, .type_name = m.type_name, .elem_size = es };
+                    return .{ .kind = .struct_ptr, .type_name = m.type_name };
+                }
+                return m;
+            }
+            return null;
+        },
         else => return null,
     }
 }
@@ -1822,14 +2014,19 @@ fn inferTypeNameFromExpr(ctx: *Ctx, e: *ast.Expr) ?[]const u8 {
 }
 
 fn indexBaseMeta(ctx: *Ctx, base_expr: *ast.Expr) ?SlotMeta {
-    if (base_expr.* != .ident) return null;
-    const name = base_expr.ident;
-    if (ctx.meta.get(name)) |m| return m;
-    // Package `var x: *byte` — type lives on Global, not local ctx.meta.
-    if (ctx.global_map.get(name)) |gi| {
-        if (gi < ctx.globals.len and ctx.globals[gi].is_raw_byte_ptr) {
-            return .{ .kind = .raw_ptr, .type_name = "byte", .elem_size = 1 };
+    if (base_expr.* == .ident) {
+        const name = base_expr.ident;
+        if (ctx.meta.get(name)) |m| return m;
+        // Package `var x: *byte` — type lives on Global, not local ctx.meta.
+        if (ctx.global_map.get(name)) |gi| {
+            if (gi < ctx.globals.len and ctx.globals[gi].is_raw_byte_ptr) {
+                return .{ .kind = .raw_ptr, .type_name = "byte", .elem_size = 1 };
+            }
         }
+    }
+    // `s.ptr[i]` / any expr whose meta is a byte pointer — stride 1 upward.
+    if (inferMetaFromExpr(ctx, base_expr)) |m| {
+        if (m.kind == .raw_ptr or m.kind == .array_ptr) return m;
     }
     return null;
 }
@@ -1843,6 +2040,32 @@ fn indexLoadStoreWidth(ctx: *Ctx, base_expr: *ast.Expr) u32 {
     return 8;
 }
 
+fn indexElemBytes(ctx: *Ctx, base_expr: *ast.Expr) ?i64 {
+    if (indexBaseMeta(ctx, base_expr)) |bm| {
+        if (std.mem.eql(u8, bm.type_name, "str") or std.mem.eql(u8, bm.type_name, "bytes"))
+            return 16;
+        if (ctx.structs.get(bm.type_name)) |sd| {
+            if (sd.fields.len > 1) return @intCast(sd.fields.len * 8);
+        }
+    }
+    return null;
+}
+
+fn emitWordCopy(ctx: *Ctx, dst: u32, src: u32, nbytes: i64) LowerError!void {
+    var off: i64 = 0;
+    while (off < nbytes) : (off += 8) {
+        const o = try ctx.fresh();
+        try ctx.emit(.{ .op = .iconst, .dst = o, .aux = off });
+        const sa = try ctx.fresh();
+        try ctx.emit(.{ .op = .add, .dst = sa, .src0 = src, .src1 = o });
+        const word = try ctx.fresh();
+        try ctx.emit(.{ .op = .load, .dst = word, .src0 = sa });
+        const da = try ctx.fresh();
+        try ctx.emit(.{ .op = .add, .dst = da, .src0 = dst, .src1 = o });
+        try ctx.emit(.{ .op = .store, .src0 = da, .src1 = word });
+    }
+}
+
 fn indexStride(ctx: *Ctx, base_expr: *ast.Expr) u32 {
     // Dense packed byte arrays / raw byte pointers use stride 1.
     if (indexBaseMeta(ctx, base_expr)) |m| {
@@ -1850,6 +2073,13 @@ fn indexStride(ctx: *Ctx, base_expr: *ast.Expr) u32 {
             return 1;
         if (m.kind == .array_ptr and m.elem_size == 1)
             return 1;
+        if (m.kind == .raw_ptr or m.kind == .array_ptr) {
+            if (std.mem.eql(u8, m.type_name, "str") or std.mem.eql(u8, m.type_name, "bytes"))
+                return 16;
+            if (ctx.structs.get(m.type_name)) |sd| {
+                if (sd.fields.len > 0) return @intCast(sd.fields.len * 8);
+            }
+        }
     }
     return 8;
 }
@@ -2013,7 +2243,7 @@ fn packParamIndex(params: []ast.Param) ?u8 {
 }
 
 fn fieldOffset(ctx: *Ctx, base_expr: *ast.Expr, field: []const u8) LowerError!i64 {
-    const tn = blk: {
+    var tn = blk: {
         if (base_expr.* == .ident) {
             if (ctx.meta.get(base_expr.ident)) |m| break :blk m.type_name;
         }
@@ -2021,6 +2251,12 @@ fn fieldOffset(ctx: *Ctx, base_expr: *ast.Expr, field: []const u8) LowerError!i6
         std.debug.print("lower UnknownName fieldOffset type for field {s}\n", .{field});
         return error.UnknownName;
     };
+    // `str` / `bytes` locals may still carry the nominal name; map to slice header.
+    if (std.mem.eql(u8, tn, "str") or std.mem.eql(u8, tn, "bytes")) {
+        const elem = try ctx.a.create(ast.TypeExpr);
+        elem.* = .{ .name = "byte" };
+        tn = try ensureSliceStruct(ctx.a, ctx.structs, elem);
+    }
     const sd = ctx.structs.get(tn) orelse {
         std.debug.print("lower UnknownName struct {s} field {s}\n", .{ tn, field });
         return error.UnknownName;
@@ -2034,6 +2270,34 @@ fn fieldOffset(ctx: *Ctx, base_expr: *ast.Expr, field: []const u8) LowerError!i6
 
 fn isFloatTypeName(name: []const u8) bool {
     return std.mem.eql(u8, name, "f64") or std.mem.eql(u8, name, "f32");
+}
+
+fn isUnsignedTypeName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "u64") or
+        std.mem.eql(u8, name, "u32") or
+        std.mem.eql(u8, name, "u16") or
+        std.mem.eql(u8, name, "u8") or
+        std.mem.eql(u8, name, "byte") or
+        std.mem.eql(u8, name, "usize");
+}
+
+/// True when this expr should use unsigned div/rem/cmp (uN locals, casts, or
+/// integer literals whose magnitude does not fit in i64).
+fn isUnsignedish(ctx: *Ctx, e: *ast.Expr) bool {
+    if (inferTypeNameFromExpr(ctx, e)) |tn| {
+        if (isUnsignedTypeName(tn)) return true;
+    }
+    return switch (e.*) {
+        .int => |n| n > std.math.maxInt(i64),
+        .binary => |b| isUnsignedish(ctx, b.left) or isUnsignedish(ctx, b.right),
+        .unary => |u| isUnsignedish(ctx, u.expr),
+        .cast => |c| isUnsignedTypeName(typeExprName(c.ty)),
+        .ident => |n| blk: {
+            if (ctx.meta.get(n)) |m| break :blk isUnsignedTypeName(m.type_name);
+            break :blk false;
+        },
+        else => false,
+    };
 }
 
 fn isFloatish(ctx: *Ctx, e: *ast.Expr) bool {
@@ -2112,7 +2376,8 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
         },
         .int => |n| {
             const d = try ctx.fresh();
-            try ctx.emit(.{ .op = .iconst, .dst = d, .aux = n });
+            const bits = intLiteralBits(n) orelse return error.TypeError;
+            try ctx.emit(.{ .op = .iconst, .dst = d, .aux = bits });
             return d;
         },
         .float => |n| {
@@ -2122,11 +2387,8 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
             return d;
         },
         .string => |s| {
-            const idx: i64 = @intCast(ctx.strings.items.len);
-            try ctx.strings.append(ctx.a, try ctx.a.dupe(u8, s));
-            const d = try ctx.fresh();
-            try ctx.emit(.{ .op = .saddr, .dst = d, .aux = idx });
-            return d;
+            // `str` / `bytes` are `{ ptr, len }` headers — not a bare data pointer.
+            return try lowerStringSlice(ctx, s);
         },
         .null_lit => {
             const d = try ctx.fresh();
@@ -2199,18 +2461,19 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
             const r = try lowerExpr(ctx, b.right);
             const d = try ctx.fresh();
             const use_float = isFloatish(ctx, b.left) or isFloatish(ctx, b.right);
+            const use_unsigned = !use_float and (isUnsignedish(ctx, b.left) or isUnsignedish(ctx, b.right));
             switch (b.op) {
                 .add => try ctx.emit(.{ .op = if (use_float) .fadd else .add, .dst = d, .src0 = l, .src1 = r }),
                 .sub => try ctx.emit(.{ .op = if (use_float) .fsub else .sub, .dst = d, .src0 = l, .src1 = r }),
                 .mul => try ctx.emit(.{ .op = if (use_float) .fmul else .mul, .dst = d, .src0 = l, .src1 = r }),
-                .div => try ctx.emit(.{ .op = if (use_float) .fdiv else .div, .dst = d, .src0 = l, .src1 = r }),
-                .rem => try ctx.emit(.{ .op = .rem, .dst = d, .src0 = l, .src1 = r }),
+                .div => try ctx.emit(.{ .op = if (use_float) .fdiv else if (use_unsigned) .udiv else .div, .dst = d, .src0 = l, .src1 = r }),
+                .rem => try ctx.emit(.{ .op = if (use_unsigned) .urem else .rem, .dst = d, .src0 = l, .src1 = r }),
                 .eq => try ctx.emit(.{ .op = .eq, .dst = d, .src0 = l, .src1 = r }),
                 .neq => try ctx.emit(.{ .op = .ne, .dst = d, .src0 = l, .src1 = r }),
-                .lt => try ctx.emit(.{ .op = .lt, .dst = d, .src0 = l, .src1 = r }),
-                .gt => try ctx.emit(.{ .op = .lt, .dst = d, .src0 = r, .src1 = l }),
-                .lte => try ctx.emit(.{ .op = .le, .dst = d, .src0 = l, .src1 = r }),
-                .gte => try ctx.emit(.{ .op = .le, .dst = d, .src0 = r, .src1 = l }),
+                .lt => try ctx.emit(.{ .op = if (use_unsigned) .ult else .lt, .dst = d, .src0 = l, .src1 = r }),
+                .gt => try ctx.emit(.{ .op = if (use_unsigned) .ult else .lt, .dst = d, .src0 = r, .src1 = l }),
+                .lte => try ctx.emit(.{ .op = if (use_unsigned) .ule else .le, .dst = d, .src0 = l, .src1 = r }),
+                .gte => try ctx.emit(.{ .op = if (use_unsigned) .ule else .le, .dst = d, .src0 = r, .src1 = l }),
                 .bit_and => try ctx.emit(.{ .op = .bit_and, .dst = d, .src0 = l, .src1 = r }),
                 .bit_or => try ctx.emit(.{ .op = .bit_or, .dst = d, .src0 = l, .src1 = r }),
                 .bit_xor => try ctx.emit(.{ .op = .bit_xor, .dst = d, .src0 = l, .src1 = r }),
@@ -2290,6 +2553,18 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
         .index => |ix| {
             try maybeBoundsCheck(ctx, ix.base, ix.index);
             const addr = try lowerIndexAddr(ctx, ix.base, ix.index);
+            // Struct / str / bytes elements are multi-word — copy into a fresh header.
+            if (indexElemBytes(ctx, ix.base)) |nbytes| {
+                const sz = try ctx.fresh();
+                try ctx.emit(.{ .op = .iconst, .dst = sz, .aux = nbytes });
+                const cid = ctx.callee_map.get("jogrt_ret_alloc").?;
+                const dst = try ctx.fresh();
+                var allo = Inst{ .op = .call, .dst = dst, .aux = cid, .arity = 1 };
+                allo.args[0] = sz;
+                try ctx.emit(allo);
+                try emitWordCopy(ctx, dst, addr, nbytes);
+                return dst;
+            }
             const d = try ctx.fresh();
             if (indexLoadStoreWidth(ctx, ix.base) == 1) {
                 try ctx.emit(.{ .op = .load8, .dst = d, .src0 = addr });
@@ -2394,8 +2669,11 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
             const to = try metaForTypeExpr(ctx.a, c.ty, ctx.structs, ctx.ifaces);
             const src_float = isFloatish(ctx, c.expr);
             const dst_float = isFloatTypeName(to_name);
+            // Pointer / optional / iface casts are bitcasts of the address word — never narrow.
+            const to_is_ptr = c.ty.* == .pointer or c.ty.* == .pointer_const or c.ty.* == .optional or
+                to.kind == .raw_ptr or to.kind == .struct_ptr or to.kind == .iface_ptr or to.kind == .opt_ptr;
             // Types.md: numeric `as` is a checked convert, not a bitcast.
-            if (src_float and !dst_float) {
+            if (!to_is_ptr and src_float and !dst_float) {
                 const conv = try ctx.fresh();
                 try ctx.emit(.{ .op = .fptosi, .dst = conv, .src0 = v });
                 const bits = scalarBits(to_name);
@@ -2406,17 +2684,19 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
                 }
                 return conv;
             }
-            if (!src_float and dst_float) {
+            if (!to_is_ptr and !src_float and dst_float) {
                 const d = try ctx.fresh();
                 try ctx.emit(.{ .op = .sitofp, .dst = d, .src0 = v });
                 return d;
             }
-            // narrow ints via `as` when target bits known
-            const bits = scalarBits(to_name);
-            if (bits > 0 and bits < 64) {
-                const d = try ctx.fresh();
-                try ctx.emit(.{ .op = .narrow, .dst = d, .src0 = v, .aux = bits });
-                return d;
+            // narrow ints via `as` when target bits known (not pointer targets)
+            if (!to_is_ptr) {
+                const bits = scalarBits(to_name);
+                if (bits > 0 and bits < 64) {
+                    const d = try ctx.fresh();
+                    try ctx.emit(.{ .op = .narrow, .dst = d, .src0 = v, .aux = bits });
+                    return d;
+                }
             }
             // iface coerce from concrete struct ptr
             if (to.kind == .iface_ptr) {
@@ -2560,7 +2840,10 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
                 try mangleNamedApp(ctx.a, sl.type_name, sl.type_args)
             else
                 sl.type_name;
-            const sd = ctx.structs.get(tname) orelse return error.UnknownName;
+            const sd = ctx.structs.get(tname) orelse {
+                std.debug.print("struct_lit missing {s}\n", .{tname});
+                return error.UnknownName;
+            };
             const size: i64 = @intCast(sd.fields.len * 8);
             if (size == 0) {
                 // empty-ish: still alloc 8
@@ -2602,6 +2885,33 @@ fn scalarBits(name: []const u8) i64 {
     return 0;
 }
 
+/// Allocate a zeroed struct/slice header value (used for `Type()` and `bytes()`).
+fn lowerEmptyStructValue(ctx: *Ctx, tname: []const u8) LowerError!u32 {
+    const sd = ctx.structs.get(tname) orelse {
+        std.debug.print("struct_lit missing {s}\n", .{tname});
+        return error.UnknownName;
+    };
+    const size: i64 = @intCast(sd.fields.len * 8);
+    const sz = try ctx.fresh();
+    try ctx.emit(.{ .op = .iconst, .dst = sz, .aux = if (size == 0) 8 else size });
+    const cid = ctx.callee_map.get("jogrt_ret_alloc").?;
+    const ptr = try ctx.fresh();
+    var allo = Inst{ .op = .call, .dst = ptr, .aux = cid, .arity = 1 };
+    allo.args[0] = sz;
+    try ctx.emit(allo);
+    var fi: usize = 0;
+    while (fi < sd.fields.len) : (fi += 1) {
+        const z = try ctx.fresh();
+        try ctx.emit(.{ .op = .iconst, .dst = z, .aux = 0 });
+        const addr = try ctx.fresh();
+        const off_s = try ctx.fresh();
+        try ctx.emit(.{ .op = .iconst, .dst = off_s, .aux = @intCast(fi * 8) });
+        try ctx.emit(.{ .op = .add, .dst = addr, .src0 = ptr, .src1 = off_s });
+        try ctx.emit(.{ .op = .store, .src0 = addr, .src1 = z });
+    }
+    return ptr;
+}
+
 fn layoutSizeOfName(name: []const u8) i64 {
     const leaf = typeNameLeaf(name);
     if (std.mem.eql(u8, leaf, "u8") or std.mem.eql(u8, leaf, "i8") or std.mem.eql(u8, leaf, "byte") or std.mem.eql(u8, leaf, "bool") or std.mem.eql(u8, leaf, "char"))
@@ -2609,17 +2919,43 @@ fn layoutSizeOfName(name: []const u8) i64 {
     if (std.mem.eql(u8, leaf, "u16") or std.mem.eql(u8, leaf, "i16")) return 2;
     if (std.mem.eql(u8, leaf, "u32") or std.mem.eql(u8, leaf, "i32") or std.mem.eql(u8, leaf, "f32") or std.mem.eql(u8, leaf, "int"))
         return 4;
-    // pointers, 64-bit scalars, unknown named types: 8 for now
+    if (std.mem.eql(u8, leaf, "str") or std.mem.eql(u8, leaf, "bytes"))
+        return 16; // `{ ptr, len }` slice header
+    // pointers, 64-bit scalars: 8. Struct sizes need the structs map — see layoutSizeOf.
     return 8;
 }
 
 fn layoutAlignOfName(name: []const u8) i64 {
+    const leaf = typeNameLeaf(name);
+    if (std.mem.eql(u8, leaf, "str") or std.mem.eql(u8, leaf, "bytes")) return 8;
     return layoutSizeOfName(name); // power-of-two scalars; pointers 8
+}
+
+fn layoutSizeOf(ctx: *Ctx, name: []const u8) i64 {
+    const leaf = typeNameLeaf(name);
+    if (ctx.structs.get(leaf)) |sd| {
+        if (sd.fields.len == 0) return 8;
+        return @intCast(sd.fields.len * 8);
+    }
+    return layoutSizeOfName(name);
 }
 
 fn lowerCall(ctx: *Ctx, c: ast.Call) LowerError!u32 {
     if (c.callee.* == .ident) {
         const name = c.callee.ident;
+        // Empty byte slice header `{ ptr: null, len: 0 }`.
+        if (std.mem.eql(u8, name, "bytes")) {
+            if (c.args.len != 0) return error.TooManyArgs;
+            return try lowerEmptyStructValue(ctx, blk: {
+                const elem = try ctx.a.create(ast.TypeExpr);
+                elem.* = .{ .name = "byte" };
+                break :blk try ensureSliceStruct(ctx.a, ctx.structs, elem);
+            });
+        }
+        // Zero-value struct: `StrBuilder()` / `ByteIter()` when Name is a struct type.
+        if (c.args.len == 0 and c.type_args.len == 0 and ctx.structs.contains(name)) {
+            return try lowerEmptyStructValue(ctx, name);
+        }
         if (std.mem.eql(u8, name, "size") or std.mem.eql(u8, name, "align")) {
             if (c.args.len != 1) return error.TypeError;
             const arg = c.args[0];
@@ -2628,7 +2964,7 @@ fn lowerCall(ctx: *Ctx, c: ast.Call) LowerError!u32 {
                 if (inferTypeNameFromExpr(ctx, arg)) |tn| break :blk tn;
                 break :blk "i64";
             };
-            const n: i64 = if (std.mem.eql(u8, name, "size")) layoutSizeOfName(tname) else layoutAlignOfName(tname);
+            const n: i64 = if (std.mem.eql(u8, name, "size")) layoutSizeOf(ctx, tname) else layoutAlignOfName(tname);
             const d = try ctx.fresh();
             try ctx.emit(.{ .op = .iconst, .dst = d, .aux = n });
             return d;
@@ -3084,8 +3420,16 @@ fn lowerMethodOrIfaceCall(
         return try lowerIfaceMethod(ctx, base_slot, method, args);
     }
 
-    const key = try std.fmt.allocPrint(ctx.a, "{s}.{s}", .{ concrete, method });
-    const mi = ctx.methods.get(key) orelse return error.UnknownName;
+    // `__Slice_byte` is the layout name for `str`/`bytes`; methods attach to `str`.
+    const recv = if (std.mem.eql(u8, concrete, "__Slice_byte")) "str" else concrete;
+    const key = try std.fmt.allocPrint(ctx.a, "{s}.{s}", .{ recv, method });
+    const mi = ctx.methods.get(key) orelse blk: {
+        if (std.mem.eql(u8, recv, "str")) {
+            const alt = try std.fmt.allocPrint(ctx.a, "bytes.{s}", .{method});
+            break :blk ctx.methods.get(alt) orelse return error.UnknownName;
+        }
+        return error.UnknownName;
+    };
     const cid = ctx.callee_map.get(mi.mangled) orelse return error.UnknownName;
 
     var arg_slots: [16]u32 = .{none} ** 16;
@@ -3163,6 +3507,28 @@ fn lowerIfaceMethod(ctx: *Ctx, fat: u32, method: []const u8, args: []*ast.Expr) 
     return d;
 }
 
+fn lowerStringSlice(ctx: *Ctx, s: []const u8) LowerError!u32 {
+    const idx: i64 = @intCast(ctx.strings.items.len);
+    try ctx.strings.append(ctx.a, try ctx.a.dupe(u8, s));
+    const data = try ctx.fresh();
+    const len = try ctx.fresh();
+    try ctx.emit(.{ .op = .saddr, .dst = data, .aux = idx });
+    try ctx.emit(.{ .op = .slen, .dst = len, .aux = idx });
+    const hdr = try lowerEmptyStructValue(ctx, blk: {
+        const elem = try ctx.a.create(ast.TypeExpr);
+        elem.* = .{ .name = "byte" };
+        break :blk try ensureSliceStruct(ctx.a, ctx.structs, elem);
+    });
+    // ptr at offset 0, len at offset 8
+    try ctx.emit(.{ .op = .store, .src0 = hdr, .src1 = data });
+    const eight = try ctx.fresh();
+    try ctx.emit(.{ .op = .iconst, .dst = eight, .aux = 8 });
+    const len_addr = try ctx.fresh();
+    try ctx.emit(.{ .op = .add, .dst = len_addr, .src0 = hdr, .src1 = eight });
+    try ctx.emit(.{ .op = .store, .src0 = len_addr, .src1 = len });
+    return hdr;
+}
+
 fn lowerPrintArgs(ctx: *Ctx, e: *ast.Expr) LowerError!struct { u32, u32 } {
     if (e.* == .string) {
         const idx: i64 = @intCast(ctx.strings.items.len);
@@ -3172,6 +3538,23 @@ fn lowerPrintArgs(ctx: *Ctx, e: *ast.Expr) LowerError!struct { u32, u32 } {
         try ctx.emit(.{ .op = .saddr, .dst = ptr, .aux = idx });
         try ctx.emit(.{ .op = .slen, .dst = len, .aux = idx });
         return .{ ptr, len };
+    }
+    // `str` / `bytes` / slice header: load `.ptr` and `.len`.
+    if (inferMetaFromExpr(ctx, e)) |m| {
+        if (m.kind == .struct_ptr and (std.mem.startsWith(u8, m.type_name, "__Slice_") or
+            std.mem.eql(u8, m.type_name, "str") or std.mem.eql(u8, m.type_name, "bytes")))
+        {
+            const base = try lowerExpr(ctx, e);
+            const ptr = try ctx.fresh();
+            try ctx.emit(.{ .op = .load, .dst = ptr, .src0 = base });
+            const eight = try ctx.fresh();
+            try ctx.emit(.{ .op = .iconst, .dst = eight, .aux = 8 });
+            const len_addr = try ctx.fresh();
+            try ctx.emit(.{ .op = .add, .dst = len_addr, .src0 = base, .src1 = eight });
+            const len = try ctx.fresh();
+            try ctx.emit(.{ .op = .load, .dst = len, .src0 = len_addr });
+            return .{ ptr, len };
+        }
     }
     const ptr = try lowerExpr(ctx, e);
     const len = try ctx.fresh();

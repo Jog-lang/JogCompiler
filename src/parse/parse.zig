@@ -1298,9 +1298,9 @@ pub const Parser = struct {
     fn parsePostfix(self: *Parser) ParseError!*ast.Expr {
         var e = try self.parsePrimary();
         while (true) {
-            // Generic call: `id<i64>(…)` — `<` after ident before `(`.
+            // Generic call: `id<i64>(…)` or `pkg.fn<i64>(…)` — `<` after ident/field before `(`.
             var pending_targs: []*ast.TypeExpr = &.{};
-            if (e.* == .ident and self.tok.kind == .lt) {
+            if ((e.* == .ident or e.* == .field) and self.tok.kind == .lt) {
                 const save = self.snapshot();
                 const targs = self.parseTypeArgList() catch {
                     self.restore(save);
@@ -1496,6 +1496,8 @@ pub const Parser = struct {
                 if (self.tok.kind == .lparen) {
                     // Could be call or struct lit — treat as call at expression level;
                     // struct lit uses Name(field: val) with named fields.
+                    // Name() with no args stays a call; lower/check turn it into a
+                    // zero struct value when Name is a struct type (StrBuilder(), etc.).
                     // Lookahead: after ( if ident then : → struct lit
                     const save = self.snapshot();
                     self.advance();
@@ -1562,10 +1564,12 @@ pub const Parser = struct {
             .int => {
                 const text = self.tok.text;
                 self.advance();
-                const n: i64 = if (text.len >= 2 and text[0] == '0' and (text[1] == 'x' or text[1] == 'X'))
-                    try std.fmt.parseInt(i64, text[2..], 16)
+                // i128 so u64-range magnitudes (e.g. 2^63 for i64-min) parse.
+                // Values outside signed i128 still error.Overflow.
+                const n: i128 = if (text.len >= 2 and text[0] == '0' and (text[1] == 'x' or text[1] == 'X'))
+                    try std.fmt.parseInt(i128, text[2..], 16)
                 else
-                    try std.fmt.parseInt(i64, text, 10);
+                    try std.fmt.parseInt(i128, text, 10);
                 e.* = .{ .int = n };
                 return e;
             },

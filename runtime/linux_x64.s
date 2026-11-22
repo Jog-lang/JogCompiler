@@ -18,6 +18,12 @@ jogrt_ret_arena:
   .zero JOGRT_RET_ARENA_SIZE
 jogrt_ret_ptr:
   .zero 8
+# Error-text bump arena (std.c.copyCStr / std.mem.ErrorArena).
+.set JOGRT_ERROR_ARENA_SIZE, 262144
+jogrt_error_arena:
+  .zero JOGRT_ERROR_ARENA_SIZE
+jogrt_error_ptr:
+  .zero 8
 # Process args (captured at main entry from CRT or freestanding _start).
 .globl jogrt_argc_val
 jogrt_argc_val:
@@ -119,6 +125,81 @@ jogrt_alloc_reset:
   lea rdi, [rip + jogrt_heap]
 1:
   mov qword ptr [rcx], rdi
+  xor eax, eax
+  ret
+
+# Error arena bump: jogrt_error_alloc(size, align). size in rdi; align in rsi (ignored; 8-byte).
+.globl jogrt_error_alloc
+.type jogrt_error_alloc, @function
+jogrt_error_alloc:
+  lea rcx, [rip + jogrt_error_ptr]
+  mov rax, qword ptr [rcx]
+  test rax, rax
+  jnz 1f
+  lea rax, [rip + jogrt_error_arena]
+1:
+  add rdi, 7
+  and rdi, -8
+  mov rdx, rax
+  add rax, rdi
+  lea rsi, [rip + jogrt_error_arena]
+  add rsi, JOGRT_ERROR_ARENA_SIZE
+  cmp rax, rsi
+  ja 2f
+  mov qword ptr [rcx], rax
+  mov rax, rdx
+  ret
+2:
+  xor eax, eax
+  ret
+
+# Bump realloc: jogrt_realloc(ptr, old_size, new_size, align).
+# rdi=ptr rsi=old rdx=new rcx=align. Allocates fresh; copies min(old,new).
+.globl jogrt_realloc
+.type jogrt_realloc, @function
+jogrt_realloc:
+  push rbx
+  push r12
+  push r13
+  push r14
+  mov rbx, rdi
+  mov r12, rsi
+  mov r14, rdx
+  mov rdi, rdx
+  call jogrt_alloc
+  test rax, rax
+  jz 3f
+  test rbx, rbx
+  jz 3f
+  mov rcx, r12
+  cmp rcx, r14
+  jbe 1f
+  mov rcx, r14
+1:
+  test rcx, rcx
+  jz 3f
+  mov rsi, rbx
+  mov rdi, rax
+  mov r13, rax
+2:
+  mov al, byte ptr [rsi]
+  mov byte ptr [rdi], al
+  inc rsi
+  inc rdi
+  dec rcx
+  jnz 2b
+  mov rax, r13
+3:
+  pop r14
+  pop r13
+  pop r12
+  pop rbx
+  ret
+
+# Bump free: no-op (heap is bump-only).
+.globl jogrt_free
+.type jogrt_free, @function
+jogrt_free:
   xor eax, eax
   ret
 

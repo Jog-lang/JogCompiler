@@ -268,6 +268,8 @@ fn emitInst(writer: anytype, prog: *const ir.Program, fname: []const u8, ninst: 
         .mul => try writer.print("  s[{d}] = s[{d}] * s[{d}];\n", .{ inst.dst, inst.src0, inst.src1 }),
         .div => try writer.print("  s[{d}] = s[{d}] / s[{d}];\n", .{ inst.dst, inst.src0, inst.src1 }),
         .rem => try writer.print("  s[{d}] = s[{d}] % s[{d}];\n", .{ inst.dst, inst.src0, inst.src1 }),
+        .udiv => try writer.print("  s[{d}] = (int64_t)((uint64_t)s[{d}] / (uint64_t)s[{d}]);\n", .{ inst.dst, inst.src0, inst.src1 }),
+        .urem => try writer.print("  s[{d}] = (int64_t)((uint64_t)s[{d}] % (uint64_t)s[{d}]);\n", .{ inst.dst, inst.src0, inst.src1 }),
         .fadd, .fsub, .fmul, .fdiv => {
             const op: []const u8 = switch (inst.op) {
                 .fadd => "+",
@@ -308,6 +310,8 @@ fn emitInst(writer: anytype, prog: *const ir.Program, fname: []const u8, ninst: 
         .ne => try writer.print("  s[{d}] = s[{d}] != s[{d}];\n", .{ inst.dst, inst.src0, inst.src1 }),
         .lt => try writer.print("  s[{d}] = s[{d}] < s[{d}];\n", .{ inst.dst, inst.src0, inst.src1 }),
         .le => try writer.print("  s[{d}] = s[{d}] <= s[{d}];\n", .{ inst.dst, inst.src0, inst.src1 }),
+        .ult => try writer.print("  s[{d}] = (uint64_t)s[{d}] < (uint64_t)s[{d}];\n", .{ inst.dst, inst.src0, inst.src1 }),
+        .ule => try writer.print("  s[{d}] = (uint64_t)s[{d}] <= (uint64_t)s[{d}];\n", .{ inst.dst, inst.src0, inst.src1 }),
         .neg => try writer.print("  s[{d}] = -s[{d}];\n", .{ inst.dst, inst.src0 }),
         .bit_not => try writer.print("  s[{d}] = ~s[{d}];\n", .{ inst.dst, inst.src0 }),
         .call => try emitCall(writer, prog, inst, false),

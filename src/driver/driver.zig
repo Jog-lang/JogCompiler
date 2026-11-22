@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const ast = @import("../ast/ast.zig");
 const parse = @import("../parse/parse.zig");
 const check_mod = @import("../check/check.zig");
@@ -6,6 +7,28 @@ const ir = @import("../ir/ir.zig");
 const link = @import("../codegen/link.zig");
 const mod = @import("../mod/mod.zig");
 const roots_mod = @import("roots.zig");
+
+/// True when `basename` is a platform file for an OS other than this host.
+/// Keeps `.posix.jog` on linux/macos; drops `.windows.jog` on linux, etc.
+fn isForeignPlatformSource(basename: []const u8) bool {
+    const host: []const u8 = switch (builtin.os.tag) {
+        .windows => "windows",
+        .macos => "macos",
+        .linux => "linux",
+        else => "linux",
+    };
+    const plats = [_][]const u8{ "windows", "linux", "macos", "wasm", "posix" };
+    for (plats) |plat| {
+        var buf: [32]u8 = undefined;
+        const suf = std.fmt.bufPrint(&buf, ".{s}.jog", .{plat}) catch continue;
+        if (!std.mem.endsWith(u8, basename, suf)) continue;
+        if (std.mem.eql(u8, plat, "posix")) {
+            return !(std.mem.eql(u8, host, "linux") or std.mem.eql(u8, host, "macos"));
+        }
+        return !std.mem.eql(u8, plat, host);
+    }
+    return false;
+}
 
 pub const version_string = "jog 0.2.11-v2 (zig host, object+std/core; ir→asm→native | ir→c→emcc; jog ide JSON)";
 
@@ -382,6 +405,7 @@ fn resolvePackageEntry(allocator: std.mem.Allocator, module_dir: []const u8, pac
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".jog")) continue;
         if (std.mem.endsWith(u8, entry.name, ".test.jog")) continue;
+        if (isForeignPlatformSource(entry.name)) continue;
         return try std.fs.path.join(allocator, &.{ pkg_dir_buf.items, entry.name });
     }
     return null;
@@ -423,6 +447,7 @@ fn enqueuePackageSiblings(
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".jog")) continue;
         if (std.mem.endsWith(u8, entry.name, ".test.jog")) continue;
+        if (isForeignPlatformSource(entry.name)) continue;
         const cand = try std.fs.path.join(allocator, &.{ dir, entry.name });
         defer allocator.free(cand);
         if (seen.contains(cand)) continue;
@@ -442,6 +467,7 @@ fn appendPackageSiblings(allocator: std.mem.Allocator, path_list: *std.ArrayList
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".jog")) continue;
         if (std.mem.endsWith(u8, entry.name, ".test.jog")) continue;
+        if (isForeignPlatformSource(entry.name)) continue;
         const cand = try std.fs.path.join(allocator, &.{ dir, entry.name });
         defer allocator.free(cand);
         try appendUniquePath(path_list, allocator, cand);
