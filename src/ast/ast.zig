@@ -274,7 +274,10 @@ pub const WithStmt = struct {
 
 pub const Expr = union(enum) {
     ident: []const u8,
-    int: i64,
+    /// Decimal/hex integer literal. Wider than i64 so values like
+    /// `9223372036854775808` (u64 2^63) parse; lowering truncates to
+    /// 64-bit bits for `iconst`.
+    int: i128,
     float: f64,
     string: []const u8,
     /// `c"…"` — string bytes with trailing NUL for FFI.

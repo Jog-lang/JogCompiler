@@ -1,5 +1,76 @@
+// POSIX actuals for std.os. env views live until the next getenv.
+// hostname/exe_path copy into the error arena via copyCStr.
+// Stack `buf[..].ptr` is not lowered yet (Friction); use malloc buffers.
+
 import std.c
+import std.mem
+import std.text
 
 actual fn env(name: str): (str, bool) {
-    return ("", false)
+    with (mem.heap()) {
+        val p = name.cstr()
+        val r = c.getenv(p)
+        free_cstr(p, name.len)
+        if r == null {
+            return "", false
+        }
+        return c.fromCStr(r as *const c.char), true
+    }
+}
+
+actual fn setenv(name: str, value: str): bool {
+    with (mem.heap()) {
+        val n = name.cstr()
+        val v = value.cstr()
+        val rc = c.setenv(n, v, 1)
+        free_cstr(n, name.len)
+        free_cstr(v, value.len)
+        return rc == 0
+    }
+}
+
+actual fn unsetenv(name: str): bool {
+    with (mem.heap()) {
+        val n = name.cstr()
+        val rc = c.unsetenv(n)
+        free_cstr(n, name.len)
+        return rc == 0
+    }
+}
+
+actual fn pid(): i64 {
+    return c.getpid() as i64
+}
+
+actual fn hostname(): (str, bool) {
+    val raw = c.malloc(256)
+    if raw == null {
+        return "", false
+    }
+    val p = raw!!
+    if c.gethostname(p as *c.char, 256) != 0 {
+        c.free(p)
+        return "", false
+    }
+    val s = c.copyCStr(p as *const c.char)
+    c.free(p)
+    return s, true
+}
+
+actual fn exe_path(): (str, bool) {
+    val raw = c.malloc(4096)
+    if raw == null {
+        return "", false
+    }
+    val p = raw!!
+    val n = c.readlink(c"/proc/self/exe", p as *c.char, 4095)
+    if n < 0 {
+        c.free(p)
+        return "", false
+    }
+    val bytes_p = p as *u8
+    bytes_p[n as usize] = 0
+    val s = c.copyCStr(p as *const c.char)
+    c.free(p)
+    return s, true
 }

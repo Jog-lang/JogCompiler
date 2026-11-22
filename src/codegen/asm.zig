@@ -248,6 +248,18 @@ fn emitInst(writer: anytype, prog: *const ir.Program, fname: []const u8, ninst: 
             try writer.print("  idiv qword ptr [rbp - {d}]\n", .{slot(inst.src1)});
             try writer.print("  mov qword ptr [rbp - {d}], rdx\n", .{slot(inst.dst)});
         },
+        .udiv => {
+            try writer.print("  mov rax, qword ptr [rbp - {d}]\n", .{slot(inst.src0)});
+            try writer.writeAll("  xor rdx, rdx\n");
+            try writer.print("  div qword ptr [rbp - {d}]\n", .{slot(inst.src1)});
+            try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{slot(inst.dst)});
+        },
+        .urem => {
+            try writer.print("  mov rax, qword ptr [rbp - {d}]\n", .{slot(inst.src0)});
+            try writer.writeAll("  xor rdx, rdx\n");
+            try writer.print("  div qword ptr [rbp - {d}]\n", .{slot(inst.src1)});
+            try writer.print("  mov qword ptr [rbp - {d}], rdx\n", .{slot(inst.dst)});
+        },
         .fadd, .fsub, .fmul, .fdiv => {
             try writer.print("  movsd xmm0, qword ptr [rbp - {d}]\n", .{slot(inst.src0)});
             const mop = switch (inst.op) {
@@ -301,7 +313,7 @@ fn emitInst(writer: anytype, prog: *const ir.Program, fname: []const u8, ninst: 
             try writer.writeAll("  shr rax, cl\n");
             try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{slot(inst.dst)});
         },
-        .eq, .ne, .lt, .le => {
+        .eq, .ne, .lt, .le, .ult, .ule => {
             try writer.print("  mov rax, qword ptr [rbp - {d}]\n", .{slot(inst.src0)});
             try writer.print("  cmp rax, qword ptr [rbp - {d}]\n", .{slot(inst.src1)});
             const set = switch (inst.op) {
@@ -309,6 +321,8 @@ fn emitInst(writer: anytype, prog: *const ir.Program, fname: []const u8, ninst: 
                 .ne => "setne",
                 .lt => "setl",
                 .le => "setle",
+                .ult => "setb",
+                .ule => "setbe",
                 else => unreachable,
             };
             try writer.print("  {s} al\n", .{set});

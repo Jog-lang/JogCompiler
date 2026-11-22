@@ -1,0 +1,62 @@
+// std.conv parse/format/hex. t.expect / t.expectEq.
+
+import std.mem
+import std.testing
+
+@test
+fn parseI64Basics() with (t: testing.Testing) {
+    val (a, oka) = parse_i64("42", 10)
+    t.expect(oka)
+    t.expect(a == 42)
+    val (b, okb) = parse_i64("-7", 10)
+    t.expect(okb)
+    t.expect(b == -7)
+    val (c, okc) = parse_i64("FF", 16)
+    t.expect(okc)
+    t.expect(c == 255)
+    val (_, bad) = parse_i64("", 10)
+    t.expect(!bad)
+}
+
+@test
+fn parseI64Min() with (t: testing.Testing) {
+    val (v, ok) = parse_i64("-9223372036854775808", 10)
+    t.expect(ok)
+    t.expect(v == -9223372036854775808)
+}
+
+@test
+fn formatRoundTrip() with (t: testing.Testing) {
+    with (mem.heap()) {
+        val s = format_i64(255, 16)
+        t.expectEq(s, "ff")
+        val (n, ok) = parse_i64(s, 16)
+        t.expect(ok)
+        t.expect(n == 255)
+        var block = bytes()
+        block.ptr = s.ptr as *u8
+        block.len = s.len
+        mem.heap().free(block)
+    }
+}
+
+@test
+fn hexRoundTrip() with (t: testing.Testing) {
+    with (mem.heap()) {
+        var raw = bytes()
+        raw.ptr = ("hi").ptr as *u8
+        raw.len = 2
+        val enc = hex_encode(raw)
+        t.expectEq(enc, "6869")
+        val (dec, ok) = hex_decode(enc)
+        t.expect(ok)
+        t.expect(dec.len == 2)
+        t.expect(dec.ptr[0] == 'h' as u8)
+        t.expect(dec.ptr[1] == 'i' as u8)
+        var eb = bytes()
+        eb.ptr = enc.ptr as *u8
+        eb.len = enc.len
+        mem.heap().free(eb)
+        mem.heap().free(dec)
+    }
+}

@@ -1,22 +1,33 @@
-// abs, min, max, and sqrt. t.expect takes a bool.
+// Free-fn abs/min/max/clamp/sign and libm sqrt. t.expect takes a bool.
 
 import std.testing
 
 @test
 fn absMinMaxSqrt() with (t: testing.Testing) {
-    val neg: i64 = -5
-    val pos: i64 = 5
-    t.expect(neg.abs() == 5)
-    t.expect(pos.abs() == 5)
-    val negf: f64 = -4.0
-    t.expect(negf.abs() == 4.0)
+    t.expect(i64_abs(-5) == 5)
+    t.expect(i64_abs(5) == 5)
+    t.expect(f64_abs(-4.0) == 4.0)
     t.expectPanic() {
-        val n: i64 = -9223372036854775808
-        n.abs()
+        i64_abs(-9223372036854775808)
     }
     t.expect(min(2, 5) == 2)
     t.expect(min(5, 2) == 2)
     t.expect(max(2, 5) == 5)
     t.expect(max(5, 2) == 5)
     t.expect(sqrt(4.0) == 2.0)
+}
+
+@test
+fn clampSign() with (t: testing.Testing) {
+    t.expect(clamp(5, 0, 10) == 5)
+    t.expect(clamp(-1, 0, 10) == 0)
+    t.expect(clamp(11, 0, 10) == 10)
+    t.expect(clampf(0.5, 0.0, 1.0) == 0.5)
+    t.expect(clampf(-1.0, 0.0, 1.0) == 0.0)
+    t.expect(sign(-3) == -1)
+    t.expect(sign(0) == 0)
+    t.expect(sign(7) == 1)
+    t.expect(signf(-2.0) == -1.0)
+    t.expect(signf(0.0) == 0.0)
+    t.expect(signf(2.0) == 1.0)
 }

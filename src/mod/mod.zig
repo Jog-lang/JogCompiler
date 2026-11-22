@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const Error = error{
     MissingJogMod,
@@ -303,6 +304,27 @@ pub fn resolveRequireDir(allocator: std.mem.Allocator, m: *const Manifest, spec:
     return try std.fs.path.join(allocator, &.{ m.dir, spec });
 }
 
+/// True when `basename` is a platform file for an OS other than this host.
+fn isForeignPlatformSource(basename: []const u8) bool {
+    const host: []const u8 = switch (builtin.os.tag) {
+        .windows => "windows",
+        .macos => "macos",
+        .linux => "linux",
+        else => "linux",
+    };
+    const plats = [_][]const u8{ "windows", "linux", "macos", "wasm", "posix" };
+    for (plats) |plat| {
+        var buf: [32]u8 = undefined;
+        const suf = std.fmt.bufPrint(&buf, ".{s}.jog", .{plat}) catch continue;
+        if (!std.mem.endsWith(u8, basename, suf)) continue;
+        if (std.mem.eql(u8, plat, "posix")) {
+            return !(std.mem.eql(u8, host, "linux") or std.mem.eql(u8, host, "macos"));
+        }
+        return !std.mem.eql(u8, plat, host);
+    }
+    return false;
+}
+
 /// Join module dir + relative sources, expanding directory `source` trees into `.jog` files.
 /// Skips `*.test.jog`, hidden names, `out/`, and nested modules (subfolders with their own `jog.mod`).
 /// Caller frees each path and the slice.
@@ -406,8 +428,11 @@ fn walkJogSources(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged([]c
                     allocator.free(child);
                     continue;
                 }
-                // OS-suffixed files other than always-loaded ones are still included;
-                // platform filtering is unchanged elsewhere (enqueuePlatformSiblings).
+                // Drop platform files for other OSes (e.g. *.windows.jog on linux).
+                if (isForeignPlatformSource(entry.name)) {
+                    allocator.free(child);
+                    continue;
+                }
                 if (containsPath(out.items, child)) {
                     allocator.free(child);
                     continue;
