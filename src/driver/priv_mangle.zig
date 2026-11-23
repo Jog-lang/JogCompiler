@@ -145,6 +145,11 @@ fn rewriteExpr(e: *ast.Expr, renames: *const std.StringHashMapUnmanaged([]const 
             rewriteExpr(ix.base, renames);
             rewriteExpr(ix.index, renames);
         },
+        .slice => |*sl| {
+            rewriteExpr(sl.base, renames);
+            if (sl.start) |s| rewriteExpr(s, renames);
+            if (sl.end) |en| rewriteExpr(en, renames);
+        },
         .cast, .try_cast => |*c| rewriteExpr(c.expr, renames),
         .is_type => |*it| rewriteExpr(it.expr, renames),
         .optional_call => |*oc| {
