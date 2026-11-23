@@ -22,6 +22,9 @@ extern {
     fn GetCurrentDirectoryW(cap: unsigned_long, buffer: *u16): unsigned_long
     fn GetEnvironmentVariableW(name: *u16, buf: *u16, cap: unsigned_long): unsigned_long
     fn SetEnvironmentVariableW(name: *u16, value: *u16?): int
+    // Double-NUL block of UTF-16 KEY=value strings; FreeEnvironmentStringsW after walk.
+    fn GetEnvironmentStringsW(): *u16?
+    fn FreeEnvironmentStringsW(block: *u16): int
     fn GetCurrentProcessId(): unsigned_long
     fn GetComputerNameW(buf: *u16, n: *unsigned_long): int
     fn GetModuleFileNameW(module: intptr_t, buf: *u16, cap: unsigned_long): unsigned_long

@@ -158,14 +158,64 @@ actual fn exe_path(): (str, bool) {
     return s, true
 }
 
-// Full GetEnvironmentStringsW walk is deferred (Friction); empty list for now.
+// Snapshot via GetEnvironmentStringsW → owned UTF-8 KEY=value (same contract as POSIX).
 actual fn environ(): list.List<str> {
-    return list.empty<str>()
+    with (mem.heap()) {
+        var xs = list.empty<str>()
+        val block = c.GetEnvironmentStringsW()
+        if block == null {
+            return xs
+        }
+        var p = block!!
+        for {
+            if p[0] == 0 {
+                break
+            }
+            var n: usize = 0
+            for {
+                if p[n] == 0 {
+                    break
+                }
+                n = n + 1
+            }
+            // UTF-8 needs at most 4 bytes per UTF-16 code unit, plus NUL.
+            val cap = n * 4 + 1
+            val utf8_raw = c.malloc(cap)
+            if utf8_raw != null {
+                val utf8 = utf8_raw!! as *u8
+                val len = c.wide_to_utf8(p, n, utf8, cap)
+                if len > 0 {
+                    utf8[len] = 0
+                    xs.push(c.fromCStr(utf8 as *const c.char).clone())
+                }
+                c.free(utf8_raw!!)
+            }
+            // Advance past this entry and its trailing UTF-16 NUL.
+            p = ((p as *u8) + ((n + 1) * 2)) as *u16
+        }
+        c.FreeEnvironmentStringsW(block!!)
+        return xs
+    }
 }
 
 actual fn free_environ(xs: list.List<str>) {
     with (mem.heap()) {
-        var owned = xs
-        owned.free()
+        free_environ_owned(xs)
     }
+}
+
+private fn free_environ_owned(xs: list.List<str>) with (a: mem.Allocator) {
+    var owned = xs
+    var i: usize = 0
+    for i < owned.len {
+        val s = owned.get(i)
+        if s.len > 0 {
+            var block = bytes()
+            block.ptr = s.ptr as *u8
+            block.len = s.len
+            a.free(block)
+        }
+        i = i + 1
+    }
+    owned.free()
 }
