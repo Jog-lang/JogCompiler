@@ -937,8 +937,26 @@ fn checkExpr(
                 if (type_name.len > 0) {
                     const key = try std.fmt.allocPrint(a, "{s}.{s}", .{ type_name, c.callee.field.name });
                     if (methods.get(key)) |md| {
-                        if (md.ret) |r| return try resolveTypeExpr(a, types, r, diags);
-                        return try voidType(a);
+                        // Bind trailing method type params from call site (`xs.map<i64>(…)` → R).
+                        var saved_tp: std.ArrayListUnmanaged(struct { []const u8, ?*TypeInfo }) = .{};
+                        if (c.type_args.len > 0 and md.type_params.len >= c.type_args.len) {
+                            const off = md.type_params.len - c.type_args.len;
+                            for (c.type_args, 0..) |ta, i| {
+                                const tp = md.type_params[off + i];
+                                const prev = types.get(tp);
+                                try saved_tp.append(a, .{ tp, prev });
+                                const concrete = try resolveTypeExpr(a, types, ta, diags);
+                                try types.put(a, tp, concrete);
+                            }
+                        }
+                        const result = if (md.ret) |r|
+                            try resolveTypeExpr(a, types, r, diags)
+                        else
+                            try voidType(a);
+                        for (saved_tp.items) |s| {
+                            if (s[1]) |p| try types.put(a, s[0], p) else _ = types.remove(s[0]);
+                        }
+                        return result;
                     }
                 }
                 const ti = try a.create(TypeInfo);

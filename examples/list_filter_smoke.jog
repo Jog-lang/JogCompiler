@@ -1,0 +1,25 @@
+import std.list
+import std.mem
+
+fn gt2(x: i64): bool {
+    return x > 2
+}
+
+fn main() {
+    with (mem.heap()) {
+        var xs = list.empty<i64>()
+        xs.push(1, 2, 3, 4)
+        var ys = xs.filter(gt2)
+        if ys.len != 2 { panic("filter len") }
+        if ys.get(0) != 3 { panic("filter 0") }
+        if !xs.any(gt2) { panic("any") }
+        if !xs.all(gt2) {
+            // expected false for all
+        } else {
+            panic("all should be false")
+        }
+        ys.free()
+        xs.free()
+        print("list.filter/any/all ok\n")
+    }
+}

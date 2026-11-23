@@ -761,6 +761,23 @@ fn substTypeExpr(a: std.mem.Allocator, te: *ast.TypeExpr, params: [][]const u8, 
             } };
             return out;
         },
+        .iface_fn => |ift| {
+            var nparams: std.ArrayListUnmanaged(ast.Param) = .{};
+            for (ift.params) |p| {
+                try nparams.append(a, .{
+                    .name = p.name,
+                    .ty = try substTypeExpr(a, p.ty, params, args),
+                    .is_pack = p.is_pack,
+                });
+            }
+            var nret: ?*ast.TypeExpr = null;
+            if (ift.ret) |r| nret = try substTypeExpr(a, r, params, args);
+            const nift = try a.create(ast.IfaceFnType);
+            nift.* = .{ .params = try nparams.toOwnedSlice(a), .ret = nret };
+            const out = try a.create(ast.TypeExpr);
+            out.* = .{ .iface_fn = nift };
+            return out;
+        },
         else => return try cloneTypeExpr(a, te),
     }
 }
@@ -867,29 +884,35 @@ fn ensureGenericMethod(
     recv_args: []*ast.TypeExpr,
     mangled_recv: []const u8,
 ) !void {
+    _ = recv_params;
     const sym = try opMethodSymbol(a, md.name);
     const mangled = try std.fmt.allocPrint(a, "{s}_{s}", .{ mangled_recv, sym });
     const key = try std.fmt.allocPrint(a, "{s}.{s}", .{ mangled_recv, md.name });
     if (methods.contains(key)) return;
 
-    // Receiver params only for type_subst (method-level R in map<R> needs extra args — skip for now).
-    var subst = try buildTypeSubst(a, recv_params, recv_args);
-    // Also bind any extra method type params that match by position if recv covers them.
-    for (md.type_params) |tp| {
-        if (subst.contains(tp)) continue;
-        // Unbound method-level param — leave for later explicit specialization.
+    // Full subst: receiver args, then method-level params (map<R> / fold<R>).
+    // Unbound method params default to the first receiver arg (R = T) so callback
+    // methods lower; call sites with matching explicit args (map<i64> on List<i64>) work.
+    var all_args: std.ArrayListUnmanaged(*ast.TypeExpr) = .{};
+    try all_args.appendSlice(a, recv_args);
+    while (all_args.items.len < md.type_params.len) {
+        if (recv_args.len == 0) break;
+        try all_args.append(a, recv_args[0]);
     }
+    if (all_args.items.len < md.type_params.len) return;
+    const subst_args = all_args.items;
+    const subst = try buildTypeSubst(a, md.type_params, subst_args);
 
     var params: std.ArrayListUnmanaged(ast.Param) = .{};
     for (md.params) |p| {
         try params.append(a, .{
             .name = p.name,
-            .ty = try substTypeExpr(a, p.ty, recv_params, recv_args),
+            .ty = try substTypeExpr(a, p.ty, md.type_params, subst_args),
             .is_pack = p.is_pack,
         });
     }
     var ret: ?*ast.TypeExpr = null;
-    if (md.ret) |r| ret = try substTypeExpr(a, r, recv_params, recv_args);
+    if (md.ret) |r| ret = try substTypeExpr(a, r, md.type_params, subst_args);
 
     var mret: []const u8 = "";
     var mret_meta: ?SlotMeta = null;
@@ -922,10 +945,10 @@ fn ensureGenericMethod(
         .type_subst = subst,
     });
 
-    // Instantiate nested generic free fns used in the body (store_elem<T>, …).
+    // Instantiate nested generic free fns used in the body (store_elem<T>, List<R>(), …).
     if (md.body) |body| {
         for (body.stmts) |s| {
-            try walkStmtInstantiateCtx(a, s, generic_fns, generic_structs, generic_methods, structs, methods, ifaces, fn_infos, callees, callee_map, specialized, specialized_methods, recv_params, recv_args);
+            try walkStmtInstantiateCtx(a, s, generic_fns, generic_structs, generic_methods, structs, methods, ifaces, fn_infos, callees, callee_map, specialized, specialized_methods, md.type_params, subst_args);
         }
     }
 }
@@ -1826,6 +1849,8 @@ fn metaForTypeExpr(a: std.mem.Allocator, te: *ast.TypeExpr, structs: *std.String
             const name = try ensureSliceStruct(a, structs, sv.elem);
             return .{ .kind = .struct_ptr, .type_name = name };
         },
+        // Function values / callbacks — one word (code address), called via `icall`.
+        .iface_fn => return .{ .kind = .scalar, .type_name = "iface_fn" },
         else => return .{ .kind = .scalar },
     }
 }
@@ -2415,8 +2440,19 @@ fn inferMetaFromExpr(ctx: *Ctx, e: *ast.Expr) ?SlotMeta {
                 return .{ .kind = .scalar, .type_name = "Dispatcher" };
             if (c.callee.* == .ident) {
                 if (c.type_args.len > 0) {
-                    const mangled = mangleNamedApp(ctx.a, c.callee.ident, c.type_args) catch "";
+                    // Resolve through type_subst so `List<T>()` inside List__i64 methods
+                    // yields struct_ptr meta for `List__i64` (clone / map / filter).
+                    var resolved = ctx.a.alloc(*ast.TypeExpr, c.type_args.len) catch return null;
+                    for (c.type_args, 0..) |ta, i| {
+                        const rn = resolveTypeExprName(ctx, ta) catch return null;
+                        const te = ctx.a.create(ast.TypeExpr) catch return null;
+                        te.* = .{ .name = rn };
+                        resolved[i] = te;
+                    }
+                    const mangled = mangleNamedApp(ctx.a, c.callee.ident, resolved) catch "";
                     if (mangled.len > 0) {
+                        if (ctx.structs.contains(mangled) and c.args.len == 0)
+                            return .{ .kind = .struct_ptr, .type_name = mangled };
                         if (ctx.fn_infos.get(mangled)) |fi| {
                             if (metaFromCallRet(ctx, fi.ret_meta, fi.ret_name)) |m| return m;
                         }
@@ -4095,7 +4131,36 @@ fn lowerCall(ctx: *Ctx, c: ast.Call) LowerError!u32 {
         const base = try lowerExpr(ctx, c.callee.field.base);
         return try lowerMethodOrIfaceCall(ctx, c.callee.field.base, base, c.callee.field.name, c.args, c.with_args);
     }
+    // Call through a function-typed local/param (`body(x)` in List.each).
+    if (c.callee.* == .ident) {
+        if (ctx.slots.get(c.callee.ident)) |fp| {
+            if (ctx.meta.get(c.callee.ident)) |m| {
+                if (std.mem.eql(u8, m.type_name, "iface_fn")) {
+                    return try lowerFnPtrCall(ctx, fp, c.args);
+                }
+            }
+        }
+    }
     return error.UnknownName;
+}
+
+fn lowerFnPtrCall(ctx: *Ctx, fnptr: u32, args: []*ast.Expr) LowerError!u32 {
+    var arg_slots: [16]u32 = .{none} ** 16;
+    var arity: u8 = 0;
+    if (args.len > max_call_args) return error.TooManyArgs;
+    for (args) |arg| {
+        arg_slots[arity] = try lowerExpr(ctx, arg);
+        arity += 1;
+    }
+    const d = try ctx.fresh();
+    try ctx.emit(.{
+        .op = .icall,
+        .dst = d,
+        .src0 = fnptr,
+        .arity = arity,
+        .args = arg_slots,
+    });
+    return d;
 }
 
 fn lowerFnCall(ctx: *Ctx, fi: FnInfo, args: []*ast.Expr, with_args: []*ast.Expr) LowerError!u32 {

@@ -1,0 +1,23 @@
+// Callback-bearing List.each (Friction residual after JOG-200).
+import std.list
+import std.mem
+
+var walk: i64 = 0
+
+fn add_walk(it: i64) {
+    walk = walk + it
+}
+
+fn main() {
+    with (mem.heap()) {
+        var xs = list.empty<i64>()
+        xs.push(1, 2, 3)
+        walk = 0
+        xs.each(add_walk)
+        if walk != 6 {
+            panic("each sum")
+        }
+        xs.free()
+        print("list.each ok\n")
+    }
+}
