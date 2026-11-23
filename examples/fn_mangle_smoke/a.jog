@@ -1,0 +1,9 @@
+// Private helper name collides with b.jog — must mangle by file path.
+
+private fn helper(): i64 {
+    return 1
+}
+
+fn a_val(): i64 {
+    return helper()
+}

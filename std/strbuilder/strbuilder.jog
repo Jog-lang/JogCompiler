@@ -11,8 +11,7 @@
 //
 // append_char writes one Unicode scalar as UTF-8. append_int writes an
 // i64 in a base from 2 to 36, lowercase, with a leading '-' when the
-// value is negative. Integer parse lives in std.conv (duplicate
-// parse_i64 labels collide under flattened merge — Friction).
+// value is negative. Integer parse lives in std.conv.
 
 import std.c
 import std.mem
@@ -81,9 +80,9 @@ fn *StrBuilder.append_byte(b: u8) with (a: mem.Allocator) {
     self.len = need
 }
 
-// Lowercase digit. d is 0..35. Named uniquely — private fns still share
-// global asm labels under flattened merge (Friction).
-private fn sb_digit_char(d: u64): u8 {
+// Lowercase digit. d is 0..35. Private name may match std.conv.digit_char;
+// load-time path mangling keeps asm labels unique under flattened merge.
+private fn digit_char(d: u64): u8 {
     if d < 10 {
         return (('0' as i64) + (d as i64)) as u8
     }
@@ -146,7 +145,7 @@ fn *StrBuilder.append_int(n: i64, base: i64) with (a: mem.Allocator) {
     for mag != 0 {
         val rem = mag % ubase
         mag = mag / ubase
-        digits[count] = sb_digit_char(rem)
+        digits[count] = digit_char(rem)
         count = count + 1
     }
     if neg {

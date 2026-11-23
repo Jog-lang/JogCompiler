@@ -1,0 +1,13 @@
+// Smoke: two files with the same private top-level fn name must link cleanly
+// (flattened merge used to emit duplicate `.Lhelper_end` / `helper` symbols).
+
+import a
+import b
+
+fn main() {
+    if (a_val() == 1 && b_val() == 2) {
+        print("fn mangle ok\n")
+    } else {
+        panic("fn mangle fail\n")
+    }
+}
