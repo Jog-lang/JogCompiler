@@ -98,9 +98,7 @@ private fn box(v: Value): *Value with (a: mem.Allocator) {
         panic("out of memory")
     }
     val p = raw.ptr as *Value
-    // `&v as *const void` as a call arg TypeErrors; split address-of (Friction).
-    val src = &v
-    c.memcpy(p as *void, src as *const void, size(Value))
+    c.memcpy(p as *void, &v as *const void, size(Value))
     return p
 }
 

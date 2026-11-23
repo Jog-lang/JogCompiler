@@ -1,0 +1,14 @@
+// Friction 2026-11-22: `&x as *T` in a call arg must parse as `(&x) as *T`
+// (castExpr above unary), not `&(x as *T)`.
+import std.c
+
+fn main() {
+    var v: i64 = 42
+    val dest = alloc(8)
+    c.memcpy(dest as *void, &v as *const void, 8)
+    val got = *(dest as *i64)
+    if got != 42 {
+        panic("addr_cast_call_arg bad\n")
+    }
+    print("addr_cast_call_arg ok\n")
+}
