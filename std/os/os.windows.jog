@@ -1,5 +1,6 @@
 // Windows actuals for std.os.
-// Stack `buf[..].ptr` is not lowered yet (Friction); use malloc buffers.
+// Fixed-size wide/UTF-8 scratch uses open slice `buf[..].ptr` (same as std.fs / std.io).
+// Variable-length environ entry conversion still mallocs (size = wide chars × 4).
 
 import std.c
 import std.list
@@ -7,93 +8,42 @@ import std.mem
 import std.text
 
 actual fn env(name: str): (str, bool) {
-    val wname_raw = c.malloc(512 * 2)
-    val wbuf_raw = c.malloc(4096 * 2)
-    if wname_raw == null || wbuf_raw == null {
-        if wname_raw != null {
-            c.free(wname_raw!!)
-        }
-        if wbuf_raw != null {
-            c.free(wbuf_raw!!)
-        }
+    var wname: [512]u16
+    var wbuf: [4096]u16
+    if !c.utf8_to_wide(name, wname[..].ptr, 512) {
         return "", false
     }
-    val wname = wname_raw!! as *u16
-    val wbuf = wbuf_raw!! as *u16
-    if !c.utf8_to_wide(name, wname, 512) {
-        c.free(wname_raw!!)
-        c.free(wbuf_raw!!)
-        return "", false
-    }
-    val n = c.GetEnvironmentVariableW(wname, wbuf, 4096)
+    val n = c.GetEnvironmentVariableW(wname[..].ptr, wbuf[..].ptr, 4096)
     if n == 0 || n >= 4096 {
-        c.free(wname_raw!!)
-        c.free(wbuf_raw!!)
         return "", false
     }
-    val utf8_raw = c.malloc(8192)
-    if utf8_raw == null {
-        c.free(wname_raw!!)
-        c.free(wbuf_raw!!)
-        return "", false
-    }
-    val utf8 = utf8_raw!! as *u8
-    val len = c.wide_to_utf8(wbuf, n as usize, utf8, 8192)
-    c.free(wname_raw!!)
-    c.free(wbuf_raw!!)
+    var utf8: [8192]u8
+    val len = c.wide_to_utf8(wbuf[..].ptr, n as usize, utf8[..].ptr, 8192)
     if len == 0 {
-        c.free(utf8_raw!!)
         return "", false
     }
     utf8[len] = 0
-    val s = c.copyCStr(utf8 as *const c.char)
-    c.free(utf8_raw!!)
-    return s, true
+    return c.copyCStr(utf8[..].ptr as *const c.char), true
 }
 
 actual fn setenv(name: str, value: str): bool {
-    val wname_raw = c.malloc(512 * 2)
-    val wval_raw = c.malloc(4096 * 2)
-    if wname_raw == null || wval_raw == null {
-        if wname_raw != null {
-            c.free(wname_raw!!)
-        }
-        if wval_raw != null {
-            c.free(wval_raw!!)
-        }
+    var wname: [512]u16
+    var wval: [4096]u16
+    if !c.utf8_to_wide(name, wname[..].ptr, 512) {
         return false
     }
-    val wname = wname_raw!! as *u16
-    val wval = wval_raw!! as *u16
-    if !c.utf8_to_wide(name, wname, 512) {
-        c.free(wname_raw!!)
-        c.free(wval_raw!!)
+    if !c.utf8_to_wide(value, wval[..].ptr, 4096) {
         return false
     }
-    if !c.utf8_to_wide(value, wval, 4096) {
-        c.free(wname_raw!!)
-        c.free(wval_raw!!)
-        return false
-    }
-    val ok = c.SetEnvironmentVariableW(wname, wval) != 0
-    c.free(wname_raw!!)
-    c.free(wval_raw!!)
-    return ok
+    return c.SetEnvironmentVariableW(wname[..].ptr, wval[..].ptr) != 0
 }
 
 actual fn unsetenv(name: str): bool {
-    val wname_raw = c.malloc(512 * 2)
-    if wname_raw == null {
+    var wname: [512]u16
+    if !c.utf8_to_wide(name, wname[..].ptr, 512) {
         return false
     }
-    val wname = wname_raw!! as *u16
-    if !c.utf8_to_wide(name, wname, 512) {
-        c.free(wname_raw!!)
-        return false
-    }
-    val ok = c.SetEnvironmentVariableW(wname, null) != 0
-    c.free(wname_raw!!)
-    return ok
+    return c.SetEnvironmentVariableW(wname[..].ptr, null) != 0
 }
 
 actual fn pid(): i64 {
@@ -101,61 +51,33 @@ actual fn pid(): i64 {
 }
 
 actual fn hostname(): (str, bool) {
-    val wbuf_raw = c.malloc(256 * 2)
-    if wbuf_raw == null {
-        return "", false
-    }
-    val wbuf = wbuf_raw!! as *u16
+    var wbuf: [256]u16
     var n: c.unsigned_long = 256
-    if c.GetComputerNameW(wbuf, &n) == 0 {
-        c.free(wbuf_raw!!)
+    if c.GetComputerNameW(wbuf[..].ptr, &n) == 0 {
         return "", false
     }
-    val utf8_raw = c.malloc(512)
-    if utf8_raw == null {
-        c.free(wbuf_raw!!)
-        return "", false
-    }
-    val utf8 = utf8_raw!! as *u8
-    val len = c.wide_to_utf8(wbuf, n as usize, utf8, 512)
-    c.free(wbuf_raw!!)
+    var utf8: [512]u8
+    val len = c.wide_to_utf8(wbuf[..].ptr, n as usize, utf8[..].ptr, 512)
     if len == 0 {
-        c.free(utf8_raw!!)
         return "", false
     }
     utf8[len] = 0
-    val s = c.copyCStr(utf8 as *const c.char)
-    c.free(utf8_raw!!)
-    return s, true
+    return c.copyCStr(utf8[..].ptr as *const c.char), true
 }
 
 actual fn exe_path(): (str, bool) {
-    val wbuf_raw = c.malloc(1024 * 2)
-    if wbuf_raw == null {
-        return "", false
-    }
-    val wbuf = wbuf_raw!! as *u16
-    val n = c.GetModuleFileNameW(0, wbuf, 1024)
+    var wbuf: [1024]u16
+    val n = c.GetModuleFileNameW(0, wbuf[..].ptr, 1024)
     if n == 0 || n >= 1024 {
-        c.free(wbuf_raw!!)
         return "", false
     }
-    val utf8_raw = c.malloc(4096)
-    if utf8_raw == null {
-        c.free(wbuf_raw!!)
-        return "", false
-    }
-    val utf8 = utf8_raw!! as *u8
-    val len = c.wide_to_utf8(wbuf, n as usize, utf8, 4096)
-    c.free(wbuf_raw!!)
+    var utf8: [4096]u8
+    val len = c.wide_to_utf8(wbuf[..].ptr, n as usize, utf8[..].ptr, 4096)
     if len == 0 {
-        c.free(utf8_raw!!)
         return "", false
     }
     utf8[len] = 0
-    val s = c.copyCStr(utf8 as *const c.char)
-    c.free(utf8_raw!!)
-    return s, true
+    return c.copyCStr(utf8[..].ptr as *const c.char), true
 }
 
 // Snapshot via GetEnvironmentStringsW → owned UTF-8 KEY=value (same contract as POSIX).

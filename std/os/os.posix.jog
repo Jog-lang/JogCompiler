@@ -1,6 +1,6 @@
 // POSIX actuals for std.os. env views live until the next getenv.
 // hostname/exe_path copy into the error arena via copyCStr.
-// Stack `buf[..].ptr` is not lowered yet (Friction); use malloc buffers.
+// Stack buffers use open slice `buf[..].ptr` (same pattern as std.fs).
 
 import std.c
 import std.list
@@ -44,36 +44,21 @@ actual fn pid(): i64 {
 }
 
 actual fn hostname(): (str, bool) {
-    val raw = c.malloc(256)
-    if raw == null {
+    var buf: [256]u8
+    if c.gethostname(buf[..].ptr as *c.char, 256) != 0 {
         return "", false
     }
-    val p = raw!!
-    if c.gethostname(p as *c.char, 256) != 0 {
-        c.free(p)
-        return "", false
-    }
-    val s = c.copyCStr(p as *const c.char)
-    c.free(p)
-    return s, true
+    return c.copyCStr(buf[..].ptr as *const c.char), true
 }
 
 actual fn exe_path(): (str, bool) {
-    val raw = c.malloc(4096)
-    if raw == null {
-        return "", false
-    }
-    val p = raw!!
-    val n = c.readlink(c"/proc/self/exe", p as *c.char, 4095)
+    var buf: [4096]u8
+    val n = c.readlink(c"/proc/self/exe", buf[..].ptr as *c.char, 4095)
     if n < 0 {
-        c.free(p)
         return "", false
     }
-    val bytes_p = p as *u8
-    bytes_p[n as usize] = 0
-    val s = c.copyCStr(p as *const c.char)
-    c.free(p)
-    return s, true
+    buf[n as usize] = 0
+    return c.copyCStr(buf[..].ptr as *const c.char), true
 }
 
 actual fn environ(): list.List<str> {
