@@ -7,6 +7,7 @@ const ir = @import("../ir/ir.zig");
 const link = @import("../codegen/link.zig");
 const mod = @import("../mod/mod.zig");
 const roots_mod = @import("roots.zig");
+const priv_mangle = @import("priv_mangle.zig");
 
 /// True when `basename` is a platform file for an OS other than this host.
 /// Keeps `.posix.jog` on linux/macos; drops `.windows.jog` on linux, etc.
@@ -200,7 +201,10 @@ fn loadSingle(allocator: std.mem.Allocator, path: []const u8, modules: []const M
         const src = try std.fs.cwd().readFileAlloc(allocator, read_path, 16 * 1024 * 1024);
         try srcs.append(allocator, src);
         try paths.append(allocator, try allocator.dupe(u8, cur));
-        const file = try parse.Parser.parseFile(allocator, src);
+        var file = try parse.Parser.parseFile(allocator, src);
+        // File-local `private fn` → path-stable symbols before flattened merge
+        // (avoids duplicate `.Lname_end` / link symbols across packages).
+        try priv_mangle.mangleFilePrivateFns(&file, cur);
         try decls.appendSlice(allocator, file.decls);
         for (file.decls) |d| {
             if (d == .import_decl) {
@@ -709,10 +713,11 @@ fn loadModuleWithOverride(
         };
         try srcs.append(allocator, src);
         try paths.append(allocator, try allocator.dupe(u8, p));
-        const file = parse.Parser.parseFile(allocator, src) catch |err| {
+        var file = parse.Parser.parseFile(allocator, src) catch |err| {
             try writer.print("parse error ({s}): {s}\n", .{ read_path, @errorName(err) });
             std.process.exit(1);
         };
+        try priv_mangle.mangleFilePrivateFns(&file, p);
         try decls.appendSlice(allocator, file.decls);
         // Also BFS imports from each file against the module map / std roots.
         for (file.decls) |d| {
