@@ -106,7 +106,8 @@ fn read_all(path: str): (bytes, error?) with (a: mem.Allocator) {
     }
     var acc = bytes()
     var chunk: [4096]byte
-    val chunk_ptr = chunk[..].ptr
+    // v2: open slice `chunk[..]` not parsed yet; bounded slice is equivalent here.
+    val chunk_ptr = chunk[0..4096].ptr
     for {
         val n = c.fread(chunk_ptr as *void, 1, 4096, file!!)
         if n == 0 {

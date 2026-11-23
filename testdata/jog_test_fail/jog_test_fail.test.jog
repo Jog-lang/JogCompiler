@@ -1,0 +1,5 @@
+import std.testing
+@test
+fn fails() with (t: testing.Testing) {
+    t.expect(false)
+}

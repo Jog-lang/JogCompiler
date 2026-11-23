@@ -184,6 +184,70 @@ pub fn main() !void {
         });
         return;
     }
+    if (std.mem.eql(u8, cmd, "test")) {
+        var path: []const u8 = ".";
+        var saw_path = false;
+        var all = false;
+        var libdirs: std.ArrayListUnmanaged([]const u8) = .{};
+        defer libdirs.deinit(allocator);
+        var modules: std.ArrayListUnmanaged(driver.ModuleMapping) = .{};
+        defer {
+            for (modules.items) |m| {
+                allocator.free(m.name);
+                allocator.free(m.dir);
+            }
+            modules.deinit(allocator);
+        }
+        while (args.next()) |a| {
+            if (std.mem.eql(u8, a, "--all")) {
+                if (all or saw_path) {
+                    try stderr.writeAll("usage: jog test [package | --all] [--module name=dir ...] [--libdir dir | -L dir ...]\n");
+                    std.process.exit(2);
+                }
+                all = true;
+            } else if (std.mem.eql(u8, a, "--module")) {
+                const v = args.next() orelse {
+                    try stderr.writeAll("test: --module needs name=dir\n");
+                    std.process.exit(2);
+                };
+                const m = parseModuleFlag(allocator, v) catch {
+                    try stderr.writeAll("test: --module needs name=dir\n");
+                    std.process.exit(2);
+                };
+                try modules.append(allocator, m);
+            } else if (std.mem.startsWith(u8, a, "--module=")) {
+                const m = parseModuleFlag(allocator, a["--module=".len..]) catch {
+                    try stderr.writeAll("test: --module needs name=dir\n");
+                    std.process.exit(2);
+                };
+                try modules.append(allocator, m);
+            } else if (std.mem.eql(u8, a, "--libdir") or std.mem.eql(u8, a, "-L")) {
+                const dir = args.next() orelse {
+                    try stderr.writeAll("test: --libdir needs a directory\n");
+                    std.process.exit(2);
+                };
+                try libdirs.append(allocator, dir);
+            } else if (std.mem.startsWith(u8, a, "--libdir=")) {
+                try libdirs.append(allocator, a["--libdir=".len..]);
+            } else if (std.mem.startsWith(u8, a, "-L") and a.len > 2) {
+                try libdirs.append(allocator, a[2..]);
+            } else if (std.mem.startsWith(u8, a, "-")) {
+                try stderr.print("test: unknown flag {s}\n", .{a});
+                std.process.exit(2);
+            } else if (!saw_path and !all) {
+                path = a;
+                saw_path = true;
+            } else {
+                try stderr.writeAll("usage: jog test [package | --all] [--module name=dir ...] [--libdir dir | -L dir ...]\n");
+                std.process.exit(2);
+            }
+        }
+        try driver.cmdTest(allocator, path, .{
+            .modules = modules.items,
+            .cli_libdirs = libdirs.items,
+        }, stdout);
+        return;
+    }
     if (std.mem.eql(u8, cmd, "build")) {
         const link = @import("codegen/link.zig");
         var path: ?[]const u8 = null;

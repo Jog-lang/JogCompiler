@@ -8,9 +8,11 @@
 // stderr, then calls finish. One shared value, not a checking allocator.
 // expectPanic catches a panic inside the closure. A panic outside it
 // still aborts.
+//
+// v2 note: speak to stderr via jogrt_write (not std.io) so loading tests
+// does not pull io's open-slice / import-alias gaps.
 
 import std.c
-import std.io
 
 interface Testing {
     fn expect(cond: bool)
@@ -26,19 +28,33 @@ struct Test {
 
 var test_value: Test
 var failures: i32 = 0
-var current: str
 
 fn testing(): Testing {
     return &test_value
 }
 
 fn note(name: str) {
-    current = name
+    // v2: package `str` vars need literal init and `.len` field meta is incomplete.
+    // The harness still calls note; failure lines omit the test name for now.
+    if name.len == 0 {
+    }
+}
+
+private fn eprint(text: str) {
+    if !c.jogrt_write(2, text.ptr as *const void?, text.len) {
+        // ignore write failure in the test harness
+    }
+}
+
+private fn eprint_buf(p: *u8, len: usize) {
+    if !c.jogrt_write(2, p as *const void?, len) {
+    }
 }
 
 private fn write_str(p: *u8, at: usize, text: str): usize {
+    // Index stores (v2); deref-assign `*(p+i)=` is still a Zig-driver gap.
     for i in 0 as usize..text.len {
-        *(p + at + i) = *(text.ptr + i)
+        p[at + i] = text.ptr[i]
     }
     return at + text.len
 }
@@ -51,10 +67,10 @@ private fn write_i32(p: *u8, at: usize, n: i32): usize {
         x = 0 - x
     }
     if x == 0 {
-        *(p + at) = 48
+        p[at] = 48
         return at + 1
     }
-    for _ in 0..16 {
+    for unused in 0..16 {
         if x == 0 {
             break
         }
@@ -62,16 +78,20 @@ private fn write_i32(p: *u8, at: usize, n: i32): usize {
         digits[i] = d as u8
         i = i + 1
         x = x / 10
+        if unused > 16 {
+            break
+        }
     }
     for k in 0 as usize..i {
-        *(p + at + k) = digits[i - 1 - k]
+        p[at + k] = digits[i - 1 - k]
     }
     return at + i
 }
 
 fn report(ran: i32) {
     var raw: [80]byte
-    val p = raw[..].ptr
+    // Open slice `raw[..]` / `&raw[0]` still limited on v2; `&raw` is the array data pointer.
+    val p = &raw
     var at: usize = 0
     at = write_i32(p, at, ran)
     at = write_str(p, at, " tests, ")
@@ -82,22 +102,18 @@ fn report(ran: i32) {
         at = write_i32(p, at, failures)
         at = write_str(p, at, " failed\n")
     }
-    io.eprint(raw[0..at])
+    eprint_buf(p, at)
     finish()
 }
 
 private fn note_fail() {
-    if current.len != 0 {
-        io.eprint(current)
-        io.eprint(": ")
-    }
 }
 
 fn Test.expect(cond: bool) {
     if !cond {
         failures = failures + 1
         note_fail()
-        io.eprint("fail\n")
+        eprint("fail\n")
     }
 }
 
@@ -105,30 +121,28 @@ fn Test.expectEq(got: str, want: str) {
     if got != want {
         failures = failures + 1
         note_fail()
-        io.eprint("fail\n")
+        eprint("fail\n")
     }
 }
 
 fn Test.fail(msg: str) {
     failures = failures + 1
     note_fail()
-    io.eprint(msg)
+    eprint(msg)
 }
 
 fn Test.fatal(msg: str) {
     failures = failures + 1
-    io.eprint(msg)
+    eprint(msg)
     panic(msg)
 }
 
 fn Test.expectPanic(body: () -> ()) {
-    // A panic is success. A normal return is a recorded failure.
-    // Nested calls save the previous handler and restore it.
-    if c.jogrt_panic_call(&body as *void) == 0 {
-        failures = failures + 1
-        note_fail()
-        io.eprint("fail\n")
-    }
+    // v2: closure / fn-type call lowering is incomplete — do not invoke `body`.
+    // Suites that need expectPanic will see a recorded failure until panic-call lands.
+    failures = failures + 1
+    note_fail()
+    eprint("fail\n")
 }
 
 fn finish() {

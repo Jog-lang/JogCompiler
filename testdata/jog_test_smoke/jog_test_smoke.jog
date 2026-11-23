@@ -1,0 +1,4 @@
+// Tiny package so jog test has a production source.
+fn answer(): i64 {
+    return 42
+}

@@ -1,0 +1,1 @@
+fn n(): i64 { return 0 }

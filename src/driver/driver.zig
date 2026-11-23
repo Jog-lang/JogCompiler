@@ -30,7 +30,7 @@ fn isForeignPlatformSource(basename: []const u8) bool {
     return false;
 }
 
-pub const version_string = "jog 0.2.11-v2 (zig host, object+std/core; ir→asm→native | ir→c→emcc; jog ide JSON)";
+pub const version_string = "jog 0.2.12-v2 (zig host, object+std/core; ir→asm→native | ir→c→emcc; jog test; jog ide JSON)";
 
 pub fn cmdVersion(writer: anytype) !void {
     try writer.print("{s}\n", .{version_string});
@@ -58,6 +58,9 @@ pub const LoadOptions = struct {
     modules: []const ModuleMapping = &.{},
     /// When true, also pull `require.test` path/module deps (LSP `*.test.jog`).
     include_test_requires: bool = false,
+    /// When true, load root-module `*.test.jog` files (`jog test`). Never loads tests of
+    /// imported std / mapped modules (seed parity).
+    include_tests: bool = false,
 };
 
 /// JogLSP writes unsaved buffers as `<realpath>.jog-lsp-tmp` next to the file.
@@ -554,7 +557,7 @@ fn loadModuleWithOverride(
         path_list.deinit(allocator);
     }
 
-    const own_paths = mod.resolveSourcePaths(allocator, &manifest) catch |err| {
+    const own_paths = mod.resolveSourcePathsOpts(allocator, &manifest, opts.include_tests) catch |err| {
         try writer.print("jog.mod error: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
@@ -1066,6 +1069,255 @@ pub fn cmdDepsOpts(allocator: std.mem.Allocator, path: []const u8, writer: anyty
     }
 }
 
+pub const TestOptions = struct {
+    modules: []const ModuleMapping = &.{},
+    cli_libdirs: []const []const u8 = &.{},
+};
+
+const TestFn = struct {
+    name: []const u8,
+    ncontexts: usize,
+};
+
+/// `jog test`: load root-module `*.test.jog`, synthesize a harness `main` that calls every
+/// `@test` (with `testing()` context supply), build, run, and fail the process on a nonzero
+/// exit or `// expect:` stdout mismatch. Matches seed / Spec Syntax tests behavior.
+pub fn cmdTest(allocator: std.mem.Allocator, path: []const u8, opts: TestOptions, writer: anytype) !void {
+    var unit = try loadPathOpts(allocator, path, writer, .{
+        .modules = opts.modules,
+        .include_test_requires = true,
+        .include_tests = true,
+    });
+    defer unit.deinit();
+
+    var tests: std.ArrayListUnmanaged(TestFn) = .{};
+    defer tests.deinit(allocator);
+    for (unit.file.decls) |d| {
+        const fd: ?ast.FnDecl = switch (d) {
+            .fn_decl => |f| f,
+            .actual_fn => |f| f,
+            else => null,
+        };
+        if (fd) |f| {
+            if (!f.is_test or f.body == null) continue;
+            try tests.append(allocator, .{ .name = f.name, .ncontexts = f.contexts.len });
+        }
+    }
+    if (tests.items.len == 0) {
+        try writer.writeAll("no tests\n");
+        return;
+    }
+
+    var harness_src: std.ArrayListUnmanaged(u8) = .{};
+    defer harness_src.deinit(allocator);
+    try harness_src.appendSlice(allocator, "fn main() {\n");
+    for (tests.items) |t| {
+        try harness_src.writer(allocator).print("  note(\"{s}\")\n", .{t.name});
+        if (t.ncontexts == 0) {
+            try harness_src.writer(allocator).print("  {s}()\n", .{t.name});
+        } else if (t.ncontexts == 1) {
+            try harness_src.writer(allocator).print("  {s}() with (testing())\n", .{t.name});
+        } else {
+            try writer.print("error: @test '{s}' has {d} contexts; only 0 or 1 supported\n", .{ t.name, t.ncontexts });
+            std.process.exit(1);
+        }
+    }
+    try harness_src.writer(allocator).print("  report({d})\n", .{tests.items.len});
+    try harness_src.appendSlice(allocator, "}\n");
+
+    var harness_file = parse.Parser.parseFile(allocator, harness_src.items) catch |err| {
+        try writer.print("test harness parse error: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer harness_file.deinit();
+
+    var new_decls: std.ArrayListUnmanaged(ast.Decl) = .{};
+    errdefer new_decls.deinit(allocator);
+    for (unit.file.decls) |d| {
+        const skip_main = switch (d) {
+            .fn_decl => |f| std.mem.eql(u8, f.name, "main"),
+            .actual_fn => |f| std.mem.eql(u8, f.name, "main"),
+            else => false,
+        };
+        if (skip_main) continue;
+        try new_decls.append(allocator, d);
+    }
+    try new_decls.appendSlice(allocator, harness_file.decls);
+    if (unit.merged_decls) |old| allocator.free(old);
+    const owned = try new_decls.toOwnedSlice(allocator);
+    unit.merged_decls = owned;
+    unit.file.decls = owned;
+
+    var result = try check_mod.check(allocator, &unit.file);
+    defer result.deinit();
+    if (!result.ok) {
+        for (result.diagnostics) |d| {
+            try writer.print("error: {s}\n", .{d.message});
+        }
+        std.process.exit(1);
+    }
+
+    var program = ir.lower(allocator, &unit.file, &result) catch |err| {
+        try writer.print("lower error: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer program.deinit();
+
+    const mod_name, const mod_root = try resolveTestModuleIdentity(allocator, path);
+    defer allocator.free(mod_name);
+    defer allocator.free(mod_root);
+
+    try mergeLinkMeta(allocator, &program, path, opts.cli_libdirs, "linux");
+
+    const out_dir = try std.fs.path.join(allocator, &.{ mod_root, "out" });
+    defer allocator.free(out_dir);
+    std.fs.cwd().makePath(out_dir) catch {};
+    const exe_path = try std.fmt.allocPrint(allocator, "{s}/{s}.exe", .{ out_dir, mod_name });
+    defer allocator.free(exe_path);
+
+    try link.buildExecutableTargeted(allocator, &program, exe_path, false, false, .native, writer);
+
+    const expects = try collectExpectLines(allocator, &unit);
+    defer {
+        for (expects) |e| allocator.free(e);
+        allocator.free(expects);
+    }
+
+    const run_result = try runTestExe(allocator, exe_path);
+    const captured = run_result.stdout;
+    const run_code = run_result.code;
+    defer allocator.free(captured);
+    try writer.writeAll(captured);
+
+    var status: u8 = run_code;
+    if (run_code != 0) {
+        try writer.print("error: test exited with status {d}\n", .{run_code});
+    }
+    if (expects.len > 0 and !expectsMatch(allocator, expects, captured, writer)) {
+        try writer.writeAll("error: test output did not match // expect: lines\n");
+        if (status == 0) status = 1;
+    }
+    if (status != 0) std.process.exit(status);
+}
+
+fn expectsMatch(allocator: std.mem.Allocator, expects: []const []const u8, stdout_text: []const u8, writer: anytype) bool {
+    var lines: std.ArrayListUnmanaged([]const u8) = .{};
+    defer lines.deinit(allocator);
+    var at: usize = 0;
+    while (at < stdout_text.len) {
+        const start = at;
+        while (at < stdout_text.len and stdout_text[at] != '\n' and stdout_text[at] != '\r') : (at += 1) {}
+        lines.append(allocator, stdout_text[start..at]) catch return false;
+        if (at < stdout_text.len and stdout_text[at] == '\r') at += 1;
+        if (at < stdout_text.len and stdout_text[at] == '\n') at += 1;
+    }
+    const same = lines.items.len == expects.len and blk: {
+        for (expects, lines.items) |want, have| {
+            if (!std.mem.eql(u8, want, have)) break :blk false;
+        }
+        break :blk true;
+    };
+    if (!same) {
+        writer.print("expected ({d})\n", .{expects.len}) catch {};
+        for (expects) |e| writer.print("  |{s}|\n", .{e}) catch {};
+        writer.print("actual ({d})\n", .{lines.items.len}) catch {};
+        for (lines.items) |e| writer.print("  |{s}|\n", .{e}) catch {};
+    }
+    return same;
+}
+
+fn resolveTestModuleIdentity(allocator: std.mem.Allocator, path: []const u8) !struct { []u8, []u8 } {
+    if (mod.isModulePath(path)) {
+        if (mod.loadFromPath(allocator, path)) |manifest_val| {
+            var m = manifest_val;
+            defer m.deinit();
+            return .{
+                try allocator.dupe(u8, m.name),
+                try allocator.dupe(u8, m.dir),
+            };
+        } else |_| {}
+        const dir = if (std.mem.eql(u8, path, ".") or path.len == 0) try allocator.dupe(u8, ".") else try allocator.dupe(u8, path);
+        const base = std.fs.path.basename(dir);
+        const name = if (base.len == 0 or std.mem.eql(u8, base, ".")) "jog" else base;
+        return .{ try allocator.dupe(u8, name), dir };
+    }
+    if (try findModuleDirUp(allocator, stripLspTmpSuffix(path))) |mod_dir| {
+        if (mod.loadFromPath(allocator, mod_dir)) |manifest_val| {
+            var m = manifest_val;
+            defer m.deinit();
+            const name = try allocator.dupe(u8, m.name);
+            const dir = try allocator.dupe(u8, m.dir);
+            allocator.free(mod_dir);
+            return .{ name, dir };
+        } else |_| {
+            const base = std.fs.path.basename(mod_dir);
+            const name = try allocator.dupe(u8, if (base.len == 0) "jog" else base);
+            return .{ name, mod_dir };
+        }
+    }
+    const dir = std.fs.path.dirname(path) orelse ".";
+    return .{ try allocator.dupe(u8, "jog"), try allocator.dupe(u8, dir) };
+}
+
+fn collectExpectLines(allocator: std.mem.Allocator, unit: *const Unit) ![][]const u8 {
+    var out: std.ArrayListUnmanaged([]const u8) = .{};
+    errdefer {
+        for (out.items) |e| allocator.free(e);
+        out.deinit(allocator);
+    }
+    const n = @min(unit.srcs.len, unit.paths.len);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (!std.mem.endsWith(u8, unit.paths[i], ".test.jog")) continue;
+        const src = unit.srcs[i];
+        var at: usize = 0;
+        while (at < src.len) {
+            const start = at;
+            while (at < src.len and src[at] != '\n' and src[at] != '\r') : (at += 1) {}
+            const line = src[start..at];
+            if (expectLineText(line)) |text| {
+                try out.append(allocator, try allocator.dupe(u8, text));
+            }
+            if (at < src.len and src[at] == '\r') at += 1;
+            if (at < src.len and src[at] == '\n') at += 1;
+        }
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn expectLineText(line: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
+    const prefix = "// expect:";
+    if (line.len - i < prefix.len) return null;
+    if (!std.mem.eql(u8, line[i .. i + prefix.len], prefix)) return null;
+    i += prefix.len;
+    if (i < line.len and line[i] == ' ') i += 1;
+    return line[i..];
+}
+
+const RunTestResult = struct {
+    stdout: []u8,
+    code: u8,
+};
+
+fn runTestExe(allocator: std.mem.Allocator, exe_path: []const u8) !RunTestResult {
+    var child = std.process.Child.init(&.{exe_path}, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Inherit;
+    try child.spawn();
+    const stdout = child.stdout orelse return error.MissingStdout;
+    const body = try stdout.readToEndAlloc(allocator, 16 * 1024 * 1024);
+    errdefer allocator.free(body);
+    const term = try child.wait();
+    const code: u8 = switch (term) {
+        .Exited => |c| @intCast(@min(c, 255)),
+        else => 1,
+    };
+    return .{ .stdout = body, .code = code };
+}
+
 pub fn usage(writer: anytype) !void {
     try writer.writeAll(
         \\usage: jog <command> [args]
@@ -1079,6 +1331,9 @@ pub fn usage(writer: anytype) !void {
         \\                          JSON IDE queries (JogLSP); line/column 1-based
         \\  check [--diag=json] [--test] [--module name=dir]... <path>
         \\                          typecheck subset (JSON diags for LSP)
+        \\  test [package | --all] [--module name=dir ...]
+        \\                          [--libdir DIR | -L DIR]...
+        \\                          build+run @test in *.test.jog (seed/Spec)
         \\  build <path> -o OUT [--keep-asm] [--keep-c]
         \\                          [--target wasm32-emscripten]
         \\                          [--libdir DIR | -L DIR]...
