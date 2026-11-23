@@ -1,0 +1,15 @@
+import std.list
+import std.mem
+
+fn main() {
+    with (mem.heap()) {
+        var xs = list.empty<i64>()
+        xs.push(1, 2, 3)
+        var ys = xs.clone()
+        if ys.len != 3 { panic("clone len") }
+        if ys.get(0) != 1 { panic("clone 0") }
+        ys.free()
+        xs.free()
+        print("list.clone ok\n")
+    }
+}

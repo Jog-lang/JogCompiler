@@ -1,0 +1,30 @@
+// Callback-bearing List.map (Friction residual after JOG-200).
+import std.list
+import std.mem
+
+fn add1(x: i64): i64 {
+    return x + 1
+}
+
+fn main() {
+    with (mem.heap()) {
+        var xs = list.empty<i64>()
+        xs.push(1, 2, 3)
+        var ys = xs.map<i64>(add1)
+        if ys.len != 3 {
+            panic("map len")
+        }
+        if ys.get(0) != 2 {
+            panic("map 0")
+        }
+        if ys.get(1) != 3 {
+            panic("map 1")
+        }
+        if ys.get(2) != 4 {
+            panic("map 2")
+        }
+        ys.free()
+        xs.free()
+        print("list.map ok\n")
+    }
+}

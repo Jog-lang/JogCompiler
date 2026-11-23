@@ -1,0 +1,17 @@
+import std.list
+import std.mem
+
+fn add(acc: i64, x: i64): i64 {
+    return acc + x
+}
+
+fn main() {
+    with (mem.heap()) {
+        var xs = list.empty<i64>()
+        xs.push(1, 2, 3)
+        val sum = xs.fold<i64>(0, add)
+        if sum != 6 { panic("fold") }
+        xs.free()
+        print("list.fold ok\n")
+    }
+}

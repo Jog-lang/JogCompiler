@@ -1,0 +1,25 @@
+// Callback-bearing Map.each (Friction residual after JOG-200).
+import std.map
+import std.mem
+
+var sum: i64 = 0
+
+fn visit(k: i64, v: i64) {
+    sum = sum + k + v
+}
+
+fn main() {
+    with (mem.heap()) {
+        var m = map.empty<i64, i64>()
+        // insert(key, hash, value)
+        m.insert(1, 1, 10)
+        m.insert(2, 2, 20)
+        sum = 0
+        m.each(visit)
+        if sum != 33 {
+            panic("map each sum")
+        }
+        m.free()
+        print("map.each ok\n")
+    }
+}
