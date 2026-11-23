@@ -1141,9 +1141,9 @@ fn walkExprInstantiate(ic: *InstCtx, e: *ast.Expr) anyerror!void {
             try walkExprInstantiate(ic, ix.index);
         },
         .slice => |sl| {
-            try walkExprInstantiate(a, sl.base, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
-            if (sl.start) |s| try walkExprInstantiate(a, s, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
-            if (sl.end) |en| try walkExprInstantiate(a, en, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+            try walkExprInstantiate(ic, sl.base);
+            if (sl.start) |s| try walkExprInstantiate(ic, s);
+            if (sl.end) |en| try walkExprInstantiate(ic, en);
         },
         .cast => |c| {
             try walkTypeInstantiateFull(ic, c.ty);
