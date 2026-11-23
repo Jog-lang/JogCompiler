@@ -13,6 +13,27 @@ import std.conv
 import std.mem
 import std.strbuilder
 
+/**
+ * Content equality for map keys and ordinary `==`. Pointer identity alone is not enough:
+ * two views can share equal bytes at different addresses.
+ */
+fn str.op==(o: str): bool {
+    if (self.len != o.len) {
+        return false
+    }
+    if (self.len == 0) {
+        return true
+    }
+    var i: usize = 0
+    for i < self.len {
+        if (self.ptr[i] != o.ptr[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
 fn str.slice(from: usize, to: usize): str {
     if from > to || to > self.len {
         panic("slice out of range")

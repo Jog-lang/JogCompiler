@@ -8,12 +8,14 @@
 /* Emscripten: argc/argv from main; captured if host sets them. */
 static int64_t jogrt_argc_val = 0;
 static char **jogrt_argv_base = 0;
+static char **jogrt_envp_base = 0;
 
 int64_t jogrt_argc(void) { return jogrt_argc_val; }
 const char *jogrt_arg_ptr(int i) {
     if (i < 0 || (int64_t)i >= jogrt_argc_val || !jogrt_argv_base) return NULL;
     return jogrt_argv_base[i];
 }
+char **jogrt_environ(void) { return jogrt_envp_base; }
 void jogrt_set_args(int argc, char **argv) {
     jogrt_argc_val = argc;
     jogrt_argv_base = argv;

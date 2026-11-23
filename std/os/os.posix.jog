@@ -3,6 +3,7 @@
 // Stack `buf[..].ptr` is not lowered yet (Friction); use malloc buffers.
 
 import std.c
+import std.list
 import std.mem
 import std.text
 
@@ -73,4 +74,48 @@ actual fn exe_path(): (str, bool) {
     val s = c.copyCStr(p as *const c.char)
     c.free(p)
     return s, true
+}
+
+actual fn environ(): list.List<str> {
+    with (mem.heap()) {
+        var xs = list.empty<str>()
+        val envp = c.jogrt_environ()
+        if envp == null {
+            return xs
+        }
+        var i: usize = 0
+        for {
+            // envp is *(*const char?)? — walk as an array of optional C string pointers.
+            val entry_slot = ((envp!! as *u8) + (i * 8)) as **const c.char?
+            val entry = entry_slot[0]
+            if entry == null {
+                break
+            }
+            xs.push(c.fromCStr(entry!!).clone())
+            i = i + 1
+        }
+        return xs
+    }
+}
+
+actual fn free_environ(xs: list.List<str>) {
+    with (mem.heap()) {
+        free_environ_owned(xs)
+    }
+}
+
+private fn free_environ_owned(xs: list.List<str>) with (a: mem.Allocator) {
+    var owned = xs
+    var i: usize = 0
+    for i < owned.len {
+        val s = owned.get(i)
+        if s.len > 0 {
+            var block = bytes()
+            block.ptr = s.ptr as *u8
+            block.len = s.len
+            a.free(block)
+        }
+        i = i + 1
+    }
+    owned.free()
 }

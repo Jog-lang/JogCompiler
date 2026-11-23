@@ -11,6 +11,7 @@ void jogrt_panic(const void *ptr, int64_t len);
 void *jogrt_alloc(int64_t nbytes);
 int64_t jogrt_argc(void);
 const char *jogrt_arg_ptr(int i);
+char **jogrt_environ(void);
 void jogrt_set_args(int argc, char **argv);
 int64_t jogrt_alloc_checkpoint(void);
 void jogrt_alloc_reset(int64_t checkpoint);

@@ -793,12 +793,14 @@ fn checkExpr(
                     return ti;
                 }
             }
-            // Builtins size(T) / align(T): type arg spelled as expr; result usize.
+            // Builtins size(T) / align(T): type form via type_args (Slot<K,V>) or value form.
             if (c.callee.* == .ident and (std.mem.eql(u8, c.callee.ident, "size") or std.mem.eql(u8, c.callee.ident, "align"))) {
-                if (c.args.len != 1) {
-                    try emitDiag(a, diags, e, 1, 1, try std.fmt.allocPrint(a, "{s} takes one type argument", .{c.callee.ident}));
-                } else {
+                if (c.type_args.len == 1) {
+                    // Type form — nothing to check as a value expr.
+                } else if (c.args.len == 1) {
                     _ = try checkExpr(a, types, fns, structs, methods, scope, c.args[0], diags);
+                } else {
+                    try emitDiag(a, diags, e, 1, 1, try std.fmt.allocPrint(a, "{s} takes one type argument", .{c.callee.ident}));
                 }
                 return types.get("usize").?;
             }

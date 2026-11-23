@@ -4,6 +4,7 @@
 // hostname/exe_path return error-arena copies (no with on expect yet).
 
 import std.c
+import std.list
 import std.mem
 import std.text
 
@@ -37,6 +38,29 @@ fn argv(i: i64): str {
     val raw = p as *u8
     return c_view(raw, c.strlen(p as *const c.char))
 }
+
+/**
+ * All process arguments as a List of views (same lifetime as argv).
+ * Caller frees the list header with xs.free(); does not free the string bytes.
+ */
+fn args(): list.List<str> with (a: mem.Allocator) {
+    var xs = list.empty<str>()
+    val n = argc()
+    xs.reserve(n as usize)
+    var i: i64 = 0
+    for i < n {
+        xs.push(argv(i))
+        i = i + 1
+    }
+    return xs
+}
+
+/**
+ * Snapshot of the process environment as `KEY=value` strings (owned copies).
+ * Call free_environ when done. POSIX uses jogrt_environ(); Windows walks via GetEnvironmentStringsW.
+ */
+expect fn environ(): list.List<str>
+expect fn free_environ(xs: list.List<str>)
 
 fn exit(code: i32) {
     // libc exit — jogrt_exit is not in the linux runtime yet (Friction).
