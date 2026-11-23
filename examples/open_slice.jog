@@ -1,0 +1,44 @@
+// Open slice `a[..]` / `a[i..j]` → `{ptr,len}` (unblocks stack `[N]T` + `[..].ptr`).
+
+fn main() {
+    var buf: [8]byte
+    buf[0] = 65
+    buf[1] = 66
+    buf[2] = 67
+    val whole = buf[..]
+    if (whole.len != 8) {
+        panic("whole len fail\n")
+    }
+    // Direct `[..].ptr` as used by std/os / std/io hostname-style buffers.
+    val q = buf[..].ptr
+    if (q == null) {
+        panic("chained ptr null\n")
+    }
+    if (q != whole.ptr) {
+        panic("ptr mismatch\n")
+    }
+    val mid = buf[1..3]
+    if (mid.len != 2) {
+        panic("mid len fail\n")
+    }
+    var xs: [4]i64
+    xs[0] = 10
+    xs[1] = 20
+    xs[2] = 30
+    xs[3] = 40
+    val tail = xs[2..]
+    if (tail.len != 2) {
+        panic("tail len fail\n")
+    }
+    if (*(tail.ptr) != 30) {
+        panic("tail ptr fail\n")
+    }
+    val head = xs[..2]
+    if (head.len != 2) {
+        panic("head len fail\n")
+    }
+    if (*(head.ptr) != 10) {
+        panic("head ptr fail\n")
+    }
+    print("open slice ok\n")
+}

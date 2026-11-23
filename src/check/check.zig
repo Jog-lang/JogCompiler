@@ -1026,6 +1026,25 @@ fn checkExpr(
             ti.* = .{ .kind = .i64_ty, .name = "i64", .bits = 64, .unsigned = false };
             return ti;
         },
+        .slice => |sl| {
+            const base = try checkExpr(a, types, fns, structs, methods, scope, sl.base, diags);
+            if (sl.start) |s| _ = try checkExpr(a, types, fns, structs, methods, scope, s, diags);
+            if (sl.end) |en| _ = try checkExpr(a, types, fns, structs, methods, scope, en, diags);
+            const elem = blk: {
+                if (base.kind == .array_ty) break :blk base.pointee;
+                if (base.kind == .struct_ty and base.pointee != null) break :blk base.pointee;
+                if (base.kind == .bytes_ty) break :blk types.get("byte");
+                break :blk types.get("i64");
+            };
+            const el = elem orelse types.get("i64").?;
+            const ti = try a.create(TypeInfo);
+            ti.* = .{
+                .kind = .struct_ty,
+                .name = try std.fmt.allocPrint(a, "View_{s}", .{el.name}),
+                .pointee = el,
+            };
+            return ti;
+        },
         .cast => |c| {
             const from = try checkExpr(a, types, fns, structs, methods, scope, c.expr, diags);
             const to = try resolveTypeExpr(a, types, c.ty, diags);

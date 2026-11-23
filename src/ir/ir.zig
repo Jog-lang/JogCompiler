@@ -1117,6 +1117,11 @@ fn walkExprInstantiate(ic: *InstCtx, e: *ast.Expr) anyerror!void {
             try walkExprInstantiate(ic, ix.base);
             try walkExprInstantiate(ic, ix.index);
         },
+        .slice => |sl| {
+            try walkExprInstantiate(a, sl.base, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+            if (sl.start) |s| try walkExprInstantiate(a, s, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+            if (sl.end) |en| try walkExprInstantiate(a, en, generic_fns, generic_structs, structs, fn_infos, callees, callee_map, specialized);
+        },
         .cast => |c| {
             try walkTypeInstantiateFull(ic, c.ty);
             try walkExprInstantiate(ic, c.expr);
@@ -1632,6 +1637,35 @@ fn ensureSliceStruct(
     try fields.append(a, .{ .name = "len", .ty = len_ty });
     try structs.put(a, name, .{ .fields = try fields.toOwnedSlice(a) });
     return name;
+}
+
+fn ensureSliceStructFromElemName(
+    a: std.mem.Allocator,
+    structs: *std.StringHashMapUnmanaged(StructInfo),
+    elem_name: []const u8,
+) ![]const u8 {
+    const elem = try a.create(ast.TypeExpr);
+    elem.* = .{ .name = try a.dupe(u8, elem_name) };
+    return ensureSliceStruct(a, structs, elem);
+}
+
+/// Element type name for slicing `base` (`[N]T` → `T`, `__Slice_T` / `View_T` → `T`).
+fn sliceElemTypeName(ctx: *Ctx, base: *ast.Expr) ?[]const u8 {
+    if (inferMetaFromExpr(ctx, base)) |bm| {
+        if (bm.kind == .array_ptr and bm.type_name.len > 0) return bm.type_name;
+        if (bm.kind == .struct_ptr and bm.type_name.len > 0) {
+            if (std.mem.startsWith(u8, bm.type_name, "__Slice_"))
+                return bm.type_name["__Slice_".len..];
+            if (std.mem.startsWith(u8, bm.type_name, "View_"))
+                return bm.type_name["View_".len..];
+            // Named slice aliases (`bytes` / `str`) share `{ptr,len}` layout.
+            if (std.mem.eql(u8, bm.type_name, "bytes") or std.mem.eql(u8, bm.type_name, "str"))
+                return "byte";
+        }
+        if (bm.kind == .scalar and (std.mem.eql(u8, bm.type_name, "bytes") or std.mem.eql(u8, bm.type_name, "str")))
+            return "byte";
+    }
+    return null;
 }
 
 fn opMethodSymbol(a: std.mem.Allocator, name: []const u8) ![]const u8 {
@@ -2332,6 +2366,11 @@ fn inferMetaFromExpr(ctx: *Ctx, e: *ast.Expr) ?SlotMeta {
             }
             return null;
         },
+        .slice => |sl| {
+            const elem = sliceElemTypeName(ctx, sl.base) orelse return null;
+            const name = ensureSliceStructFromElemName(ctx.a, ctx.structs, elem) catch return null;
+            return .{ .kind = .struct_ptr, .type_name = name };
+        },
         .array_lit => |al| return .{ .kind = .array_ptr, .type_name = "i64", .array_len = al.elems.len, .elem_size = 8 },
         .binary => |b| {
             if (binOpMethodName(b.op)) |opm| {
@@ -2581,6 +2620,99 @@ fn lowerIndexAddr(ctx: *Ctx, base_expr: *ast.Expr, index_expr: *ast.Expr) LowerE
         try ctx.emit(.{ .op = .sub, .dst = addr, .src0 = base, .src1 = off });
     }
     return addr;
+}
+
+/// `a[..]` / `a[i..j]` → stack `{ ptr, len }` header (same layout as `[]T`).
+fn lowerSliceAccess(ctx: *Ctx, sl: ast.SliceAccess) LowerError!u32 {
+    const elem = sliceElemTypeName(ctx, sl.base) orelse {
+        std.debug.print("lower TypeError slice: unknown elem type\n", .{});
+        return error.TypeError;
+    };
+    _ = try ensureSliceStructFromElemName(ctx.a, ctx.structs, elem);
+
+    const base_meta = inferMetaFromExpr(ctx, sl.base);
+    const is_byte = std.mem.eql(u8, elem, "byte") or std.mem.eql(u8, elem, "u8") or std.mem.eql(u8, elem, "bool");
+    const stride: i64 = if (is_byte) 1 else 8;
+
+    // Data pointer and full length of the sliced value.
+    var data_base: u32 = undefined;
+    var full_len: u32 = undefined;
+    var upward = is_byte;
+
+    if (base_meta) |bm| {
+        if (bm.kind == .array_ptr) {
+            data_base = try lowerExpr(ctx, sl.base);
+            if (bm.array_len > 0) {
+                full_len = try ctx.fresh();
+                try ctx.emit(.{ .op = .iconst, .dst = full_len, .aux = @intCast(bm.array_len) });
+            } else if (bm.len_slot != none) {
+                full_len = bm.len_slot;
+            } else {
+                return error.TypeError;
+            }
+            upward = bm.elem_size == 1 or is_byte;
+        } else {
+            // Existing slice / `{ptr,len}` header — load fields.
+            const hdr = try lowerExpr(ctx, sl.base);
+            data_base = try ctx.fresh();
+            try ctx.emit(.{ .op = .load, .dst = data_base, .src0 = hdr });
+            const len_addr = try ctx.fresh();
+            const eight = try ctx.fresh();
+            try ctx.emit(.{ .op = .iconst, .dst = eight, .aux = 8 });
+            try ctx.emit(.{ .op = .add, .dst = len_addr, .src0 = hdr, .src1 = eight });
+            full_len = try ctx.fresh();
+            try ctx.emit(.{ .op = .load, .dst = full_len, .src0 = len_addr });
+            upward = true;
+        }
+    } else {
+        return error.TypeError;
+    }
+
+    const start_v: u32 = if (sl.start) |s|
+        try lowerExpr(ctx, s)
+    else blk: {
+        const z = try ctx.fresh();
+        try ctx.emit(.{ .op = .iconst, .dst = z, .aux = 0 });
+        break :blk z;
+    };
+    const end_v: u32 = if (sl.end) |en|
+        try lowerExpr(ctx, en)
+    else
+        full_len;
+
+    // ptr = data_base ± start * stride
+    const scale = try ctx.fresh();
+    try ctx.emit(.{ .op = .iconst, .dst = scale, .aux = stride });
+    const off = try ctx.fresh();
+    try ctx.emit(.{ .op = .mul, .dst = off, .src0 = start_v, .src1 = scale });
+    const data_ptr = try ctx.fresh();
+    if (upward) {
+        try ctx.emit(.{ .op = .add, .dst = data_ptr, .src0 = data_base, .src1 = off });
+    } else {
+        try ctx.emit(.{ .op = .sub, .dst = data_ptr, .src0 = data_base, .src1 = off });
+    }
+
+    // len = end - start
+    const len_v = try ctx.fresh();
+    try ctx.emit(.{ .op = .sub, .dst = len_v, .src0 = end_v, .src1 = start_v });
+
+    // Heap `{ ptr, len }` via ret arena (same as struct_lit). Stack lea_slot + field
+    // offsets grow opposite directions on the frame, so a stack header is unsafe
+    // when `len == 8` (the byte offset of `.len`) collides with nearby slots.
+    const sz = try ctx.fresh();
+    try ctx.emit(.{ .op = .iconst, .dst = sz, .aux = 16 });
+    const cid = ctx.callee_map.get("jogrt_ret_alloc").?;
+    const hdr = try ctx.fresh();
+    var allo = Inst{ .op = .call, .dst = hdr, .aux = cid, .arity = 1 };
+    allo.args[0] = sz;
+    try ctx.emit(allo);
+    try ctx.emit(.{ .op = .store, .src0 = hdr, .src1 = data_ptr });
+    const len_addr = try ctx.fresh();
+    const eight = try ctx.fresh();
+    try ctx.emit(.{ .op = .iconst, .dst = eight, .aux = 8 });
+    try ctx.emit(.{ .op = .add, .dst = len_addr, .src0 = hdr, .src1 = eight });
+    try ctx.emit(.{ .op = .store, .src0 = len_addr, .src1 = len_v });
+    return hdr;
 }
 
 fn maybeBoundsCheck(ctx: *Ctx, base_expr: *ast.Expr, index_expr: *ast.Expr) LowerError!void {
@@ -3094,6 +3226,7 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
             }
             return d;
         },
+        .slice => |sl| return try lowerSliceAccess(ctx, sl),
         .cstring => |s| {
             const idx: i64 = @intCast(ctx.strings.items.len);
             try ctx.strings.append(ctx.a, try ctx.a.dupe(u8, s));
