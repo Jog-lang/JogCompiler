@@ -75,6 +75,38 @@ jogrt_print:
   syscall
   ret
 
+/* bool jogrt_write(int fd, const void *ptr, size_t len) — SysV: edi/rsi/rdx. */
+.globl jogrt_write
+.type jogrt_write, @function
+jogrt_write:
+  mov eax, edi
+  /* reject stdin / bad fds; null ptr with nonzero len */
+  cmp eax, 1
+  jl 1f
+  cmp eax, 2
+  jg 1f
+  test rsi, rsi
+  jnz 2f
+  test rdx, rdx
+  jnz 1f
+2:
+  mov edi, eax
+  mov eax, 1
+  syscall
+  cmp rax, 0
+  jl 1f
+  mov eax, 1
+  ret
+1:
+  xor eax, eax
+  ret
+
+.globl jogrt_exit
+.type jogrt_exit, @function
+jogrt_exit:
+  mov eax, 231
+  syscall
+
 .globl jogrt_panic
 .type jogrt_panic, @function
 jogrt_panic:

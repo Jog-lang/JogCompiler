@@ -104,6 +104,12 @@ pub const Parser = struct {
                 fd.is_private = is_private;
                 return .{ .fn_decl = fd };
             } else if (std.mem.eql(u8, attr, "test")) {
+                // Optional `@test("display name")` — harness still uses the fn name.
+                if (self.tok.kind == .lparen) {
+                    self.advance();
+                    if (self.tok.kind == .string) self.advance();
+                    try self.expect(.rparen);
+                }
                 var fd = try self.parseFn();
                 fd.is_test = true;
                 fd.is_private = is_private;
@@ -554,6 +560,17 @@ pub const Parser = struct {
         };
     }
 
+    /// Method / field name: ident, contextual `expect`/`actual`, or `op` + operator.
+    /// Spec: `expect`/`actual` are keywords only before top-level `fn`; elsewhere they are names.
+    fn parseNameToken(self: *Parser) ParseError![]const u8 {
+        if (self.tok.kind == .ident or self.tok.kind == .kw_expect or self.tok.kind == .kw_actual) {
+            const name = self.tok.text;
+            self.advance();
+            return name;
+        }
+        return error.UnexpectedToken;
+    }
+
     /// Method name: ident, or `op` + operator (`op+`, `op==`, …).
     fn parseMethodName(self: *Parser) ParseError![]const u8 {
         if (self.tok.kind == .ident and std.mem.eql(u8, self.tok.text, "op")) {
@@ -582,10 +599,7 @@ pub const Parser = struct {
             self.advance();
             return try std.fmt.allocPrint(self.allocator, "op{s}", .{op_text});
         }
-        if (self.tok.kind != .ident) return error.UnexpectedToken;
-        const name = self.tok.text;
-        self.advance();
-        return name;
+        return try self.parseNameToken();
     }
 
     fn parseTypeParamList(self: *Parser) ParseError![][]const u8 {
@@ -1446,9 +1460,7 @@ pub const Parser = struct {
             }
             if (self.tok.kind == .dot) {
                 self.advance();
-                if (self.tok.kind != .ident) return error.UnexpectedToken;
-                const name = self.tok.text;
-                self.advance();
+                const name = try self.parseNameToken();
                 const f = try self.allocExpr();
                 f.* = .{ .field = .{ .base = e, .name = name } };
                 e = f;
@@ -1456,9 +1468,7 @@ pub const Parser = struct {
             }
             if (self.tok.kind == .dot_q) {
                 self.advance();
-                if (self.tok.kind != .ident) return error.UnexpectedToken;
-                const name = self.tok.text;
-                self.advance();
+                const name = try self.parseNameToken();
                 try self.expect(.lparen);
                 var args: std.ArrayListUnmanaged(*ast.Expr) = .{};
                 if (self.tok.kind != .rparen) {

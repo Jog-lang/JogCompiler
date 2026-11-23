@@ -1,0 +1,11 @@
+import std.testing
+
+@test
+fn answerIs42() with (t: testing.Testing) {
+    t.expect(answer() == 42)
+}
+
+@test
+fn truth() with (t: testing.Testing) {
+    t.expect(true)
+}

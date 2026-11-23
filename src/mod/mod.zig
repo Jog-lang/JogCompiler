@@ -329,6 +329,11 @@ fn isForeignPlatformSource(basename: []const u8) bool {
 /// Skips `*.test.jog`, hidden names, `out/`, and nested modules (subfolders with their own `jog.mod`).
 /// Caller frees each path and the slice.
 pub fn resolveSourcePaths(allocator: std.mem.Allocator, m: *const Manifest) Error![][]const u8 {
+    return resolveSourcePathsOpts(allocator, m, false);
+}
+
+/// Like `resolveSourcePaths`, but when `include_tests` also keeps root-module `*.test.jog` files.
+pub fn resolveSourcePathsOpts(allocator: std.mem.Allocator, m: *const Manifest, include_tests: bool) Error![][]const u8 {
     var out: std.ArrayListUnmanaged([]const u8) = .{};
     errdefer {
         for (out.items) |p| allocator.free(p);
@@ -343,12 +348,40 @@ pub fn resolveSourcePaths(allocator: std.mem.Allocator, m: *const Manifest) Erro
         };
         if (st.kind == .directory) {
             defer allocator.free(joined);
-            try walkJogSources(allocator, &out, joined);
+            try walkJogSources(allocator, &out, joined, include_tests);
         } else {
             try out.append(allocator, joined);
         }
     }
+    if (include_tests) {
+        try appendCompanionTestFiles(allocator, &out);
+    }
     return try out.toOwnedSlice(allocator);
+}
+
+/// For each non-test `.jog` already listed, add same-folder `*.test.jog` companions (OS-filtered).
+fn appendCompanionTestFiles(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged([]const u8)) Error!void {
+    const n = out.items.len;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const p = out.items[i];
+        if (!std.mem.endsWith(u8, p, ".jog") or std.mem.endsWith(u8, p, ".test.jog")) continue;
+        const dir = std.fs.path.dirname(p) orelse continue;
+        var d = std.fs.cwd().openDir(dir, .{ .iterate = true }) catch continue;
+        defer d.close();
+        var it = d.iterate();
+        while (it.next() catch null) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".test.jog")) continue;
+            if (isForeignPlatformSource(entry.name)) continue;
+            const child = try std.fs.path.join(allocator, &.{ dir, entry.name });
+            if (containsPath(out.items, child)) {
+                allocator.free(child);
+                continue;
+            }
+            try out.append(allocator, child);
+        }
+    }
 }
 
 /// True when this dependency should not be flat-merged into the consumer.
@@ -390,7 +423,7 @@ pub fn resolveLibdirs(allocator: std.mem.Allocator, m: *const Manifest) Error![]
     return try out.toOwnedSlice(allocator);
 }
 
-fn walkJogSources(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged([]const u8), abs_dir: []const u8) Error!void {
+fn walkJogSources(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged([]const u8), abs_dir: []const u8, include_tests: bool) Error!void {
     var dir = std.fs.cwd().openDir(abs_dir, .{ .iterate = true }) catch return error.MissingJogMod;
     defer dir.close();
 
@@ -416,7 +449,7 @@ fn walkJogSources(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged([]c
                     allocator.free(child);
                     continue;
                 } else |_| {}
-                try walkJogSources(allocator, out, child);
+                try walkJogSources(allocator, out, child, include_tests);
                 allocator.free(child);
             },
             .file => {
@@ -424,7 +457,7 @@ fn walkJogSources(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged([]c
                     allocator.free(child);
                     continue;
                 }
-                if (std.mem.endsWith(u8, entry.name, ".test.jog")) {
+                if (std.mem.endsWith(u8, entry.name, ".test.jog") and !include_tests) {
                     allocator.free(child);
                     continue;
                 }
