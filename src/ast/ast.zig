@@ -285,6 +285,8 @@ pub const Expr = union(enum) {
     call: Call,
     field: FieldAccess,
     index: IndexAccess,
+    /// `a[..]`, `a[i..]`, `a[..j]`, `a[i..j]` — view over array/slice (Grammar postfixOp).
+    slice: SliceAccess,
     cast: Cast,
     /// `e as? T` — optional cast (null on failure).
     try_cast: Cast,
@@ -344,6 +346,13 @@ pub const WhenArm = struct {
 pub const IndexAccess = struct {
     base: *Expr,
     index: *Expr,
+};
+
+/// Half-open slice of `base`. Missing `start` means 0; missing `end` means length of base.
+pub const SliceAccess = struct {
+    base: *Expr,
+    start: ?*Expr = null,
+    end: ?*Expr = null,
 };
 
 pub const PanicCall = struct {

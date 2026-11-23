@@ -1370,11 +1370,33 @@ pub const Parser = struct {
             }
             if (pending_targs.len != 0) return error.UnexpectedToken;
             if (self.tok.kind == .lbracket) {
+                // `a[i]` index, or `a[..]` / `a[i..j]` / `a[i..]` / `a[..j]` slice.
+                // Bounds use parseCoalesce so `..` is not eaten as a range expr.
                 self.advance();
-                const idx = try self.parseExpr();
+                if (self.tok.kind == .dotdot) {
+                    self.advance();
+                    var end: ?*ast.Expr = null;
+                    if (self.tok.kind != .rbracket) end = try self.parseCoalesce();
+                    try self.expect(.rbracket);
+                    const sl = try self.allocExpr();
+                    sl.* = .{ .slice = .{ .base = e, .start = null, .end = end } };
+                    e = sl;
+                    continue;
+                }
+                const mid = try self.parseCoalesce();
+                if (self.tok.kind == .dotdot) {
+                    self.advance();
+                    var end: ?*ast.Expr = null;
+                    if (self.tok.kind != .rbracket) end = try self.parseCoalesce();
+                    try self.expect(.rbracket);
+                    const sl = try self.allocExpr();
+                    sl.* = .{ .slice = .{ .base = e, .start = mid, .end = end } };
+                    e = sl;
+                    continue;
+                }
                 try self.expect(.rbracket);
                 const ix = try self.allocExpr();
-                ix.* = .{ .index = .{ .base = e, .index = idx } };
+                ix.* = .{ .index = .{ .base = e, .index = mid } };
                 e = ix;
                 continue;
             }
