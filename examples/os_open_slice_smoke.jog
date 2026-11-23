@@ -1,0 +1,19 @@
+import std.os
+
+fn main() {
+    val (h, okh) = os.hostname()
+    if !okh || h.len == 0 {
+        panic("hostname fail\n")
+    }
+    val (p, okp) = os.exe_path()
+    if !okp || p.len == 0 {
+        panic("exe_path fail\n")
+    }
+    var xs = os.environ()
+    if xs.len == 0 {
+        os.free_environ(xs)
+        panic("environ empty\n")
+    }
+    os.free_environ(xs)
+    print("os open-slice smoke ok\n")
+}

@@ -18,4 +18,4 @@ The standard library is written in Jog. Each directory is one package. The compi
 - `testing` — `expect`, `expectEq`, `fail`, `fatal`, and `expectPanic`
 - `text` — string views, ASCII helpers, pad/join/repeat
 
-`*.test.jog` files are the package tests. On the Zig v2 driver, prefer `jog check` plus smoke builds until `jog test` is restored (see JogDocs `bootstrap/Friction.md`).
+`*.test.jog` files are the package tests. Prefer `jog test <package-dir>` on the Zig v2 driver (see JogDocs `guide/Toolchain.md`).

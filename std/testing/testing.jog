@@ -9,8 +9,8 @@
 // expectPanic catches a panic inside the closure. A panic outside it
 // still aborts.
 //
-// v2 note: speak to stderr via jogrt_write (not std.io) so loading tests
-// does not pull io's open-slice / import-alias gaps.
+// v2 note: speak to stderr via jogrt_write (not std.io) so the harness
+// stays free of io import weight when only testing is loaded.
 
 import std.c
 
