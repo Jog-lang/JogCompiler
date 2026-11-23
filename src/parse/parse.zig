@@ -1249,7 +1249,8 @@ pub const Parser = struct {
     }
 
     fn parseMul(self: *Parser) ParseError!*ast.Expr {
-        var left = try self.parseUnary();
+        // Grammar: mulExpr = castExpr { ("*"|"/"|"%") castExpr }
+        var left = try self.parseCast();
         while (self.tok.kind == .star or self.tok.kind == .slash or self.tok.kind == .percent) {
             const op: ast.BinaryOp = switch (self.tok.kind) {
                 .star => .mul,
@@ -1258,12 +1259,32 @@ pub const Parser = struct {
                 else => unreachable,
             };
             self.advance();
-            const right = try self.parseUnary();
+            const right = try self.parseCast();
             const e = try self.allocExpr();
             e.* = .{ .binary = .{ .op = op, .left = left, .right = right } };
             left = e;
         }
         return left;
+    }
+
+    /// Grammar castExpr = unaryExpr { ("as"|"as?") type }.
+    /// Prefix `&` binds tighter than `as`, so `&x as *T` is `(&x) as *T` (not `&(x as *T)`).
+    fn parseCast(self: *Parser) ParseError!*ast.Expr {
+        var e = try self.parseUnary();
+        while (self.tok.kind == .kw_as) {
+            self.advance();
+            const try_cast = self.tok.kind == .question;
+            if (try_cast) self.advance();
+            const ty = try self.parseTypeExpr();
+            const c = try self.allocExpr();
+            if (try_cast) {
+                c.* = .{ .try_cast = .{ .expr = e, .ty = ty } };
+            } else {
+                c.* = .{ .cast = .{ .expr = e, .ty = ty } };
+            }
+            e = c;
+        }
+        return e;
     }
 
     fn parseUnary(self: *Parser) ParseError!*ast.Expr {
@@ -1435,20 +1456,7 @@ pub const Parser = struct {
                 e = oc;
                 continue;
             }
-            if (self.tok.kind == .kw_as) {
-                self.advance();
-                const try_cast = self.tok.kind == .question;
-                if (try_cast) self.advance();
-                const ty = try self.parseTypeExpr();
-                const c = try self.allocExpr();
-                if (try_cast) {
-                    c.* = .{ .try_cast = .{ .expr = e, .ty = ty } };
-                } else {
-                    c.* = .{ .cast = .{ .expr = e, .ty = ty } };
-                }
-                e = c;
-                continue;
-            }
+            // `as` / `as?` are castExpr (above unary), not postfix — see parseCast.
             if (self.tok.kind == .kw_is) {
                 self.advance();
                 const ty = try self.parseTypeExpr();
