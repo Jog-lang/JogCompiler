@@ -1,0 +1,23 @@
+import std.testing
+
+@test("str content equality")
+fn strEq() with (t: testing.Testing) {
+    t.expect("hi" == "hi")
+    t.expect("" == "")
+    t.expect("hi" != "bye")
+    t.expectEq("abc", "abc")
+    val a = "xyz"
+    val b = "xyz"
+    t.expect(a == b)
+    t.expectEq(a, b)
+}
+
+@test("iface method returning str")
+fn ifaceStr() with (t: testing.Testing) {
+    val d = Dog(name: "Rex")
+    val s = nameOf(&d)
+    t.expect(s == "woof")
+    t.expectEq(s, "woof")
+    val n: Named = &d
+    t.expectEq(nameOf(n), "woof")
+}
