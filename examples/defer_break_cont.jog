@@ -1,0 +1,25 @@
+// defer runs on break / continue and accepts assignment stmts. JOG-219.
+
+fn main() {
+    var n: i64 = 0
+    for {
+        defer n = n + 1
+        break
+    }
+    var i: i64 = 0
+    for i < 3 {
+        defer {
+            n = n + 10
+        }
+        i = i + 1
+        if i == 2 {
+            continue
+        }
+    }
+    // break +1; three loop iters +10 each → 31
+    if n == 31 {
+        print("defer break cont ok\n")
+    } else {
+        panic("defer break cont bad\n")
+    }
+}

@@ -1,0 +1,36 @@
+// Regression: content equality for `str` (JOG-224 / Friction 2026-11-23).
+// Literals each get their own `{ptr,len}` header — `==` must compare bytes.
+
+fn main() {
+    if "hi" == "hi" {
+        print("lit eq ok\n")
+    } else {
+        panic("lit eq fail\n")
+    }
+    if "" == "" {
+        print("empty eq ok\n")
+    } else {
+        panic("empty eq fail\n")
+    }
+    if "hi" != "bye" {
+        print("neq ok\n")
+    } else {
+        panic("neq fail\n")
+    }
+    if "hi" == "bye" {
+        panic("false positive eq\n")
+    }
+    val a = "abc"
+    val b = a
+    if a == b {
+        print("alias eq ok\n")
+    } else {
+        panic("alias eq fail\n")
+    }
+    val c = "abc"
+    if a == c {
+        print("dup lit eq ok\n")
+    } else {
+        panic("dup lit eq fail\n")
+    }
+}

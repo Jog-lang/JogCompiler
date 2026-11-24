@@ -1,0 +1,32 @@
+// Regression: interface method returning `str` (JOG-224 / Friction 2026-11-23).
+// Return headers live in the ret arena; assigning to a local must durable-copy.
+
+interface Named {
+    fn greet(): str
+}
+
+struct Dog {
+    name: str
+}
+
+fn Dog.greet(): str = "woof"
+
+fn nameOf(n: Named): str = n.greet()
+
+fn main() {
+    val d = Dog(name: "Rex")
+    // Spec form: pass `&concrete` into an iface parameter (fat ptr built at the call).
+    val s = nameOf(&d)
+    if s == "woof" {
+        print("iface str ok\n")
+    } else {
+        panic("iface str mismatch\n")
+    }
+    // Typed local + another call through the iface value.
+    val n: Named = &d
+    if nameOf(n) != "woof" {
+        panic("iface local mismatch\n")
+    }
+    print(s)
+    print("\n")
+}

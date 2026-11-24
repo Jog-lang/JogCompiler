@@ -95,6 +95,9 @@ pub const EnumDecl = struct {
 pub const EnumVariant = struct {
     name: []const u8,
     value: ?i64 = null,
+    /// Payload fields (`Circle(r: f64)`). Empty for tag-only variants.
+    /// Grammar: a variant has either a payload or an explicit tag value, never both.
+    fields: []Field = &.{},
 };
 
 pub const ExternBlock = struct {
@@ -120,6 +123,9 @@ pub const Field = struct {
     ty: *TypeExpr,
     /// `private name: T` — readable/writable only as `self.name` in methods.
     is_private: bool = false,
+    /// Bare type name in a struct body (`Entity`) — stored under that type's
+    /// name; fields/methods are promoted onto the outer type.
+    is_embedded: bool = false,
 };
 
 pub const StructDecl = struct {
@@ -241,11 +247,14 @@ pub const Destructure = struct {
 };
 
 pub const Assign = struct {
-    /// Simple `name = value`, field store (`base.name = value`), or index store (`base[i] = value`).
+    /// Simple `name = value`, field store (`base.name = value`), index store
+    /// (`base[i] = value`), or deref store (`*p = value`).
     name: []const u8,
     value: *Expr,
     field: ?FieldAssign = null,
     index: ?IndexAssign = null,
+    /// `*ptr = value` — pointer expression being stored through.
+    deref: ?*Expr = null,
     /// Compound `+=` etc.; null means plain `=`.
     compound: ?BinaryOp = null,
 };
@@ -297,8 +306,13 @@ pub const Expr = union(enum) {
     is_type: IsType,
     optional_call: OptionalCall,
     struct_lit: StructLit,
+    /// `Shape.Circle(r: 2.0)` or `.Empty` (type_name filled when the expected type is known).
+    enum_lit: EnumLit,
     panic_call: PanicCall,
     when_expr: WhenExpr,
+    /// `if cond { … } else { … }` used as a value (Grammar ifExpr).
+    /// Branch value is the last expression statement in each block.
+    if_expr: IfStmt,
     /// `(a, b, …)` product value.
     tuple: []*Expr,
     /// `a..b` half-open range (start inclusive, end exclusive).
@@ -358,7 +372,17 @@ pub const WhenExpr = struct {
 
 pub const WhenArm = struct {
     pattern: []const u8,
+    /// Positional payload binds: `Circle(r)` → `["r"]`. `_` is kept as `"_"`.
+    bindings: [][]const u8 = &.{},
     body: *Expr,
+};
+
+/// Enum variant construction: `Shape.Circle(r: 2.0)` or `.Empty`.
+pub const EnumLit = struct {
+    /// Enum type name; null for `.Variant` until check fills it from context.
+    type_name: ?[]const u8 = null,
+    variant: []const u8,
+    fields: []StructLitField = &.{},
 };
 
 pub const IndexAccess = struct {

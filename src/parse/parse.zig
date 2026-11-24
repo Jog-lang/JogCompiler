@@ -29,6 +29,7 @@ pub const Parser = struct {
         };
         p.tok = p.lx.next();
         var decls: std.ArrayListUnmanaged(ast.Decl) = .{};
+        p.skipSeps();
         while (p.tok.kind != .eof) {
             const d = p.parseDecl() catch |err| {
                 std.debug.print("parse error at {d}:{d} near '{s}' ({s}): {s}\n", .{
@@ -41,6 +42,7 @@ pub const Parser = struct {
                 return err;
             };
             try decls.append(p.allocator, d);
+            p.skipSeps();
         }
         file.decls = try decls.toOwnedSlice(p.allocator);
         return file;
@@ -66,16 +68,28 @@ pub const Parser = struct {
         self.advance();
     }
 
+    /// Grammar `SEP`: inserted newline terminator or explicit `;`.
+    fn skipSeps(self: *Parser) void {
+        while (self.tok.kind == .semicolon) self.advance();
+    }
+
     fn parseDecl(self: *Parser) ParseError!ast.Decl {
         var is_private = false;
         if (self.tok.kind == .kw_private) {
-            is_private = true;
             self.advance();
-            // private(package) — accept and ignore scope for now
+            // Bare `private` / `private(file)` are file-local (mangled before flatten).
+            // `private(package)` is package-visible — keep the source name.
             if (self.tok.kind == .lparen) {
                 self.advance();
-                if (self.tok.kind == .ident) self.advance();
+                var file_local = true;
+                if (self.tok.kind == .ident) {
+                    if (std.mem.eql(u8, self.tok.text, "package")) file_local = false;
+                    self.advance();
+                }
                 try self.expect(.rparen);
+                is_private = file_local;
+            } else {
+                is_private = true;
             }
         }
         // @link / @export / @test / @packed / @intrinsic
@@ -95,10 +109,12 @@ pub const Parser = struct {
                 self.advance();
                 try self.expect(.rparen);
                 const lib = try unescape(self.allocator, if (raw.len >= 2) raw[1 .. raw.len - 1] else raw);
+                self.skipSeps();
                 var eb = try self.parseExternBlock();
                 eb.link_lib = lib;
                 return .{ .extern_block = eb };
             } else if (std.mem.eql(u8, attr, "export")) {
+                self.skipSeps();
                 var fd = try self.parseFn();
                 fd.exported = true;
                 fd.is_private = is_private;
@@ -110,11 +126,13 @@ pub const Parser = struct {
                     if (self.tok.kind == .string) self.advance();
                     try self.expect(.rparen);
                 }
+                self.skipSeps();
                 var fd = try self.parseFn();
                 fd.is_test = true;
                 fd.is_private = is_private;
                 return .{ .fn_decl = fd };
             } else if (std.mem.eql(u8, attr, "packed")) {
+                self.skipSeps();
                 var sd = try self.parseStruct();
                 sd.packed_attr = true;
                 return .{ .struct_decl = sd };
@@ -129,9 +147,11 @@ pub const Parser = struct {
                         self.advance();
                     }
                 }
+                self.skipSeps();
                 return .{ .type_alias = try self.parseTypeAlias() };
             } else if (std.mem.eql(u8, attr, "opaque")) {
                 // `@opaque struct Name` — parse as ordinary struct (layout later).
+                self.skipSeps();
                 const sd = try self.parseStruct();
                 return .{ .struct_decl = sd };
             } else {
@@ -248,6 +268,7 @@ pub const Parser = struct {
     fn parseExternBlock(self: *Parser) ParseError!ast.ExternBlock {
         try self.expect(.kw_extern);
         try self.expect(.lbrace);
+        self.skipSeps();
         var fns: std.ArrayListUnmanaged(ast.ExternFn) = .{};
         while (self.tok.kind != .rbrace and self.tok.kind != .eof) {
             try self.expect(.kw_fn);
@@ -261,6 +282,7 @@ pub const Parser = struct {
                 ret = try self.parseTypeExpr();
             }
             try fns.append(self.allocator, .{ .name = name, .params = params, .ret = ret });
+            self.skipSeps();
         }
         try self.expect(.rbrace);
         return .{ .fns = try fns.toOwnedSlice(self.allocator), .link_lib = null };
@@ -299,21 +321,29 @@ pub const Parser = struct {
             _ = try self.parseTypeExpr();
         }
         try self.expect(.lbrace);
+        self.skipSeps();
         var variants: std.ArrayListUnmanaged(ast.EnumVariant) = .{};
         while (self.tok.kind != .rbrace and self.tok.kind != .eof) {
             if (self.tok.kind != .ident) return error.UnexpectedToken;
             const vname = self.tok.text;
             self.advance();
             var value: ?i64 = null;
-            if (self.tok.kind == .eq) {
+            var fields: []ast.Field = &.{};
+            // Payload `Circle(r: f64)` or explicit tag `Red = 1` — never both (Grammar).
+            if (self.tok.kind == .lparen) {
+                fields = try self.parseEnumPayloadFields();
+            } else if (self.tok.kind == .eq) {
                 self.advance();
                 if (self.tok.kind != .int) return error.UnexpectedToken;
                 value = try std.fmt.parseInt(i64, self.tok.text, 10);
                 self.advance();
             }
-            if (self.tok.kind == .lparen) return error.UnexpectedToken;
-            try variants.append(self.allocator, .{ .name = vname, .value = value });
-            if (self.tok.kind == .comma) self.advance();
+            try variants.append(self.allocator, .{ .name = vname, .value = value, .fields = fields });
+            self.skipSeps();
+            if (self.tok.kind == .comma) {
+                self.advance();
+                self.skipSeps();
+            }
         }
         try self.expect(.rbrace);
         return .{
@@ -322,6 +352,30 @@ pub const Parser = struct {
             .line = line,
             .col = col,
         };
+    }
+
+    /// Payload field list inside `Variant(name: T, ...)`.
+    fn parseEnumPayloadFields(self: *Parser) ParseError![]ast.Field {
+        try self.expect(.lparen);
+        var fields: std.ArrayListUnmanaged(ast.Field) = .{};
+        if (self.tok.kind != .rparen) {
+            while (true) {
+                if (self.tok.kind != .ident) return error.UnexpectedToken;
+                const fname = self.tok.text;
+                self.advance();
+                try self.expect(.colon);
+                const ty = try self.parseTypeExpr();
+                try fields.append(self.allocator, .{ .name = fname, .ty = ty });
+                if (self.tok.kind == .comma) {
+                    self.advance();
+                    if (self.tok.kind == .rparen) break;
+                    continue;
+                }
+                break;
+            }
+        }
+        try self.expect(.rparen);
+        return try fields.toOwnedSlice(self.allocator);
     }
 
     fn parseTypeAlias(self: *Parser) ParseError!ast.TypeAlias {
@@ -368,6 +422,7 @@ pub const Parser = struct {
             };
         }
         try self.expect(.lbrace);
+        self.skipSeps();
         var fields: std.ArrayListUnmanaged(ast.Field) = .{};
         while (self.tok.kind != .rbrace and self.tok.kind != .eof) {
             var is_private = false;
@@ -378,9 +433,27 @@ pub const Parser = struct {
             if (self.tok.kind != .ident) return error.UnexpectedToken;
             const fname = self.tok.text;
             self.advance();
-            try self.expect(.colon);
-            const ty = try self.parseTypeExpr();
-            try fields.append(self.allocator, .{ .name = fname, .ty = ty, .is_private = is_private });
+            if (self.tok.kind == .colon) {
+                self.advance();
+                const ty = try self.parseTypeExpr();
+                try fields.append(self.allocator, .{ .name = fname, .ty = ty, .is_private = is_private });
+            } else {
+                // Embedding: bare type name, field name is the type leaf.
+                // Spec: `struct Player { Entity  name: str }` — see Structs.md.
+                const ty = try self.allocator.create(ast.TypeExpr);
+                ty.* = .{ .name = fname };
+                try fields.append(self.allocator, .{
+                    .name = fname,
+                    .ty = ty,
+                    .is_private = is_private,
+                    .is_embedded = true,
+                });
+            }
+            self.skipSeps();
+            if (self.tok.kind == .comma) {
+                self.advance();
+                self.skipSeps();
+            }
         }
         try self.expect(.rbrace);
         return .{
@@ -427,11 +500,13 @@ pub const Parser = struct {
         const name = self.tok.text;
         self.advance();
         try self.expect(.lbrace);
+        self.skipSeps();
         var methods: std.ArrayListUnmanaged(ast.MethodSig) = .{};
         while (self.tok.kind != .rbrace and self.tok.kind != .eof) {
             // Spec also allows `val`/`var` property requirements and embeds — accept `fn` methods for now.
             if (self.tok.kind == .kw_fn) {
                 try methods.append(self.allocator, try self.parseMethodSig());
+                self.skipSeps();
                 continue;
             }
             // Skip unsupported property/embed/type-set lines (`~i8 | ~i16`, …) until `fn` or `}`.
@@ -441,6 +516,7 @@ pub const Parser = struct {
                 while (self.tok.kind != .kw_fn and self.tok.kind != .rbrace and self.tok.kind != .eof) {
                     self.advance();
                 }
+                self.skipSeps();
                 continue;
             }
             return error.UnexpectedToken;
@@ -862,9 +938,11 @@ pub const Parser = struct {
 
     fn parseBlock(self: *Parser) ParseError!*ast.Block {
         try self.expect(.lbrace);
+        self.skipSeps();
         var stmts: std.ArrayListUnmanaged(ast.Stmt) = .{};
         while (self.tok.kind != .rbrace and self.tok.kind != .eof) {
             try stmts.append(self.allocator, try self.parseStmt());
+            self.skipSeps();
         }
         try self.expect(.rbrace);
         const block = try self.allocator.create(ast.Block);
@@ -960,6 +1038,8 @@ pub const Parser = struct {
                 }
                 const then_b = try self.parseBlock();
                 var else_b: ?*ast.Block = null;
+                // Grammar: ignore SEP right before `else`.
+                self.skipSeps();
                 if (self.tok.kind == .kw_else) {
                     self.advance();
                     // Grammar ifExpr: else ( ifExpr | block ). `else if` → one-stmt block.
@@ -1031,17 +1111,35 @@ pub const Parser = struct {
             },
             .kw_defer => {
                 self.advance();
+                // Grammar: defer ( block | stmt ). Wrap a bare stmt in a one-stmt block
+                // so assignment (`defer n = n + 1`) and other stmts lower cleanly.
                 if (self.tok.kind == .lbrace) {
                     return .{ .defer_stmt = .{ .block = try self.parseBlock() } };
                 }
-                return .{ .defer_stmt = .{ .expr = try self.parseExpr() } };
+                const inner = try self.parseStmt();
+                if (inner == .expr) {
+                    return .{ .defer_stmt = .{ .expr = inner.expr } };
+                }
+                const wrap = try self.allocator.create(ast.Block);
+                const stmts = try self.allocator.alloc(ast.Stmt, 1);
+                stmts[0] = inner;
+                wrap.* = .{ .stmts = stmts };
+                return .{ .defer_stmt = .{ .block = wrap } };
             },
             .kw_errdefer => {
                 self.advance();
                 if (self.tok.kind == .lbrace) {
                     return .{ .errdefer_stmt = .{ .block = try self.parseBlock() } };
                 }
-                return .{ .errdefer_stmt = .{ .expr = try self.parseExpr() } };
+                const inner = try self.parseStmt();
+                if (inner == .expr) {
+                    return .{ .errdefer_stmt = .{ .expr = inner.expr } };
+                }
+                const wrap = try self.allocator.create(ast.Block);
+                const stmts = try self.allocator.alloc(ast.Stmt, 1);
+                stmts[0] = inner;
+                wrap.* = .{ .stmts = stmts };
+                return .{ .errdefer_stmt = .{ .block = wrap } };
             },
             .kw_with => {
                 self.advance();
@@ -1085,32 +1183,79 @@ pub const Parser = struct {
                 };
                 self.advance();
                 const v = try self.parseExpr();
-                if (e.* == .ident) {
-                    return .{ .assign = .{ .name = e.ident, .value = v, .compound = compound } };
+                switch (e.*) {
+                    .ident => |name| {
+                        return .{ .assign = .{ .name = name, .value = v, .compound = compound } };
+                    },
+                    .field => |fa| {
+                        return .{ .assign = .{
+                            .name = fa.name,
+                            .value = v,
+                            .field = .{ .base = fa.base, .name = fa.name },
+                            .compound = compound,
+                        } };
+                    },
+                    .index => |ix| {
+                        return .{ .assign = .{
+                            .name = "",
+                            .value = v,
+                            .index = .{ .base = ix.base, .index = ix.index },
+                            .compound = compound,
+                        } };
+                    },
+                    .unary => |u| {
+                        if (u.op == .deref) {
+                            return .{ .assign = .{
+                                .name = "",
+                                .value = v,
+                                .deref = u.expr,
+                                .compound = compound,
+                            } };
+                        }
+                        return error.UnexpectedToken;
+                    },
+                    else => return error.UnexpectedToken,
                 }
-                if (e.* == .field) {
-                    return .{ .assign = .{
-                        .name = e.field.name,
-                        .value = v,
-                        .field = .{ .base = e.field.base, .name = e.field.name },
-                        .compound = compound,
-                    } };
-                }
-                if (e.* == .index) {
-                    return .{ .assign = .{
-                        .name = "",
-                        .value = v,
-                        .index = .{ .base = e.index.base, .index = e.index.index },
-                        .compound = compound,
-                    } };
-                }
-                return error.UnexpectedToken;
             },
         }
     }
 
     fn parseExpr(self: *Parser) ParseError!*ast.Expr {
+        // Grammar: expr = ifExpr | whenExpr | goExpr | lambda | orExpr
+        if (self.tok.kind == .kw_if) return try self.parseIfExpr();
         return try self.parseRange();
+    }
+
+    /// `if cond { … } [ else ( ifExpr | block ) ]` as a value-producing expression.
+    fn parseIfExpr(self: *Parser) ParseError!*ast.Expr {
+        try self.expect(.kw_if);
+        var cond: *ast.Expr = undefined;
+        if (self.tok.kind == .lparen) {
+            self.advance();
+            cond = try self.parseExpr();
+            try self.expect(.rparen);
+        } else {
+            cond = try self.parseExpr();
+        }
+        const then_b = try self.parseBlock();
+        var else_b: ?*ast.Block = null;
+        if (self.tok.kind == .kw_else) {
+            self.advance();
+            if (self.tok.kind == .kw_if) {
+                // else if → one-stmt block whose value is the nested if_expr.
+                const inner = try self.parseIfExpr();
+                const wrap = try self.allocator.create(ast.Block);
+                const stmts = try self.allocator.alloc(ast.Stmt, 1);
+                stmts[0] = .{ .expr = inner };
+                wrap.* = .{ .stmts = stmts };
+                else_b = wrap;
+            } else {
+                else_b = try self.parseBlock();
+            }
+        }
+        const e = try self.allocExpr();
+        e.* = .{ .if_expr = .{ .cond = cond, .then_block = then_b, .else_block = else_b } };
+        return e;
     }
 
     fn parseRange(self: *Parser) ParseError!*ast.Expr {
@@ -1371,6 +1516,41 @@ pub const Parser = struct {
                     e = call;
                     continue;
                 }
+                // `Shape.Circle(r: 2.0)` — field access + named fields → enum variant lit.
+                // Empty `()` must stay a call (`n.greet()`); tag-only variants use
+                // `Shape.Empty` / `.Empty` without parens (see field / primary paths).
+                if (e.* == .field and e.field.base.* == .ident and pending_targs.len == 0) {
+                    const save_enum = self.snapshot();
+                    self.advance(); // (
+                    if (self.tok.kind == .ident) {
+                        const fname = self.tok.text;
+                        self.advance();
+                        if (self.tok.kind == .colon) {
+                            self.advance();
+                            var fields: std.ArrayListUnmanaged(ast.StructLitField) = .{};
+                            try fields.append(self.allocator, .{ .name = fname, .value = try self.parseExpr() });
+                            while (self.tok.kind == .comma) {
+                                self.advance();
+                                if (self.tok.kind == .rparen) break;
+                                if (self.tok.kind != .ident) return error.UnexpectedToken;
+                                const n = self.tok.text;
+                                self.advance();
+                                try self.expect(.colon);
+                                try fields.append(self.allocator, .{ .name = n, .value = try self.parseExpr() });
+                            }
+                            try self.expect(.rparen);
+                            const el = try self.allocExpr();
+                            el.* = .{ .enum_lit = .{
+                                .type_name = e.field.base.ident,
+                                .variant = e.field.name,
+                                .fields = try fields.toOwnedSlice(self.allocator),
+                            } };
+                            e = el;
+                            continue;
+                        }
+                    }
+                    self.restore(save_enum);
+                }
                 self.advance();
                 var args: std.ArrayListUnmanaged(*ast.Expr) = .{};
                 if (self.tok.kind != .rparen) {
@@ -1460,7 +1640,16 @@ pub const Parser = struct {
             }
             if (self.tok.kind == .dot) {
                 self.advance();
-                const name = try self.parseNameToken();
+                // Tuple fields: `pair.0` / `pair.1` → synthetic `_0` / `_1`
+                // (same names as lowered `__Tup*` structs).
+                const name: []const u8 = blk: {
+                    if (self.tok.kind == .int) {
+                        const n = try std.fmt.allocPrint(self.allocator, "_{s}", .{self.tok.text});
+                        self.advance();
+                        break :blk n;
+                    }
+                    break :blk try self.parseNameToken();
+                };
                 const f = try self.allocExpr();
                 f.* = .{ .field = .{ .base = e, .name = name } };
                 e = f;
@@ -1516,6 +1705,7 @@ pub const Parser = struct {
                 self.advance();
                 const scrutinee = try self.parseExpr();
                 try self.expect(.lbrace);
+                self.skipSeps();
                 var arms: std.ArrayListUnmanaged(ast.WhenArm) = .{};
                 var else_body: ?*ast.Expr = null;
                 while (self.tok.kind != .rbrace and self.tok.kind != .eof) {
@@ -1523,14 +1713,37 @@ pub const Parser = struct {
                         self.advance();
                         try self.expect(.arrow);
                         else_body = try self.parseExpr();
+                        self.skipSeps();
                         continue;
                     }
                     if (self.tok.kind != .ident) return error.UnexpectedToken;
                     const pat = self.tok.text;
                     self.advance();
+                    // Payload binds: `Circle(r)` / `Rect(w, h)` (positional; `_` allowed).
+                    var bindings: [][]const u8 = &.{};
+                    if (self.tok.kind == .lparen) {
+                        self.advance();
+                        var binds: std.ArrayListUnmanaged([]const u8) = .{};
+                        if (self.tok.kind != .rparen) {
+                            while (true) {
+                                if (self.tok.kind != .ident) return error.UnexpectedToken;
+                                try binds.append(self.allocator, self.tok.text);
+                                self.advance();
+                                if (self.tok.kind == .comma) {
+                                    self.advance();
+                                    if (self.tok.kind == .rparen) break;
+                                    continue;
+                                }
+                                break;
+                            }
+                        }
+                        try self.expect(.rparen);
+                        bindings = try binds.toOwnedSlice(self.allocator);
+                    }
                     try self.expect(.arrow);
                     const body = try self.parseExpr();
-                    try arms.append(self.allocator, .{ .pattern = pat, .body = body });
+                    try arms.append(self.allocator, .{ .pattern = pat, .bindings = bindings, .body = body });
+                    self.skipSeps();
                 }
                 try self.expect(.rbrace);
                 e.* = .{ .when_expr = .{
@@ -1744,6 +1957,38 @@ pub const Parser = struct {
                 e.* = .null_lit;
                 return e;
             },
+            // `.Empty` — enum variant with type filled in by check from context.
+            .dot => {
+                self.advance();
+                if (self.tok.kind != .ident) return error.UnexpectedToken;
+                const vname = self.tok.text;
+                self.advance();
+                var fields: []ast.StructLitField = &.{};
+                if (self.tok.kind == .lparen) {
+                    self.advance();
+                    if (self.tok.kind != .rparen) {
+                        if (self.tok.kind != .ident) return error.UnexpectedToken;
+                        const fname = self.tok.text;
+                        self.advance();
+                        try self.expect(.colon);
+                        var flist: std.ArrayListUnmanaged(ast.StructLitField) = .{};
+                        try flist.append(self.allocator, .{ .name = fname, .value = try self.parseExpr() });
+                        while (self.tok.kind == .comma) {
+                            self.advance();
+                            if (self.tok.kind == .rparen) break;
+                            if (self.tok.kind != .ident) return error.UnexpectedToken;
+                            const n = self.tok.text;
+                            self.advance();
+                            try self.expect(.colon);
+                            try flist.append(self.allocator, .{ .name = n, .value = try self.parseExpr() });
+                        }
+                        fields = try flist.toOwnedSlice(self.allocator);
+                    }
+                    try self.expect(.rparen);
+                }
+                e.* = .{ .enum_lit = .{ .type_name = null, .variant = vname, .fields = fields } };
+                return e;
+            },
             .kw_true => {
                 self.advance();
                 e.* = .{ .int = 1 };
@@ -1887,4 +2132,44 @@ test "parse scope and go blocks" {
     try std.testing.expect(sb.body.stmts[0].expr.* == .go_block);
     try std.testing.expect(sb.body.stmts[1].expr.* == .go_block);
     try std.testing.expect(sb.body.stmts[1].expr.go_block.with_args.len == 1);
+}
+
+test "parse enum payload variants" {
+    const src =
+        \\enum Shape {
+        \\    Circle(r: f64)
+        \\    Rect(w: f64, h: f64)
+        \\    Empty
+        \\}
+        \\
+    ;
+    var file = try Parser.parseFile(std.testing.allocator, src);
+    defer file.deinit();
+    try std.testing.expectEqual(@as(usize, 1), file.decls.len);
+    const ed = file.decls[0].enum_decl;
+    try std.testing.expectEqualStrings("Shape", ed.name);
+    try std.testing.expectEqual(@as(usize, 3), ed.variants.len);
+    try std.testing.expectEqualStrings("Circle", ed.variants[0].name);
+    try std.testing.expectEqual(@as(usize, 1), ed.variants[0].fields.len);
+    try std.testing.expectEqualStrings("r", ed.variants[0].fields[0].name);
+    try std.testing.expectEqual(@as(usize, 2), ed.variants[1].fields.len);
+    try std.testing.expectEqual(@as(usize, 0), ed.variants[2].fields.len);
+}
+
+test "parse enum lit and when bindings" {
+    const src =
+        \\enum Shape { Circle(r: i64), Empty }
+        \\fn f(s: Shape): i64 {
+        \\    val x = Shape.Circle(r: 2)
+        \\    val e: Shape = .Empty
+        \\    return when s {
+        \\        Circle(r) -> r
+        \\        Empty -> 0
+        \\    }
+        \\}
+        \\
+    ;
+    var file = try Parser.parseFile(std.testing.allocator, src);
+    defer file.deinit();
+    try std.testing.expect(file.decls.len >= 2);
 }

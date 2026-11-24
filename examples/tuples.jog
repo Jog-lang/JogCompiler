@@ -8,7 +8,8 @@ fn main() {
     val (x, y) = pair(3, 4)
     if (x + y == 7) {
         val t = (10, 20)
-        if (t._0 + t._1 == 30) {
+        // Spec: pair.0 / pair.1 (Types.md); `_0` remains accepted as the synthetic name.
+        if (t.0 + t.1 == 30) {
             print("tuples ok\n")
         } else {
             panic("fields\n")

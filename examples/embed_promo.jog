@@ -1,0 +1,34 @@
+// Struct embedding + field/method promotion (JOG-223 / Structs.md).
+
+struct Entity {
+    id: i64
+    pos: i64
+}
+
+struct Player {
+    Entity
+    name: i64
+    hp: i64
+}
+
+fn *Entity.bump() {
+    self.id = self.id + 1
+}
+
+fn main() {
+    var pl = Player(Entity: Entity(id: 1, pos: 2), name: 3, hp: 100)
+    if (pl.id == 1) {
+        if (pl.Entity.pos == 2) {
+            pl.bump()
+            if (pl.id == 2) {
+                print("embed promo ok\n")
+            } else {
+                panic("bump\n")
+            }
+        } else {
+            panic("pos\n")
+        }
+    } else {
+        panic("id\n")
+    }
+}
