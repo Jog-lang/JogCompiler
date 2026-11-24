@@ -1756,6 +1756,37 @@ pub const Parser = struct {
             .ident => {
                 const name = self.tok.text;
                 self.advance();
+                // JOG-222: `go { … }` / `go with (…) { … }` — `go(fn, arg)` stays a normal call.
+                if (std.mem.eql(u8, name, "go") and (self.tok.kind == .kw_with or self.tok.kind == .lbrace)) {
+                    var with_args: []*ast.Expr = &.{};
+                    if (self.tok.kind == .kw_with) {
+                        self.advance();
+                        try self.expect(.lparen);
+                        var wargs: std.ArrayListUnmanaged(*ast.Expr) = .{};
+                        if (self.tok.kind != .rparen) {
+                            while (true) {
+                                try wargs.append(self.allocator, try self.parseExpr());
+                                if (self.tok.kind == .comma) {
+                                    self.advance();
+                                    if (self.tok.kind == .rparen) break;
+                                    continue;
+                                }
+                                break;
+                            }
+                        }
+                        try self.expect(.rparen);
+                        with_args = try wargs.toOwnedSlice(self.allocator);
+                    }
+                    const body = try self.parseBlock();
+                    e.* = .{ .go_block = .{ .with_args = with_args, .body = body } };
+                    return e;
+                }
+                // JOG-222: `scope { … }` (trailing-lambda `scope()` waits on JOG-221).
+                if (std.mem.eql(u8, name, "scope") and self.tok.kind == .lbrace) {
+                    const body = try self.parseBlock();
+                    e.* = .{ .scope_block = .{ .body = body } };
+                    return e;
+                }
                 // Optional type args before struct lit / call: Name<…>(…)
                 var type_args: []*ast.TypeExpr = &.{};
                 if (self.tok.kind == .lt) {
@@ -2074,6 +2105,33 @@ fn unescape(allocator: std.mem.Allocator, s: []const u8) ParseError![]const u8 {
         }
     }
     return try out.toOwnedSlice(allocator);
+}
+
+test "parse scope and go blocks" {
+    const src =
+        \\fn main() {
+        \\    scope {
+        \\        go {
+        \\            print("x\n")
+        \\        }
+        \\        go with (1) {
+        \\            print("y\n")
+        \\        }
+        \\    }
+        \\}
+    ;
+    var file = try Parser.parseFile(std.testing.allocator, src);
+    defer file.deinit();
+    try std.testing.expect(file.decls.len == 1);
+    const body = file.decls[0].fn_decl.body.?;
+    try std.testing.expect(body.stmts.len == 1);
+    try std.testing.expect(body.stmts[0] == .expr);
+    try std.testing.expect(body.stmts[0].expr.* == .scope_block);
+    const sb = body.stmts[0].expr.scope_block;
+    try std.testing.expect(sb.body.stmts.len == 2);
+    try std.testing.expect(sb.body.stmts[0].expr.* == .go_block);
+    try std.testing.expect(sb.body.stmts[1].expr.* == .go_block);
+    try std.testing.expect(sb.body.stmts[1].expr.go_block.with_args.len == 1);
 }
 
 test "parse enum payload variants" {

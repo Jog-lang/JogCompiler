@@ -69,9 +69,20 @@ No x86_64 stack switch / `clone` workers. `runtime/emscripten/jogrt.c`:
 - `dispatcher_*` — opaque non-null handles; no OS threads / steal.
 - Example: `examples/emscripten_go_rtc.jog`.
 
+## Structured concurrency (JOG-222 slice)
+
+| Form | Notes |
+|---|---|
+| `scope { … }` | Enter a child Scope, run the body, join children (yield-loop), leave. |
+| `go { … }` / `go with (…) { … }` | Block launch; captures parent locals by address. Registers with the current Scope via `jogrt_scope_go`. |
+| `go(fn, arg)` | Unchanged enqueue API (examples / Dispatcher demos). |
+
+Runtime: `runtime/jogrt_scope.c` (fixed BSS pool, freestanding). Examples: `examples/coro_scope_go.jog`, `examples/coro_scope_capture.jog`.
+
 ## Limits (not in this step)
 
-- No `go { }` blocks / captures, no `Scope`, no `Task` / join.
+- No `Task` / `join`, no `Chan` / `select`, no `for` over channels, no cancel/`ErrCancelled` plumbing yet.
+- `scope()` as a trailing-lambda call still needs general lambdas (JOG-221); this slice accepts the `scope { }` block form.
 - Fixed max 32 coro slots, 16 workers, 4 Dispatcher pools; stacks via `mmap` (not charged to `alloc`).
 - Chase-Lev arrays are fixed-capacity (no grow); full queue panics.
 - IO pool shrink-beyond-min is deferred (grow only for now).

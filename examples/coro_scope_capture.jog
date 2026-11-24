@@ -1,0 +1,18 @@
+// JOG-222: go { } captures a parent local by address; scope joins before read.
+
+fn main() {
+    dispatcher_single()
+    var x: i64 = 0
+    scope {
+        go {
+            x = 41
+            yield()
+            x = x + 1
+        }
+    }
+    if x == 42 {
+        print("ok\n")
+    } else {
+        print("bad\n")
+    }
+}

@@ -48,6 +48,18 @@ void jogrt_print_tid(const void *ptr, int64_t len);
 int64_t jogrt_worker_id(void);
 int64_t jogrt_gettid(void);
 
+/* Structured concurrency (JOG-222). RTC: children finish before go returns. */
+void *jogrt_scope_root(void);
+void *jogrt_scope_current(void);
+void *jogrt_scope_enter(void);
+void *jogrt_scope_leave(void *scope);
+void jogrt_scope_child_inc(void *scope);
+void jogrt_scope_child_done(void *scope);
+void jogrt_scope_cancel(void *scope);
+int64_t jogrt_scope_cancelled(void *scope);
+void jogrt_scope_trampoline(void *p);
+void jogrt_scope_go(void *scope, void *fn, void *arg, void *wrap);
+
 #ifdef __cplusplus
 }
 #endif

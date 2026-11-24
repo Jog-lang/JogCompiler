@@ -1,0 +1,19 @@
+// JOG-222: scope { } + go { } on the v2 dispatcher runtime.
+// Expected: both children run; scope joins before "done".
+
+fn main() {
+    dispatcher_single()
+    scope {
+        go {
+            print("a1\n")
+            yield()
+            print("a2\n")
+        }
+        go {
+            print("b1\n")
+            yield()
+            print("b2\n")
+        }
+    }
+    print("done\n")
+}

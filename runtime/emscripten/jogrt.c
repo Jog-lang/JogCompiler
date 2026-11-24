@@ -154,3 +154,27 @@ void jogrt_sleep_ms(int64_t ms) { (void)ms; }
 void jogrt_print_tid(const void *ptr, int64_t len) { jogrt_print(ptr, len); }
 int64_t jogrt_worker_id(void) { return 0; }
 int64_t jogrt_gettid(void) { return 0; }
+
+/* RTC scope: go runs to completion, so join is a no-op. */
+static char jogrt_em_scope_root;
+void *jogrt_scope_root(void) { return &jogrt_em_scope_root; }
+void *jogrt_scope_current(void) { return &jogrt_em_scope_root; }
+void *jogrt_scope_enter(void) { return &jogrt_em_scope_root; }
+void *jogrt_scope_leave(void *scope) {
+    (void)scope;
+    return NULL;
+}
+void jogrt_scope_child_inc(void *scope) { (void)scope; }
+void jogrt_scope_child_done(void *scope) { (void)scope; }
+void jogrt_scope_cancel(void *scope) { (void)scope; }
+int64_t jogrt_scope_cancelled(void *scope) {
+    (void)scope;
+    return 0;
+}
+void jogrt_scope_trampoline(void *p) { (void)p; }
+void jogrt_scope_go(void *scope, void *fn, void *arg, void *wrap) {
+    (void)scope;
+    (void)wrap;
+    /* RTC: run now; child_inc/done are no-ops. */
+    jogrt_go(fn, arg);
+}

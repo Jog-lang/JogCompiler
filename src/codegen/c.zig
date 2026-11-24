@@ -420,7 +420,19 @@ fn emitCall(writer: anytype, prog: *const ir.Program, inst: ir.Inst, _: bool) !v
         // void jogrt_go(void *fn, void *arg) — RTC under emscripten.
         try writer.print("    {s}((void*)(intptr_t)s[{d}], (void*)(intptr_t)s[{d}]);\n", .{ callee.name, inst.args[0], inst.args[1] });
         if (inst.dst != ir.none) try writer.print("    s[{d}] = 0;\n", .{inst.dst});
-    } else if (callee.kind == .runtime and (std.mem.eql(u8, callee.name, "jogrt_yield") or std.mem.eql(u8, callee.name, "jogrt_coro_drain") or std.mem.eql(u8, callee.name, "jogrt_coro_park") or std.mem.eql(u8, callee.name, "jogrt_dispatcher_leave") or std.mem.eql(u8, callee.name, "jogrt_dispatcher_stub"))) {
+    } else if (callee.kind == .runtime and (std.mem.eql(u8, callee.name, "jogrt_scope_enter") or std.mem.eql(u8, callee.name, "jogrt_scope_current") or std.mem.eql(u8, callee.name, "jogrt_scope_root"))) {
+        try writer.print("    void *p = {s}();\n", .{callee.name});
+        if (inst.dst != ir.none) try writer.print("    s[{d}] = (int64_t)(intptr_t)p;\n", .{inst.dst});
+    } else if (callee.kind == .runtime and std.mem.eql(u8, callee.name, "jogrt_scope_leave")) {
+        try writer.print("    void *p = jogrt_scope_leave((void*)(intptr_t)s[{d}]);\n", .{inst.args[0]});
+        if (inst.dst != ir.none) try writer.print("    s[{d}] = (int64_t)(intptr_t)p;\n", .{inst.dst});
+    } else if (callee.kind == .runtime and std.mem.eql(u8, callee.name, "jogrt_scope_go")) {
+        try writer.print(
+            "    jogrt_scope_go((void*)(intptr_t)s[{d}], (void*)(intptr_t)s[{d}], (void*)(intptr_t)s[{d}], (void*)(intptr_t)s[{d}]);\n",
+            .{ inst.args[0], inst.args[1], inst.args[2], inst.args[3] },
+        );
+        if (inst.dst != ir.none) try writer.print("    s[{d}] = 0;\n", .{inst.dst});
+    } else if (callee.kind == .runtime and (std.mem.eql(u8, callee.name, "jogrt_yield") or std.mem.eql(u8, callee.name, "jogrt_coro_drain") or std.mem.eql(u8, callee.name, "jogrt_coro_park") or std.mem.eql(u8, callee.name, "jogrt_dispatcher_leave") or std.mem.eql(u8, callee.name, "jogrt_dispatcher_stub") or std.mem.eql(u8, callee.name, "jogrt_scope_trampoline"))) {
         try writer.print("    {s}();\n", .{callee.name});
         if (inst.dst != ir.none) try writer.print("    s[{d}] = 0;\n", .{inst.dst});
     } else if (callee.kind == .runtime and (std.mem.eql(u8, callee.name, "jogrt_coro_alive") or std.mem.eql(u8, callee.name, "jogrt_coro_id") or std.mem.eql(u8, callee.name, "jogrt_worker_id") or std.mem.eql(u8, callee.name, "jogrt_gettid"))) {

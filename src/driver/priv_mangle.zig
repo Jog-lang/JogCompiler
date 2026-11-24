@@ -192,5 +192,10 @@ fn rewriteExpr(e: *ast.Expr, renames: *const std.StringHashMapUnmanaged([]const 
             }
         },
         .force_unwrap => |inner| rewriteExpr(inner, renames),
+        .go_block => |*gb| {
+            for (gb.with_args) |w| rewriteExpr(w, renames);
+            rewriteBlock(gb.body, renames);
+        },
+        .scope_block => |*sb| rewriteBlock(sb.body, renames),
     }
 }
