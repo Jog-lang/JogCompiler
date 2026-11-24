@@ -1009,7 +1009,14 @@ fn checkExpr(
             }
             if (c.callee.* == .ident) {
                 if (fns.get(c.callee.ident)) |fd| {
-                    try checkArgsAgainstParams(a, types, fns, structs, methods, scope, fd.params, c.args, c.arg_names, diags, e);
+                    // Flattened import merge can leave one same-named fn in `fns`
+                    // (`mem.slice` vs `text.slice`). Skip arity expand when the
+                    // looked-up decl clearly cannot match this call.
+                    if (callArgsFitParams(fd.params, c.args, c.arg_names)) {
+                        try checkArgsAgainstParams(a, types, fns, structs, methods, scope, fd.params, c.args, c.arg_names, diags, e);
+                    } else {
+                        for (c.args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
+                    }
                     for (c.with_args) |w| _ = try checkExpr(a, types, fns, structs, methods, scope, w, diags);
                     for (c.type_args) |ta| _ = try resolveTypeExpr(a, types, ta, diags);
                     if (fd.type_params.len > 0) {
@@ -1050,7 +1057,11 @@ fn checkExpr(
                     const base_name = c.callee.field.base.ident;
                     if (lookupVar(scope, base_name) == null) {
                         if (fns.get(c.callee.field.name)) |fd| {
-                            try checkArgsAgainstParams(a, types, fns, structs, methods, scope, fd.params, c.args, c.arg_names, diags, e);
+                            if (callArgsFitParams(fd.params, c.args, c.arg_names)) {
+                                try checkArgsAgainstParams(a, types, fns, structs, methods, scope, fd.params, c.args, c.arg_names, diags, e);
+                            } else {
+                                for (c.args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
+                            }
                             for (c.with_args) |w| _ = try checkExpr(a, types, fns, structs, methods, scope, w, diags);
                             if (fd.ret) |r| return try resolveTypeExpr(a, types, r, diags);
                             return try voidType(a);
@@ -1435,6 +1446,27 @@ fn checkExpr(
             return try checkLambda(a, types, fns, structs, methods, scope, e, null, diags);
         },
     }
+}
+
+/// True when `args` could bind to `params` under positional/default/trailing rules.
+/// Used to avoid false "missing argument" when flattened `fns` holds a same-named sibling
+/// (`mem.slice` vs `text.slice`) after import merge.
+fn callArgsFitParams(params: []ast.Param, args: []*ast.Expr, arg_names: []const ?[]const u8) bool {
+    _ = arg_names;
+    for (params) |p| {
+        if (p.is_pack) return true;
+    }
+    var provided = args.len;
+    if (args.len > 0 and params.len > 0 and args[args.len - 1].* == .lambda) {
+        // Trailing lambda always fills the last parameter.
+        provided = args.len; // already counted
+    }
+    if (provided > params.len) return false;
+    var required: usize = 0;
+    for (params) |p| {
+        if (p.default == null) required += 1;
+    }
+    return provided >= required;
 }
 
 /// Expand positional / named / default / trailing-lambda args to match `params` order.
