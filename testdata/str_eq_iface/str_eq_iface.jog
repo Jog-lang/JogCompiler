@@ -1,0 +1,13 @@
+// Types used by str_eq_iface.test.jog (JOG-224).
+
+interface Named {
+    fn greet(): str
+}
+
+struct Dog {
+    name: str
+}
+
+fn Dog.greet(): str = "woof"
+
+fn nameOf(n: Named): str = n.greet()

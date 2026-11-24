@@ -245,11 +245,16 @@ const StructInfo = struct {
 
 const EnumInfo = struct {
     variants: []EnumVariantVal,
+    /// True if any variant carries a payload — values are heap ptrs (tag at +0).
+    has_payload: bool = false,
+    /// Max payload field count (for allocation size).
+    max_fields: usize = 0,
 };
 
 const EnumVariantVal = struct {
     name: []const u8,
     value: i64,
+    fields: []ast.Field = &.{},
 };
 
 const DeferItem = struct {
@@ -303,6 +308,8 @@ const FnInfo = struct {
     nparams: u32,
     contexts: []ast.ContextParam,
     exported: bool,
+    /// Value params (AST borrows; used to coerce args to iface params).
+    params: []ast.Param = &.{},
     /// Return type name when a named struct/scalar; empty if void/unknown.
     /// For pointers this is the pointee name (see `ret_meta` for pointer-ness).
     ret_name: []const u8 = "",
@@ -431,12 +438,20 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
             .enum_decl => |ed| {
                 var variants: std.ArrayListUnmanaged(EnumVariantVal) = .{};
                 var next: i64 = 0;
+                var has_payload = false;
+                var max_fields: usize = 0;
                 for (ed.variants) |v| {
                     const val = v.value orelse next;
-                    try variants.append(a, .{ .name = v.name, .value = val });
+                    if (v.fields.len > 0) has_payload = true;
+                    if (v.fields.len > max_fields) max_fields = v.fields.len;
+                    try variants.append(a, .{ .name = v.name, .value = val, .fields = v.fields });
                     next = val + 1;
                 }
-                try enums.put(a, ed.name, .{ .variants = try variants.toOwnedSlice(a) });
+                try enums.put(a, ed.name, .{
+                    .variants = try variants.toOwnedSlice(a),
+                    .has_payload = has_payload,
+                    .max_fields = max_fields,
+                });
             },
             .interface_struct => |ins| try ifaces.put(a, ins.name, .{ .methods = ins.methods }),
             .extern_block => |eb| {
@@ -475,6 +490,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                         .nparams = @intCast(ef.params.len),
                         .contexts = &[_]ast.ContextParam{},
                         .exported = false,
+                        .params = ef.params,
                         .ret_name = ret_name,
                         .ret_meta = ret_meta,
                     });
@@ -548,6 +564,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                         .nparams = @intCast(fd.params.len + (if (packParamIndex(fd.params) != null) @as(usize, 1) else 0)),
                         .contexts = fd.contexts,
                         .exported = fd.exported or std.mem.eql(u8, fd.name, "main"),
+                        .params = fd.params,
                         .ret_name = ret_name,
                         .ret_meta = ret_meta,
                         .pack_index = packParamIndex(fd.params),
@@ -570,6 +587,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                         .nparams = @intCast(ef.params.len),
                         .contexts = &[_]ast.ContextParam{},
                         .exported = false,
+                        .params = ef.params,
                         .ret_name = ret_name,
                         .ret_meta = ret_meta,
                     });
@@ -1035,6 +1053,7 @@ fn ensureGenericFn(
         .nparams = @intCast(fd.params.len + (if (packParamIndex(fd.params) != null) @as(usize, 1) else 0)),
         .contexts = fd.contexts,
         .exported = false,
+        .params = fd.params,
         .ret_name = ret_name,
         .ret_meta = ret_meta,
         .pack_index = packParamIndex(fd.params),
@@ -1133,6 +1152,9 @@ fn walkExprInstantiate(ic: *InstCtx, e: *ast.Expr) anyerror!void {
             }
             for (sl.fields) |f| try walkExprInstantiate(ic, f.value);
         },
+        .enum_lit => |el| {
+            for (el.fields) |f| try walkExprInstantiate(ic, f.value);
+        },
         .tuple => |elems| {
             _ = try ensureTupleStruct(ic.a, ic.structs, elems.len);
             for (elems) |el| try walkExprInstantiate(ic, el);
@@ -1160,6 +1182,11 @@ fn walkExprInstantiate(ic: *InstCtx, e: *ast.Expr) anyerror!void {
             try walkExprInstantiate(ic, w.scrutinee);
             for (w.arms) |arm| try walkExprInstantiate(ic, arm.body);
             if (w.else_body) |eb| try walkExprInstantiate(ic, eb);
+        },
+        .if_expr => |ifs| {
+            try walkExprInstantiate(ic, ifs.cond);
+            for (ifs.then_block.stmts) |s| try walkStmtInstantiate(ic, s);
+            if (ifs.else_block) |eb| for (eb.stmts) |s| try walkStmtInstantiate(ic, s);
         },
         .optional_call => |oc| {
             try walkExprInstantiate(ic, oc.base);
@@ -1375,6 +1402,8 @@ const Ctx = struct {
     /// Indices of `jmp` insts from `continue`; patched to loop head.
     continue_jmps: *std.ArrayListUnmanaged(usize),
     defer_stack: *std.ArrayListUnmanaged(std.ArrayListUnmanaged(DeferItem)),
+    /// `defer_stack.items.len` before each loop body — break/continue unwind down to this.
+    loop_defer_depths: *std.ArrayListUnmanaged(usize),
     /// When set, `return` values are coerced to this interface fat pointer.
     ret_iface: ?[]const u8 = null,
     /// Generic method/fn type-param → concrete name (`T` → `i64`). Empty for non-generic.
@@ -1468,6 +1497,7 @@ fn lowerFn(
     var break_jmps: std.ArrayListUnmanaged(usize) = .{};
     var continue_jmps: std.ArrayListUnmanaged(usize) = .{};
     var defer_stack: std.ArrayListUnmanaged(std.ArrayListUnmanaged(DeferItem)) = .{};
+    var loop_defer_depths: std.ArrayListUnmanaged(usize) = .{};
     var empty_subst: std.StringHashMapUnmanaged([]const u8) = .{};
     const subst_ptr: *const std.StringHashMapUnmanaged([]const u8) = fl.type_subst orelse &empty_subst;
     // Resolve type-param names in param meta (T → i64) and fix pack elem sizes.
@@ -1505,6 +1535,7 @@ fn lowerFn(
         .break_jmps = &break_jmps,
         .continue_jmps = &continue_jmps,
         .defer_stack = &defer_stack,
+        .loop_defer_depths = &loop_defer_depths,
         .ret_iface = fl.ret_iface,
         .type_subst = subst_ptr,
         .type_aliases = type_aliases,
@@ -1681,6 +1712,27 @@ fn ensureSliceStructFromElemName(
     const elem = try a.create(ast.TypeExpr);
     elem.* = .{ .name = try a.dupe(u8, elem_name) };
     return ensureSliceStruct(a, structs, elem);
+}
+
+/// Nominal `str`/`bytes` keep that type_name for method lookup, but layout lives in `__Slice_byte`.
+fn layoutStructName(
+    a: std.mem.Allocator,
+    structs: *std.StringHashMapUnmanaged(StructInfo),
+    type_name: []const u8,
+) ![]const u8 {
+    if (std.mem.eql(u8, type_name, "str") or std.mem.eql(u8, type_name, "bytes")) {
+        return try ensureSliceStructFromElemName(a, structs, "byte");
+    }
+    return type_name;
+}
+
+fn layoutStructInfo(
+    a: std.mem.Allocator,
+    structs: *std.StringHashMapUnmanaged(StructInfo),
+    type_name: []const u8,
+) !?StructInfo {
+    const layout = try layoutStructName(a, structs, type_name);
+    return structs.get(layout);
 }
 
 /// Element type name for slicing `base` (`[N]T` → `T`, `__Slice_T` / `View_T` → `T`).
@@ -1879,6 +1931,27 @@ fn lowerBlock(ctx: *Ctx, block: *ast.Block) LowerError!void {
     _ = ctx.defer_stack.pop();
 }
 
+/// Lower a block whose value is the last expression statement; copy into `result`.
+fn lowerBlockAsValue(ctx: *Ctx, block: *ast.Block, result: u32) LowerError!void {
+    try ctx.defer_stack.append(ctx.a, .{});
+    if (block.stmts.len == 0) {
+        try ctx.emit(.{ .op = .iconst, .dst = result, .aux = 0 });
+    } else {
+        const last_i = block.stmts.len - 1;
+        for (block.stmts[0..last_i]) |stmt| try lowerStmt(ctx, stmt);
+        const last = block.stmts[last_i];
+        if (last == .expr) {
+            const v = try lowerExpr(ctx, last.expr);
+            try ctx.emit(.{ .op = .copy, .dst = result, .src0 = v });
+        } else {
+            try lowerStmt(ctx, last);
+            try ctx.emit(.{ .op = .iconst, .dst = result, .aux = 0 });
+        }
+    }
+    try emitCurrentDefers(ctx);
+    _ = ctx.defer_stack.pop();
+}
+
 fn emitDeferItem(ctx: *Ctx, item: DeferItem) LowerError!void {
     if (item.kind == .expr) {
         if (item.expr) |ex| _ = try lowerExpr(ctx, ex);
@@ -1890,19 +1963,24 @@ fn emitDeferItem(ctx: *Ctx, item: DeferItem) LowerError!void {
 fn emitCurrentDefers(ctx: *Ctx) LowerError!void {
     if (ctx.defer_stack.items.len == 0) return;
     const frame = &ctx.defer_stack.items[ctx.defer_stack.items.len - 1];
-    var i: usize = frame.items.len;
+    // Snapshot: emitDeferItem → lowerBlock may reallocate defer_stack.
+    const snapshot = try ctx.a.dupe(DeferItem, frame.items);
+    defer ctx.a.free(snapshot);
+    var i: usize = snapshot.len;
     while (i > 0) {
         i -= 1;
         // Scope-exit defers: skip errdefer (those only run on error return).
-        if (!frame.items[i].on_error_only) try emitDeferItem(ctx, frame.items[i]);
+        if (!snapshot[i].on_error_only) try emitDeferItem(ctx, snapshot[i]);
     }
     // Keep errdefer items for return paths; clear normal ones.
     var kept: std.ArrayListUnmanaged(DeferItem) = .{};
-    for (frame.items) |it| {
+    for (snapshot) |it| {
         if (it.on_error_only) try kept.append(ctx.a, it);
     }
-    frame.clearRetainingCapacity();
-    try frame.appendSlice(ctx.a, kept.items);
+    // Re-fetch frame after possible realloc.
+    const frame2 = &ctx.defer_stack.items[ctx.defer_stack.items.len - 1];
+    frame2.clearRetainingCapacity();
+    try frame2.appendSlice(ctx.a, kept.items);
 }
 
 fn emitAllDefers(ctx: *Ctx) LowerError!void {
@@ -1910,18 +1988,23 @@ fn emitAllDefers(ctx: *Ctx) LowerError!void {
 }
 
 fn emitAllDefersFiltered(ctx: *Ctx, error_path: bool) LowerError!void {
+    try emitDefersDownTo(ctx, 0, error_path);
+}
+
+/// Emit deferred work for frames with index >= `keep_frames` (LIFO), without clearing.
+/// Used by return / break / continue. Nested `lowerBlock` may grow `defer_stack`, so each
+/// frame's items are snapshotted first.
+fn emitDefersDownTo(ctx: *Ctx, keep_frames: usize, error_path: bool) LowerError!void {
     var fi: usize = ctx.defer_stack.items.len;
-    while (fi > 0) {
+    while (fi > keep_frames) {
         fi -= 1;
-        const frame = &ctx.defer_stack.items[fi];
-        var i: usize = frame.items.len;
+        const snapshot = try ctx.a.dupe(DeferItem, ctx.defer_stack.items[fi].items);
+        defer ctx.a.free(snapshot);
+        var i: usize = snapshot.len;
         while (i > 0) {
             i -= 1;
-            const it = frame.items[i];
+            const it = snapshot[i];
             if (it.on_error_only and !error_path) continue;
-            if (!it.on_error_only and error_path) {
-                // On error path still run normal defers too (LIFO with errdefer).
-            }
             try emitDeferItem(ctx, it);
         }
     }
@@ -1950,8 +2033,9 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
                 const sm = try metaForTypeExpr(ctx.a, sd.fields[i].ty, ctx.structs, ctx.ifaces);
                 // Struct tuple elems point at ret_alloc — durable-copy like `var x = …`
                 // so later calls do not clobber `val (v, ok) = parse(…)`.
+                // `str`/`bytes` meta uses the nominal name; layout is `__Slice_byte`.
                 if (sm.kind == .struct_ptr and sm.type_name.len > 0) {
-                    if (ctx.structs.get(sm.type_name)) |vsd| {
+                    if (try layoutStructInfo(ctx.a, ctx.structs, sm.type_name)) |vsd| {
                         var nbytes: i64 = 0;
                         for (vsd.fields) |fld| nbytes += typeExprSizeOf(ctx, fld.ty);
                         if (nbytes == 0) nbytes = 8;
@@ -2036,11 +2120,15 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
                 return;
             }
             if (vd.init) |init| {
-                const v = try lowerExpr(ctx, init);
+                var v = try lowerExpr(ctx, init);
                 if (vd.ty == null) {
                     if (ctx.meta.get(slotNameOf(ctx, v))) |m| sm = m;
                     // struct lit / alloc leave meta on temp — copy from init kind via peek
                     sm = inferMetaFromExpr(ctx, init) orelse sm;
+                }
+                // `val n: Named = &d` / `= d` — build a fat iface pointer.
+                if (sm.kind == .iface_ptr and sm.type_name.len > 0) {
+                    v = try maybeCoerceArg(ctx, v, init, vd.ty);
                 }
                 // `var p: *Box = null` is a machine-word pointer. Do not treat it like a
                 // durable `Box` header (that path memcpy's from the initializer address —
@@ -2051,8 +2139,11 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
                 } else false;
                 // Struct / slice headers from `jogrt_ret_alloc` are ephemeral.
                 // Copy into a durable heap block (upward layout matches fieldOffset).
+                // Nominal `str`/`bytes` must resolve through `__Slice_byte` or the
+                // durable copy is skipped and iface/`print` later segfault on a
+                // recycled ret-arena header.
                 if (!ty_is_ptr and sm.kind == .struct_ptr and sm.type_name.len > 0) {
-                    if (ctx.structs.get(sm.type_name)) |sd| {
+                    if (try layoutStructInfo(ctx.a, ctx.structs, sm.type_name)) |sd| {
                         var nbytes: i64 = 0;
                         for (sd.fields) |fld| nbytes += typeExprSizeOf(ctx, fld.ty);
                         if (nbytes == 0) nbytes = 8;
@@ -2290,7 +2381,10 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
             const cond = try lowerExpr(ctx, ws.cond);
             const jz_i = ctx.insts.items.len;
             try ctx.emit(.{ .op = .jz, .src0 = cond, .aux = 0 });
+            // Depth before body frame: break/continue run body (+ nested) defers.
+            try ctx.loop_defer_depths.append(ctx.a, ctx.defer_stack.items.len);
             try lowerBlock(ctx, ws.body);
+            _ = ctx.loop_defer_depths.pop();
             try ctx.emit(.{ .op = .jmp, .aux = head });
             const end_pos: i64 = @intCast(ctx.insts.items.len);
             ctx.insts.items[jz_i].aux = end_pos;
@@ -2304,11 +2398,19 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
             }
         },
         .break_stmt => {
+            if (ctx.loop_defer_depths.items.len > 0) {
+                const keep = ctx.loop_defer_depths.items[ctx.loop_defer_depths.items.len - 1];
+                try emitDefersDownTo(ctx, keep, false);
+            }
             const ji = ctx.insts.items.len;
             try ctx.emit(.{ .op = .jmp, .aux = 0 });
             try ctx.break_jmps.append(ctx.a, ji);
         },
         .continue_stmt => {
+            if (ctx.loop_defer_depths.items.len > 0) {
+                const keep = ctx.loop_defer_depths.items[ctx.loop_defer_depths.items.len - 1];
+                try emitDefersDownTo(ctx, keep, false);
+            }
             const ji = ctx.insts.items.len;
             try ctx.emit(.{ .op = .jmp, .aux = 0 });
             try ctx.continue_jmps.append(ctx.a, ji);
@@ -2369,6 +2471,14 @@ fn inferMetaFromExpr(ctx: *Ctx, e: *ast.Expr) ?SlotMeta {
             }
             return .{ .kind = .struct_ptr, .type_name = sl.type_name };
         },
+        .enum_lit => |el| {
+            const tn = el.type_name orelse return null;
+            if (ctx.enums.get(tn)) |ei| {
+                if (ei.has_payload) return .{ .kind = .struct_ptr, .type_name = tn };
+                return .{ .kind = .scalar, .type_name = tn };
+            }
+            return .{ .kind = .struct_ptr, .type_name = tn };
+        },
         .null_lit => return .{ .kind = .opt_ptr },
         .float => return .{ .kind = .scalar, .type_name = "f64" },
         .int => return .{ .kind = .scalar, .type_name = "i64" },
@@ -2401,6 +2511,11 @@ fn inferMetaFromExpr(ctx: *Ctx, e: *ast.Expr) ?SlotMeta {
                         if (std.mem.eql(u8, f.name, "len"))
                             return .{ .kind = .scalar, .type_name = "usize" };
                     }
+                }
+                // Enum.Variant construction (no args).
+                if (ctx.enums.get(f.base.ident)) |ei| {
+                    if (ei.has_payload) return .{ .kind = .struct_ptr, .type_name = f.base.ident };
+                    return .{ .kind = .scalar, .type_name = f.base.ident };
                 }
             }
             var base_tn = inferTypeNameFromExpr(ctx, f.base) orelse return null;
@@ -2924,7 +3039,9 @@ fn lowerForIn(ctx: *Ctx, fs: ast.ForInStmt) LowerError!void {
         try ctx.emit(.{ .op = .lt, .dst = cmp, .src0 = iv, .src1 = end });
         const jz_i = ctx.insts.items.len;
         try ctx.emit(.{ .op = .jz, .src0 = cmp, .aux = 0 });
+        try ctx.loop_defer_depths.append(ctx.a, ctx.defer_stack.items.len);
         try lowerBlock(ctx, fs.body);
+        _ = ctx.loop_defer_depths.pop();
         const cont_pos: i64 = @intCast(ctx.insts.items.len);
         const one = try ctx.fresh();
         try ctx.emit(.{ .op = .iconst, .dst = one, .aux = 1 });
@@ -2985,7 +3102,9 @@ fn lowerForIn(ctx: *Ctx, fs: ast.ForInStmt) LowerError!void {
     }
     try ctx.slots.put(ctx.a, fs.name, elem);
     try ctx.meta.put(ctx.a, fs.name, .{ .kind = .scalar, .type_name = "i64" });
+    try ctx.loop_defer_depths.append(ctx.a, ctx.defer_stack.items.len);
     try lowerBlock(ctx, fs.body);
+    _ = ctx.loop_defer_depths.pop();
     const cont_pos: i64 = @intCast(ctx.insts.items.len);
     const one = try ctx.fresh();
     try ctx.emit(.{ .op = .iconst, .dst = one, .aux = 1 });
@@ -3261,6 +3380,11 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
                     }
                 }
             }
+            // Builtin `str`/`bytes` content equality (core methods are not merged into
+            // every program yet — do not compare header pointers).
+            if ((b.op == .eq or b.op == .neq) and isStrLikeExpr(ctx, b.left) and isStrLikeExpr(ctx, b.right)) {
+                return try lowerStrContentEq(ctx, b.left, b.right, b.op == .neq);
+            }
             const l = try lowerExpr(ctx, b.left);
             const r = try lowerExpr(ctx, b.right);
             const d = try ctx.fresh();
@@ -3297,8 +3421,14 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
                 .mul => try ctx.emit(.{ .op = if (use_float) .fmul else .mul, .dst = d, .src0 = l, .src1 = r }),
                 .div => try ctx.emit(.{ .op = if (use_float) .fdiv else if (use_unsigned) .udiv else .div, .dst = d, .src0 = l, .src1 = r }),
                 .rem => try ctx.emit(.{ .op = if (use_unsigned) .urem else .rem, .dst = d, .src0 = l, .src1 = r }),
-                .eq => try ctx.emit(.{ .op = .eq, .dst = d, .src0 = l, .src1 = r }),
-                .neq => try ctx.emit(.{ .op = .ne, .dst = d, .src0 = l, .src1 = r }),
+                .eq, .neq => {
+                    // Payload enums: deep-compare tag + fields (not pointer identity).
+                    if (try lowerEnumEquality(ctx, b.left, b.right, l, r, b.op == .neq)) |eqd| {
+                        try ctx.emit(.{ .op = .copy, .dst = d, .src0 = eqd });
+                    } else {
+                        try ctx.emit(.{ .op = if (b.op == .eq) .eq else .ne, .dst = d, .src0 = l, .src1 = r });
+                    }
+                },
                 .lt => try ctx.emit(.{ .op = if (use_unsigned) .ult else .lt, .dst = d, .src0 = l, .src1 = r }),
                 .gt => try ctx.emit(.{ .op = if (use_unsigned) .ult else .lt, .dst = d, .src0 = r, .src1 = l }),
                 .lte => try ctx.emit(.{ .op = if (use_unsigned) .ule else .le, .dst = d, .src0 = l, .src1 = r }),
@@ -3484,9 +3614,29 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
             return v;
         },
         .is_type => |it| {
-            // `e is T` — structural: true if meta type_name matches T name.
-            _ = try lowerExpr(ctx, it.expr);
             const want = typeExprName(it.ty);
+            // `e is Variant` — runtime tag test when want names a variant of e's enum.
+            if (inferTypeNameFromExpr(ctx, it.expr)) |en| {
+                if (ctx.enums.get(en)) |ei| {
+                    for (ei.variants) |v| {
+                        if (std.mem.eql(u8, v.name, want)) {
+                            const scrut = try lowerExpr(ctx, it.expr);
+                            const tag_slot = if (ei.has_payload) blk: {
+                                const t = try ctx.fresh();
+                                try ctx.emit(.{ .op = .load, .dst = t, .src0 = scrut });
+                                break :blk t;
+                            } else scrut;
+                            const expect = try ctx.fresh();
+                            try ctx.emit(.{ .op = .iconst, .dst = expect, .aux = v.value });
+                            const d = try ctx.fresh();
+                            try ctx.emit(.{ .op = .eq, .dst = d, .src0 = tag_slot, .src1 = expect });
+                            return d;
+                        }
+                    }
+                }
+            }
+            // Structural: true if meta type_name matches T name.
+            _ = try lowerExpr(ctx, it.expr);
             const got = inferTypeNameFromExpr(ctx, it.expr) orelse "";
             const d = try ctx.fresh();
             try ctx.emit(.{ .op = .iconst, .dst = d, .aux = if (std.mem.eql(u8, want, got)) 1 else 0 });
@@ -3529,9 +3679,10 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
                     return d;
                 }
             }
-            // iface coerce from concrete struct ptr
+            // iface coerce from concrete struct ptr (`d as Named`, `&d as Named`)
             if (to.kind == .iface_ptr) {
-                return try coerceToIface(ctx, v, inferTypeNameFromExpr(ctx, c.expr) orelse "", to.type_name);
+                const concrete = concreteTypeForIfaceCoerce(ctx, c.expr);
+                return try coerceToIface(ctx, v, concrete, to.type_name);
             }
             return v;
         },
@@ -3547,6 +3698,10 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
                 if (ctx.enums.get(f.base.ident)) |ei| {
                     for (ei.variants) |v| {
                         if (std.mem.eql(u8, v.name, f.name)) {
+                            // Payload enums: bare `Shape.Empty` allocates tag-only value.
+                            if (ei.has_payload) {
+                                return try lowerEnumConstruct(ctx, f.base.ident, ei, v, &.{});
+                            }
                             const d = try ctx.fresh();
                             try ctx.emit(.{ .op = .iconst, .dst = d, .aux = v.value });
                             return d;
@@ -3600,19 +3755,52 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
             try ctx.emit(.{ .op = .load, .dst = d, .src0 = addr });
             return d;
         },
+        .if_expr => |ifs| {
+            const cond = try lowerExpr(ctx, ifs.cond);
+            const result = try ctx.fresh();
+            const jz_i = ctx.insts.items.len;
+            try ctx.emit(.{ .op = .jz, .src0 = cond, .aux = 0 });
+            try lowerBlockAsValue(ctx, ifs.then_block, result);
+            const jmp_i = ctx.insts.items.len;
+            try ctx.emit(.{ .op = .jmp, .aux = 0 });
+            const else_pos: i64 = @intCast(ctx.insts.items.len);
+            ctx.insts.items[jz_i].aux = else_pos;
+            if (ifs.else_block) |eb| {
+                try lowerBlockAsValue(ctx, eb, result);
+            } else {
+                try ctx.emit(.{ .op = .iconst, .dst = result, .aux = 0 });
+            }
+            const end_pos: i64 = @intCast(ctx.insts.items.len);
+            ctx.insts.items[jmp_i].aux = end_pos;
+            return result;
+        },
         .when_expr => |w| {
             const scrut = try lowerExpr(ctx, w.scrutinee);
             const result = try ctx.fresh();
             const enum_name = inferTypeNameFromExpr(ctx, w.scrutinee);
+            const payload_enum = blk: {
+                if (enum_name) |en| {
+                    if (ctx.enums.get(en)) |ei| break :blk ei.has_payload;
+                }
+                break :blk false;
+            };
+            // Payload enums store the tag at offset 0 of the heap value.
+            const scrut_tag = if (payload_enum) blk: {
+                const t = try ctx.fresh();
+                try ctx.emit(.{ .op = .load, .dst = t, .src0 = scrut });
+                break :blk t;
+            } else scrut;
             var end_jmps: std.ArrayListUnmanaged(usize) = .{};
             for (w.arms) |arm| {
                 var tag_val: i64 = undefined;
+                var matched_fields: []ast.Field = &.{};
                 var found = false;
                 if (enum_name) |en| {
                     if (ctx.enums.get(en)) |ei| {
                         for (ei.variants) |v| {
                             if (std.mem.eql(u8, v.name, arm.pattern)) {
                                 tag_val = v.value;
+                                matched_fields = v.fields;
                                 found = true;
                                 break;
                             }
@@ -3625,6 +3813,7 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
                         for (entry.value_ptr.variants) |v| {
                             if (std.mem.eql(u8, v.name, arm.pattern)) {
                                 tag_val = v.value;
+                                matched_fields = v.fields;
                                 found = true;
                                 break;
                             }
@@ -3639,9 +3828,27 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
                 const tag = try ctx.fresh();
                 try ctx.emit(.{ .op = .iconst, .dst = tag, .aux = tag_val });
                 const cmp = try ctx.fresh();
-                try ctx.emit(.{ .op = .eq, .dst = cmp, .src0 = scrut, .src1 = tag });
+                try ctx.emit(.{ .op = .eq, .dst = cmp, .src0 = scrut_tag, .src1 = tag });
                 const jz_i = ctx.insts.items.len;
                 try ctx.emit(.{ .op = .jz, .src0 = cmp, .aux = 0 });
+                // Bind payload locals: field i lives at offset 8*(1+i).
+                const nbind = @min(arm.bindings.len, matched_fields.len);
+                var bi: usize = 0;
+                while (bi < nbind) : (bi += 1) {
+                    const bname = arm.bindings[bi];
+                    if (std.mem.eql(u8, bname, "_")) continue;
+                    const off: i64 = @intCast(8 * (1 + bi));
+                    const addr = try ctx.fresh();
+                    const off_s = try ctx.fresh();
+                    try ctx.emit(.{ .op = .iconst, .dst = off_s, .aux = off });
+                    try ctx.emit(.{ .op = .add, .dst = addr, .src0 = scrut, .src1 = off_s });
+                    const slot = try ctx.fresh();
+                    try ctx.emit(.{ .op = .load, .dst = slot, .src0 = addr });
+                    try ctx.slots.put(ctx.a, bname, slot);
+                    if (metaForTypeExpr(ctx.a, matched_fields[bi].ty, ctx.structs, ctx.ifaces)) |m| {
+                        try ctx.meta.put(ctx.a, bname, m);
+                    } else |_| {}
+                }
                 const body_v = try lowerExpr(ctx, arm.body);
                 try ctx.emit(.{ .op = .copy, .dst = result, .src0 = body_v });
                 const jmp_i = ctx.insts.items.len;
@@ -3699,6 +3906,28 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
                 try ctx.emit(.{ .op = .store, .src0 = addr, .src1 = val });
             }
             return ptr;
+        },
+        .enum_lit => |el| {
+            const tname = el.type_name orelse {
+                std.debug.print("enum_lit missing type for .{s}\n", .{el.variant});
+                return error.UnknownName;
+            };
+            const ei = ctx.enums.get(tname) orelse {
+                std.debug.print("enum_lit unknown enum {s}\n", .{tname});
+                return error.UnknownName;
+            };
+            for (ei.variants) |v| {
+                if (std.mem.eql(u8, v.name, el.variant)) {
+                    if (!ei.has_payload) {
+                        const d = try ctx.fresh();
+                        try ctx.emit(.{ .op = .iconst, .dst = d, .aux = v.value });
+                        return d;
+                    }
+                    return try lowerEnumConstruct(ctx, tname, ei, v, el.fields);
+                }
+            }
+            std.debug.print("enum_lit unknown variant {s}.{s}\n", .{ tname, el.variant });
+            return error.UnknownName;
         },
         .struct_lit => |sl| {
             const tname = if (sl.type_args.len > 0) blk: {
@@ -3798,6 +4027,133 @@ fn lowerEmptyStructValue(ctx: *Ctx, tname: []const u8) LowerError!u32 {
         off += nbytes;
     }
     return ptr;
+}
+
+/// Allocate a payload-enum value: `[tag][field0][field1]…` (8-byte slots).
+fn lowerEnumConstruct(
+    ctx: *Ctx,
+    type_name: []const u8,
+    ei: EnumInfo,
+    variant: EnumVariantVal,
+    fields: []ast.StructLitField,
+) LowerError!u32 {
+    _ = type_name;
+    const nfields = ei.max_fields;
+    const size: i64 = @intCast(8 * (1 + nfields));
+    const sz = try ctx.fresh();
+    try ctx.emit(.{ .op = .iconst, .dst = sz, .aux = if (size < 8) 8 else size });
+    // Durable bump alloc — enum values outlive the expression (locals / params).
+    const cid = ctx.callee_map.get("jogrt_alloc").?;
+    const ptr = try ctx.fresh();
+    var allo = Inst{ .op = .call, .dst = ptr, .aux = cid, .arity = 1 };
+    allo.args[0] = sz;
+    try ctx.emit(allo);
+    // Store tag at offset 0.
+    const tag_s = try ctx.fresh();
+    try ctx.emit(.{ .op = .iconst, .dst = tag_s, .aux = variant.value });
+    try ctx.emit(.{ .op = .store, .src0 = ptr, .src1 = tag_s });
+    // Store each payload field by declaration order / named match.
+    for (variant.fields, 0..) |vf, i| {
+        var val_expr: ?*ast.Expr = null;
+        for (fields) |flit| {
+            if (std.mem.eql(u8, flit.name, vf.name)) {
+                val_expr = flit.value;
+                break;
+            }
+        }
+        const val = if (val_expr) |ve|
+            try lowerExpr(ctx, ve)
+        else blk: {
+            const z = try ctx.fresh();
+            try ctx.emit(.{ .op = .iconst, .dst = z, .aux = 0 });
+            break :blk z;
+        };
+        const off: i64 = @intCast(8 * (1 + i));
+        const addr = try ctx.fresh();
+        const off_s = try ctx.fresh();
+        try ctx.emit(.{ .op = .iconst, .dst = off_s, .aux = off });
+        try ctx.emit(.{ .op = .add, .dst = addr, .src0 = ptr, .src1 = off_s });
+        try ctx.emit(.{ .op = .store, .src0 = addr, .src1 = val });
+    }
+    return ptr;
+}
+
+/// Deep-compare two payload-enum values. Returns null if not payload enums (caller uses scalar eq).
+fn lowerEnumEquality(ctx: *Ctx, left_e: *ast.Expr, right_e: *ast.Expr, l: u32, r: u32, negate: bool) LowerError!?u32 {
+    const ln = inferTypeNameFromExpr(ctx, left_e) orelse return null;
+    const rn = inferTypeNameFromExpr(ctx, right_e) orelse return null;
+    if (!std.mem.eql(u8, ln, rn)) return null;
+    const ei = ctx.enums.get(ln) orelse return null;
+    if (!ei.has_payload) return null;
+
+    // result starts true; clear on mismatch.
+    const result = try ctx.fresh();
+    try ctx.emit(.{ .op = .iconst, .dst = result, .aux = 1 });
+
+    const ltag = try ctx.fresh();
+    const rtag = try ctx.fresh();
+    try ctx.emit(.{ .op = .load, .dst = ltag, .src0 = l });
+    try ctx.emit(.{ .op = .load, .dst = rtag, .src0 = r });
+    const tags_eq = try ctx.fresh();
+    try ctx.emit(.{ .op = .eq, .dst = tags_eq, .src0 = ltag, .src1 = rtag });
+    // if tags differ → result = 0; skip field compares
+    const jz_tag = ctx.insts.items.len;
+    try ctx.emit(.{ .op = .jz, .src0 = tags_eq, .aux = 0 });
+
+    // For each variant: if tag matches, compare that variant's fields.
+    var end_jmps: std.ArrayListUnmanaged(usize) = .{};
+    for (ei.variants) |v| {
+        const expect = try ctx.fresh();
+        try ctx.emit(.{ .op = .iconst, .dst = expect, .aux = v.value });
+        const is_v = try ctx.fresh();
+        try ctx.emit(.{ .op = .eq, .dst = is_v, .src0 = ltag, .src1 = expect });
+        const jz_v = ctx.insts.items.len;
+        try ctx.emit(.{ .op = .jz, .src0 = is_v, .aux = 0 });
+        for (v.fields, 0..) |_, i| {
+            const off: i64 = @intCast(8 * (1 + i));
+            const loff = try ctx.fresh();
+            const roff = try ctx.fresh();
+            try ctx.emit(.{ .op = .iconst, .dst = loff, .aux = off });
+            try ctx.emit(.{ .op = .iconst, .dst = roff, .aux = off });
+            const laddr = try ctx.fresh();
+            const raddr = try ctx.fresh();
+            try ctx.emit(.{ .op = .add, .dst = laddr, .src0 = l, .src1 = loff });
+            try ctx.emit(.{ .op = .add, .dst = raddr, .src0 = r, .src1 = roff });
+            const lv = try ctx.fresh();
+            const rv = try ctx.fresh();
+            try ctx.emit(.{ .op = .load, .dst = lv, .src0 = laddr });
+            try ctx.emit(.{ .op = .load, .dst = rv, .src0 = raddr });
+            const feq = try ctx.fresh();
+            try ctx.emit(.{ .op = .eq, .dst = feq, .src0 = lv, .src1 = rv });
+            // result &= feq (bitwise — and_op is short-circuit-only and lowers to ud2)
+            try ctx.emit(.{ .op = .bit_and, .dst = result, .src0 = result, .src1 = feq });
+        }
+        const jmp_done = ctx.insts.items.len;
+        try ctx.emit(.{ .op = .jmp, .aux = 0 });
+        try end_jmps.append(ctx.a, jmp_done);
+        const next_v: i64 = @intCast(ctx.insts.items.len);
+        ctx.insts.items[jz_v].aux = next_v;
+    }
+    const fields_done: i64 = @intCast(ctx.insts.items.len);
+    for (end_jmps.items) |ji| ctx.insts.items[ji].aux = fields_done;
+
+    // tags differed
+    const jmp_ok = ctx.insts.items.len;
+    try ctx.emit(.{ .op = .jmp, .aux = 0 });
+    const tag_fail: i64 = @intCast(ctx.insts.items.len);
+    ctx.insts.items[jz_tag].aux = tag_fail;
+    try ctx.emit(.{ .op = .iconst, .dst = result, .aux = 0 });
+    const end: i64 = @intCast(ctx.insts.items.len);
+    ctx.insts.items[jmp_ok].aux = end;
+
+    if (negate) {
+        const out = try ctx.fresh();
+        const one = try ctx.fresh();
+        try ctx.emit(.{ .op = .iconst, .dst = one, .aux = 1 });
+        try ctx.emit(.{ .op = .bit_xor, .dst = out, .src0 = result, .src1 = one });
+        return out;
+    }
+    return result;
 }
 
 fn layoutSizeOfName(name: []const u8) i64 {
@@ -4336,7 +4692,8 @@ fn lowerFnCall(ctx: *Ctx, fi: FnInfo, args: []*ast.Expr, with_args: []*ast.Expr)
         if (fixed + arity > max_call_args) return error.TooManyArgs;
         var i: usize = 0;
         while (i < fixed) : (i += 1) {
-            arg_slots[arity] = try lowerExpr(ctx, args[i]);
+            const raw = try lowerExpr(ctx, args[i]);
+            arg_slots[arity] = try maybeCoerceArg(ctx, raw, args[i], if (i < fi.params.len) fi.params[i].ty else null);
             arity += 1;
         }
         const pack_n = args.len - fixed;
@@ -4368,8 +4725,9 @@ fn lowerFnCall(ctx: *Ctx, fi: FnInfo, args: []*ast.Expr, with_args: []*ast.Expr)
         arity += 1;
     } else {
         if (args.len + arity > max_call_args) return error.TooManyArgs;
-        for (args) |arg| {
-            arg_slots[arity] = try lowerExpr(ctx, arg);
+        for (args, 0..) |arg, ai| {
+            const raw = try lowerExpr(ctx, arg);
+            arg_slots[arity] = try maybeCoerceArg(ctx, raw, arg, if (ai < fi.params.len) fi.params[ai].ty else null);
             arity += 1;
         }
     }
@@ -4414,6 +4772,29 @@ fn maybeCoerceCtx(ctx: *Ctx, slot: u32, concrete: []const u8, want: []const u8) 
         return try coerceToIface(ctx, slot, concrete, want);
     }
     return slot;
+}
+
+/// Concrete type name for iface coercion. `&x` → type of `x`; otherwise expression meta.
+fn concreteTypeForIfaceCoerce(ctx: *Ctx, e: *ast.Expr) []const u8 {
+    if (e.* == .unary and e.unary.op == .addr) {
+        return inferTypeNameFromExpr(ctx, e.unary.expr) orelse "";
+    }
+    return inferTypeNameFromExpr(ctx, e) orelse "";
+}
+
+/// Coerce a call/assign argument to an iface parameter/local when needed.
+fn maybeCoerceArg(ctx: *Ctx, slot: u32, arg: *ast.Expr, want_ty: ?*ast.TypeExpr) LowerError!u32 {
+    const ty = want_ty orelse return slot;
+    const want_meta = metaForTypeExpr(ctx.a, ty, ctx.structs, ctx.ifaces) catch return slot;
+    if (want_meta.kind != .iface_ptr or want_meta.type_name.len == 0) return slot;
+    // Already an iface value of the right type — pass through.
+    if (inferMetaFromExpr(ctx, arg)) |am| {
+        if (am.kind == .iface_ptr and std.mem.eql(u8, am.type_name, want_meta.type_name))
+            return slot;
+    }
+    const concrete = concreteTypeForIfaceCoerce(ctx, arg);
+    if (concrete.len == 0 or std.mem.eql(u8, concrete, want_meta.type_name)) return slot;
+    return try coerceToIface(ctx, slot, concrete, want_meta.type_name);
 }
 
 fn coerceToIface(ctx: *Ctx, data_slot: u32, concrete: []const u8, iface_name: []const u8) LowerError!u32 {
@@ -4668,6 +5049,101 @@ fn lowerStringSlice(ctx: *Ctx, s: []const u8) LowerError!u32 {
     try ctx.emit(.{ .op = .add, .dst = len_addr, .src0 = hdr, .src1 = eight });
     try ctx.emit(.{ .op = .store, .src0 = len_addr, .src1 = len });
     return hdr;
+}
+
+fn isStrLikeName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "str") or
+        std.mem.eql(u8, name, "bytes") or
+        std.mem.eql(u8, name, "__Slice_byte");
+}
+
+fn isStrLikeExpr(ctx: *Ctx, e: *ast.Expr) bool {
+    if (e.* == .string) return true;
+    if (inferMetaFromExpr(ctx, e)) |m| {
+        if (m.kind == .struct_ptr and isStrLikeName(m.type_name)) return true;
+    }
+    if (inferTypeNameFromExpr(ctx, e)) |tn| {
+        if (isStrLikeName(tn)) return true;
+    }
+    return false;
+}
+
+/// Content equality for `{ptr,len}` string/bytes headers. `neq` inverts the result.
+fn lowerStrContentEq(ctx: *Ctx, left: *ast.Expr, right: *ast.Expr, invert: bool) LowerError!u32 {
+    const lh = try lowerExpr(ctx, left);
+    const rh = try lowerExpr(ctx, right);
+    const eight = try ctx.fresh();
+    try ctx.emit(.{ .op = .iconst, .dst = eight, .aux = 8 });
+
+    const lp = try ctx.fresh();
+    try ctx.emit(.{ .op = .load, .dst = lp, .src0 = lh });
+    const lplen = try ctx.fresh();
+    try ctx.emit(.{ .op = .add, .dst = lplen, .src0 = lh, .src1 = eight });
+    const llen = try ctx.fresh();
+    try ctx.emit(.{ .op = .load, .dst = llen, .src0 = lplen });
+
+    const rp = try ctx.fresh();
+    try ctx.emit(.{ .op = .load, .dst = rp, .src0 = rh });
+    const rplen = try ctx.fresh();
+    try ctx.emit(.{ .op = .add, .dst = rplen, .src0 = rh, .src1 = eight });
+    const rlen = try ctx.fresh();
+    try ctx.emit(.{ .op = .load, .dst = rlen, .src0 = rplen });
+
+    const result = try ctx.fresh();
+    // Default: equal (or unequal when invert) — empty equal-length strings win immediately.
+    try ctx.emit(.{ .op = .iconst, .dst = result, .aux = if (invert) 0 else 1 });
+
+    const len_eq = try ctx.fresh();
+    try ctx.emit(.{ .op = .eq, .dst = len_eq, .src0 = llen, .src1 = rlen });
+    const jz_len = ctx.insts.items.len;
+    try ctx.emit(.{ .op = .jz, .src0 = len_eq, .aux = 0 });
+
+    // Byte loop: for i in 0..len
+    const i = try ctx.fresh();
+    try ctx.emit(.{ .op = .iconst, .dst = i, .aux = 0 });
+    const head: i64 = @intCast(ctx.insts.items.len);
+    const more = try ctx.fresh();
+    try ctx.emit(.{ .op = .lt, .dst = more, .src0 = i, .src1 = llen });
+    const jz_done = ctx.insts.items.len;
+    try ctx.emit(.{ .op = .jz, .src0 = more, .aux = 0 });
+
+    const ap = try ctx.fresh();
+    try ctx.emit(.{ .op = .add, .dst = ap, .src0 = lp, .src1 = i });
+    const av = try ctx.fresh();
+    try ctx.emit(.{ .op = .load8, .dst = av, .src0 = ap });
+    const bp = try ctx.fresh();
+    try ctx.emit(.{ .op = .add, .dst = bp, .src0 = rp, .src1 = i });
+    const bv = try ctx.fresh();
+    try ctx.emit(.{ .op = .load8, .dst = bv, .src0 = bp });
+    const beq = try ctx.fresh();
+    try ctx.emit(.{ .op = .eq, .dst = beq, .src0 = av, .src1 = bv });
+    const jz_diff = ctx.insts.items.len;
+    try ctx.emit(.{ .op = .jz, .src0 = beq, .aux = 0 });
+    const one = try ctx.fresh();
+    try ctx.emit(.{ .op = .iconst, .dst = one, .aux = 1 });
+    try ctx.emit(.{ .op = .add, .dst = i, .src0 = i, .src1 = one });
+    try ctx.emit(.{ .op = .jmp, .aux = head });
+
+    const diff_pos: i64 = @intCast(ctx.insts.items.len);
+    ctx.insts.items[jz_diff].aux = diff_pos;
+    try ctx.emit(.{ .op = .iconst, .dst = result, .aux = if (invert) 1 else 0 });
+    const jmp_end1 = ctx.insts.items.len;
+    try ctx.emit(.{ .op = .jmp, .aux = 0 });
+
+    const done_pos: i64 = @intCast(ctx.insts.items.len);
+    ctx.insts.items[jz_done].aux = done_pos;
+    // lens matched and all bytes matched — result already set to eq/!eq default
+    const jmp_end2 = ctx.insts.items.len;
+    try ctx.emit(.{ .op = .jmp, .aux = 0 });
+
+    const len_ne_pos: i64 = @intCast(ctx.insts.items.len);
+    ctx.insts.items[jz_len].aux = len_ne_pos;
+    try ctx.emit(.{ .op = .iconst, .dst = result, .aux = if (invert) 1 else 0 });
+
+    const end_pos: i64 = @intCast(ctx.insts.items.len);
+    ctx.insts.items[jmp_end1].aux = end_pos;
+    ctx.insts.items[jmp_end2].aux = end_pos;
+    return result;
 }
 
 fn lowerPrintArgs(ctx: *Ctx, e: *ast.Expr) LowerError!struct { u32, u32 } {
