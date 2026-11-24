@@ -102,13 +102,50 @@ pub const Lexer = struct {
     i: usize = 0,
     line: u32 = 1,
     col: u32 = 1,
+    /// Last emitted token kind (for the Grammar newline → SEP rule).
+    last_kind: TokenKind = .eof,
+    has_last: bool = false,
+    /// Bracket stack: '(', '[', '{' — SEP only when empty or top is '{'.
+    brackets: [64]u8 = undefined,
+    bracket_depth: usize = 0,
+    /// Pending inserted SEP (emitted as `.semicolon`).
+    pending_sep: bool = false,
+    sep_line: u32 = 1,
+    sep_col: u32 = 1,
 
     pub fn init(src: []const u8) Lexer {
         return .{ .src = src };
     }
 
+    fn emit(self: *Lexer, t: Token) Token {
+        self.noteEmitted(t.kind);
+        return t;
+    }
+
     pub fn next(self: *Lexer) Token {
+        if (self.pending_sep) {
+            self.pending_sep = false;
+            const t: Token = .{
+                .kind = .semicolon,
+                .text = ";",
+                .line = self.sep_line,
+                .col = self.sep_col,
+            };
+            self.noteEmitted(t.kind);
+            return t;
+        }
         self.skipTrivia();
+        if (self.pending_sep) {
+            self.pending_sep = false;
+            const t: Token = .{
+                .kind = .semicolon,
+                .text = ";",
+                .line = self.sep_line,
+                .col = self.sep_col,
+            };
+            self.noteEmitted(t.kind);
+            return t;
+        }
         if (self.i >= self.src.len) return self.tok(.eof, self.src[self.i..self.i]);
 
         const start_i = self.i;
@@ -125,18 +162,18 @@ pub const Lexer = struct {
                 self.advance();
             }
             if (self.i < self.src.len) self.advance();
-            return .{ .kind = .cstring, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+            return self.emit(.{ .kind = .cstring, .text = self.src[start_i..self.i], .line = start_line, .col = start_col });
         }
         if (isIdentStart(c)) {
             self.advance();
             while (self.i < self.src.len and isIdentCont(self.src[self.i])) self.advance();
             const text = self.src[start_i..self.i];
-            return .{
+            return self.emit(.{
                 .kind = keyword(text),
                 .text = text,
                 .line = start_line,
                 .col = start_col,
-            };
+            });
         }
         if (c >= '0' and c <= '9') {
             self.advance();
@@ -144,15 +181,15 @@ pub const Lexer = struct {
             if ((c == '0') and self.i < self.src.len and (self.src[self.i] == 'x' or self.src[self.i] == 'X')) {
                 self.advance();
                 while (self.i < self.src.len and isHex(self.src[self.i])) self.advance();
-                return .{ .kind = .int, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+                return self.emit(.{ .kind = .int, .text = self.src[start_i..self.i], .line = start_line, .col = start_col });
             }
             while (self.i < self.src.len and self.src[self.i] >= '0' and self.src[self.i] <= '9') self.advance();
             if (self.i + 1 < self.src.len and self.src[self.i] == '.' and self.src[self.i + 1] >= '0' and self.src[self.i + 1] <= '9') {
                 self.advance(); // .
                 while (self.i < self.src.len and self.src[self.i] >= '0' and self.src[self.i] <= '9') self.advance();
-                return .{ .kind = .float, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+                return self.emit(.{ .kind = .float, .text = self.src[start_i..self.i], .line = start_line, .col = start_col });
             }
-            return .{ .kind = .int, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+            return self.emit(.{ .kind = .int, .text = self.src[start_i..self.i], .line = start_line, .col = start_col });
         }
         if (c == '"') {
             self.advance();
@@ -163,102 +200,102 @@ pub const Lexer = struct {
                 self.advance();
             }
             if (self.i < self.src.len) self.advance(); // closing "
-            return .{ .kind = .string, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+            return self.emit(.{ .kind = .string, .text = self.src[start_i..self.i], .line = start_line, .col = start_col });
         }
 
         // two-char: ?.  (optional call / field)
         if (c == '?' and self.i + 1 < self.src.len and self.src[self.i + 1] == '.') {
             self.advance();
             self.advance();
-            return .{ .kind = .dot_q, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+            return self.emit(.{ .kind = .dot_q, .text = self.src[start_i..self.i], .line = start_line, .col = start_col });
         }
         if (c == '=' and self.i + 1 < self.src.len and self.src[self.i + 1] == '=') {
             self.advance();
             self.advance();
-            return .{ .kind = .eqeq, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+            return self.emit(.{ .kind = .eqeq, .text = self.src[start_i..self.i], .line = start_line, .col = start_col });
         }
         if (c == '!' and self.i + 1 < self.src.len and self.src[self.i + 1] == '=') {
             self.advance();
             self.advance();
-            return .{ .kind = .neq, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+            return self.emit(.{ .kind = .neq, .text = self.src[start_i..self.i], .line = start_line, .col = start_col });
         }
         if (c == '!' and self.i + 1 < self.src.len and self.src[self.i + 1] == '!') {
             self.advance();
             self.advance();
-            return .{ .kind = .bang_bang, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+            return self.emit(.{ .kind = .bang_bang, .text = self.src[start_i..self.i], .line = start_line, .col = start_col });
         }
         if (c == '&' and self.i + 1 < self.src.len and self.src[self.i + 1] == '&') {
             self.advance();
             self.advance();
-            return .{ .kind = .ampamp, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+            return self.emit(.{ .kind = .ampamp, .text = self.src[start_i..self.i], .line = start_line, .col = start_col });
         }
         if (c == '|' and self.i + 1 < self.src.len and self.src[self.i + 1] == '|') {
             self.advance();
             self.advance();
-            return .{ .kind = .pipepipe, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+            return self.emit(.{ .kind = .pipepipe, .text = self.src[start_i..self.i], .line = start_line, .col = start_col });
         }
         if (c == '<' and self.i + 2 < self.src.len and self.src[self.i + 1] == '=' and self.src[self.i + 2] == '>') {
             self.advance();
             self.advance();
             self.advance();
-            return .{ .kind = .spaceship, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+            return self.emit(.{ .kind = .spaceship, .text = self.src[start_i..self.i], .line = start_line, .col = start_col });
         }
         if (c == '<' and self.i + 1 < self.src.len and self.src[self.i + 1] == '=') {
             self.advance();
             self.advance();
-            return .{ .kind = .lte, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+            return self.emit(.{ .kind = .lte, .text = self.src[start_i..self.i], .line = start_line, .col = start_col });
         }
         if (c == '>' and self.i + 1 < self.src.len and self.src[self.i + 1] == '=') {
             self.advance();
             self.advance();
-            return .{ .kind = .gte, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+            return self.emit(.{ .kind = .gte, .text = self.src[start_i..self.i], .line = start_line, .col = start_col });
         }
         if (c == '<' and self.i + 1 < self.src.len and self.src[self.i + 1] == '<') {
             self.advance();
             self.advance();
-            return .{ .kind = .shl, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+            return self.emit(.{ .kind = .shl, .text = self.src[start_i..self.i], .line = start_line, .col = start_col });
         }
         if (c == '>' and self.i + 1 < self.src.len and self.src[self.i + 1] == '>') {
             self.advance();
             self.advance();
-            return .{ .kind = .shr, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+            return self.emit(.{ .kind = .shr, .text = self.src[start_i..self.i], .line = start_line, .col = start_col });
         }
         if (c == '-' and self.i + 1 < self.src.len and self.src[self.i + 1] == '>') {
             self.advance();
             self.advance();
-            return .{ .kind = .arrow, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+            return self.emit(.{ .kind = .arrow, .text = self.src[start_i..self.i], .line = start_line, .col = start_col });
         }
         // `...` before `..` so three dots are not `..` plus a leftover `.`.
         if (c == '.' and self.i + 2 < self.src.len and self.src[self.i + 1] == '.' and self.src[self.i + 2] == '.') {
             self.advance();
             self.advance();
             self.advance();
-            return .{ .kind = .ellipsis, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+            return self.emit(.{ .kind = .ellipsis, .text = self.src[start_i..self.i], .line = start_line, .col = start_col });
         }
         if (c == '.' and self.i + 1 < self.src.len and self.src[self.i + 1] == '.') {
             self.advance();
             self.advance();
-            return .{ .kind = .dotdot, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+            return self.emit(.{ .kind = .dotdot, .text = self.src[start_i..self.i], .line = start_line, .col = start_col });
         }
         if (c == '+' and self.i + 1 < self.src.len and self.src[self.i + 1] == '=') {
             self.advance();
             self.advance();
-            return .{ .kind = .pluseq, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+            return self.emit(.{ .kind = .pluseq, .text = self.src[start_i..self.i], .line = start_line, .col = start_col });
         }
         if (c == '-' and self.i + 1 < self.src.len and self.src[self.i + 1] == '=') {
             self.advance();
             self.advance();
-            return .{ .kind = .minuseq, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+            return self.emit(.{ .kind = .minuseq, .text = self.src[start_i..self.i], .line = start_line, .col = start_col });
         }
         if (c == '*' and self.i + 1 < self.src.len and self.src[self.i + 1] == '=') {
             self.advance();
             self.advance();
-            return .{ .kind = .stareq, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+            return self.emit(.{ .kind = .stareq, .text = self.src[start_i..self.i], .line = start_line, .col = start_col });
         }
         if (c == '%' and self.i + 1 < self.src.len and self.src[self.i + 1] == '=') {
             self.advance();
             self.advance();
-            return .{ .kind = .percenteq, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+            return self.emit(.{ .kind = .percenteq, .text = self.src[start_i..self.i], .line = start_line, .col = start_col });
         }
         // Division vs // comment vs /= .
         if (c == '/') {
@@ -267,10 +304,10 @@ pub const Lexer = struct {
             } else if (self.i + 1 < self.src.len and self.src[self.i + 1] == '=') {
                 self.advance();
                 self.advance();
-                return .{ .kind = .slasheq, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+                return self.emit(.{ .kind = .slasheq, .text = self.src[start_i..self.i], .line = start_line, .col = start_col });
             } else {
                 self.advance();
-                return .{ .kind = .slash, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+                return self.emit(.{ .kind = .slash, .text = self.src[start_i..self.i], .line = start_line, .col = start_col });
             }
         }
         // Char lit 'x' or '\n'
@@ -283,7 +320,7 @@ pub const Lexer = struct {
                 self.advance();
             }
             if (self.i < self.src.len and self.src[self.i] == '\'') self.advance();
-            return .{ .kind = .char, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+            return self.emit(.{ .kind = .char, .text = self.src[start_i..self.i], .line = start_line, .col = start_col });
         }
 
         self.advance();
@@ -314,7 +351,7 @@ pub const Lexer = struct {
             '~' => .tilde,
             else => .eof,
         };
-        return .{ .kind = kind, .text = self.src[start_i..self.i], .line = start_line, .col = start_col };
+        return self.emit(.{ .kind = kind, .text = self.src[start_i..self.i], .line = start_line, .col = start_col });
     }
 
     fn skipTrivia(self: *Lexer) void {
@@ -325,7 +362,15 @@ pub const Lexer = struct {
                 continue;
             }
             if (c == '\n') {
+                const nl_line = self.line;
+                const nl_col = self.col;
                 self.advance();
+                if (self.shouldInsertSep() and !self.continuesLine()) {
+                    self.pending_sep = true;
+                    self.sep_line = nl_line;
+                    self.sep_col = nl_col;
+                    return;
+                }
                 continue;
             }
             if (c == '/' and self.i + 1 < self.src.len and self.src[self.i + 1] == '/') {
@@ -342,12 +387,85 @@ pub const Lexer = struct {
                         self.advance();
                         break;
                     }
+                    // Block comment spanning lines counts as a newline for SEP.
+                    if (self.src[self.i] == '\n') {
+                        const nl_line = self.line;
+                        const nl_col = self.col;
+                        self.advance();
+                        // Finish comment first; SEP decision after close is complex — treat
+                        // in-comment newlines as trivia only (V1 inserts on the physical \n
+                        // when ends_statement; keep simple: no SEP mid-comment).
+                        _ = nl_line;
+                        _ = nl_col;
+                        continue;
+                    }
                     self.advance();
                 }
                 continue;
             }
             break;
         }
+    }
+
+    fn shouldInsertSep(self: *Lexer) bool {
+        if (!self.has_last) return false;
+        if (!endsStatement(self.last_kind)) return false;
+        if (self.bracket_depth == 0) return true;
+        return self.brackets[self.bracket_depth - 1] == '{';
+    }
+
+    /// Lookahead: next significant line starts with `.`, `?.`, or `?:`.
+    fn continuesLine(self: *Lexer) bool {
+        var i = self.i;
+        while (i < self.src.len) {
+            const c = self.src[i];
+            if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+                i += 1;
+                continue;
+            }
+            if (c == '/' and i + 1 < self.src.len and self.src[i + 1] == '/') {
+                i += 2;
+                while (i < self.src.len and self.src[i] != '\n') i += 1;
+                continue;
+            }
+            if (c == '/' and i + 1 < self.src.len and self.src[i + 1] == '*') {
+                i += 2;
+                while (i + 1 < self.src.len and !(self.src[i] == '*' and self.src[i + 1] == '/')) i += 1;
+                if (i + 1 < self.src.len) i += 2;
+                continue;
+            }
+            if (c == '.') return true;
+            if (c == '?' and i + 1 < self.src.len and self.src[i + 1] == '.') return true;
+            if (c == '?' and i + 1 < self.src.len and self.src[i + 1] == ':') return true;
+            return false;
+        }
+        return false;
+    }
+
+    fn noteEmitted(self: *Lexer, kind: TokenKind) void {
+        switch (kind) {
+            .lparen => self.pushBracket('('),
+            .lbracket => self.pushBracket('['),
+            .lbrace => self.pushBracket('{'),
+            .rparen => self.popBracket('('),
+            .rbracket => self.popBracket('['),
+            .rbrace => self.popBracket('{'),
+            else => {},
+        }
+        self.last_kind = kind;
+        self.has_last = true;
+    }
+
+    fn pushBracket(self: *Lexer, b: u8) void {
+        if (self.bracket_depth < self.brackets.len) {
+            self.brackets[self.bracket_depth] = b;
+            self.bracket_depth += 1;
+        }
+    }
+
+    fn popBracket(self: *Lexer, expected: u8) void {
+        _ = expected;
+        if (self.bracket_depth > 0) self.bracket_depth -= 1;
     }
 
     fn advance(self: *Lexer) void {
@@ -365,6 +483,32 @@ pub const Lexer = struct {
         return .{ .kind = kind, .text = text, .line = self.line, .col = self.col };
     }
 };
+
+fn endsStatement(kind: TokenKind) bool {
+    return switch (kind) {
+        .ident,
+        .int,
+        .float,
+        .string,
+        .cstring,
+        .char,
+        .rparen,
+        .rbracket,
+        .rbrace,
+        .question,
+        .bang_bang,
+        .gt,
+        .shr,
+        .kw_return,
+        .kw_break,
+        .kw_continue,
+        .kw_true,
+        .kw_false,
+        .kw_null,
+        => true,
+        else => false,
+    };
+}
 
 fn isIdentStart(c: u8) bool {
     return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
@@ -422,4 +566,25 @@ test "lex hello" {
     var lx = Lexer.init("fn main() {\n  print(\"hi\")\n}\n");
     try std.testing.expect(lx.next().kind == .kw_fn);
     try std.testing.expect(lx.next().kind == .ident);
+}
+
+test "lex inserts SEP after statement-ending newline" {
+    // After `x` (ident) a newline becomes SEP so `*p` cannot continue as multiply.
+    var lx = Lexer.init("var p = &x\n*p = 1\n");
+    var saw_sep = false;
+    var saw_star_after_sep = false;
+    var prev_sep = false;
+    while (true) {
+        const t = lx.next();
+        if (t.kind == .eof) break;
+        if (t.kind == .semicolon) {
+            saw_sep = true;
+            prev_sep = true;
+            continue;
+        }
+        if (prev_sep and t.kind == .star) saw_star_after_sep = true;
+        prev_sep = false;
+    }
+    try std.testing.expect(saw_sep);
+    try std.testing.expect(saw_star_after_sep);
 }
