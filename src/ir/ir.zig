@@ -308,6 +308,8 @@ const FnInfo = struct {
     nparams: u32,
     contexts: []ast.ContextParam,
     exported: bool,
+    /// Value params (AST borrows; used to coerce args to iface params).
+    params: []ast.Param = &.{},
     /// Return type name when a named struct/scalar; empty if void/unknown.
     /// For pointers this is the pointee name (see `ret_meta` for pointer-ness).
     ret_name: []const u8 = "",
@@ -481,6 +483,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                         .nparams = @intCast(ef.params.len),
                         .contexts = &[_]ast.ContextParam{},
                         .exported = false,
+                        .params = ef.params,
                         .ret_name = ret_name,
                         .ret_meta = ret_meta,
                     });
@@ -554,6 +557,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                         .nparams = @intCast(fd.params.len + (if (packParamIndex(fd.params) != null) @as(usize, 1) else 0)),
                         .contexts = fd.contexts,
                         .exported = fd.exported or std.mem.eql(u8, fd.name, "main"),
+                        .params = fd.params,
                         .ret_name = ret_name,
                         .ret_meta = ret_meta,
                         .pack_index = packParamIndex(fd.params),
@@ -576,6 +580,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                         .nparams = @intCast(ef.params.len),
                         .contexts = &[_]ast.ContextParam{},
                         .exported = false,
+                        .params = ef.params,
                         .ret_name = ret_name,
                         .ret_meta = ret_meta,
                     });
@@ -1041,6 +1046,7 @@ fn ensureGenericFn(
         .nparams = @intCast(fd.params.len + (if (packParamIndex(fd.params) != null) @as(usize, 1) else 0)),
         .contexts = fd.contexts,
         .exported = false,
+        .params = fd.params,
         .ret_name = ret_name,
         .ret_meta = ret_meta,
         .pack_index = packParamIndex(fd.params),
@@ -1697,6 +1703,27 @@ fn ensureSliceStructFromElemName(
     return ensureSliceStruct(a, structs, elem);
 }
 
+/// Nominal `str`/`bytes` keep that type_name for method lookup, but layout lives in `__Slice_byte`.
+fn layoutStructName(
+    a: std.mem.Allocator,
+    structs: *std.StringHashMapUnmanaged(StructInfo),
+    type_name: []const u8,
+) ![]const u8 {
+    if (std.mem.eql(u8, type_name, "str") or std.mem.eql(u8, type_name, "bytes")) {
+        return try ensureSliceStructFromElemName(a, structs, "byte");
+    }
+    return type_name;
+}
+
+fn layoutStructInfo(
+    a: std.mem.Allocator,
+    structs: *std.StringHashMapUnmanaged(StructInfo),
+    type_name: []const u8,
+) !?StructInfo {
+    const layout = try layoutStructName(a, structs, type_name);
+    return structs.get(layout);
+}
+
 /// Element type name for slicing `base` (`[N]T` → `T`, `__Slice_T` / `View_T` → `T`).
 fn sliceElemTypeName(ctx: *Ctx, base: *ast.Expr) ?[]const u8 {
     if (inferMetaFromExpr(ctx, base)) |bm| {
@@ -1995,8 +2022,9 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
                 const sm = try metaForTypeExpr(ctx.a, sd.fields[i].ty, ctx.structs, ctx.ifaces);
                 // Struct tuple elems point at ret_alloc — durable-copy like `var x = …`
                 // so later calls do not clobber `val (v, ok) = parse(…)`.
+                // `str`/`bytes` meta uses the nominal name; layout is `__Slice_byte`.
                 if (sm.kind == .struct_ptr and sm.type_name.len > 0) {
-                    if (ctx.structs.get(sm.type_name)) |vsd| {
+                    if (try layoutStructInfo(ctx.a, ctx.structs, sm.type_name)) |vsd| {
                         var nbytes: i64 = 0;
                         for (vsd.fields) |fld| nbytes += typeExprSizeOf(ctx, fld.ty);
                         if (nbytes == 0) nbytes = 8;
@@ -2081,11 +2109,15 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
                 return;
             }
             if (vd.init) |init| {
-                const v = try lowerExpr(ctx, init);
+                var v = try lowerExpr(ctx, init);
                 if (vd.ty == null) {
                     if (ctx.meta.get(slotNameOf(ctx, v))) |m| sm = m;
                     // struct lit / alloc leave meta on temp — copy from init kind via peek
                     sm = inferMetaFromExpr(ctx, init) orelse sm;
+                }
+                // `val n: Named = &d` / `= d` — build a fat iface pointer.
+                if (sm.kind == .iface_ptr and sm.type_name.len > 0) {
+                    v = try maybeCoerceArg(ctx, v, init, vd.ty);
                 }
                 // `var p: *Box = null` is a machine-word pointer. Do not treat it like a
                 // durable `Box` header (that path memcpy's from the initializer address —
@@ -2096,8 +2128,11 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
                 } else false;
                 // Struct / slice headers from `jogrt_ret_alloc` are ephemeral.
                 // Copy into a durable heap block (upward layout matches fieldOffset).
+                // Nominal `str`/`bytes` must resolve through `__Slice_byte` or the
+                // durable copy is skipped and iface/`print` later segfault on a
+                // recycled ret-arena header.
                 if (!ty_is_ptr and sm.kind == .struct_ptr and sm.type_name.len > 0) {
-                    if (ctx.structs.get(sm.type_name)) |sd| {
+                    if (try layoutStructInfo(ctx.a, ctx.structs, sm.type_name)) |sd| {
                         var nbytes: i64 = 0;
                         for (sd.fields) |fld| nbytes += typeExprSizeOf(ctx, fld.ty);
                         if (nbytes == 0) nbytes = 8;
@@ -3205,6 +3240,11 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
                     }
                 }
             }
+            // Builtin `str`/`bytes` content equality (core methods are not merged into
+            // every program yet — do not compare header pointers).
+            if ((b.op == .eq or b.op == .neq) and isStrLikeExpr(ctx, b.left) and isStrLikeExpr(ctx, b.right)) {
+                return try lowerStrContentEq(ctx, b.left, b.right, b.op == .neq);
+            }
             const l = try lowerExpr(ctx, b.left);
             const r = try lowerExpr(ctx, b.right);
             const d = try ctx.fresh();
@@ -3498,9 +3538,10 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
                     return d;
                 }
             }
-            // iface coerce from concrete struct ptr
+            // iface coerce from concrete struct ptr (`d as Named`, `&d as Named`)
             if (to.kind == .iface_ptr) {
-                return try coerceToIface(ctx, v, inferTypeNameFromExpr(ctx, c.expr) orelse "", to.type_name);
+                const concrete = concreteTypeForIfaceCoerce(ctx, c.expr);
+                return try coerceToIface(ctx, v, concrete, to.type_name);
             }
             return v;
         },
@@ -4508,7 +4549,8 @@ fn lowerFnCall(ctx: *Ctx, fi: FnInfo, args: []*ast.Expr, with_args: []*ast.Expr)
         if (fixed + arity > max_call_args) return error.TooManyArgs;
         var i: usize = 0;
         while (i < fixed) : (i += 1) {
-            arg_slots[arity] = try lowerExpr(ctx, args[i]);
+            const raw = try lowerExpr(ctx, args[i]);
+            arg_slots[arity] = try maybeCoerceArg(ctx, raw, args[i], if (i < fi.params.len) fi.params[i].ty else null);
             arity += 1;
         }
         const pack_n = args.len - fixed;
@@ -4540,8 +4582,9 @@ fn lowerFnCall(ctx: *Ctx, fi: FnInfo, args: []*ast.Expr, with_args: []*ast.Expr)
         arity += 1;
     } else {
         if (args.len + arity > max_call_args) return error.TooManyArgs;
-        for (args) |arg| {
-            arg_slots[arity] = try lowerExpr(ctx, arg);
+        for (args, 0..) |arg, ai| {
+            const raw = try lowerExpr(ctx, arg);
+            arg_slots[arity] = try maybeCoerceArg(ctx, raw, arg, if (ai < fi.params.len) fi.params[ai].ty else null);
             arity += 1;
         }
     }
@@ -4586,6 +4629,29 @@ fn maybeCoerceCtx(ctx: *Ctx, slot: u32, concrete: []const u8, want: []const u8) 
         return try coerceToIface(ctx, slot, concrete, want);
     }
     return slot;
+}
+
+/// Concrete type name for iface coercion. `&x` → type of `x`; otherwise expression meta.
+fn concreteTypeForIfaceCoerce(ctx: *Ctx, e: *ast.Expr) []const u8 {
+    if (e.* == .unary and e.unary.op == .addr) {
+        return inferTypeNameFromExpr(ctx, e.unary.expr) orelse "";
+    }
+    return inferTypeNameFromExpr(ctx, e) orelse "";
+}
+
+/// Coerce a call/assign argument to an iface parameter/local when needed.
+fn maybeCoerceArg(ctx: *Ctx, slot: u32, arg: *ast.Expr, want_ty: ?*ast.TypeExpr) LowerError!u32 {
+    const ty = want_ty orelse return slot;
+    const want_meta = metaForTypeExpr(ctx.a, ty, ctx.structs, ctx.ifaces) catch return slot;
+    if (want_meta.kind != .iface_ptr or want_meta.type_name.len == 0) return slot;
+    // Already an iface value of the right type — pass through.
+    if (inferMetaFromExpr(ctx, arg)) |am| {
+        if (am.kind == .iface_ptr and std.mem.eql(u8, am.type_name, want_meta.type_name))
+            return slot;
+    }
+    const concrete = concreteTypeForIfaceCoerce(ctx, arg);
+    if (concrete.len == 0 or std.mem.eql(u8, concrete, want_meta.type_name)) return slot;
+    return try coerceToIface(ctx, slot, concrete, want_meta.type_name);
 }
 
 fn coerceToIface(ctx: *Ctx, data_slot: u32, concrete: []const u8, iface_name: []const u8) LowerError!u32 {
@@ -4840,6 +4906,101 @@ fn lowerStringSlice(ctx: *Ctx, s: []const u8) LowerError!u32 {
     try ctx.emit(.{ .op = .add, .dst = len_addr, .src0 = hdr, .src1 = eight });
     try ctx.emit(.{ .op = .store, .src0 = len_addr, .src1 = len });
     return hdr;
+}
+
+fn isStrLikeName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "str") or
+        std.mem.eql(u8, name, "bytes") or
+        std.mem.eql(u8, name, "__Slice_byte");
+}
+
+fn isStrLikeExpr(ctx: *Ctx, e: *ast.Expr) bool {
+    if (e.* == .string) return true;
+    if (inferMetaFromExpr(ctx, e)) |m| {
+        if (m.kind == .struct_ptr and isStrLikeName(m.type_name)) return true;
+    }
+    if (inferTypeNameFromExpr(ctx, e)) |tn| {
+        if (isStrLikeName(tn)) return true;
+    }
+    return false;
+}
+
+/// Content equality for `{ptr,len}` string/bytes headers. `neq` inverts the result.
+fn lowerStrContentEq(ctx: *Ctx, left: *ast.Expr, right: *ast.Expr, invert: bool) LowerError!u32 {
+    const lh = try lowerExpr(ctx, left);
+    const rh = try lowerExpr(ctx, right);
+    const eight = try ctx.fresh();
+    try ctx.emit(.{ .op = .iconst, .dst = eight, .aux = 8 });
+
+    const lp = try ctx.fresh();
+    try ctx.emit(.{ .op = .load, .dst = lp, .src0 = lh });
+    const lplen = try ctx.fresh();
+    try ctx.emit(.{ .op = .add, .dst = lplen, .src0 = lh, .src1 = eight });
+    const llen = try ctx.fresh();
+    try ctx.emit(.{ .op = .load, .dst = llen, .src0 = lplen });
+
+    const rp = try ctx.fresh();
+    try ctx.emit(.{ .op = .load, .dst = rp, .src0 = rh });
+    const rplen = try ctx.fresh();
+    try ctx.emit(.{ .op = .add, .dst = rplen, .src0 = rh, .src1 = eight });
+    const rlen = try ctx.fresh();
+    try ctx.emit(.{ .op = .load, .dst = rlen, .src0 = rplen });
+
+    const result = try ctx.fresh();
+    // Default: equal (or unequal when invert) — empty equal-length strings win immediately.
+    try ctx.emit(.{ .op = .iconst, .dst = result, .aux = if (invert) 0 else 1 });
+
+    const len_eq = try ctx.fresh();
+    try ctx.emit(.{ .op = .eq, .dst = len_eq, .src0 = llen, .src1 = rlen });
+    const jz_len = ctx.insts.items.len;
+    try ctx.emit(.{ .op = .jz, .src0 = len_eq, .aux = 0 });
+
+    // Byte loop: for i in 0..len
+    const i = try ctx.fresh();
+    try ctx.emit(.{ .op = .iconst, .dst = i, .aux = 0 });
+    const head: i64 = @intCast(ctx.insts.items.len);
+    const more = try ctx.fresh();
+    try ctx.emit(.{ .op = .lt, .dst = more, .src0 = i, .src1 = llen });
+    const jz_done = ctx.insts.items.len;
+    try ctx.emit(.{ .op = .jz, .src0 = more, .aux = 0 });
+
+    const ap = try ctx.fresh();
+    try ctx.emit(.{ .op = .add, .dst = ap, .src0 = lp, .src1 = i });
+    const av = try ctx.fresh();
+    try ctx.emit(.{ .op = .load8, .dst = av, .src0 = ap });
+    const bp = try ctx.fresh();
+    try ctx.emit(.{ .op = .add, .dst = bp, .src0 = rp, .src1 = i });
+    const bv = try ctx.fresh();
+    try ctx.emit(.{ .op = .load8, .dst = bv, .src0 = bp });
+    const beq = try ctx.fresh();
+    try ctx.emit(.{ .op = .eq, .dst = beq, .src0 = av, .src1 = bv });
+    const jz_diff = ctx.insts.items.len;
+    try ctx.emit(.{ .op = .jz, .src0 = beq, .aux = 0 });
+    const one = try ctx.fresh();
+    try ctx.emit(.{ .op = .iconst, .dst = one, .aux = 1 });
+    try ctx.emit(.{ .op = .add, .dst = i, .src0 = i, .src1 = one });
+    try ctx.emit(.{ .op = .jmp, .aux = head });
+
+    const diff_pos: i64 = @intCast(ctx.insts.items.len);
+    ctx.insts.items[jz_diff].aux = diff_pos;
+    try ctx.emit(.{ .op = .iconst, .dst = result, .aux = if (invert) 1 else 0 });
+    const jmp_end1 = ctx.insts.items.len;
+    try ctx.emit(.{ .op = .jmp, .aux = 0 });
+
+    const done_pos: i64 = @intCast(ctx.insts.items.len);
+    ctx.insts.items[jz_done].aux = done_pos;
+    // lens matched and all bytes matched — result already set to eq/!eq default
+    const jmp_end2 = ctx.insts.items.len;
+    try ctx.emit(.{ .op = .jmp, .aux = 0 });
+
+    const len_ne_pos: i64 = @intCast(ctx.insts.items.len);
+    ctx.insts.items[jz_len].aux = len_ne_pos;
+    try ctx.emit(.{ .op = .iconst, .dst = result, .aux = if (invert) 1 else 0 });
+
+    const end_pos: i64 = @intCast(ctx.insts.items.len);
+    ctx.insts.items[jmp_end1].aux = end_pos;
+    ctx.insts.items[jmp_end2].aux = end_pos;
+    return result;
 }
 
 fn lowerPrintArgs(ctx: *Ctx, e: *ast.Expr) LowerError!struct { u32, u32 } {
