@@ -40,6 +40,8 @@ pub const TypeInfo = struct {
     /// bit width for integers (for widen/narrow)
     bits: u16 = 0,
     unsigned: bool = true,
+    /// Backing decl when `kind == .enum_ty` (payloads / comparability).
+    enum_decl: ?*ast.EnumDecl = null,
 };
 
 pub const Diagnostic = struct {
@@ -170,9 +172,9 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
                     }
                 }
             },
-            .enum_decl => |ed| {
+            .enum_decl => |*ed| {
                 const ti = try a.create(TypeInfo);
-                ti.* = .{ .kind = .enum_ty, .name = ed.name, .bits = 64, .unsigned = false };
+                ti.* = .{ .kind = .enum_ty, .name = ed.name, .bits = 64, .unsigned = false, .enum_decl = ed };
                 try types.put(a, ed.name, ti);
             },
             .import_decl => {},
@@ -616,6 +618,12 @@ fn checkStmt(
             var ty: ?*TypeInfo = null;
             if (vd.ty) |t| ty = try resolveTypeExpr(a, types, t, diags);
             if (vd.init) |init| {
+                // `.Empty` / `.Circle(r: …)` — fill enum type from the annotation.
+                if (init.* == .enum_lit and init.enum_lit.type_name == null) {
+                    if (ty) |t| {
+                        if (t.kind == .enum_ty) init.enum_lit.type_name = t.name;
+                    }
+                }
                 const it = try checkExpr(a, types, fns, structs, methods, scope, init, diags);
                 if (ty) |t| {
                     if (!canAssign(it, t)) {
@@ -776,8 +784,20 @@ fn checkExpr(
         .binary => |b| {
             const l = try checkExpr(a, types, fns, structs, methods, scope, b.left, diags);
             const r = try checkExpr(a, types, fns, structs, methods, scope, b.right, diags);
-            _ = r;
-            if (b.op == .eq or b.op == .neq or b.op == .lt or b.op == .gt or b.op == .lte or b.op == .gte or b.op == .and_op or b.op == .or_op)
+            if (b.op == .eq or b.op == .neq) {
+                // Types.md: comparable enums only — reject struct/slice/pointer/option payloads.
+                if (l.kind == .enum_ty) {
+                    if (!enumIsComparable(types, l)) {
+                        try emitDiag(a, diags, e, 1, 1, try std.fmt.allocPrint(a, "operator '==' does not apply to {s}", .{l.name}));
+                    }
+                } else if (r.kind == .enum_ty) {
+                    if (!enumIsComparable(types, r)) {
+                        try emitDiag(a, diags, e, 1, 1, try std.fmt.allocPrint(a, "operator '==' does not apply to {s}", .{r.name}));
+                    }
+                }
+                return types.get("bool").?;
+            }
+            if (b.op == .lt or b.op == .gt or b.op == .lte or b.op == .gte or b.op == .and_op or b.op == .or_op)
                 return types.get("bool").?;
             // arithmetic / bitwise: allow widen
             return l;
@@ -1033,10 +1053,32 @@ fn checkExpr(
             return ti;
         },
         .when_expr => |w| {
-            _ = try checkExpr(a, types, fns, structs, methods, scope, w.scrutinee, diags);
+            const scrut_t = try checkExpr(a, types, fns, structs, methods, scope, w.scrutinee, diags);
             var result: ?*TypeInfo = null;
             for (w.arms) |arm| {
-                const bt = try checkExpr(a, types, fns, structs, methods, scope, arm.body, diags);
+                // Bind payload locals for this arm (positional).
+                var arm_scope = Scope{
+                    .parent = scope,
+                    .vars = .{},
+                    .narrowed = .{},
+                };
+                if (scrut_t.kind == .enum_ty) {
+                    if (scrut_t.enum_decl) |ed| {
+                        for (ed.variants) |v| {
+                            if (!std.mem.eql(u8, v.name, arm.pattern)) continue;
+                            const nbind = @min(arm.bindings.len, v.fields.len);
+                            var bi: usize = 0;
+                            while (bi < nbind) : (bi += 1) {
+                                const bname = arm.bindings[bi];
+                                if (std.mem.eql(u8, bname, "_")) continue;
+                                const fty = try resolveTypeExpr(a, types, v.fields[bi].ty, diags);
+                                try arm_scope.vars.put(a, bname, .{ .ty = fty, .mutable = false });
+                            }
+                            break;
+                        }
+                    }
+                }
+                const bt = try checkExpr(a, types, fns, structs, methods, &arm_scope, arm.body, diags);
                 if (result == null) result = bt;
             }
             if (w.else_body) |eb| {
@@ -1140,6 +1182,54 @@ fn checkExpr(
             try emitDiag(a, diags, e, 1, 1, try std.fmt.allocPrint(a, "unknown struct '{s}'", .{sl.type_name}));
             return try voidType(a);
         },
+        .enum_lit => |*el| {
+            // Resolve missing type from a unique matching enum variant, if possible.
+            if (el.type_name == null) {
+                var found: ?[]const u8 = null;
+                var it = types.iterator();
+                while (it.next()) |entry| {
+                    const ti = entry.value_ptr.*;
+                    if (ti.kind != .enum_ty) continue;
+                    if (ti.enum_decl) |ed| {
+                        for (ed.variants) |v| {
+                            if (std.mem.eql(u8, v.name, el.variant)) {
+                                if (found != null and !std.mem.eql(u8, found.?, ti.name)) {
+                                    found = null;
+                                    break;
+                                }
+                                found = ti.name;
+                            }
+                        }
+                    }
+                }
+                if (found) |tn| el.type_name = tn;
+            }
+            const tname = el.type_name orelse {
+                try emitDiag(a, diags, e, 1, 1, try std.fmt.allocPrint(a, "enum variant '.{s}' needs a known type", .{el.variant}));
+                return try voidType(a);
+            };
+            const et = types.get(tname) orelse {
+                try emitDiag(a, diags, e, 1, 1, try std.fmt.allocPrint(a, "unknown enum '{s}'", .{tname}));
+                return try voidType(a);
+            };
+            if (et.kind != .enum_ty) {
+                try emitDiag(a, diags, e, 1, 1, try std.fmt.allocPrint(a, "'{s}' is not an enum", .{tname}));
+                return try voidType(a);
+            }
+            var matched = false;
+            if (et.enum_decl) |ed| {
+                for (ed.variants) |v| {
+                    if (!std.mem.eql(u8, v.name, el.variant)) continue;
+                    matched = true;
+                    for (el.fields) |f| _ = try checkExpr(a, types, fns, structs, methods, scope, f.value, diags);
+                    break;
+                }
+            }
+            if (!matched) {
+                try emitDiag(a, diags, e, 1, 1, try std.fmt.allocPrint(a, "unknown variant '{s}.{s}'", .{ tname, el.variant }));
+            }
+            return et;
+        },
         .tuple => |elems| {
             for (elems) |el| _ = try checkExpr(a, types, fns, structs, methods, scope, el, diags);
             const ti = try a.create(TypeInfo);
@@ -1183,7 +1273,18 @@ fn checkExpr(
             return ti;
         },
         .is_type => |it| {
-            _ = try checkExpr(a, types, fns, structs, methods, scope, it.expr, diags);
+            const scrut = try checkExpr(a, types, fns, structs, methods, scope, it.expr, diags);
+            // `e is Variant` — when T is not a known type but names a variant of e's enum.
+            if (it.ty.* == .name) {
+                const n = it.ty.name;
+                if (types.get(n) == null and scrut.kind == .enum_ty) {
+                    if (scrut.enum_decl) |ed| {
+                        for (ed.variants) |v| {
+                            if (std.mem.eql(u8, v.name, n)) return types.get("bool").?;
+                        }
+                    }
+                }
+            }
             _ = try resolveTypeExpr(a, types, it.ty, diags);
             return types.get("bool").?;
         },
@@ -1202,6 +1303,32 @@ fn voidType(a: std.mem.Allocator) !*TypeInfo {
     const ti = try a.create(TypeInfo);
     ti.* = .{ .kind = .void_ty, .name = "void" };
     return ti;
+}
+
+/// Types.md: comparable when every payload is bool/int/float/bytes/str or nested comparable enum.
+fn enumIsComparable(types: *std.StringHashMapUnmanaged(*TypeInfo), ti: *TypeInfo) bool {
+    const ed = ti.enum_decl orelse return true; // tag-only / unknown → allow (scalar path)
+    for (ed.variants) |v| {
+        for (v.fields) |f| {
+            if (!payloadTypeComparable(types, f.ty)) return false;
+        }
+    }
+    return true;
+}
+
+fn payloadTypeComparable(types: *std.StringHashMapUnmanaged(*TypeInfo), te: *ast.TypeExpr) bool {
+    return switch (te.*) {
+        .name => |n| blk: {
+            const ok = [_][]const u8{ "bool", "byte", "u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "usize", "isize", "f32", "f64", "str", "bytes", "rune" };
+            for (ok) |k| if (std.mem.eql(u8, n, k)) break :blk true;
+            if (types.get(n)) |inner| {
+                if (inner.kind == .enum_ty) break :blk enumIsComparable(types, inner);
+            }
+            break :blk false;
+        },
+        .pointer, .pointer_const, .optional, .slice_view, .array, .tuple => false,
+        else => false,
+    };
 }
 
 /// Implicit assign: widen ints, same type, optional wrap, iface structural later
@@ -1264,4 +1391,47 @@ test "widen rule" {
     var to = TypeInfo{ .kind = .u32_ty, .name = "u32", .bits = 32, .unsigned = true };
     try std.testing.expect(canAssign(&from, &to));
     try std.testing.expect(!canAssign(&to, &from));
+}
+
+test "enum payload check and equality" {
+    const parse = @import("../parse/parse.zig");
+    const src =
+        \\enum Shape {
+        \\    Circle(r: i64)
+        \\    Empty
+        \\}
+        \\fn main() {
+        \\    val s = Shape.Circle(r: 1)
+        \\    val e: Shape = .Empty
+        \\    if s == e {}
+        \\}
+        \\
+    ;
+    var file = try parse.Parser.parseFile(std.testing.allocator, src);
+    defer file.deinit();
+    var cr = try check(std.testing.allocator, &file);
+    defer cr.deinit();
+    try std.testing.expect(cr.ok);
+}
+
+test "enum equality rejected for struct payload" {
+    const parse = @import("../parse/parse.zig");
+    const src =
+        \\struct Box { n: i64 }
+        \\enum E { Wrap(b: Box) }
+        \\fn eq(a: E, b: E): bool {
+        \\    return a == b
+        \\}
+        \\
+    ;
+    var file = try parse.Parser.parseFile(std.testing.allocator, src);
+    defer file.deinit();
+    var cr = try check(std.testing.allocator, &file);
+    defer cr.deinit();
+    try std.testing.expect(!cr.ok);
+    var found = false;
+    for (cr.diagnostics) |d| {
+        if (std.mem.indexOf(u8, d.message, "does not apply") != null) found = true;
+    }
+    try std.testing.expect(found);
 }

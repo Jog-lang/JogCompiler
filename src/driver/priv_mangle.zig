@@ -159,6 +159,9 @@ fn rewriteExpr(e: *ast.Expr, renames: *const std.StringHashMapUnmanaged([]const 
         .struct_lit => |*sl| {
             for (sl.fields) |*f| rewriteExpr(f.value, renames);
         },
+        .enum_lit => |*el| {
+            for (el.fields) |*f| rewriteExpr(f.value, renames);
+        },
         .panic_call => |*p| rewriteExpr(p.message, renames),
         .when_expr => |*w| {
             rewriteExpr(w.scrutinee, renames);
