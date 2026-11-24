@@ -55,12 +55,15 @@ fn buildNative(
     defer allocator.free(rt_main);
     const rt_coro = try std.fs.path.join(allocator, &.{ rt, "linux_x64_coro.s" });
     defer allocator.free(rt_coro);
+    const rt_scope = try std.fs.path.join(allocator, &.{ rt, "jogrt_scope.c" });
+    defer allocator.free(rt_scope);
     const rt_start = try std.fs.path.join(allocator, &.{ rt, "linux_x64_start.s" });
     defer allocator.free(rt_start);
 
     var argv: std.ArrayListUnmanaged([]const u8) = .{};
     defer argv.deinit(allocator);
-    try argv.appendSlice(allocator, &.{ "zig", "cc", "-no-pie", "-o", out_path, asm_path, rt_main, rt_coro });
+    // -fno-sanitize=all keeps jogrt_scope.c freestanding (no ubsan→getauxval).
+    try argv.appendSlice(allocator, &.{ "zig", "cc", "-no-pie", "-fno-sanitize=all", "-o", out_path, asm_path, rt_main, rt_coro, rt_scope });
     if (!program.needs_libc) {
         try argv.appendSlice(allocator, &.{ rt_start, "-nostdlib", "-fno-stack-protector" });
     }

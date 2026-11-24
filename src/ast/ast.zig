@@ -309,6 +309,21 @@ pub const Expr = union(enum) {
     interp: Interp,
     /// Postfix `e!!` — force-unwrap optional (Grammar postfixOp).
     force_unwrap: *Expr,
+    /// `go { … }` / `go with (…) { … }` — block launch (JOG-222). `go(fn, arg)` stays a normal call.
+    go_block: GoBlock,
+    /// `scope { … }` — structured-concurrency block (JOG-222). Trailing-lambda `scope()` waits on JOG-221.
+    scope_block: ScopeBlock,
+};
+
+/// `go with (e1, …)? { stmts }` — body runs on a new stack; captures outer locals by address.
+pub const GoBlock = struct {
+    with_args: []*Expr = &.{},
+    body: *Block,
+};
+
+/// `scope { stmts }` — enter a child Scope, run body, join children, leave.
+pub const ScopeBlock = struct {
+    body: *Block,
 };
 
 pub const Range = struct {

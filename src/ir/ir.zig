@@ -379,6 +379,12 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_coro_id" });
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_coro_park" });
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_coro_unpark" });
+    // JOG-222 structured concurrency (scope + go blocks).
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_scope_enter" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_scope_leave" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_scope_current" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_scope_go" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_scope_trampoline" });
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_dispatcher_single" });
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_dispatcher_pool" });
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_dispatcher_new" });
@@ -610,6 +616,8 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
     try instantiateGenerics(a, file, &generic_fns, &generic_structs, &generic_methods, &structs, &methods, &ifaces, &fn_infos, &callees, &callee_map, &specialized, &specialized_methods);
 
     var funcs: std.ArrayListUnmanaged(Func) = .{};
+    var pending_gos: std.ArrayListUnmanaged(PendingGoFn) = .{};
+    var go_seq: u32 = 0;
     for (file.decls) |d| {
         const maybe_fd: ?ast.FnDecl = switch (d) {
             .fn_decl => |fd| if (fd.body != null and fd.type_params.len == 0) fd else null,
@@ -627,7 +635,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                 .self_type = null,
                 .pointer_recv = false,
                 .ret_iface = retIfaceName(&ifaces, fd.ret),
-            }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map, globals.items, &object_map);
+            }, &strings, &callees, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map, globals.items, &object_map, &pending_gos, &go_seq);
             try funcs.append(a, f);
         } else if (d == .method and d.method.body != null and d.method.type_params.len == 0) {
             const md = d.method;
@@ -642,7 +650,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                 .self_type = md.type_name,
                 .pointer_recv = md.pointer_recv,
                 .ret_iface = retIfaceName(&ifaces, md.ret),
-            }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map, globals.items, &object_map);
+            }, &strings, &callees, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map, globals.items, &object_map, &pending_gos, &go_seq);
             try funcs.append(a, f);
         }
     }
@@ -658,7 +666,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
             .pointer_recv = false,
             .ret_iface = retIfaceName(&ifaces, fd.ret),
             .type_subst = &sf.type_subst,
-        }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map, globals.items, &object_map);
+        }, &strings, &callees, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map, globals.items, &object_map, &pending_gos, &go_seq);
         try funcs.append(a, f);
     }
     for (specialized_methods.items) |*sm| {
@@ -672,13 +680,27 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
             .pointer_recv = sm.pointer_recv,
             .ret_iface = retIfaceName(&ifaces, sm.ret),
             .type_subst = &sm.type_subst,
-        }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map, globals.items, &object_map) catch |err| {
+        }, &strings, &callees, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map, globals.items, &object_map, &pending_gos, &go_seq) catch |err| {
             // Callback / unsupported bodies (each, map, fold, …) — drop so callers error clearly.
             std.debug.print("skip specialized method {s}: {s}\n", .{ sm.mangled, @errorName(err) });
             const key = try std.fmt.allocPrint(a, "{s}.{s}", .{ sm.type_name, sm.method_name });
             _ = methods.remove(key);
             continue;
         };
+        try funcs.append(a, f);
+    }
+    // Lower synthetic `go { }` children (may enqueue nested go blocks).
+    var gi: usize = 0;
+    while (gi < pending_gos.items.len) : (gi += 1) {
+        const pg = pending_gos.items[gi];
+        try internCallee(a, &callees, &callee_map, .{ .kind = .jog_fn, .name = pg.name });
+        try fn_infos.put(a, pg.name, .{
+            .mangled = pg.name,
+            .nparams = 1,
+            .contexts = &[_]ast.ContextParam{},
+            .exported = false,
+        });
+        const f = try lowerGoChild(a, pg, &strings, &callees, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map, globals.items, &object_map, &pending_gos, &go_seq);
         try funcs.append(a, f);
     }
 
@@ -1340,6 +1362,15 @@ const FnLower = struct {
     ret_iface: ?[]const u8 = null,
     /// Borrowed map for this specialization (`T` → concrete); null = empty.
     type_subst: ?*const std.StringHashMapUnmanaged([]const u8) = null,
+    /// JOG-222: go-child capture name → index in the `__env` pointer array.
+    go_captures: ?*const std.StringHashMapUnmanaged(u32) = null,
+};
+
+/// Synthetic child function for `go { … }` (JOG-222).
+const PendingGoFn = struct {
+    name: []const u8,
+    body: *ast.Block,
+    capture_names: [][]const u8,
 };
 
 const Ctx = struct {
@@ -1372,6 +1403,15 @@ const Ctx = struct {
     ret_iface: ?[]const u8 = null,
     /// Generic method/fn type-param → concrete name (`T` → `i64`). Empty for non-generic.
     type_subst: *const std.StringHashMapUnmanaged([]const u8),
+    /// Queued `go { }` bodies to lower as sibling funcs after the parent.
+    pending_gos: *std.ArrayListUnmanaged(PendingGoFn),
+    go_seq: *u32,
+    callees: *std.ArrayListUnmanaged(Callee),
+    /// Active `scope { }` handle slot, if any.
+    scope_slot: ?u32 = null,
+    /// Inside a go child: env param slot + capture name → index in env pointer array.
+    env_slot: ?u32 = null,
+    capture_map: ?*const std.StringHashMapUnmanaged(u32) = null,
 
     fn fresh(self: *Ctx) !u32 {
         const s = self.next_slot.*;
@@ -1381,12 +1421,16 @@ const Ctx = struct {
     fn emit(self: *Ctx, inst: Inst) !void {
         try self.insts.append(self.a, inst);
     }
+    fn intern(self: *Ctx, c: Callee) !void {
+        try internCallee(self.a, self.callees, self.callee_map, c);
+    }
 };
 
 fn lowerFn(
     a: std.mem.Allocator,
     fl: FnLower,
     strings: *std.ArrayListUnmanaged([]const u8),
+    callees: *std.ArrayListUnmanaged(Callee),
     callee_map: *std.StringHashMapUnmanaged(u32),
     structs: *std.StringHashMapUnmanaged(StructInfo),
     enums: *std.StringHashMapUnmanaged(EnumInfo),
@@ -1399,6 +1443,8 @@ fn lowerFn(
     global_map: *std.StringHashMapUnmanaged(u32),
     globals: []const Global,
     object_map: *std.StringHashMapUnmanaged(u32),
+    pending_gos: *std.ArrayListUnmanaged(PendingGoFn),
+    go_seq: *u32,
 ) !Func {
     std.debug.print("lowerFn:{s}\n", .{fl.name});
     var slots: std.StringHashMapUnmanaged(u32) = .{};
@@ -1497,6 +1543,11 @@ fn lowerFn(
         .defer_stack = &defer_stack,
         .ret_iface = fl.ret_iface,
         .type_subst = subst_ptr,
+        .pending_gos = pending_gos,
+        .go_seq = go_seq,
+        .callees = callees,
+        .capture_map = fl.go_captures,
+        .env_slot = if (fl.go_captures != null) slots.get("__env") else null,
     };
     lowerBlock(&ctx, fl.body) catch |err| {
         std.debug.print("lowerFn body fail {s}: {s}\n", .{ fl.name, @errorName(err) });
@@ -1513,6 +1564,216 @@ fn lowerFn(
         .exported = fl.exported,
         .insts = try insts.toOwnedSlice(a),
     };
+}
+
+fn lowerGoChild(
+    a: std.mem.Allocator,
+    pg: PendingGoFn,
+    strings: *std.ArrayListUnmanaged([]const u8),
+    callees: *std.ArrayListUnmanaged(Callee),
+    callee_map: *std.StringHashMapUnmanaged(u32),
+    structs: *std.StringHashMapUnmanaged(StructInfo),
+    enums: *std.StringHashMapUnmanaged(EnumInfo),
+    methods: *std.StringHashMapUnmanaged(MethodInfo),
+    ifaces: *std.StringHashMapUnmanaged(IfaceInfo),
+    fn_infos: *std.StringHashMapUnmanaged(FnInfo),
+    vtables: *std.ArrayListUnmanaged(VTable),
+    vtable_map: *std.StringHashMapUnmanaged(u32),
+    const_vals: *std.StringHashMapUnmanaged(ConstVal),
+    global_map: *std.StringHashMapUnmanaged(u32),
+    globals: []const Global,
+    object_map: *std.StringHashMapUnmanaged(u32),
+    pending_gos: *std.ArrayListUnmanaged(PendingGoFn),
+    go_seq: *u32,
+) !Func {
+    var capture_map: std.StringHashMapUnmanaged(u32) = .{};
+    for (pg.capture_names, 0..) |n, i| {
+        try capture_map.put(a, n, @intCast(i));
+    }
+    // Synthetic: `fn __go_N(env: *byte)` — env is an array of capture pointers.
+    const env_param = try a.alloc(ast.Param, 1);
+    const env_ty = try a.create(ast.TypeExpr);
+    const byte_ty = try a.create(ast.TypeExpr);
+    byte_ty.* = .{ .name = "byte" };
+    env_ty.* = .{ .pointer = byte_ty };
+    env_param[0] = .{ .name = "__env", .ty = env_ty, .is_pack = false };
+    return try lowerFn(a, .{
+        .name = pg.name,
+        .params = env_param,
+        .contexts = &[_]ast.ContextParam{},
+        .body = pg.body,
+        .exported = false,
+        .self_type = null,
+        .pointer_recv = false,
+        .go_captures = &capture_map,
+    }, strings, callees, callee_map, structs, enums, methods, ifaces, fn_infos, vtables, vtable_map, const_vals, global_map, globals, object_map, pending_gos, go_seq);
+}
+
+fn loadCapturePtr(ctx: *Ctx, name: []const u8) LowerError!?u32 {
+    const cm = ctx.capture_map orelse return null;
+    const idx = cm.get(name) orelse return null;
+    const env = ctx.env_slot orelse return error.TypeError;
+    const off = try ctx.fresh();
+    try ctx.emit(.{ .op = .iconst, .dst = off, .aux = @as(i64, @intCast(idx)) * 8 });
+    const addr = try ctx.fresh();
+    try ctx.emit(.{ .op = .add, .dst = addr, .src0 = env, .src1 = off });
+    const ptr = try ctx.fresh();
+    try ctx.emit(.{ .op = .load, .dst = ptr, .src0 = addr });
+    return ptr;
+}
+
+fn collectGoCaptures(ctx: *Ctx, body: *ast.Block) LowerError![][]const u8 {
+    var locals: std.StringHashMapUnmanaged(void) = .{};
+    var caps: std.ArrayListUnmanaged([]const u8) = .{};
+    var seen: std.StringHashMapUnmanaged(void) = .{};
+    try scanBlockCaptures(ctx, body, &locals, &caps, &seen);
+    return try caps.toOwnedSlice(ctx.a);
+}
+
+fn scanBlockCaptures(
+    ctx: *Ctx,
+    body: *ast.Block,
+    locals: *std.StringHashMapUnmanaged(void),
+    caps: *std.ArrayListUnmanaged([]const u8),
+    seen: *std.StringHashMapUnmanaged(void),
+) LowerError!void {
+    for (body.stmts) |st| try scanStmtCaptures(ctx, st, locals, caps, seen);
+}
+
+fn scanStmtCaptures(
+    ctx: *Ctx,
+    stmt: ast.Stmt,
+    locals: *std.StringHashMapUnmanaged(void),
+    caps: *std.ArrayListUnmanaged([]const u8),
+    seen: *std.StringHashMapUnmanaged(void),
+) LowerError!void {
+    switch (stmt) {
+        .var_decl => |vd| {
+            try locals.put(ctx.a, vd.name, {});
+            if (vd.init) |init| try scanExprCaptures(ctx, init, locals, caps, seen);
+        },
+        .destructure => |ds| {
+            for (ds.names) |n| try locals.put(ctx.a, n, {});
+            try scanExprCaptures(ctx, ds.init, locals, caps, seen);
+        },
+        .assign => |as| {
+            if (as.index == null and as.field == null) {
+                try noteCapture(ctx, as.name, locals, caps, seen);
+            }
+            try scanExprCaptures(ctx, as.value, locals, caps, seen);
+            if (as.field) |fa| try scanExprCaptures(ctx, fa.base, locals, caps, seen);
+            if (as.index) |ix| {
+                try scanExprCaptures(ctx, ix.base, locals, caps, seen);
+                try scanExprCaptures(ctx, ix.index, locals, caps, seen);
+            }
+        },
+        .expr => |e| try scanExprCaptures(ctx, e, locals, caps, seen),
+        .return_stmt => |re| if (re) |e| try scanExprCaptures(ctx, e, locals, caps, seen),
+        .if_stmt => |ifs| {
+            try scanExprCaptures(ctx, ifs.cond, locals, caps, seen);
+            try scanBlockCaptures(ctx, ifs.then_block, locals, caps, seen);
+            if (ifs.else_block) |eb| try scanBlockCaptures(ctx, eb, locals, caps, seen);
+        },
+        .while_stmt => |ws| {
+            try scanExprCaptures(ctx, ws.cond, locals, caps, seen);
+            try scanBlockCaptures(ctx, ws.body, locals, caps, seen);
+        },
+        .for_in_stmt => |fs| {
+            try locals.put(ctx.a, fs.name, {});
+            try scanExprCaptures(ctx, fs.iter, locals, caps, seen);
+            try scanBlockCaptures(ctx, fs.body, locals, caps, seen);
+        },
+        .with_stmt => |ws| {
+            for (ws.values) |v| try scanExprCaptures(ctx, v, locals, caps, seen);
+            try scanBlockCaptures(ctx, ws.body, locals, caps, seen);
+        },
+        .defer_stmt, .errdefer_stmt => |ds| switch (ds) {
+            .expr => |ex| try scanExprCaptures(ctx, ex, locals, caps, seen),
+            .block => |b| try scanBlockCaptures(ctx, b, locals, caps, seen),
+        },
+        .break_stmt, .continue_stmt => {},
+    }
+}
+
+fn noteCapture(
+    ctx: *Ctx,
+    name: []const u8,
+    locals: *std.StringHashMapUnmanaged(void),
+    caps: *std.ArrayListUnmanaged([]const u8),
+    seen: *std.StringHashMapUnmanaged(void),
+) LowerError!void {
+    if (locals.contains(name)) return;
+    if (seen.contains(name)) return;
+    // Only parent stack locals — globals/fns/consts resolve without capture.
+    if (!ctx.slots.contains(name)) return;
+    try seen.put(ctx.a, name, {});
+    try caps.append(ctx.a, name);
+}
+
+fn scanExprCaptures(
+    ctx: *Ctx,
+    e: *ast.Expr,
+    locals: *std.StringHashMapUnmanaged(void),
+    caps: *std.ArrayListUnmanaged([]const u8),
+    seen: *std.StringHashMapUnmanaged(void),
+) LowerError!void {
+    switch (e.*) {
+        .ident => |name| try noteCapture(ctx, name, locals, caps, seen),
+        .binary => |b| {
+            try scanExprCaptures(ctx, b.left, locals, caps, seen);
+            try scanExprCaptures(ctx, b.right, locals, caps, seen);
+        },
+        .unary => |u| try scanExprCaptures(ctx, u.expr, locals, caps, seen),
+        .call => |c| {
+            try scanExprCaptures(ctx, c.callee, locals, caps, seen);
+            for (c.args) |arg| try scanExprCaptures(ctx, arg, locals, caps, seen);
+            for (c.with_args) |w| try scanExprCaptures(ctx, w, locals, caps, seen);
+        },
+        .field => |f| try scanExprCaptures(ctx, f.base, locals, caps, seen),
+        .index => |ix| {
+            try scanExprCaptures(ctx, ix.base, locals, caps, seen);
+            try scanExprCaptures(ctx, ix.index, locals, caps, seen);
+        },
+        .slice => |sl| {
+            try scanExprCaptures(ctx, sl.base, locals, caps, seen);
+            if (sl.start) |s| try scanExprCaptures(ctx, s, locals, caps, seen);
+            if (sl.end) |en| try scanExprCaptures(ctx, en, locals, caps, seen);
+        },
+        .cast, .try_cast => |c| try scanExprCaptures(ctx, c.expr, locals, caps, seen),
+        .is_type => |it| try scanExprCaptures(ctx, it.expr, locals, caps, seen),
+        .optional_call => |oc| {
+            try scanExprCaptures(ctx, oc.base, locals, caps, seen);
+            for (oc.args) |arg| try scanExprCaptures(ctx, arg, locals, caps, seen);
+        },
+        .struct_lit => |sl| {
+            for (sl.fields) |f| try scanExprCaptures(ctx, f.value, locals, caps, seen);
+        },
+        .panic_call => |p| try scanExprCaptures(ctx, p.message, locals, caps, seen),
+        .when_expr => |w| {
+            try scanExprCaptures(ctx, w.scrutinee, locals, caps, seen);
+            for (w.arms) |arm| try scanExprCaptures(ctx, arm.body, locals, caps, seen);
+            if (w.else_body) |eb| try scanExprCaptures(ctx, eb, locals, caps, seen);
+        },
+        .tuple => |elems| for (elems) |el| try scanExprCaptures(ctx, el, locals, caps, seen),
+        .range => |r| {
+            try scanExprCaptures(ctx, r.start, locals, caps, seen);
+            try scanExprCaptures(ctx, r.end, locals, caps, seen);
+        },
+        .array_lit => |al| for (al.elems) |el| try scanExprCaptures(ctx, el, locals, caps, seen),
+        .interp => |ip| {
+            for (ip.parts) |part| switch (part) {
+                .text => {},
+                .expr => |ex| try scanExprCaptures(ctx, ex, locals, caps, seen),
+            };
+        },
+        .force_unwrap => |inner| try scanExprCaptures(ctx, inner, locals, caps, seen),
+        .go_block => |gb| {
+            for (gb.with_args) |w| try scanExprCaptures(ctx, w, locals, caps, seen);
+            try scanBlockCaptures(ctx, gb.body, locals, caps, seen);
+        },
+        .scope_block => |sb| try scanBlockCaptures(ctx, sb.body, locals, caps, seen),
+        .int, .float, .string, .cstring, .null_lit => {},
+    }
 }
 
 fn typeExprName(te: *ast.TypeExpr) []const u8 {
@@ -2093,6 +2354,10 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
                         const d = try ctx.fresh();
                         try ctx.emit(.{ .op = .load, .dst = d, .src0 = addr });
                         break :blk d;
+                    } else if (try loadCapturePtr(ctx, as.name)) |ptr| {
+                        const d = try ctx.fresh();
+                        try ctx.emit(.{ .op = .load, .dst = d, .src0 = ptr });
+                        break :blk d;
                     } else if (ctx.slots.get(as.name)) |slot| {
                         break :blk slot;
                     } else if (ctx.global_map.get(as.name)) |gi| {
@@ -2140,6 +2405,8 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
                 } else {
                     try ctx.emit(.{ .op = .store, .src0 = addr, .src1 = v });
                 }
+            } else if (try loadCapturePtr(ctx, as.name)) |ptr| {
+                try ctx.emit(.{ .op = .store, .src0 = ptr, .src1 = v });
             } else if (ctx.slots.get(as.name)) |slot| {
                 try ctx.emit(.{ .op = .copy, .dst = slot, .src0 = v });
             } else if (ctx.global_map.get(as.name)) |gi| {
@@ -3004,6 +3271,11 @@ fn isFloatish(ctx: *Ctx, e: *ast.Expr) bool {
 fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
     switch (e.*) {
         .ident => |name| {
+            if (try loadCapturePtr(ctx, name)) |ptr| {
+                const d = try ctx.fresh();
+                try ctx.emit(.{ .op = .load, .dst = d, .src0 = ptr });
+                return d;
+            }
             if (ctx.slots.get(name)) |s| return s;
             if (ctx.const_vals.get(name)) |cv| {
                 const d = try ctx.fresh();
@@ -3177,6 +3449,7 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
             if (u.op == .addr) {
                 if (u.expr.* != .ident) return error.TypeError;
                 const name = u.expr.ident;
+                if (try loadCapturePtr(ctx, name)) |ptr| return ptr;
                 const d = try ctx.fresh();
                 if (ctx.slots.get(name)) |slot| {
                     // Array / struct / iface slots already hold a data pointer; &x is that pointer
@@ -3613,6 +3886,109 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
                 }
             }
             return ptr;
+        },
+        .go_block => |gb| {
+            for (gb.with_args) |w| _ = try lowerExpr(ctx, w);
+            const caps = try collectGoCaptures(ctx, gb.body);
+            const seq = ctx.go_seq.*;
+            ctx.go_seq.* += 1;
+            const name = try std.fmt.allocPrint(ctx.a, "__go_{d}", .{seq});
+            try ctx.intern(.{ .kind = .jog_fn, .name = name });
+            try ctx.fn_infos.put(ctx.a, name, .{
+                .mangled = name,
+                .nparams = 1,
+                .contexts = &[_]ast.ContextParam{},
+                .exported = false,
+            });
+            try ctx.pending_gos.append(ctx.a, .{
+                .name = name,
+                .body = gb.body,
+                .capture_names = caps,
+            });
+
+            // Capture env: array of pointers to parent locals (or null if none).
+            var env_ptr: u32 = none;
+            if (caps.len > 0) {
+                const nbytes: i64 = @intCast(caps.len * 8);
+                const sz = try ctx.fresh();
+                try ctx.emit(.{ .op = .iconst, .dst = sz, .aux = nbytes });
+                // Bump heap: must outlive the child until scope leave joins.
+                const acid = ctx.callee_map.get("jogrt_alloc").?;
+                env_ptr = try ctx.fresh();
+                var allo = Inst{ .op = .call, .dst = env_ptr, .aux = acid, .arity = 1 };
+                allo.args[0] = sz;
+                try ctx.emit(allo);
+                for (caps, 0..) |cname, i| {
+                    const slot = ctx.slots.get(cname) orelse return error.UnknownName;
+                    const p = try ctx.fresh();
+                    // Struct/array slots already hold pointers; scalars need lea.
+                    if (ctx.meta.get(cname)) |m| {
+                        if (m.kind == .array_ptr or m.kind == .struct_ptr or m.kind == .iface_ptr) {
+                            try ctx.emit(.{ .op = .copy, .dst = p, .src0 = slot });
+                        } else {
+                            try ctx.emit(.{ .op = .lea_slot, .dst = p, .src0 = slot });
+                        }
+                    } else {
+                        try ctx.emit(.{ .op = .lea_slot, .dst = p, .src0 = slot });
+                    }
+                    const off = try ctx.fresh();
+                    try ctx.emit(.{ .op = .iconst, .dst = off, .aux = @as(i64, @intCast(i)) * 8 });
+                    const addr = try ctx.fresh();
+                    try ctx.emit(.{ .op = .add, .dst = addr, .src0 = env_ptr, .src1 = off });
+                    try ctx.emit(.{ .op = .store, .src0 = addr, .src1 = p });
+                }
+            } else {
+                env_ptr = try ctx.fresh();
+                try ctx.emit(.{ .op = .iconst, .dst = env_ptr, .aux = 0 });
+            }
+
+            const scope = blk: {
+                if (ctx.scope_slot) |s| break :blk s;
+                const cid = ctx.callee_map.get("jogrt_scope_current").?;
+                const d = try ctx.fresh();
+                try ctx.emit(.{ .op = .call, .dst = d, .aux = cid, .arity = 0 });
+                break :blk d;
+            };
+            const fn_addr = try ctx.fresh();
+            const fcid = ctx.callee_map.get(name).?;
+            try ctx.emit(.{ .op = .saddr, .dst = fn_addr, .aux = -1 - @as(i64, @intCast(fcid)) });
+
+            // GoWrap { fn, arg, scope } — 24 bytes; bump heap until scope leave.
+            const wraps = try ctx.fresh();
+            try ctx.emit(.{ .op = .iconst, .dst = wraps, .aux = 24 });
+            const wcid = ctx.callee_map.get("jogrt_alloc").?;
+            const wrap = try ctx.fresh();
+            var wallo = Inst{ .op = .call, .dst = wrap, .aux = wcid, .arity = 1 };
+            wallo.args[0] = wraps;
+            try ctx.emit(wallo);
+
+            const gcid = ctx.callee_map.get("jogrt_scope_go").?;
+            var ginst = Inst{ .op = .call, .dst = none, .aux = gcid, .arity = 4 };
+            ginst.args[0] = scope;
+            ginst.args[1] = fn_addr;
+            ginst.args[2] = env_ptr;
+            ginst.args[3] = wrap;
+            try ctx.emit(ginst);
+
+            const zero = try ctx.fresh();
+            try ctx.emit(.{ .op = .iconst, .dst = zero, .aux = 0 });
+            return zero;
+        },
+        .scope_block => |sb| {
+            const ecid = ctx.callee_map.get("jogrt_scope_enter").?;
+            const entered = try ctx.fresh();
+            try ctx.emit(.{ .op = .call, .dst = entered, .aux = ecid, .arity = 0 });
+            const saved = ctx.scope_slot;
+            ctx.scope_slot = entered;
+            defer ctx.scope_slot = saved;
+            try lowerBlock(ctx, sb.body);
+            const lcid = ctx.callee_map.get("jogrt_scope_leave").?;
+            var linst = Inst{ .op = .call, .dst = none, .aux = lcid, .arity = 1 };
+            linst.args[0] = entered;
+            try ctx.emit(linst);
+            const zero = try ctx.fresh();
+            try ctx.emit(.{ .op = .iconst, .dst = zero, .aux = 0 });
+            return zero;
         },
     }
 }

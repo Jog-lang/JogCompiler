@@ -1155,6 +1155,16 @@ fn checkExpr(
             // Non-optional: accept (no-op unwrap) for pointer-ish values.
             return t;
         },
+        .go_block => |gb| {
+            for (gb.with_args) |w| _ = try checkExpr(a, types, fns, structs, methods, scope, w, diags);
+            // Body sees parent locals (captures by address at lower time).
+            try checkBlock(a, types, fns, structs, methods, gb.body, diags, scope);
+            return try voidType(a);
+        },
+        .scope_block => |sb| {
+            try checkBlock(a, types, fns, structs, methods, sb.body, diags, scope);
+            return try voidType(a);
+        },
     }
 }
 
