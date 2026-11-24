@@ -69,13 +69,20 @@ pub const Parser = struct {
     fn parseDecl(self: *Parser) ParseError!ast.Decl {
         var is_private = false;
         if (self.tok.kind == .kw_private) {
-            is_private = true;
             self.advance();
-            // private(package) — accept and ignore scope for now
+            // Bare `private` / `private(file)` are file-local (mangled before flatten).
+            // `private(package)` is package-visible — keep the source name.
             if (self.tok.kind == .lparen) {
                 self.advance();
-                if (self.tok.kind == .ident) self.advance();
+                var file_local = true;
+                if (self.tok.kind == .ident) {
+                    if (std.mem.eql(u8, self.tok.text, "package")) file_local = false;
+                    self.advance();
+                }
                 try self.expect(.rparen);
+                is_private = file_local;
+            } else {
+                is_private = true;
             }
         }
         // @link / @export / @test / @packed / @intrinsic

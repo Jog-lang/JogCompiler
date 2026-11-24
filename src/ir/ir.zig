@@ -361,6 +361,8 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
     var global_map: std.StringHashMapUnmanaged(u32) = .{};
     var object_map: std.StringHashMapUnmanaged(u32) = .{}; // object name → global index
     var const_vals: std.StringHashMapUnmanaged(ConstVal) = .{};
+    var addr_consts: std.StringHashMapUnmanaged(u32) = .{}; // val Name = &global
+    var import_binds: std.StringHashMapUnmanaged(void) = .{};
 
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_print" });
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_panic" });
@@ -474,18 +476,39 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                     program.needs_libc = true;
                 }
             },
+            .import_decl => |imp| {
+                const bind = if (imp.alias) |al|
+                    al
+                else if (std.mem.lastIndexOfScalar(u8, imp.path, '.')) |dot|
+                    imp.path[dot + 1 ..]
+                else
+                    imp.path;
+                try import_binds.put(a, bind, {});
+            },
             .global_decl => |gd| {
                 var bits: i64 = 0;
                 var is_float = false;
                 var is_raw_byte_ptr = false;
                 var iface_type_name: []const u8 = "";
                 var type_name: []const u8 = "";
+                var addr_of_global: ?u32 = null;
                 if (gd.init) |init| {
                     if (literalConstBits(init)) |cv| {
                         bits = cv.bits;
                         is_float = cv.is_float;
                     } else if (init.* == .null_lit) {
                         bits = 0;
+                    } else if (!gd.mutable and init.* == .unary and init.unary.op == .addr and init.unary.expr.* == .ident) {
+                        // `val ErrX = &global` / `&object` — sentinel address constants (std.error).
+                        const target = init.unary.expr.ident;
+                        if (global_map.get(target)) |gi| {
+                            addr_of_global = gi;
+                        } else if (object_map.get(target)) |gi| {
+                            addr_of_global = gi;
+                        } else {
+                            std.debug.print("lower: top-level val '{s}' address-of unknown '{s}'\n", .{ gd.name, target });
+                            return error.TypeError;
+                        }
                     } else {
                         std.debug.print("lower: top-level {s} '{s}' needs a literal/null init\n", .{ if (gd.mutable) "var" else "val", gd.name });
                         return error.TypeError;
@@ -506,8 +529,12 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                     if (leaf.len > 0) type_name = try a.dupe(u8, leaf);
                 }
                 if (!gd.mutable) {
-                    // Compile-time constant: fold at use sites (no storage).
-                    try const_vals.put(a, gd.name, .{ .bits = bits, .is_float = is_float });
+                    if (addr_of_global) |gi| {
+                        try addr_consts.put(a, gd.name, gi);
+                    } else {
+                        // Compile-time constant: fold at use sites (no storage).
+                        try const_vals.put(a, gd.name, .{ .bits = bits, .is_float = is_float });
+                    }
                 } else {
                     // Mutable: zero-init OK when no initializer (BSS-like .data zero).
                     const idx: u32 = @intCast(globals.items.len);
@@ -627,7 +654,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                 .self_type = null,
                 .pointer_recv = false,
                 .ret_iface = retIfaceName(&ifaces, fd.ret),
-            }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map, globals.items, &object_map);
+            }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &addr_consts, &global_map, globals.items, &object_map, &import_binds);
             try funcs.append(a, f);
         } else if (d == .method and d.method.body != null and d.method.type_params.len == 0) {
             const md = d.method;
@@ -642,7 +669,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                 .self_type = md.type_name,
                 .pointer_recv = md.pointer_recv,
                 .ret_iface = retIfaceName(&ifaces, md.ret),
-            }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map, globals.items, &object_map);
+            }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &addr_consts, &global_map, globals.items, &object_map, &import_binds);
             try funcs.append(a, f);
         }
     }
@@ -658,7 +685,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
             .pointer_recv = false,
             .ret_iface = retIfaceName(&ifaces, fd.ret),
             .type_subst = &sf.type_subst,
-        }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map, globals.items, &object_map);
+        }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &addr_consts, &global_map, globals.items, &object_map, &import_binds);
         try funcs.append(a, f);
     }
     for (specialized_methods.items) |*sm| {
@@ -672,7 +699,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
             .pointer_recv = sm.pointer_recv,
             .ret_iface = retIfaceName(&ifaces, sm.ret),
             .type_subst = &sm.type_subst,
-        }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map, globals.items, &object_map) catch |err| {
+        }, &strings, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &addr_consts, &global_map, globals.items, &object_map, &import_binds) catch |err| {
             // Callback / unsupported bodies (each, map, fold, …) — drop so callers error clearly.
             std.debug.print("skip specialized method {s}: {s}\n", .{ sm.mangled, @errorName(err) });
             const key = try std.fmt.allocPrint(a, "{s}.{s}", .{ sm.type_name, sm.method_name });
@@ -1354,10 +1381,14 @@ const Ctx = struct {
     vtables: *std.ArrayListUnmanaged(VTable),
     vtable_map: *std.StringHashMapUnmanaged(u32),
     const_vals: *std.StringHashMapUnmanaged(ConstVal),
+    /// `val Name = &global` → emit gaddr of the mapped global index.
+    addr_consts: *std.StringHashMapUnmanaged(u32),
     global_map: *std.StringHashMapUnmanaged(u32),
     /// Package `var` storage (for floatish gload typing).
     globals: []const Global,
     object_map: *std.StringHashMapUnmanaged(u32),
+    /// Import bind names (`as` alias or last path segment) for `pkg.Name` under flatten.
+    import_binds: *std.StringHashMapUnmanaged(void),
     slots: *std.StringHashMapUnmanaged(u32),
     meta: *std.StringHashMapUnmanaged(SlotMeta),
     next_slot: *u32,
@@ -1396,9 +1427,11 @@ fn lowerFn(
     vtables: *std.ArrayListUnmanaged(VTable),
     vtable_map: *std.StringHashMapUnmanaged(u32),
     const_vals: *std.StringHashMapUnmanaged(ConstVal),
+    addr_consts: *std.StringHashMapUnmanaged(u32),
     global_map: *std.StringHashMapUnmanaged(u32),
     globals: []const Global,
     object_map: *std.StringHashMapUnmanaged(u32),
+    import_binds: *std.StringHashMapUnmanaged(void),
 ) !Func {
     std.debug.print("lowerFn:{s}\n", .{fl.name});
     var slots: std.StringHashMapUnmanaged(u32) = .{};
@@ -1484,9 +1517,11 @@ fn lowerFn(
         .vtables = vtables,
         .vtable_map = vtable_map,
         .const_vals = const_vals,
+        .addr_consts = addr_consts,
         .global_map = global_map,
         .globals = globals,
         .object_map = object_map,
+        .import_binds = import_binds,
         .slots = &slots,
         .meta = &meta,
         .next_slot = &next_slot,
@@ -3014,6 +3049,12 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
                 }
                 return d;
             }
+            // `val ErrX = &global` — address of the referenced package storage.
+            if (ctx.addr_consts.get(name)) |gi| {
+                const d = try ctx.fresh();
+                try ctx.emit(.{ .op = .gaddr, .dst = d, .aux = @intCast(gi) });
+                return d;
+            }
             // Object singleton: bare name is the address of static storage (no heap).
             if (ctx.object_map.get(name)) |gi| {
                 const d = try ctx.fresh();
@@ -3434,6 +3475,43 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
                             return try lowerExpr(ctx, f.base);
                         }
                     }
+                }
+                // `pkg.Name` / `alias.Name` after import — flattened merge exposes the leaf.
+                const base_name = f.base.ident;
+                const is_value = ctx.meta.contains(base_name) or ctx.global_map.contains(base_name) or ctx.object_map.contains(base_name) or ctx.const_vals.contains(base_name) or ctx.addr_consts.contains(base_name) or ctx.slots.contains(base_name);
+                if (!is_value and ctx.import_binds.contains(base_name)) {
+                    // Synthesize leaf lookup (const / addr_const / global / fn).
+                    if (ctx.const_vals.get(f.name)) |cv| {
+                        const d = try ctx.fresh();
+                        if (cv.is_float) {
+                            try ctx.emit(.{ .op = .fconst, .dst = d, .aux = cv.bits });
+                        } else {
+                            try ctx.emit(.{ .op = .iconst, .dst = d, .aux = cv.bits });
+                        }
+                        return d;
+                    }
+                    if (ctx.addr_consts.get(f.name)) |gi| {
+                        const d = try ctx.fresh();
+                        try ctx.emit(.{ .op = .gaddr, .dst = d, .aux = @intCast(gi) });
+                        return d;
+                    }
+                    if (ctx.object_map.get(f.name)) |gi| {
+                        const d = try ctx.fresh();
+                        try ctx.emit(.{ .op = .gaddr, .dst = d, .aux = @intCast(gi) });
+                        return d;
+                    }
+                    if (ctx.global_map.get(f.name)) |gi| {
+                        const d = try ctx.fresh();
+                        try ctx.emit(.{ .op = .gload, .dst = d, .aux = @intCast(gi) });
+                        return d;
+                    }
+                    if (ctx.callee_map.get(f.name)) |cid| {
+                        const d = try ctx.fresh();
+                        try ctx.emit(.{ .op = .saddr, .dst = d, .aux = -1 - @as(i64, @intCast(cid)) });
+                        return d;
+                    }
+                    std.debug.print("lower UnknownName import field: {s}.{s}\n", .{ base_name, f.name });
+                    return error.UnknownName;
                 }
             }
             const base = try lowerExpr(ctx, f.base);

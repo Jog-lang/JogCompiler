@@ -1,0 +1,29 @@
+// Binding shape used by `std.io`: leaf `std.c` types and `std.error as`
+// alias vals must resolve under flattened merge (Friction 2026-11-23).
+// `jog check std/io` is the package gate; this smoke links without pulling
+// the posix `open_c_file` actual (deref-index assign still a separate gap).
+
+import std.c
+import std.error as errors
+
+fn open_failed(code: c.int): error? {
+    if code == 2 {
+        return errors.ErrNotFound
+    }
+    return errors.ErrIO
+}
+
+fn main() {
+    val e = open_failed(2)
+    if e == null {
+        panic("expected ErrNotFound\n")
+    }
+    if e != errors.ErrNotFound {
+        panic("wrong sentinel\n")
+    }
+    val n = c.strlen(c"io")
+    if n != 2 {
+        panic("strlen\n")
+    }
+    print("std.io bind ok\n")
+}

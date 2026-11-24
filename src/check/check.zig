@@ -40,6 +40,8 @@ pub const TypeInfo = struct {
     /// bit width for integers (for widen/narrow)
     bits: u16 = 0,
     unsigned: bool = true,
+    /// Element types for product `(T, U, …)` (`name` is `__TupN`).
+    tuple_elems: []*TypeInfo = &.{},
 };
 
 pub const Diagnostic = struct {
@@ -56,6 +58,20 @@ pub const Diagnostic = struct {
 /// Active file while `check` runs (CLI is single-threaded). Used to attach
 /// expression spans to diagnostics without threading File through every helper.
 threadlocal var active_file: ?*const ast.File = null;
+/// Import bind names (`as` alias, else last path segment) for `pkg.Name` resolution
+/// under flattened merge. Set for the duration of `check`.
+threadlocal var active_imports: ?*const std.StringHashMapUnmanaged(void) = null;
+
+fn importBindName(path: []const u8, alias: ?[]const u8) []const u8 {
+    if (alias) |a| return a;
+    if (std.mem.lastIndexOfScalar(u8, path, '.')) |dot| return path[dot + 1 ..];
+    return path;
+}
+
+fn isImportBind(name: []const u8) bool {
+    if (active_imports) |imps| return imps.contains(name);
+    return false;
+}
 
 fn emitDiag(
     a: std.mem.Allocator,
@@ -123,6 +139,7 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
     var iface_fns = std.StringHashMapUnmanaged(*ast.InterfaceFn){};
     var fns = std.StringHashMapUnmanaged(*ast.FnDecl){};
     var methods = std.StringHashMapUnmanaged(*ast.MethodDecl){};
+    var import_binds: std.StringHashMapUnmanaged(void) = .{};
 
     // Transitional substrate builtins (Spec: load from core/scalar.jog). Keep thin —
     // library APIs belong in std/; see JogDocs Friction 2026-11-14 std/core port.
@@ -149,7 +166,9 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
     // Opaque pool handle (i64-sized); with (Dispatcher) migrates stackful coros (gate 3).
     try defineBuiltin(a, &types, "Dispatcher", .{ .kind = .i64_ty, .name = "Dispatcher", .bits = 64, .unsigned = false });
 
-    // collect decls
+    // Pass 1: register types, fn names, and import binds. Do not resolve expect/extern
+    // signatures yet — flattened merge puts the root file before imported type aliases
+    // (`c.char` in an expect fn would fail if resolved here).
     for (file.decls) |*d| {
         switch (d.*) {
             .type_alias => |ta| {
@@ -175,7 +194,10 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
                 ti.* = .{ .kind = .enum_ty, .name = ed.name, .bits = 64, .unsigned = false };
                 try types.put(a, ed.name, ti);
             },
-            .import_decl => {},
+            .import_decl => |imp| {
+                const bind = importBindName(imp.path, imp.alias);
+                try import_binds.put(a, bind, {});
+            },
             .require_decl => {},
             .interface_fn => |*inf| {
                 try iface_fns.put(a, inf.name, inf);
@@ -188,6 +210,23 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
                 const ti = try a.create(TypeInfo);
                 ti.* = .{ .kind = .iface_struct, .name = ins.name };
                 try types.put(a, ins.name, ti);
+                // Register iface method signatures so `alloc.resize(...)` returns the
+                // declared tuple/optional type (needed for destructure binding).
+                for (ins.methods) |ms| {
+                    const key = try std.fmt.allocPrint(a, "{s}.{s}", .{ ins.name, ms.name });
+                    if (methods.contains(key)) continue;
+                    const stub = try a.create(ast.MethodDecl);
+                    stub.* = .{
+                        .pointer_recv = ms.pointer_recv,
+                        .type_name = ins.name,
+                        .name = ms.name,
+                        .params = ms.params,
+                        .contexts = ms.contexts,
+                        .ret = ms.ret,
+                        .body = null,
+                    };
+                    try methods.put(a, key, stub);
+                }
             },
             .fn_decl, .actual_fn => |*fd| {
                 try fns.put(a, fd.name, fd);
@@ -203,8 +242,6 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
                     .exported = false,
                 };
                 try fns.put(a, ef.name, stub);
-                for (ef.params) |p| _ = try resolveTypeExpr(a, &types, p.ty, &diags);
-                if (ef.ret) |r| _ = try resolveTypeExpr(a, &types, r, &diags);
             },
             .method => |*md| {
                 const key = try std.fmt.allocPrint(a, "{s}.{s}", .{ md.type_name, md.name });
@@ -223,11 +260,30 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
                         .exported = false,
                     };
                     try fns.put(a, ef.name, stub);
+                }
+            },
+            .global_decl => {}, // bound into package scope below
+        }
+    }
+
+    const prev_imports = active_imports;
+    active_imports = &import_binds;
+    defer active_imports = prev_imports;
+
+    // Pass 2: resolve expect/extern signatures now that imported type aliases exist.
+    for (file.decls) |*d| {
+        switch (d.*) {
+            .expect_fn => |ef| {
+                for (ef.params) |p| _ = try resolveTypeExpr(a, &types, p.ty, &diags);
+                if (ef.ret) |r| _ = try resolveTypeExpr(a, &types, r, &diags);
+            },
+            .extern_block => |eb| {
+                for (eb.fns) |ef| {
                     for (ef.params) |p| _ = try resolveTypeExpr(a, &types, p.ty, &diags);
                     if (ef.ret) |r| _ = try resolveTypeExpr(a, &types, r, &diags);
                 }
             },
-            .global_decl => {}, // bound into package scope below
+            else => {},
         }
     }
 
@@ -239,17 +295,14 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
         var t: *TypeInfo = undefined;
         if (gd.ty) |te| {
             t = try resolveTypeExpr(a, &types, te, &diags);
+            if (gd.init) |init| {
+                _ = try checkExpr(a, &types, &fns, &structs, &methods, &globals_scope, init, &diags);
+            }
         } else if (gd.init) |init| {
-            // Infer from a literal init only (const fold path).
-            t = switch (init.*) {
-                .float => types.get("f64").?,
-                else => types.get("i64").?,
-            };
+            // Infer from init (literals, `&global`, null, …).
+            t = try checkExpr(a, &types, &fns, &structs, &methods, &globals_scope, init, &diags);
         } else {
             t = types.get("i64").?;
-        }
-        if (gd.init) |init| {
-            _ = try checkExpr(a, &types, &fns, &structs, &methods, &globals_scope, init, &diags);
         }
         try globals_scope.vars.put(a, gd.name, .{ .ty = t, .mutable = gd.mutable });
     }
@@ -486,11 +539,13 @@ fn resolveTypeExpr(
             return ti;
         },
         .tuple => |elems| {
-            for (elems) |el| _ = try resolveTypeExpr(a, types, el, diags);
+            var elem_tys: std.ArrayListUnmanaged(*TypeInfo) = .{};
+            for (elems) |el| try elem_tys.append(a, try resolveTypeExpr(a, types, el, diags));
             const ti = try a.create(TypeInfo);
             ti.* = .{
                 .kind = .struct_ty,
                 .name = try std.fmt.allocPrint(a, "__Tup{d}", .{elems.len}),
+                .tuple_elems = try elem_tys.toOwnedSlice(a),
             };
             return ti;
         },
@@ -609,10 +664,16 @@ fn checkStmt(
         },
         .destructure => |ds| {
             const it = try checkExpr(a, types, fns, structs, methods, scope, ds.init, diags);
-            _ = it;
-            const i64t = types.get("i64").?;
-            for (ds.names) |n| {
-                try scope.vars.put(a, n, .{ .ty = i64t, .mutable = ds.mutable });
+            if (it.tuple_elems.len == ds.names.len and it.tuple_elems.len > 0) {
+                for (ds.names, it.tuple_elems) |n, et| {
+                    try scope.vars.put(a, n, .{ .ty = et, .mutable = ds.mutable });
+                }
+            } else {
+                // Untyped / non-tuple RHS — soft ints until richer inference lands.
+                const i64t = types.get("i64").?;
+                for (ds.names) |n| {
+                    try scope.vars.put(a, n, .{ .ty = i64t, .mutable = ds.mutable });
+                }
             }
         },
         .for_in_stmt => |fs| {
@@ -927,9 +988,10 @@ fn checkExpr(
                 for (c.with_args) |w| _ = try checkExpr(a, types, fns, structs, methods, scope, w, diags);
                 const type_name = blk: {
                     if (base_t.kind == .struct_ty) break :blk base_t.name;
+                    if (base_t.kind == .iface_struct) break :blk base_t.name;
                     if (base_t.kind == .pointer) {
                         if (base_t.pointee) |po| {
-                            if (po.kind == .struct_ty) break :blk po.name;
+                            if (po.kind == .struct_ty or po.kind == .iface_struct) break :blk po.name;
                         }
                     }
                     break :blk "";
@@ -969,6 +1031,26 @@ fn checkExpr(
             return try voidType(a);
         },
         .field => |f| {
+            // `pkg.Name` / `alias.Name` after import — flattened merge; base is a bind, not a value.
+            if (f.base.* == .ident) {
+                const base_name = f.base.ident;
+                if (lookupVar(scope, base_name) == null and isImportBind(base_name)) {
+                    if (lookupVar(scope, f.name)) |v| {
+                        if (v.ty.kind == .optional and isNarrowed(scope, f.name)) {
+                            return v.ty.pointee orelse v.ty;
+                        }
+                        return v.ty;
+                    }
+                    if (fns.contains(f.name)) {
+                        const ti = try a.create(TypeInfo);
+                        ti.* = .{ .kind = .iface_fn, .name = f.name };
+                        return ti;
+                    }
+                    if (lookupTypeName(types, f.name)) |t| return t;
+                    try emitDiag(a, diags, e, 1, 1, try std.fmt.allocPrint(a, "unknown name '{s}.{s}'", .{ base_name, f.name }));
+                    return try voidType(a);
+                }
+            }
             const base = try checkExpr(a, types, fns, structs, methods, scope, f.base, diags);
             if (base.kind == .enum_ty) return base;
             // Slice headers: str / bytes expose .ptr and .len (usize), not i64.
@@ -1101,11 +1183,13 @@ fn checkExpr(
             return try voidType(a);
         },
         .tuple => |elems| {
-            for (elems) |el| _ = try checkExpr(a, types, fns, structs, methods, scope, el, diags);
+            var elem_tys: std.ArrayListUnmanaged(*TypeInfo) = .{};
+            for (elems) |el| try elem_tys.append(a, try checkExpr(a, types, fns, structs, methods, scope, el, diags));
             const ti = try a.create(TypeInfo);
             ti.* = .{
                 .kind = .struct_ty,
                 .name = try std.fmt.allocPrint(a, "__Tup{d}", .{elems.len}),
+                .tuple_elems = try elem_tys.toOwnedSlice(a),
             };
             return ti;
         },
@@ -1167,6 +1251,8 @@ fn voidType(a: std.mem.Allocator) !*TypeInfo {
 /// Implicit assign: widen ints, same type, optional wrap, iface structural later
 fn canAssign(from: *TypeInfo, to: *TypeInfo) bool {
     if (from.kind == to.kind and std.mem.eql(u8, from.name, to.name)) return true;
+    // `bytes` / `str` builtins vs same-kind aliases that share the spelling.
+    if (from.kind == to.kind and (from.kind == .bytes_ty or from.kind == .string_ty)) return true;
     // Generic type params are placeholders in the check subset.
     if (from.kind == .named or to.kind == .named) return true;
     if (to.kind == .optional) {
