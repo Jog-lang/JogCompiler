@@ -1,0 +1,76 @@
+// Enum payloads + equality (JOG-220 / Types.md).
+
+enum Shape {
+    Circle(r: i64)
+    Rect(w: i64, h: i64)
+    Empty
+}
+
+enum Flag {
+    Off
+    On
+}
+
+struct Box {
+    n: i64
+}
+
+enum Wrapped {
+    Wrap(b: Box)
+}
+
+fn area(s: Shape): i64 {
+    return when s {
+        Circle(r) -> r
+        Rect(w, h) -> w + h
+        Empty -> 0
+    }
+}
+
+fn main() {
+    val s = Shape.Circle(r: 2)
+    val t = Shape.Rect(w: 3, h: 4)
+    val e: Shape = .Empty
+    val a = Shape.Circle(r: 2)
+    val b = Shape.Circle(r: 9)
+
+    if area(s) != 2 {
+        panic("area circle\n")
+    }
+    if area(t) != 7 {
+        panic("area rect\n")
+    }
+    if area(e) != 0 {
+        panic("area empty\n")
+    }
+
+    // Tag-only enums keep scalar ==.
+    if Flag.Off == Flag.On {
+        panic("flag eq\n")
+    }
+    if Flag.On != Flag.On {
+        panic("flag ne\n")
+    }
+
+    // Comparable payload enums: tag + fields.
+    if s == e {
+        panic("circle == empty\n")
+    }
+    if s != a {
+        panic("circle != twin\n")
+    }
+    if s == b {
+        panic("circle == other r\n")
+    }
+
+    if !(e is Empty) {
+        panic("is Empty\n")
+    }
+
+    // Construction of a non-comparable enum is fine; `==` on it is rejected (unit test).
+    val w = Wrapped.Wrap(b: Box(n: 1))
+    if !(w is Wrap) {
+        panic("is Wrap\n")
+    }
+    print("enum payload ok\n")
+}
