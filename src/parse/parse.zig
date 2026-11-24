@@ -1451,20 +1451,11 @@ pub const Parser = struct {
                     continue;
                 }
                 // `Shape.Circle(r: 2.0)` — field access + named fields → enum variant lit.
+                // Empty `()` must stay a call (`n.greet()`); tag-only variants use
+                // `Shape.Empty` / `.Empty` without parens (see field / primary paths).
                 if (e.* == .field and e.field.base.* == .ident and pending_targs.len == 0) {
                     const save_enum = self.snapshot();
                     self.advance(); // (
-                    if (self.tok.kind == .rparen) {
-                        self.advance();
-                        const el = try self.allocExpr();
-                        el.* = .{ .enum_lit = .{
-                            .type_name = e.field.base.ident,
-                            .variant = e.field.name,
-                            .fields = &.{},
-                        } };
-                        e = el;
-                        continue;
-                    }
                     if (self.tok.kind == .ident) {
                         const fname = self.tok.text;
                         self.advance();
