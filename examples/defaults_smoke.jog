@@ -1,0 +1,21 @@
+fn connect(host: str, port: i64 = 80, retries: i64 = 3): i64 = port + retries
+
+fn main() {
+    val a = connect("db")
+    val b = connect("db", 8080)
+    val c = connect("db", retries: 0)
+    val d = connect(host: "db", port: 1)
+    if a != 83 {
+        panic("defaults a")
+    }
+    if b != 8083 {
+        panic("defaults b")
+    }
+    if c != 80 {
+        panic("defaults c")
+    }
+    if d != 4 {
+        panic("defaults d")
+    }
+    print("defaults ok\n")
+}

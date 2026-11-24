@@ -14,6 +14,8 @@ pub const Parser = struct {
     lx: lex.Lexer,
     tok: lex.Token,
     file: *ast.File,
+    /// Grammar: no trailing lambda in the head of `if` / `for` / `while` / `with`.
+    allow_trailing: bool = true,
 
     pub fn parseFile(parent: std.mem.Allocator, src: []const u8) ParseError!ast.File {
         var file: ast.File = .{
@@ -770,7 +772,12 @@ pub const Parser = struct {
                 self.advance();
                 try self.expect(.colon);
                 const ty = try self.parseTypeExpr();
-                try params.append(self.allocator, .{ .name = name, .ty = ty });
+                var default: ?*ast.Expr = null;
+                if (self.tok.kind == .eq) {
+                    self.advance();
+                    default = try self.parseExpr();
+                }
+                try params.append(self.allocator, .{ .name = name, .ty = ty, .default = default });
                 if (self.tok.kind == .comma) {
                     self.advance();
                     // Grammar paramList / fnParams: optional trailing comma before `)`.
@@ -1028,6 +1035,9 @@ pub const Parser = struct {
             .kw_if => {
                 self.advance();
                 // Allow `if (cond)` or `if cond` (bang/ident).
+                // Heads do not take a trailing lambda (Grammar disambiguation).
+                const saved_trail = self.allow_trailing;
+                self.allow_trailing = false;
                 var cond: *ast.Expr = undefined;
                 if (self.tok.kind == .lparen) {
                     self.advance();
@@ -1036,6 +1046,7 @@ pub const Parser = struct {
                 } else {
                     cond = try self.parseExpr();
                 }
+                self.allow_trailing = saved_trail;
                 const then_b = try self.parseBlock();
                 var else_b: ?*ast.Block = null;
                 // Grammar: ignore SEP right before `else`.
@@ -1058,6 +1069,8 @@ pub const Parser = struct {
             },
             .kw_while => {
                 self.advance();
+                const saved_trail = self.allow_trailing;
+                self.allow_trailing = false;
                 var cond: *ast.Expr = undefined;
                 if (self.tok.kind == .lparen) {
                     self.advance();
@@ -1066,6 +1079,7 @@ pub const Parser = struct {
                 } else {
                     cond = try self.parseExpr();
                 }
+                self.allow_trailing = saved_trail;
                 const body = try self.parseBlock();
                 return .{ .while_stmt = .{ .cond = cond, .body = body } };
             },
@@ -1078,6 +1092,8 @@ pub const Parser = struct {
                     return .{ .while_stmt = .{ .cond = one, .body = try self.parseBlock() } };
                 }
                 // Lookahead: ident `in` → for-in
+                const saved_trail = self.allow_trailing;
+                self.allow_trailing = false;
                 if (self.tok.kind == .ident) {
                     const save = self.snapshot();
                     const name = self.tok.text;
@@ -1085,6 +1101,7 @@ pub const Parser = struct {
                     if (self.tok.kind == .kw_in) {
                         self.advance();
                         const iter = try self.parseExpr();
+                        self.allow_trailing = saved_trail;
                         const body = try self.parseBlock();
                         return .{ .for_in_stmt = .{ .name = name, .iter = iter, .body = body } };
                     }
@@ -1098,6 +1115,7 @@ pub const Parser = struct {
                 } else {
                     cond = try self.parseExpr();
                 }
+                self.allow_trailing = saved_trail;
                 const body = try self.parseBlock();
                 return .{ .while_stmt = .{ .cond = cond, .body = body } };
             },
@@ -1229,6 +1247,9 @@ pub const Parser = struct {
     /// `if cond { … } [ else ( ifExpr | block ) ]` as a value-producing expression.
     fn parseIfExpr(self: *Parser) ParseError!*ast.Expr {
         try self.expect(.kw_if);
+        // Heads do not take a trailing lambda (same disambiguation as if-stmt).
+        const saved_trail = self.allow_trailing;
+        self.allow_trailing = false;
         var cond: *ast.Expr = undefined;
         if (self.tok.kind == .lparen) {
             self.advance();
@@ -1237,6 +1258,7 @@ pub const Parser = struct {
         } else {
             cond = try self.parseExpr();
         }
+        self.allow_trailing = saved_trail;
         const then_b = try self.parseBlock();
         var else_b: ?*ast.Block = null;
         if (self.tok.kind == .kw_else) {
@@ -1552,20 +1574,10 @@ pub const Parser = struct {
                     self.restore(save_enum);
                 }
                 self.advance();
-                var args: std.ArrayListUnmanaged(*ast.Expr) = .{};
-                if (self.tok.kind != .rparen) {
-                    while (true) {
-                        try args.append(self.allocator, try self.parseExpr());
-                        if (self.tok.kind == .comma) {
-                            self.advance();
-                            // Grammar argList: optional trailing comma before `)`.
-                            if (self.tok.kind == .rparen) break;
-                            continue;
-                        }
-                        break;
-                    }
-                }
-                try self.expect(.rparen);
+                const parsed_args = try self.parseArgList(.rparen);
+                if (self.tok.kind != .rparen) return error.UnexpectedToken;
+                const rparen_line = self.tok.line;
+                self.advance();
                 var with_args: []*ast.Expr = &.{};
                 // Call-site `f() with (ctx)` must not steal statement `with (ctx) { ... }`.
                 if (self.tok.kind == .kw_with) {
@@ -1599,14 +1611,25 @@ pub const Parser = struct {
                 const call = try self.allocExpr();
                 call.* = .{ .call = .{
                     .callee = e,
-                    .args = try args.toOwnedSlice(self.allocator),
+                    .args = parsed_args.args,
+                    .arg_names = parsed_args.names,
                     .with_args = with_args,
                     .type_args = pending_targs,
                 } };
                 e = call;
+                // Trailing lambda on the same line as the call's `)`.
+                e = try self.maybeAttachTrailing(e, rparen_line);
                 continue;
             }
             if (pending_targs.len != 0) return error.UnexpectedToken;
+            // Bare trailing lambda: `items.each { … }` / `twiceDo { … }` (same line).
+            if (self.allow_trailing and self.tok.kind == .lbrace) {
+                const base_line = self.file.spanOf(e).line;
+                if (self.tok.line == base_line) {
+                    e = try self.attachTrailing(e);
+                    continue;
+                }
+            }
             if (self.tok.kind == .lbracket) {
                 // `a[i]` index, or `a[..]` / `a[i..j]` / `a[i..]` / `a[..j]` slice.
                 // Bounds use parseCoalesce so `..` is not eaten as a range expr.
@@ -1703,7 +1726,11 @@ pub const Parser = struct {
         switch (self.tok.kind) {
             .kw_when => {
                 self.advance();
+                // Scrutinee must not steal the arm-list `{` as a trailing lambda.
+                const saved_trail = self.allow_trailing;
+                self.allow_trailing = false;
                 const scrutinee = try self.parseExpr();
+                self.allow_trailing = saved_trail;
                 try self.expect(.lbrace);
                 self.skipSeps();
                 var arms: std.ArrayListUnmanaged(ast.WhenArm) = .{};
@@ -2000,6 +2027,10 @@ pub const Parser = struct {
                 return e;
             },
             .lparen => {
+                // Grammar: at `(`, scan to matching `)`; if next is `:` or `->`, parse a lambda.
+                if (self.lookaheadLambda()) {
+                    return try self.parseLambda(e);
+                }
                 self.advance();
                 if (self.tok.kind == .rparen) {
                     self.advance();
@@ -2024,6 +2055,209 @@ pub const Parser = struct {
             },
             else => return error.UnexpectedToken,
         }
+    }
+
+    const ParsedArgs = struct {
+        args: []*ast.Expr,
+        names: []const ?[]const u8,
+    };
+
+    /// Parse `arg { "," arg }` until `end_kind` (not consuming it).
+    /// `arg = [ IDENT ":" ] expr` — named only when IDENT is followed by `:`.
+    fn parseArgList(self: *Parser, end_kind: lex.TokenKind) ParseError!ParsedArgs {
+        var args: std.ArrayListUnmanaged(*ast.Expr) = .{};
+        var names: std.ArrayListUnmanaged(?[]const u8) = .{};
+        var any_named = false;
+        if (self.tok.kind != end_kind) {
+            while (true) {
+                var name: ?[]const u8 = null;
+                if (self.tok.kind == .ident) {
+                    const save = self.snapshot();
+                    const n = self.tok.text;
+                    self.advance();
+                    if (self.tok.kind == .colon) {
+                        self.advance();
+                        name = n;
+                        any_named = true;
+                    } else {
+                        self.restore(save);
+                    }
+                }
+                try args.append(self.allocator, try self.parseExpr());
+                try names.append(self.allocator, name);
+                if (self.tok.kind == .comma) {
+                    self.advance();
+                    if (self.tok.kind == end_kind) break;
+                    continue;
+                }
+                break;
+            }
+        }
+        const owned_args = try args.toOwnedSlice(self.allocator);
+        if (!any_named) {
+            return .{ .args = owned_args, .names = &.{} };
+        }
+        return .{ .args = owned_args, .names = try names.toOwnedSlice(self.allocator) };
+    }
+
+    /// True when `(…)` is followed by `:` or `->` (lambda, not grouping/tuple).
+    fn lookaheadLambda(self: *Parser) bool {
+        if (self.tok.kind != .lparen) return false;
+        // `self.lx` is already past the current `(`.
+        var tmp = self.lx;
+        var depth: i32 = 1;
+        while (true) {
+            const t = tmp.next();
+            if (t.kind == .eof) return false;
+            if (t.kind == .lparen) depth += 1;
+            if (t.kind == .rparen) {
+                depth -= 1;
+                if (depth == 0) {
+                    const after = tmp.next();
+                    return after.kind == .colon or after.kind == .arrow;
+                }
+            }
+        }
+    }
+
+    fn parseLambda(self: *Parser, e: *ast.Expr) ParseError!*ast.Expr {
+        try self.expect(.lparen);
+        var params: std.ArrayListUnmanaged(ast.Param) = .{};
+        if (self.tok.kind != .rparen) {
+            while (true) {
+                if (self.tok.kind != .ident) return error.UnexpectedToken;
+                const name = self.tok.text;
+                self.advance();
+                var ty: ?*ast.TypeExpr = null;
+                if (self.tok.kind == .colon) {
+                    self.advance();
+                    ty = try self.parseTypeExpr();
+                }
+                const pty = ty orelse blk: {
+                    const t = try self.allocator.create(ast.TypeExpr);
+                    t.* = .{ .name = "_" }; // inferred later
+                    break :blk t;
+                };
+                try params.append(self.allocator, .{ .name = name, .ty = pty });
+                if (self.tok.kind == .comma) {
+                    self.advance();
+                    if (self.tok.kind == .rparen) break;
+                    continue;
+                }
+                break;
+            }
+        }
+        try self.expect(.rparen);
+        var ret: ?*ast.TypeExpr = null;
+        if (self.tok.kind == .colon) {
+            self.advance();
+            ret = try self.parseTypeExpr();
+        }
+        try self.expect(.arrow);
+        var expr_body: ?*ast.Expr = null;
+        var block: ?*ast.Block = null;
+        if (self.tok.kind == .lbrace) {
+            block = try self.parseBlock();
+        } else {
+            expr_body = try self.parseExpr();
+        }
+        e.* = .{ .lambda = .{
+            .params = try params.toOwnedSlice(self.allocator),
+            .ret = ret,
+            .expr_body = expr_body,
+            .block = block,
+        } };
+        return e;
+    }
+
+    fn maybeAttachTrailing(self: *Parser, call_or_expr: *ast.Expr, same_line: u32) ParseError!*ast.Expr {
+        if (!self.allow_trailing) return call_or_expr;
+        if (self.tok.kind != .lbrace) return call_or_expr;
+        if (self.tok.line != same_line) return call_or_expr;
+        return try self.attachTrailing(call_or_expr);
+    }
+
+    /// Attach `{ [params ->] stmts }` as the last argument of a call (creating a call if needed).
+    fn attachTrailing(self: *Parser, node: *ast.Expr) ParseError!*ast.Expr {
+        const lam = try self.parseTrailingLambda();
+        if (node.* == .call) {
+            var args: std.ArrayListUnmanaged(*ast.Expr) = .{};
+            try args.appendSlice(self.allocator, node.call.args);
+            try args.append(self.allocator, lam);
+            var names: std.ArrayListUnmanaged(?[]const u8) = .{};
+            if (node.call.arg_names.len > 0) {
+                try names.appendSlice(self.allocator, node.call.arg_names);
+                try names.append(self.allocator, null);
+            }
+            node.call.args = try args.toOwnedSlice(self.allocator);
+            if (names.items.len > 0) node.call.arg_names = try names.toOwnedSlice(self.allocator);
+            return node;
+        }
+        const call = try self.allocExpr();
+        const args = try self.allocator.alloc(*ast.Expr, 1);
+        args[0] = lam;
+        call.* = .{ .call = .{ .callee = node, .args = args } };
+        return call;
+    }
+
+    /// `{ body }` / `{ x -> body }` / `{ a, b -> body }` on a trailing-lambda `{`.
+    fn parseTrailingLambda(self: *Parser) ParseError!*ast.Expr {
+        const e = try self.allocExpr();
+        try self.expect(.lbrace);
+        var params: std.ArrayListUnmanaged(ast.Param) = .{};
+        var implicit_it = true;
+        if (self.atTrailingLambdaParams()) {
+            implicit_it = false;
+            while (true) {
+                if (self.tok.kind != .ident) return error.UnexpectedToken;
+                const name = self.tok.text;
+                self.advance();
+                const ty = try self.allocator.create(ast.TypeExpr);
+                ty.* = .{ .name = "_" };
+                try params.append(self.allocator, .{ .name = name, .ty = ty });
+                if (self.tok.kind == .comma) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+            try self.expect(.arrow);
+        }
+        // Rest of the block body (statements until `}`).
+        var stmts: std.ArrayListUnmanaged(ast.Stmt) = .{};
+        while (self.tok.kind != .rbrace and self.tok.kind != .eof) {
+            try stmts.append(self.allocator, try self.parseStmt());
+            if (self.tok.kind == .semicolon) self.advance();
+        }
+        try self.expect(.rbrace);
+        const block = try self.allocator.create(ast.Block);
+        block.* = .{ .stmts = try stmts.toOwnedSlice(self.allocator) };
+        if (implicit_it) {
+            // Placeholder; check may clear this when the expected type is `() -> R`.
+            const ty = try self.allocator.create(ast.TypeExpr);
+            ty.* = .{ .name = "_" };
+            try params.append(self.allocator, .{ .name = "it", .ty = ty });
+        }
+        e.* = .{ .lambda = .{
+            .params = try params.toOwnedSlice(self.allocator),
+            .block = block,
+            .implicit_it = implicit_it,
+        } };
+        return e;
+    }
+
+    /// `x ->` or `x, y ->` at the start of a trailing-lambda body.
+    fn atTrailingLambdaParams(self: *Parser) bool {
+        if (self.tok.kind != .ident) return false;
+        const save = self.snapshot();
+        defer self.restore(save);
+        self.advance();
+        while (self.tok.kind == .comma) {
+            self.advance();
+            if (self.tok.kind != .ident) return false;
+            self.advance();
+        }
+        return self.tok.kind == .arrow;
     }
 
     const Snap = struct { i: usize, line: u32, col: u32, tok: lex.Token };

@@ -512,6 +512,12 @@ fn resolveTypeExpr(
                 ti.* = .{ .kind = .pointer, .name = n, .pointee = types.get("byte") };
                 return ti;
             }
+            // Lambda param placeholder — inferred from the expected function type.
+            if (std.mem.eql(u8, n, "_")) {
+                const ti = try a.create(TypeInfo);
+                ti.* = .{ .kind = .named, .name = "_" };
+                return ti;
+            }
             try emitDiag(a, diags, null, 1, 1, try std.fmt.allocPrint(a, "unknown type '{s}'", .{n}));
             const bad = try a.create(TypeInfo);
             bad.* = .{ .kind = .named, .name = n };
@@ -1003,7 +1009,7 @@ fn checkExpr(
             }
             if (c.callee.* == .ident) {
                 if (fns.get(c.callee.ident)) |fd| {
-                    for (c.args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
+                    try checkArgsAgainstParams(a, types, fns, structs, methods, scope, fd.params, c.args, c.arg_names, diags, e);
                     for (c.with_args) |w| _ = try checkExpr(a, types, fns, structs, methods, scope, w, diags);
                     for (c.type_args) |ta| _ = try resolveTypeExpr(a, types, ta, diags);
                     if (fd.type_params.len > 0) {
@@ -1044,7 +1050,7 @@ fn checkExpr(
                     const base_name = c.callee.field.base.ident;
                     if (lookupVar(scope, base_name) == null) {
                         if (fns.get(c.callee.field.name)) |fd| {
-                            for (c.args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
+                            try checkArgsAgainstParams(a, types, fns, structs, methods, scope, fd.params, c.args, c.arg_names, diags, e);
                             for (c.with_args) |w| _ = try checkExpr(a, types, fns, structs, methods, scope, w, diags);
                             if (fd.ret) |r| return try resolveTypeExpr(a, types, r, diags);
                             return try voidType(a);
@@ -1052,7 +1058,6 @@ fn checkExpr(
                     }
                 }
                 const base_t = try checkExpr(a, types, fns, structs, methods, scope, c.callee.field.base, diags);
-                for (c.args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
                 for (c.with_args) |w| _ = try checkExpr(a, types, fns, structs, methods, scope, w, diags);
                 const type_name = blk: {
                     if (base_t.kind == .struct_ty) break :blk base_t.name;
@@ -1079,6 +1084,7 @@ fn checkExpr(
                                 try types.put(a, tp, concrete);
                             }
                         }
+                        try checkArgsAgainstParams(a, types, fns, structs, methods, scope, md.params, c.args, c.arg_names, diags, e);
                         const result = if (md.ret) |r|
                             try resolveTypeExpr(a, types, r, diags)
                         else
@@ -1089,6 +1095,7 @@ fn checkExpr(
                         return result;
                     }
                 }
+                for (c.args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
                 const ti = try a.create(TypeInfo);
                 ti.* = .{ .kind = .pointer, .name = "ptr", .pointee = types.get("byte") };
                 return ti;
@@ -1276,6 +1283,18 @@ fn checkExpr(
             return try voidType(a);
         },
         .struct_lit => |sl| {
+            // `connect(host: "db")` parses as struct_lit; if the name is a function, treat as named-arg call.
+            if (fns.get(sl.type_name)) |fd| {
+                var args = try a.alloc(*ast.Expr, sl.fields.len);
+                var names = try a.alloc(?[]const u8, sl.fields.len);
+                for (sl.fields, 0..) |f, i| {
+                    args[i] = f.value;
+                    names[i] = f.name;
+                }
+                try checkArgsAgainstParams(a, types, fns, structs, methods, scope, fd.params, args, names, diags, e);
+                if (fd.ret) |r| return try resolveTypeExpr(a, types, r, diags);
+                return try voidType(a);
+            }
             for (sl.fields) |f| _ = try checkExpr(a, types, fns, structs, methods, scope, f.value, diags);
             if (sl.type_args.len > 0) {
                 const te = try a.create(ast.TypeExpr);
@@ -1412,6 +1431,169 @@ fn checkExpr(
             try checkBlock(a, types, fns, structs, methods, sb.body, diags, scope);
             return try voidType(a);
         },
+        .lambda => {
+            return try checkLambda(a, types, fns, structs, methods, scope, e, null, diags);
+        },
+    }
+}
+
+/// Expand positional / named / default / trailing-lambda args to match `params` order.
+fn expandCallArgs(
+    a: std.mem.Allocator,
+    params: []ast.Param,
+    args: []*ast.Expr,
+    arg_names: []const ?[]const u8,
+    diags: *std.ArrayListUnmanaged(Diagnostic),
+    at: ?*const ast.Expr,
+) CheckError![]*ast.Expr {
+    const n = params.len;
+    var out = try a.alloc(?*ast.Expr, n);
+    @memset(out, null);
+
+    var trailing: ?*ast.Expr = null;
+    var usable_len = args.len;
+    if (args.len > 0 and n > 0 and args[args.len - 1].* == .lambda) {
+        // Trailing lambda always fills the last parameter.
+        trailing = args[args.len - 1];
+        usable_len = args.len - 1;
+        out[n - 1] = trailing;
+    }
+
+    var next_pos: usize = 0;
+    var i: usize = 0;
+    while (i < usable_len) : (i += 1) {
+        const name: ?[]const u8 = if (arg_names.len == args.len) arg_names[i] else if (arg_names.len == usable_len) arg_names[i] else null;
+        if (name) |nm| {
+            var found = false;
+            for (params, 0..) |p, pi| {
+                if (std.mem.eql(u8, p.name, nm)) {
+                    if (out[pi] != null) {
+                        try emitDiag(a, diags, at, 1, 1, try std.fmt.allocPrint(a, "duplicate argument '{s}'", .{nm}));
+                    }
+                    out[pi] = args[i];
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                try emitDiag(a, diags, at, 1, 1, try std.fmt.allocPrint(a, "unknown argument '{s}'", .{nm}));
+            }
+        } else {
+            while (next_pos < n and out[next_pos] != null) : (next_pos += 1) {}
+            if (next_pos >= n) {
+                try emitDiag(a, diags, at, 1, 1, "too many arguments");
+                break;
+            }
+            out[next_pos] = args[i];
+            next_pos += 1;
+        }
+    }
+
+    var result = try a.alloc(*ast.Expr, n);
+    for (params, 0..) |p, pi| {
+        if (out[pi]) |e| {
+            result[pi] = e;
+        } else if (p.default) |d| {
+            result[pi] = d;
+        } else {
+            try emitDiag(a, diags, at, 1, 1, try std.fmt.allocPrint(a, "missing argument '{s}'", .{p.name}));
+            const dummy = try a.create(ast.Expr);
+            dummy.* = .{ .int = 0 };
+            result[pi] = dummy;
+        }
+    }
+    return result;
+}
+
+fn isZeroParamIfaceFn(te: *ast.TypeExpr) bool {
+    if (te.* != .iface_fn) return false;
+    return te.iface_fn.params.len == 0;
+}
+
+fn checkLambda(
+    a: std.mem.Allocator,
+    types: *std.StringHashMapUnmanaged(*TypeInfo),
+    fns: *std.StringHashMapUnmanaged(*ast.FnDecl),
+    structs: *std.StringHashMapUnmanaged(*ast.StructDecl),
+    methods: *std.StringHashMapUnmanaged(*ast.MethodDecl),
+    scope: *Scope,
+    lam_expr: *ast.Expr,
+    expected: ?*ast.TypeExpr,
+    diags: *std.ArrayListUnmanaged(Diagnostic),
+) CheckError!*TypeInfo {
+    if (lam_expr.* != .lambda) return try voidType(a);
+    // `{ body }` with expected `() -> R` is a zero-param lambda (no `it`).
+    // Mutate AST so IR sees the same shape.
+    if (lam_expr.lambda.implicit_it and expected != null and isZeroParamIfaceFn(expected.?)) {
+        lam_expr.lambda.params = &.{};
+        lam_expr.lambda.implicit_it = false;
+    }
+    const lam = lam_expr.lambda;
+
+    var child = Scope{
+        .parent = scope,
+        .vars = .{},
+        .narrowed = .{},
+    };
+
+    // Bind params; `_` / missing types inferred from expected iface_fn when present.
+    const exp_params: []ast.Param = if (expected) |et|
+        (if (et.* == .iface_fn) et.iface_fn.params else &.{})
+    else
+        &.{};
+
+    for (lam.params, 0..) |p, i| {
+        var ty: *TypeInfo = undefined;
+        const is_infer = p.ty.* == .name and std.mem.eql(u8, p.ty.name, "_");
+        if (is_infer and i < exp_params.len) {
+            ty = try resolveTypeExpr(a, types, exp_params[i].ty, diags);
+        } else if (is_infer) {
+            ty = types.get("i64").?;
+        } else {
+            ty = try resolveTypeExpr(a, types, p.ty, diags);
+        }
+        try child.vars.put(a, p.name, .{ .ty = ty, .mutable = false });
+    }
+
+    if (lam.expr_body) |eb| {
+        _ = try checkExpr(a, types, fns, structs, methods, &child, eb, diags);
+    } else if (lam.block) |b| {
+        try checkBlock(a, types, fns, structs, methods, b, diags, &child);
+    }
+
+    const ti = try a.create(TypeInfo);
+    ti.* = .{ .kind = .iface_fn, .name = "iface_fn" };
+    return ti;
+}
+
+fn checkArgsAgainstParams(
+    a: std.mem.Allocator,
+    types: *std.StringHashMapUnmanaged(*TypeInfo),
+    fns: *std.StringHashMapUnmanaged(*ast.FnDecl),
+    structs: *std.StringHashMapUnmanaged(*ast.StructDecl),
+    methods: *std.StringHashMapUnmanaged(*ast.MethodDecl),
+    scope: *Scope,
+    params: []ast.Param,
+    args: []*ast.Expr,
+    arg_names: []const ?[]const u8,
+    diags: *std.ArrayListUnmanaged(Diagnostic),
+    at: *ast.Expr,
+) CheckError!void {
+    // Pack params (`...T`) accept a variable arg list — skip named/default expansion.
+    for (params) |p| {
+        if (p.is_pack) {
+            for (args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
+            return;
+        }
+    }
+    const expanded = try expandCallArgs(a, params, args, arg_names, diags, at);
+    for (params, 0..) |p, i| {
+        const arg = expanded[i];
+        if (arg.* == .lambda) {
+            _ = try checkLambda(a, types, fns, structs, methods, scope, arg, p.ty, diags);
+        } else {
+            _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
+        }
     }
 }
 
@@ -1452,6 +1634,8 @@ fn canAssign(from: *TypeInfo, to: *TypeInfo) bool {
     if (from.kind == to.kind and std.mem.eql(u8, from.name, to.name)) return true;
     // `bytes` / `str` builtins vs same-kind aliases that share the spelling.
     if (from.kind == to.kind and (from.kind == .bytes_ty or from.kind == .string_ty)) return true;
+    // Function values are interchangeable at this check depth.
+    if (from.kind == .iface_fn and to.kind == .iface_fn) return true;
     // Generic type params are placeholders in the check subset.
     if (from.kind == .named or to.kind == .named) return true;
     if (to.kind == .optional) {
@@ -1552,4 +1736,10 @@ test "enum equality rejected for struct payload" {
         if (std.mem.indexOf(u8, d.message, "does not apply") != null) found = true;
     }
     try std.testing.expect(found);
+}
+
+test "iface_fn assign" {
+    var a = TypeInfo{ .kind = .iface_fn, .name = "iface_fn" };
+    var b = TypeInfo{ .kind = .iface_fn, .name = "iface_fn" };
+    try std.testing.expect(canAssign(&a, &b));
 }
