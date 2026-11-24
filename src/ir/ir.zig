@@ -324,7 +324,7 @@ const Ambient = struct {
     type_name: []const u8, // concrete struct or iface name
 };
 
-const SlotKind = enum { scalar, struct_ptr, iface_ptr, opt_ptr, raw_ptr, array_ptr };
+const SlotKind = enum { scalar, struct_ptr, iface_ptr, opt_ptr, raw_ptr, array_ptr, capture_ptr };
 
 const SlotMeta = struct {
     kind: SlotKind,
@@ -670,6 +670,8 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
     var funcs: std.ArrayListUnmanaged(Func) = .{};
     var pending_gos: std.ArrayListUnmanaged(PendingGoFn) = .{};
     var go_seq: u32 = 0;
+    var pending_funcs: std.ArrayListUnmanaged(Func) = .{};
+    var lambda_seq: u32 = 0;
     for (file.decls) |d| {
         const maybe_fd: ?ast.FnDecl = switch (d) {
             .fn_decl => |fd| if (fd.body != null and fd.type_params.len == 0) fd else null,
@@ -687,7 +689,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                 .self_type = null,
                 .pointer_recv = false,
                 .ret_iface = retIfaceName(&ifaces, fd.ret),
-            }, &strings, &callees, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &addr_consts, &global_map, globals.items, &object_map, &import_binds, &type_aliases, &pending_gos, &go_seq);
+            }, &strings, &callees, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &addr_consts, &global_map, globals.items, &object_map, &import_binds, &type_aliases, &pending_gos, &go_seq, &pending_funcs, &lambda_seq);
             try funcs.append(a, f);
         } else if (d == .method and d.method.body != null and d.method.type_params.len == 0) {
             const md = d.method;
@@ -702,7 +704,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                 .self_type = md.type_name,
                 .pointer_recv = md.pointer_recv,
                 .ret_iface = retIfaceName(&ifaces, md.ret),
-            }, &strings, &callees, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &addr_consts, &global_map, globals.items, &object_map, &import_binds, &type_aliases, &pending_gos, &go_seq);
+            }, &strings, &callees, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &addr_consts, &global_map, globals.items, &object_map, &import_binds, &type_aliases, &pending_gos, &go_seq, &pending_funcs, &lambda_seq);
             try funcs.append(a, f);
         }
     }
@@ -718,7 +720,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
             .pointer_recv = false,
             .ret_iface = retIfaceName(&ifaces, fd.ret),
             .type_subst = &sf.type_subst,
-        }, &strings, &callees, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &addr_consts, &global_map, globals.items, &object_map, &import_binds, &type_aliases, &pending_gos, &go_seq);
+        }, &strings, &callees, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &addr_consts, &global_map, globals.items, &object_map, &import_binds, &type_aliases, &pending_gos, &go_seq, &pending_funcs, &lambda_seq);
         try funcs.append(a, f);
     }
     for (specialized_methods.items) |*sm| {
@@ -732,7 +734,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
             .pointer_recv = sm.pointer_recv,
             .ret_iface = retIfaceName(&ifaces, sm.ret),
             .type_subst = &sm.type_subst,
-        }, &strings, &callees, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &addr_consts, &global_map, globals.items, &object_map, &import_binds, &type_aliases, &pending_gos, &go_seq) catch |err| {
+        }, &strings, &callees, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &addr_consts, &global_map, globals.items, &object_map, &import_binds, &type_aliases, &pending_gos, &go_seq, &pending_funcs, &lambda_seq) catch |err| {
             // Callback / unsupported bodies (each, map, fold, …) — drop so callers error clearly.
             std.debug.print("skip specialized method {s}: {s}\n", .{ sm.mangled, @errorName(err) });
             const key = try std.fmt.allocPrint(a, "{s}.{s}", .{ sm.type_name, sm.method_name });
@@ -752,9 +754,10 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
             .contexts = &[_]ast.ContextParam{},
             .exported = false,
         });
-        const f = try lowerGoChild(a, pg, &strings, &callees, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map, globals.items, &object_map, &addr_consts, &import_binds, &type_aliases, &pending_gos, &go_seq);
+        const f = try lowerGoChild(a, pg, &strings, &callees, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map, globals.items, &object_map, &addr_consts, &import_binds, &type_aliases, &pending_gos, &go_seq, &pending_funcs, &lambda_seq);
         try funcs.append(a, f);
     }
+    try funcs.appendSlice(a, pending_funcs.items);
 
     program.strings = try strings.toOwnedSlice(a);
     program.callees = try callees.toOwnedSlice(a);
@@ -1266,6 +1269,17 @@ fn walkExprInstantiate(ic: *InstCtx, e: *ast.Expr) anyerror!void {
             try walkExprInstantiate(ic, it.expr);
         },
         .force_unwrap => |inner| try walkExprInstantiate(ic, inner),
+        .lambda => |lam| {
+            for (lam.params) |p| {
+                if (p.default) |d| try walkExprInstantiate(ic, d);
+                try walkTypeInstantiateFull(ic, p.ty);
+            }
+            if (lam.ret) |r| try walkTypeInstantiateFull(ic, r);
+            if (lam.expr_body) |eb| try walkExprInstantiate(ic, eb);
+            if (lam.block) |b| {
+                for (b.stmts) |s| try walkStmtInstantiate(ic, s);
+            }
+        },
         else => {},
     }
 }
@@ -1440,6 +1454,7 @@ const PendingGoFn = struct {
 const Ctx = struct {
     a: std.mem.Allocator,
     strings: *std.ArrayListUnmanaged([]const u8),
+    callees: *std.ArrayListUnmanaged(Callee),
     callee_map: *std.StringHashMapUnmanaged(u32),
     structs: *std.StringHashMapUnmanaged(StructInfo),
     enums: *std.StringHashMapUnmanaged(EnumInfo),
@@ -1476,7 +1491,6 @@ const Ctx = struct {
     /// Queued `go { }` bodies to lower as sibling funcs after the parent.
     pending_gos: *std.ArrayListUnmanaged(PendingGoFn),
     go_seq: *u32,
-    callees: *std.ArrayListUnmanaged(Callee),
     /// Active `scope { }` handle slot, if any.
     scope_slot: ?u32 = null,
     /// Inside a go child: env param slot + capture name → index in env pointer array.
@@ -1484,6 +1498,9 @@ const Ctx = struct {
     capture_map: ?*const std.StringHashMapUnmanaged(u32) = null,
     /// `type Name: f64` distinct/alias → underlying leaf (floatish resolution).
     type_aliases: *const std.StringHashMapUnmanaged([]const u8),
+    /// Synthetic lambdas / adapters lowered during expression lowering.
+    pending_funcs: *std.ArrayListUnmanaged(Func),
+    lambda_seq: *u32,
 
     fn fresh(self: *Ctx) !u32 {
         const s = self.next_slot.*;
@@ -1520,6 +1537,8 @@ fn lowerFn(
     type_aliases: *const std.StringHashMapUnmanaged([]const u8),
     pending_gos: *std.ArrayListUnmanaged(PendingGoFn),
     go_seq: *u32,
+    pending_funcs: *std.ArrayListUnmanaged(Func),
+    lambda_seq: *u32,
 ) !Func {
     std.debug.print("lowerFn:{s}\n", .{fl.name});
     var slots: std.StringHashMapUnmanaged(u32) = .{};
@@ -1597,6 +1616,7 @@ fn lowerFn(
     var ctx = Ctx{
         .a = a,
         .strings = strings,
+        .callees = callees,
         .callee_map = callee_map,
         .structs = structs,
         .enums = enums,
@@ -1624,10 +1644,11 @@ fn lowerFn(
         .type_subst = subst_ptr,
         .pending_gos = pending_gos,
         .go_seq = go_seq,
-        .callees = callees,
         .capture_map = fl.go_captures,
         .env_slot = if (fl.go_captures != null) slots.get("__env") else null,
         .type_aliases = type_aliases,
+        .pending_funcs = pending_funcs,
+        .lambda_seq = lambda_seq,
     };
     lowerBlock(&ctx, fl.body) catch |err| {
         std.debug.print("lowerFn body fail {s}: {s}\n", .{ fl.name, @errorName(err) });
@@ -1668,6 +1689,8 @@ fn lowerGoChild(
     type_aliases: *const std.StringHashMapUnmanaged([]const u8),
     pending_gos: *std.ArrayListUnmanaged(PendingGoFn),
     go_seq: *u32,
+    pending_funcs: *std.ArrayListUnmanaged(Func),
+    lambda_seq: *u32,
 ) !Func {
     var capture_map: std.StringHashMapUnmanaged(u32) = .{};
     for (pg.capture_names, 0..) |n, i| {
@@ -1689,7 +1712,7 @@ fn lowerGoChild(
         .self_type = null,
         .pointer_recv = false,
         .go_captures = &capture_map,
-    }, strings, callees, callee_map, structs, enums, methods, ifaces, fn_infos, vtables, vtable_map, const_vals, addr_consts, global_map, globals, object_map, import_binds, type_aliases, pending_gos, go_seq);
+    }, strings, callees, callee_map, structs, enums, methods, ifaces, fn_infos, vtables, vtable_map, const_vals, addr_consts, global_map, globals, object_map, import_binds, type_aliases, pending_gos, go_seq, pending_funcs, lambda_seq);
 }
 
 fn loadCapturePtr(ctx: *Ctx, name: []const u8) LowerError!?u32 {
@@ -1862,6 +1885,14 @@ fn scanExprCaptures(
             try scanExprCaptures(ctx, ie.cond, locals, caps, seen);
             try scanBlockCaptures(ctx, ie.then_block, locals, caps, seen);
             if (ie.else_block) |eb| try scanBlockCaptures(ctx, eb, locals, caps, seen);
+        },
+        .lambda => |lam| {
+            // Nested lambda: scan defaults and body; params are new locals for the child.
+            for (lam.params) |p| {
+                if (p.default) |d| try scanExprCaptures(ctx, d, locals, caps, seen);
+            }
+            if (lam.expr_body) |eb| try scanExprCaptures(ctx, eb, locals, caps, seen);
+            if (lam.block) |bb| try scanBlockCaptures(ctx, bb, locals, caps, seen);
         },
         .int, .float, .string, .cstring, .null_lit => {},
     }
@@ -2544,6 +2575,13 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
                         try ctx.emit(.{ .op = .load, .dst = d, .src0 = ptr });
                         break :blk d;
                     } else if (ctx.slots.get(as.name)) |slot| {
+                        if (ctx.meta.get(as.name)) |m| {
+                            if (m.kind == .capture_ptr) {
+                                const d = try ctx.fresh();
+                                try ctx.emit(.{ .op = .load, .dst = d, .src0 = slot });
+                                break :blk d;
+                            }
+                        }
                         break :blk slot;
                     } else if (ctx.global_map.get(as.name)) |gi| {
                         const d = try ctx.fresh();
@@ -2596,6 +2634,12 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
             } else if (try loadCapturePtr(ctx, as.name)) |ptr| {
                 try ctx.emit(.{ .op = .store, .src0 = ptr, .src1 = v });
             } else if (ctx.slots.get(as.name)) |slot| {
+                if (ctx.meta.get(as.name)) |m| {
+                    if (m.kind == .capture_ptr) {
+                        try ctx.emit(.{ .op = .store, .src0 = slot, .src1 = v });
+                        return;
+                    }
+                }
                 try ctx.emit(.{ .op = .copy, .dst = slot, .src0 = v });
             } else if (ctx.global_map.get(as.name)) |gi| {
                 try ctx.emit(.{ .op = .gstore, .src0 = v, .aux = @intCast(gi) });
@@ -2781,7 +2825,15 @@ fn metaFromCallRet(ctx: *Ctx, ret_meta: ?SlotMeta, ret_name: []const u8) ?SlotMe
 
 fn inferMetaFromExpr(ctx: *Ctx, e: *ast.Expr) ?SlotMeta {
     switch (e.*) {
+        .lambda => return .{ .kind = .scalar, .type_name = "iface_fn" },
         .struct_lit => |sl| {
+            if (ctx.fn_infos.contains(sl.type_name)) {
+                // Named-arg function call — meta from return type.
+                if (ctx.fn_infos.get(sl.type_name)) |fi| {
+                    if (metaFromCallRet(ctx, fi.ret_meta, fi.ret_name)) |m| return m;
+                }
+                return null;
+            }
             if (sl.type_args.len > 0) {
                 var resolved = ctx.a.alloc(*ast.TypeExpr, sl.type_args.len) catch return .{ .kind = .struct_ptr, .type_name = sl.type_name };
                 for (sl.type_args, 0..) |ta, i| {
@@ -2823,6 +2875,7 @@ fn inferMetaFromExpr(ctx: *Ctx, e: *ast.Expr) ?SlotMeta {
                 }
             }
             if (ctx.object_map.contains(n)) return .{ .kind = .struct_ptr, .type_name = n };
+            if (ctx.callee_map.contains(n)) return .{ .kind = .scalar, .type_name = "iface_fn" };
             return null;
         },
         .field => |f| {
@@ -3649,7 +3702,17 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
                 try ctx.emit(.{ .op = .load, .dst = d, .src0 = ptr });
                 return d;
             }
-            if (ctx.slots.get(name)) |s| return s;
+            if (ctx.slots.get(name)) |s| {
+                // Captured local: slot holds the address; load the value.
+                if (ctx.meta.get(name)) |m| {
+                    if (m.kind == .capture_ptr) {
+                        const d = try ctx.fresh();
+                        try ctx.emit(.{ .op = .load, .dst = d, .src0 = s });
+                        return d;
+                    }
+                }
+                return s;
+            }
             if (ctx.const_vals.get(name)) |cv| {
                 const d = try ctx.fresh();
                 if (cv.is_float) {
@@ -3676,11 +3739,9 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
                 try ctx.emit(.{ .op = .gload, .dst = d, .aux = @intCast(gi) });
                 return d;
             }
-            // function address
-            if (ctx.callee_map.get(name)) |cid| {
-                const d = try ctx.fresh();
-                try ctx.emit(.{ .op = .saddr, .dst = d, .aux = -1 - @as(i64, @intCast(cid)) });
-                return d;
+            // function address — fat pointer `{code, env=null}` for iface_fn values
+            if (ctx.callee_map.contains(name)) {
+                return try lowerFnValuePair(ctx, name, none);
             }
             std.debug.print("lower UnknownName ident: {s}\n", .{name});
             return error.UnknownName;
@@ -3845,7 +3906,7 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
                     // Array / struct / iface slots already hold a data pointer; &x is that pointer
                     // (LEA of the slot would pass a **T to C and break SDL createinfo / FRect FFI).
                     if (ctx.meta.get(name)) |m| {
-                        if (m.kind == .array_ptr or m.kind == .struct_ptr or m.kind == .iface_ptr) {
+                        if (m.kind == .array_ptr or m.kind == .struct_ptr or m.kind == .iface_ptr or m.kind == .capture_ptr) {
                             try ctx.emit(.{ .op = .copy, .dst = d, .src0 = slot });
                             return d;
                         }
@@ -4359,7 +4420,18 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
             std.debug.print("enum_lit unknown variant {s}.{s}\n", .{ tname, el.variant });
             return error.UnknownName;
         },
+        .lambda => |lam| return try lowerLambda(ctx, lam),
         .struct_lit => |sl| {
+            // Named-arg call parsed as struct_lit: `connect(host: "db")`.
+            if (ctx.fn_infos.get(sl.type_name)) |fi| {
+                var args = try ctx.a.alloc(*ast.Expr, sl.fields.len);
+                var names = try ctx.a.alloc(?[]const u8, sl.fields.len);
+                for (sl.fields, 0..) |f, i| {
+                    args[i] = f.value;
+                    names[i] = f.name;
+                }
+                return try lowerFnCall(ctx, fi, args, &.{}, names);
+            }
             const tname = if (sl.type_args.len > 0) blk: {
                 var resolved = try ctx.a.alloc(*ast.TypeExpr, sl.type_args.len);
                 for (sl.type_args, 0..) |ta, i| {
@@ -5082,11 +5154,11 @@ fn lowerCall(ctx: *Ctx, c: ast.Call) LowerError!u32 {
                 return try lowerEmptyStructValue(ctx, mangled);
             }
             if (ctx.fn_infos.get(mangled)) |fi| {
-                return try lowerFnCall(ctx, fi, c.args, c.with_args);
+                return try lowerFnCall(ctx, fi, c.args, c.with_args, c.arg_names);
             }
         }
         if (ctx.fn_infos.get(name)) |fi| {
-            return try lowerFnCall(ctx, fi, c.args, c.with_args);
+            return try lowerFnCall(ctx, fi, c.args, c.with_args, c.arg_names);
         }
         // Inside specialized bodies (`store_elem` in `List<*Value>.push`): bind via type_subst
         // so `store_elem__PValue` is found even when arg meta peels to `Value`.
@@ -5095,7 +5167,7 @@ fn lowerCall(ctx: *Ctx, c: ast.Call) LowerError!u32 {
             if (it.next()) |e| {
                 const mangled = try std.fmt.allocPrint(ctx.a, "{s}__{s}", .{ name, e.value_ptr.* });
                 if (ctx.fn_infos.get(mangled)) |fi| {
-                    return try lowerFnCall(ctx, fi, c.args, c.with_args);
+                    return try lowerFnCall(ctx, fi, c.args, c.with_args, c.arg_names);
                 }
             }
         }
@@ -5105,7 +5177,7 @@ fn lowerCall(ctx: *Ctx, c: ast.Call) LowerError!u32 {
             if (atn.len > 0) {
                 const mangled = try std.fmt.allocPrint(ctx.a, "{s}__{s}", .{ name, atn });
                 if (ctx.fn_infos.get(mangled)) |fi| {
-                    return try lowerFnCall(ctx, fi, c.args, c.with_args);
+                    return try lowerFnCall(ctx, fi, c.args, c.with_args, c.arg_names);
                 }
             }
         }
@@ -5129,7 +5201,7 @@ fn lowerCall(ctx: *Ctx, c: ast.Call) LowerError!u32 {
                     }
                     const mangled = try mangleNamedApp(ctx.a, fname, resolved_args);
                     if (ctx.fn_infos.get(mangled)) |fi| {
-                        return try lowerFnCall(ctx, fi, c.args, c.with_args);
+                        return try lowerFnCall(ctx, fi, c.args, c.with_args, c.arg_names);
                     }
                 }
                 // Infer from current type_subst (mem.slice inside List<T>.items) or first arg.
@@ -5140,7 +5212,7 @@ fn lowerCall(ctx: *Ctx, c: ast.Call) LowerError!u32 {
                         if (it.next()) |e| {
                             const mangled = try std.fmt.allocPrint(ctx.a, "{s}__{s}", .{ fname, e.value_ptr.* });
                             if (ctx.fn_infos.get(mangled)) |fi| {
-                                return try lowerFnCall(ctx, fi, c.args, c.with_args);
+                                return try lowerFnCall(ctx, fi, c.args, c.with_args, c.arg_names);
                             }
                         }
                     }
@@ -5149,12 +5221,12 @@ fn lowerCall(ctx: *Ctx, c: ast.Call) LowerError!u32 {
                     if (inferTypeNameFromExpr(ctx, c.args[0])) |atn| {
                         const mangled = try std.fmt.allocPrint(ctx.a, "{s}__{s}", .{ fname, atn });
                         if (ctx.fn_infos.get(mangled)) |fi| {
-                            return try lowerFnCall(ctx, fi, c.args, c.with_args);
+                            return try lowerFnCall(ctx, fi, c.args, c.with_args, c.arg_names);
                         }
                     }
                 }
                 if (ctx.fn_infos.get(fname)) |fi| {
-                    return try lowerFnCall(ctx, fi, c.args, c.with_args);
+                    return try lowerFnCall(ctx, fi, c.args, c.with_args, c.arg_names);
                 }
                 std.debug.print("lower UnknownName pkg fn {s}.{s}\n", .{ base_name, fname });
                 return error.UnknownName;
@@ -5167,8 +5239,8 @@ fn lowerCall(ctx: *Ctx, c: ast.Call) LowerError!u32 {
     if (c.callee.* == .ident) {
         if (ctx.slots.get(c.callee.ident)) |fp| {
             if (ctx.meta.get(c.callee.ident)) |m| {
-                if (std.mem.eql(u8, m.type_name, "iface_fn")) {
-                    return try lowerFnPtrCall(ctx, fp, c.args);
+                if (std.mem.eql(u8, m.type_name, "iface_fn") or std.mem.eql(u8, m.type_name, "closure")) {
+                    return try lowerFnPtrCall(ctx, fp, c.args, std.mem.eql(u8, m.type_name, "closure"));
                 }
             }
         }
@@ -5176,28 +5248,510 @@ fn lowerCall(ctx: *Ctx, c: ast.Call) LowerError!u32 {
     return error.UnknownName;
 }
 
-fn lowerFnPtrCall(ctx: *Ctx, fnptr: u32, args: []*ast.Expr) LowerError!u32 {
-    var arg_slots: [16]u32 = .{none} ** 16;
-    var arity: u8 = 0;
-    if (args.len > max_call_args) return error.TooManyArgs;
-    for (args) |arg| {
-        arg_slots[arity] = try lowerExpr(ctx, arg);
-        arity += 1;
+/// Expand named args + defaults into a full positional list matching `params`.
+fn expandArgsForLower(
+    a: std.mem.Allocator,
+    params: []ast.Param,
+    args: []*ast.Expr,
+    arg_names: []const ?[]const u8,
+) LowerError![]*ast.Expr {
+    if (params.len == 0) return args;
+    // Fast path: all positional, correct arity, no defaults needed.
+    var any_default = false;
+    for (params) |p| {
+        if (p.default != null) any_default = true;
     }
-    const d = try ctx.fresh();
-    try ctx.emit(.{
-        .op = .icall,
-        .dst = d,
-        .src0 = fnptr,
-        .arity = arity,
-        .args = arg_slots,
+    const any_named = arg_names.len > 0;
+    if (!any_default and !any_named and args.len == params.len) return args;
+    if (!any_default and !any_named and args.len != params.len) {
+        // Still may be trailing-lambda short form with defaults — fall through if defaults exist.
+        if (!any_default) return args;
+    }
+
+    const n = params.len;
+    var out = try a.alloc(?*ast.Expr, n);
+    @memset(out, null);
+
+    var usable_len = args.len;
+    if (args.len > 0 and n > 0 and args[args.len - 1].* == .lambda) {
+        out[n - 1] = args[args.len - 1];
+        usable_len = args.len - 1;
+    }
+
+    var next_pos: usize = 0;
+    var i: usize = 0;
+    while (i < usable_len) : (i += 1) {
+        const name: ?[]const u8 = if (arg_names.len == args.len)
+            arg_names[i]
+        else if (arg_names.len == usable_len)
+            arg_names[i]
+        else
+            null;
+        if (name) |nm| {
+            for (params, 0..) |p, pi| {
+                if (std.mem.eql(u8, p.name, nm)) {
+                    out[pi] = args[i];
+                    break;
+                }
+            }
+        } else {
+            while (next_pos < n and out[next_pos] != null) : (next_pos += 1) {}
+            if (next_pos >= n) return error.TooManyArgs;
+            out[next_pos] = args[i];
+            next_pos += 1;
+        }
+    }
+
+    var result = try a.alloc(*ast.Expr, n);
+    for (params, 0..) |p, pi| {
+        if (out[pi]) |e| {
+            result[pi] = e;
+        } else if (p.default) |d| {
+            result[pi] = d;
+        } else {
+            return error.TooManyArgs; // missing required
+        }
+    }
+    return result;
+}
+
+fn collectCaptures(
+    ctx: *Ctx,
+    e: *ast.Expr,
+    param_names: []const []const u8,
+    out: *std.ArrayListUnmanaged([]const u8),
+) void {
+    const isParam = struct {
+        fn check(names: []const []const u8, n: []const u8) bool {
+            for (names) |p| if (std.mem.eql(u8, p, n)) return true;
+            return false;
+        }
+    }.check;
+    const already = struct {
+        fn check(list: *std.ArrayListUnmanaged([]const u8), n: []const u8) bool {
+            for (list.items) |x| if (std.mem.eql(u8, x, n)) return true;
+            return false;
+        }
+    }.check;
+    switch (e.*) {
+        .ident => |n| {
+            if (isParam(param_names, n)) return;
+            if (already(out, n)) return;
+            if (ctx.slots.contains(n)) {
+                out.append(ctx.a, n) catch {};
+            }
+        },
+        .binary => |b| {
+            collectCaptures(ctx, b.left, param_names, out);
+            collectCaptures(ctx, b.right, param_names, out);
+        },
+        .unary => |u| collectCaptures(ctx, u.expr, param_names, out),
+        .call => |c| {
+            collectCaptures(ctx, c.callee, param_names, out);
+            for (c.args) |a| collectCaptures(ctx, a, param_names, out);
+            for (c.with_args) |w| collectCaptures(ctx, w, param_names, out);
+        },
+        .field => |f| collectCaptures(ctx, f.base, param_names, out),
+        .index => |ix| {
+            collectCaptures(ctx, ix.base, param_names, out);
+            collectCaptures(ctx, ix.index, param_names, out);
+        },
+        .slice => |sl| {
+            collectCaptures(ctx, sl.base, param_names, out);
+            if (sl.start) |s| collectCaptures(ctx, s, param_names, out);
+            if (sl.end) |en| collectCaptures(ctx, en, param_names, out);
+        },
+        .cast, .try_cast => |c| collectCaptures(ctx, c.expr, param_names, out),
+        .force_unwrap => |inner| collectCaptures(ctx, inner, param_names, out),
+        .lambda => |lam| {
+            // Nested lambda: only scan free vars not bound by the inner params.
+            var nested_params: std.ArrayListUnmanaged([]const u8) = .{};
+            defer nested_params.deinit(ctx.a);
+            nested_params.appendSlice(ctx.a, param_names) catch {};
+            for (lam.params) |p| nested_params.append(ctx.a, p.name) catch {};
+            if (lam.expr_body) |eb| collectCaptures(ctx, eb, nested_params.items, out);
+            if (lam.block) |b| collectCapturesBlock(ctx, b, nested_params.items, out);
+        },
+        .when_expr => |w| {
+            collectCaptures(ctx, w.scrutinee, param_names, out);
+            for (w.arms) |arm| collectCaptures(ctx, arm.body, param_names, out);
+            if (w.else_body) |eb| collectCaptures(ctx, eb, param_names, out);
+        },
+        .tuple => |elems| for (elems) |el| collectCaptures(ctx, el, param_names, out),
+        .array_lit => |al| for (al.elems) |el| collectCaptures(ctx, el, param_names, out),
+        .struct_lit => |sl| for (sl.fields) |f| collectCaptures(ctx, f.value, param_names, out),
+        .range => |r| {
+            collectCaptures(ctx, r.start, param_names, out);
+            collectCaptures(ctx, r.end, param_names, out);
+        },
+        .interp => |ip| {
+            for (ip.parts) |p| switch (p) {
+                .text => {},
+                .expr => |ex| collectCaptures(ctx, ex, param_names, out),
+            };
+        },
+        .optional_call => |oc| {
+            collectCaptures(ctx, oc.base, param_names, out);
+            for (oc.args) |a| collectCaptures(ctx, a, param_names, out);
+        },
+        .panic_call => |p| collectCaptures(ctx, p.message, param_names, out),
+        .is_type => |it| collectCaptures(ctx, it.expr, param_names, out),
+        else => {},
+    }
+}
+
+fn collectCapturesStmt(
+    ctx: *Ctx,
+    stmt: ast.Stmt,
+    param_names: []const []const u8,
+    out: *std.ArrayListUnmanaged([]const u8),
+) void {
+    switch (stmt) {
+        .var_decl => |vd| if (vd.init) |init| collectCaptures(ctx, init, param_names, out),
+        .destructure => |ds| collectCaptures(ctx, ds.init, param_names, out),
+        .assign => |as| {
+            collectCaptures(ctx, as.value, param_names, out);
+            // Assigned name may be a capture (`sum += …`).
+            const isParam = struct {
+                fn check(names: []const []const u8, n: []const u8) bool {
+                    for (names) |p| if (std.mem.eql(u8, p, n)) return true;
+                    return false;
+                }
+            }.check;
+            const already = struct {
+                fn check(list: *std.ArrayListUnmanaged([]const u8), n: []const u8) bool {
+                    for (list.items) |x| if (std.mem.eql(u8, x, n)) return true;
+                    return false;
+                }
+            }.check;
+            if (as.field == null and as.index == null and !isParam(param_names, as.name) and !already(out, as.name)) {
+                if (ctx.slots.contains(as.name)) out.append(ctx.a, as.name) catch {};
+            }
+            if (as.field) |fa| collectCaptures(ctx, fa.base, param_names, out);
+            if (as.index) |ix| {
+                collectCaptures(ctx, ix.base, param_names, out);
+                collectCaptures(ctx, ix.index, param_names, out);
+            }
+        },
+        .expr => |e| collectCaptures(ctx, e, param_names, out),
+        .return_stmt => |re| if (re) |e| collectCaptures(ctx, e, param_names, out),
+        .if_stmt => |ifs| {
+            collectCaptures(ctx, ifs.cond, param_names, out);
+            collectCapturesBlock(ctx, ifs.then_block, param_names, out);
+            if (ifs.else_block) |eb| collectCapturesBlock(ctx, eb, param_names, out);
+        },
+        .while_stmt => |ws| {
+            collectCaptures(ctx, ws.cond, param_names, out);
+            collectCapturesBlock(ctx, ws.body, param_names, out);
+        },
+        .for_in_stmt => |fs| {
+            collectCaptures(ctx, fs.iter, param_names, out);
+            collectCapturesBlock(ctx, fs.body, param_names, out);
+        },
+        .with_stmt => |ws| {
+            for (ws.values) |v| collectCaptures(ctx, v, param_names, out);
+            collectCapturesBlock(ctx, ws.body, param_names, out);
+        },
+        .defer_stmt, .errdefer_stmt => |ds| switch (ds) {
+            .expr => |ex| collectCaptures(ctx, ex, param_names, out),
+            .block => |b| collectCapturesBlock(ctx, b, param_names, out),
+        },
+        else => {},
+    }
+}
+
+fn collectCapturesBlock(
+    ctx: *Ctx,
+    block: *ast.Block,
+    param_names: []const []const u8,
+    out: *std.ArrayListUnmanaged([]const u8),
+) void {
+    for (block.stmts) |s| collectCapturesStmt(ctx, s, param_names, out);
+}
+
+fn lambdaBodyBlock(a: std.mem.Allocator, lam: ast.Lambda) LowerError!*ast.Block {
+    if (lam.expr_body) |eb| {
+        const stmts = try a.alloc(ast.Stmt, 1);
+        stmts[0] = .{ .return_stmt = eb };
+        const b = try a.create(ast.Block);
+        b.* = .{ .stmts = stmts };
+        return b;
+    }
+    const block = lam.block orelse {
+        const b = try a.create(ast.Block);
+        b.* = .{ .stmts = &.{} };
+        return b;
+    };
+    // Last expression statement becomes the return value.
+    if (block.stmts.len > 0) {
+        const last = block.stmts[block.stmts.len - 1];
+        if (last == .expr) {
+            var stmts = try a.alloc(ast.Stmt, block.stmts.len);
+            @memcpy(stmts[0 .. block.stmts.len - 1], block.stmts[0 .. block.stmts.len - 1]);
+            stmts[block.stmts.len - 1] = .{ .return_stmt = last.expr };
+            const b = try a.create(ast.Block);
+            b.* = .{ .stmts = stmts };
+            return b;
+        }
+    }
+    return block;
+}
+
+fn lowerLambda(ctx: *Ctx, lam: ast.Lambda) LowerError!u32 {
+    var param_names: std.ArrayListUnmanaged([]const u8) = .{};
+    for (lam.params) |p| try param_names.append(ctx.a, p.name);
+
+    var captures: std.ArrayListUnmanaged([]const u8) = .{};
+    if (lam.expr_body) |eb| collectCaptures(ctx, eb, param_names.items, &captures);
+    if (lam.block) |b| collectCapturesBlock(ctx, b, param_names.items, &captures);
+
+    const seq = ctx.lambda_seq.*;
+    ctx.lambda_seq.* += 1;
+    const name = try std.fmt.allocPrint(ctx.a, "jog_lambda_{d}", .{seq});
+
+    const body = try lambdaBodyBlock(ctx.a, lam);
+    const has_captures = captures.items.len > 0;
+
+    // Synthetic params: optional env (*byte), then lambda params.
+    var synth_params: std.ArrayListUnmanaged(ast.Param) = .{};
+    if (has_captures) {
+        const env_ty = try ctx.a.create(ast.TypeExpr);
+        env_ty.* = .{ .name = "byte" }; // lowered as raw pointer slot
+        const env_ptr = try ctx.a.create(ast.TypeExpr);
+        env_ptr.* = .{ .pointer = env_ty };
+        try synth_params.append(ctx.a, .{ .name = "__env", .ty = env_ptr });
+    }
+    for (lam.params) |p| try synth_params.append(ctx.a, p);
+
+    const owned_params = try synth_params.toOwnedSlice(ctx.a);
+    try internCallee(ctx.a, ctx.callees, ctx.callee_map, .{ .kind = .jog_fn, .name = name });
+    try ctx.fn_infos.put(ctx.a, name, .{
+        .mangled = name,
+        .nparams = @intCast(owned_params.len),
+        .contexts = &.{},
+        .exported = false,
+        .params = owned_params,
     });
+
+    const f = try lowerLambdaFn(ctx, name, if (has_captures) captures.items else &.{}, lam.params, body);
+    try ctx.pending_funcs.append(ctx.a, f);
+
+    if (!has_captures) {
+        return try lowerFnValuePair(ctx, name, none);
+    }
+
+    // Build env array of pointers to captured locals on the parent stack.
+    const ncap = captures.items.len;
+    const first = try ctx.fresh();
+    try ctx.emit(.{ .op = .iconst, .dst = first, .aux = 0 });
+    var ci: usize = 1;
+    while (ci < ncap) : (ci += 1) {
+        const s = try ctx.fresh();
+        try ctx.emit(.{ .op = .iconst, .dst = s, .aux = 0 });
+    }
+    const env_ptr = try ctx.fresh();
+    try ctx.emit(.{ .op = .lea_slot, .dst = env_ptr, .src0 = first });
+    for (captures.items, 0..) |cname, i| {
+        const parent_slot = ctx.slots.get(cname) orelse return error.UnknownName;
+        // Address of parent local.
+        const addr = try ctx.fresh();
+        if (ctx.meta.get(cname)) |m| {
+            // Already a pointer-ish local (struct/array): capture that pointer.
+            if (m.kind == .struct_ptr or m.kind == .array_ptr or m.kind == .iface_ptr or m.kind == .capture_ptr) {
+                try ctx.emit(.{ .op = .copy, .dst = addr, .src0 = parent_slot });
+            } else {
+                try ctx.emit(.{ .op = .lea_slot, .dst = addr, .src0 = parent_slot });
+            }
+        } else {
+            try ctx.emit(.{ .op = .lea_slot, .dst = addr, .src0 = parent_slot });
+        }
+        const slot_addr = try ctx.fresh();
+        const off = try ctx.fresh();
+        try ctx.emit(.{ .op = .iconst, .dst = off, .aux = @intCast(i * 8) });
+        // Stack slots grow downward from lea_slot — index with sub.
+        try ctx.emit(.{ .op = .sub, .dst = slot_addr, .src0 = env_ptr, .src1 = off });
+        try ctx.emit(.{ .op = .store, .src0 = slot_addr, .src1 = addr });
+    }
+    return try lowerFnValuePair(ctx, name, env_ptr);
+}
+
+fn lowerLambdaFn(
+    parent_ctx: *Ctx,
+    name: []const u8,
+    captures: []const []const u8,
+    lam_params: []ast.Param,
+    body: *ast.Block,
+) LowerError!Func {
+    var slots: std.StringHashMapUnmanaged(u32) = .{};
+    var meta: std.StringHashMapUnmanaged(SlotMeta) = .{};
+    var next_slot: u32 = 0;
+    var ambient: std.ArrayListUnmanaged(Ambient) = .{};
+    var insts: std.ArrayListUnmanaged(Inst) = .{};
+    var break_jmps: std.ArrayListUnmanaged(usize) = .{};
+    var continue_jmps: std.ArrayListUnmanaged(usize) = .{};
+    var defer_stack: std.ArrayListUnmanaged(std.ArrayListUnmanaged(DeferItem)) = .{};
+    var empty_subst: std.StringHashMapUnmanaged([]const u8) = .{};
+
+    // Bind params (env first if present).
+    if (captures.len > 0) {
+        const env_slot = next_slot;
+        next_slot += 1;
+        try slots.put(parent_ctx.a, "__env", env_slot);
+        try meta.put(parent_ctx.a, "__env", .{ .kind = .raw_ptr, .type_name = "byte", .elem_size = 1 });
+    }
+    for (lam_params) |p| {
+        const slot = next_slot;
+        next_slot += 1;
+        try slots.put(parent_ctx.a, p.name, slot);
+        try meta.put(parent_ctx.a, p.name, try metaForTypeExpr(parent_ctx.a, p.ty, parent_ctx.structs, parent_ctx.ifaces));
+    }
+    const nparams = next_slot;
+
+    var loop_defer_depths: std.ArrayListUnmanaged(usize) = .{};
+    var ctx = Ctx{
+        .a = parent_ctx.a,
+        .strings = parent_ctx.strings,
+        .callees = parent_ctx.callees,
+        .callee_map = parent_ctx.callee_map,
+        .structs = parent_ctx.structs,
+        .enums = parent_ctx.enums,
+        .methods = parent_ctx.methods,
+        .ifaces = parent_ctx.ifaces,
+        .fn_infos = parent_ctx.fn_infos,
+        .vtables = parent_ctx.vtables,
+        .vtable_map = parent_ctx.vtable_map,
+        .const_vals = parent_ctx.const_vals,
+        .addr_consts = parent_ctx.addr_consts,
+        .global_map = parent_ctx.global_map,
+        .globals = parent_ctx.globals,
+        .object_map = parent_ctx.object_map,
+        .import_binds = parent_ctx.import_binds,
+        .slots = &slots,
+        .meta = &meta,
+        .next_slot = &next_slot,
+        .insts = &insts,
+        .ambient = &ambient,
+        .break_jmps = &break_jmps,
+        .continue_jmps = &continue_jmps,
+        .defer_stack = &defer_stack,
+        .loop_defer_depths = &loop_defer_depths,
+        .ret_iface = null,
+        .type_subst = &empty_subst,
+        .pending_gos = parent_ctx.pending_gos,
+        .go_seq = parent_ctx.go_seq,
+        .type_aliases = parent_ctx.type_aliases,
+        .pending_funcs = parent_ctx.pending_funcs,
+        .lambda_seq = parent_ctx.lambda_seq,
+    };
+
+    // Prologue: bind each capture as capture_ptr loaded from env[i].
+    if (captures.len > 0) {
+        const env_slot = slots.get("__env").?;
+        for (captures, 0..) |cname, i| {
+            const off = try ctx.fresh();
+            try ctx.emit(.{ .op = .iconst, .dst = off, .aux = @intCast(i * 8) });
+            const addr = try ctx.fresh();
+            // Env buffer lives on the caller's stack (downward slots).
+            try ctx.emit(.{ .op = .sub, .dst = addr, .src0 = env_slot, .src1 = off });
+            const ptr = try ctx.fresh();
+            try ctx.emit(.{ .op = .load, .dst = ptr, .src0 = addr });
+            try slots.put(parent_ctx.a, cname, ptr);
+            try meta.put(parent_ctx.a, cname, .{ .kind = .capture_ptr, .type_name = "i64" });
+        }
+    }
+
+    try lowerBlock(&ctx, body);
+    if (insts.items.len == 0 or insts.items[insts.items.len - 1].op != .ret) {
+        try emitAllDefers(&ctx);
+        try ctx.emit(.{ .op = .ret, .src0 = none });
+    }
+    return .{
+        .name = name,
+        .nparams = nparams,
+        .nlocals = next_slot,
+        .exported = false,
+        .insts = try insts.toOwnedSlice(parent_ctx.a),
+    };
+}
+
+/// Build a stack pair `{code, env}` and return a pointer to it (function value).
+/// `env_slot == none` stores a null env (bare / no-capture).
+fn lowerFnValuePair(ctx: *Ctx, fn_name: []const u8, env_slot: u32) LowerError!u32 {
+    const cid = ctx.callee_map.get(fn_name) orelse return error.UnknownName;
+    const code = try ctx.fresh();
+    try ctx.emit(.{ .op = .saddr, .dst = code, .aux = -1 - @as(i64, @intCast(cid)) });
+    const env = try ctx.fresh();
+    if (env_slot == none) {
+        try ctx.emit(.{ .op = .iconst, .dst = env, .aux = 0 });
+    } else {
+        try ctx.emit(.{ .op = .copy, .dst = env, .src0 = env_slot });
+    }
+    const ptr = try ctx.fresh();
+    try ctx.emit(.{ .op = .lea_slot, .dst = ptr, .src0 = code });
+    return ptr;
+}
+
+fn lowerFnPtrCall(ctx: *Ctx, fnptr: u32, args: []*ast.Expr, force_closure: bool) LowerError!u32 {
+    _ = force_closure;
+    // Function values are pointers to `{code, env}` on the caller's stack.
+    // Slots grow downward: env is at fnptr - 8.
+    const code = try ctx.fresh();
+    try ctx.emit(.{ .op = .load, .dst = code, .src0 = fnptr });
+    const env_addr = try ctx.fresh();
+    const eight = try ctx.fresh();
+    try ctx.emit(.{ .op = .iconst, .dst = eight, .aux = 8 });
+    try ctx.emit(.{ .op = .sub, .dst = env_addr, .src0 = fnptr, .src1 = eight });
+    const env = try ctx.fresh();
+    try ctx.emit(.{ .op = .load, .dst = env, .src0 = env_addr });
+
+    var user: [16]u32 = .{none} ** 16;
+    if (args.len + 1 > max_call_args) return error.TooManyArgs;
+    for (args, 0..) |arg, i| {
+        user[i] = try lowerExpr(ctx, arg);
+    }
+
+    const d = try ctx.fresh();
+    // if env == 0 → bare; else closure (env first).
+    const jz_i = ctx.insts.items.len;
+    try ctx.emit(.{ .op = .jz, .src0 = env, .aux = 0 });
+
+    var carg: [16]u32 = .{none} ** 16;
+    carg[0] = env;
+    var carity: u8 = 1;
+    for (args, 0..) |_, i| {
+        carg[carity] = user[i];
+        carity += 1;
+    }
+    const d_cl = try ctx.fresh();
+    try ctx.emit(.{ .op = .icall, .dst = d_cl, .src0 = code, .arity = carity, .args = carg });
+    try ctx.emit(.{ .op = .copy, .dst = d, .src0 = d_cl });
+    const jmp_i = ctx.insts.items.len;
+    try ctx.emit(.{ .op = .jmp, .aux = 0 });
+
+    const bare_pos: i64 = @intCast(ctx.insts.items.len);
+    ctx.insts.items[jz_i].aux = bare_pos;
+    var barg: [16]u32 = .{none} ** 16;
+    var barity: u8 = 0;
+    for (args, 0..) |_, i| {
+        barg[barity] = user[i];
+        barity += 1;
+    }
+    const d_b = try ctx.fresh();
+    try ctx.emit(.{ .op = .icall, .dst = d_b, .src0 = code, .arity = barity, .args = barg });
+    try ctx.emit(.{ .op = .copy, .dst = d, .src0 = d_b });
+    const end_pos: i64 = @intCast(ctx.insts.items.len);
+    ctx.insts.items[jmp_i].aux = end_pos;
     return d;
 }
 
-fn lowerFnCall(ctx: *Ctx, fi: FnInfo, args: []*ast.Expr, with_args: []*ast.Expr) LowerError!u32 {
+fn lowerFnCall(ctx: *Ctx, fi: FnInfo, args: []*ast.Expr, with_args: []*ast.Expr, arg_names: []const ?[]const u8) LowerError!u32 {
     var arg_slots: [16]u32 = .{none} ** 16;
     var arity: u8 = 0;
+
+    const expanded = if (fi.params.len > 0)
+        try expandArgsForLower(ctx.a, fi.params, args, arg_names)
+    else
+        args;
 
     // resolve contexts: explicit with_args first, else ambient
     if (fi.contexts.len > 0) {
@@ -5221,15 +5775,15 @@ fn lowerFnCall(ctx: *Ctx, fi: FnInfo, args: []*ast.Expr, with_args: []*ast.Expr)
 
     if (fi.pack_index) |pi| {
         const fixed: usize = pi;
-        if (args.len < fixed) return error.TooManyArgs;
+        if (expanded.len < fixed) return error.TooManyArgs;
         if (fixed + arity > max_call_args) return error.TooManyArgs;
         var i: usize = 0;
         while (i < fixed) : (i += 1) {
-            const raw = try lowerExpr(ctx, args[i]);
-            arg_slots[arity] = try maybeCoerceArg(ctx, raw, args[i], if (i < fi.params.len) fi.params[i].ty else null);
+            const raw = try lowerExpr(ctx, expanded[i]);
+            arg_slots[arity] = try maybeCoerceArg(ctx, raw, expanded[i], if (i < fi.params.len) fi.params[i].ty else null);
             arity += 1;
         }
-        const pack_n = args.len - fixed;
+        const pack_n = expanded.len - fixed;
         // Stack buffer of pack_n slots (same layout as `[N]T` locals).
         const first = try ctx.fresh();
         try ctx.emit(.{ .op = .iconst, .dst = first, .aux = 0 });
@@ -5242,7 +5796,7 @@ fn lowerFnCall(ctx: *Ctx, fi: FnInfo, args: []*ast.Expr, with_args: []*ast.Expr)
         try ctx.emit(.{ .op = .lea_slot, .dst = ptr, .src0 = first });
         var k: usize = 0;
         while (k < pack_n) : (k += 1) {
-            const val = try lowerExpr(ctx, args[fixed + k]);
+            const val = try lowerExpr(ctx, expanded[fixed + k]);
             const addr = try ctx.fresh();
             const off = try ctx.fresh();
             try ctx.emit(.{ .op = .iconst, .dst = off, .aux = @intCast(k * 8) });
@@ -5257,8 +5811,8 @@ fn lowerFnCall(ctx: *Ctx, fi: FnInfo, args: []*ast.Expr, with_args: []*ast.Expr)
         arg_slots[arity] = len;
         arity += 1;
     } else {
-        if (args.len + arity > max_call_args) return error.TooManyArgs;
-        for (args, 0..) |arg, ai| {
+        if (expanded.len + arity > max_call_args) return error.TooManyArgs;
+        for (expanded, 0..) |arg, ai| {
             const raw = try lowerExpr(ctx, arg);
             arg_slots[arity] = try maybeCoerceArg(ctx, raw, arg, if (ai < fi.params.len) fi.params[ai].ty else null);
             arity += 1;

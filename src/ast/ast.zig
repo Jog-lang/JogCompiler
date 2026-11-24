@@ -42,6 +42,8 @@ pub const Param = struct {
     ty: *TypeExpr,
     /// True for `...T: name` — local type is `[]T` (Grammar pack).
     is_pack: bool = false,
+    /// Optional default: `name: T = expr` (Grammar param). Evaluated at the call site.
+    default: ?*Expr = null,
 };
 
 pub const ContextParam = struct {
@@ -327,6 +329,8 @@ pub const Expr = union(enum) {
     go_block: GoBlock,
     /// `scope { … }` — structured-concurrency block (JOG-222). Trailing-lambda `scope()` waits on JOG-221.
     scope_block: ScopeBlock,
+    /// `(params) [: Ret] -> body` anonymous function (Grammar lambda).
+    lambda: Lambda,
 };
 
 /// `go with (e1, …)? { stmts }` — body runs on a new stack; captures outer locals by address.
@@ -439,10 +443,24 @@ pub const UnaryOp = enum { neg, not, bit_not, addr, deref };
 pub const Call = struct {
     callee: *Expr,
     args: []*Expr,
+    /// Parallel to `args`: set when the corresponding arg used `name: expr`.
+    /// Empty means every argument is positional. When non-empty, `len == args.len`.
+    arg_names: []const ?[]const u8 = &.{},
     /// Call-site contexts: `f(args) with (e1, e2)`.
     with_args: []*Expr = &.{},
     /// Explicit generic args: `id<i64>(x)`.
     type_args: []*TypeExpr = &.{},
+};
+
+/// Anonymous function: `(x: i64) -> { x * 2 }` / `() -> 1` / trailing `{ i -> … }`.
+pub const Lambda = struct {
+    params: []Param,
+    ret: ?*TypeExpr = null,
+    /// Expression body (`-> expr`) when set; otherwise `block` is the body.
+    expr_body: ?*Expr = null,
+    block: ?*Block = null,
+    /// Trailing `{ body }` with one implied parameter named `it`.
+    implicit_it: bool = false,
 };
 
 pub const FieldAccess = struct {
