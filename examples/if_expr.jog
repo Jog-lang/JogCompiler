@@ -1,0 +1,15 @@
+// `if` as an expression (Grammar ifExpr / Functions.md). JOG-219.
+
+fn main() {
+    val a: i64 = 3
+    val b: i64 = 7
+    val max = if a > b { a } else { b }
+    val sign = if a > 0 { 1 } else if a < 0 { -1 } else { 0 }
+    if max == 7 {
+        if sign == 1 {
+            print("if expr ok\n")
+            return
+        }
+    }
+    panic("if expr bad\n")
+}

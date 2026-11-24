@@ -1031,17 +1031,35 @@ pub const Parser = struct {
             },
             .kw_defer => {
                 self.advance();
+                // Grammar: defer ( block | stmt ). Wrap a bare stmt in a one-stmt block
+                // so assignment (`defer n = n + 1`) and other stmts lower cleanly.
                 if (self.tok.kind == .lbrace) {
                     return .{ .defer_stmt = .{ .block = try self.parseBlock() } };
                 }
-                return .{ .defer_stmt = .{ .expr = try self.parseExpr() } };
+                const inner = try self.parseStmt();
+                if (inner == .expr) {
+                    return .{ .defer_stmt = .{ .expr = inner.expr } };
+                }
+                const wrap = try self.allocator.create(ast.Block);
+                const stmts = try self.allocator.alloc(ast.Stmt, 1);
+                stmts[0] = inner;
+                wrap.* = .{ .stmts = stmts };
+                return .{ .defer_stmt = .{ .block = wrap } };
             },
             .kw_errdefer => {
                 self.advance();
                 if (self.tok.kind == .lbrace) {
                     return .{ .errdefer_stmt = .{ .block = try self.parseBlock() } };
                 }
-                return .{ .errdefer_stmt = .{ .expr = try self.parseExpr() } };
+                const inner = try self.parseStmt();
+                if (inner == .expr) {
+                    return .{ .errdefer_stmt = .{ .expr = inner.expr } };
+                }
+                const wrap = try self.allocator.create(ast.Block);
+                const stmts = try self.allocator.alloc(ast.Stmt, 1);
+                stmts[0] = inner;
+                wrap.* = .{ .stmts = stmts };
+                return .{ .errdefer_stmt = .{ .block = wrap } };
             },
             .kw_with => {
                 self.advance();
@@ -1110,7 +1128,41 @@ pub const Parser = struct {
     }
 
     fn parseExpr(self: *Parser) ParseError!*ast.Expr {
+        // Grammar: expr = ifExpr | whenExpr | goExpr | lambda | orExpr
+        if (self.tok.kind == .kw_if) return try self.parseIfExpr();
         return try self.parseRange();
+    }
+
+    /// `if cond { … } [ else ( ifExpr | block ) ]` as a value-producing expression.
+    fn parseIfExpr(self: *Parser) ParseError!*ast.Expr {
+        try self.expect(.kw_if);
+        var cond: *ast.Expr = undefined;
+        if (self.tok.kind == .lparen) {
+            self.advance();
+            cond = try self.parseExpr();
+            try self.expect(.rparen);
+        } else {
+            cond = try self.parseExpr();
+        }
+        const then_b = try self.parseBlock();
+        var else_b: ?*ast.Block = null;
+        if (self.tok.kind == .kw_else) {
+            self.advance();
+            if (self.tok.kind == .kw_if) {
+                // else if → one-stmt block whose value is the nested if_expr.
+                const inner = try self.parseIfExpr();
+                const wrap = try self.allocator.create(ast.Block);
+                const stmts = try self.allocator.alloc(ast.Stmt, 1);
+                stmts[0] = .{ .expr = inner };
+                wrap.* = .{ .stmts = stmts };
+                else_b = wrap;
+            } else {
+                else_b = try self.parseBlock();
+            }
+        }
+        const e = try self.allocExpr();
+        e.* = .{ .if_expr = .{ .cond = cond, .then_block = then_b, .else_block = else_b } };
+        return e;
     }
 
     fn parseRange(self: *Parser) ParseError!*ast.Expr {
