@@ -372,6 +372,29 @@ fn lookupTypeName(types: *std.StringHashMapUnmanaged(*TypeInfo), n: []const u8) 
     return null;
 }
 
+/// Look up a field on `sd`, including fields promoted through embeds.
+fn findFieldDecl(structs: *std.StringHashMapUnmanaged(*ast.StructDecl), sd: *ast.StructDecl, name: []const u8) ?*ast.TypeExpr {
+    for (sd.fields) |fld| {
+        if (std.mem.eql(u8, fld.name, name)) return fld.ty;
+    }
+    var found: ?*ast.TypeExpr = null;
+    for (sd.fields) |fld| {
+        if (!fld.is_embedded) continue;
+        const etn = switch (fld.ty.*) {
+            .name => |n| n,
+            .named_app => |na| na.name,
+            else => continue,
+        };
+        const leaf = if (std.mem.lastIndexOfScalar(u8, etn, '.')) |dot| etn[dot + 1 ..] else etn;
+        const esd = structs.get(leaf) orelse continue;
+        if (findFieldDecl(structs, esd, name)) |ty| {
+            if (found != null) return null; // ambiguous
+            found = ty;
+        }
+    }
+    return found;
+}
+
 /// Private fields are only readable/writable as `self.<name>` inside methods.
 /// Struct literals may still initialize them (construction).
 fn checkPrivateFieldAccess(
@@ -633,6 +656,9 @@ fn checkStmt(
             } else if (as.field) |fa| {
                 const base_t = try checkExpr(a, types, fns, structs, methods, scope, fa.base, diags);
                 try checkPrivateFieldAccess(a, structs, diags, fa.base, base_t, fa.name);
+                _ = try checkExpr(a, types, fns, structs, methods, scope, as.value, diags);
+            } else if (as.deref) |ptr_e| {
+                _ = try checkExpr(a, types, fns, structs, methods, scope, ptr_e, diags);
                 _ = try checkExpr(a, types, fns, structs, methods, scope, as.value, diags);
             } else {
                 const v = lookupVar(scope, as.name) orelse {
@@ -984,11 +1010,9 @@ fn checkExpr(
             }
             if (base.kind == .struct_ty) {
                 if (structs.get(base.name)) |sd| {
-                    for (sd.fields) |fld| {
-                        if (std.mem.eql(u8, fld.name, f.name)) {
-                            try checkPrivateFieldAccess(a, structs, diags, f.base, base, f.name);
-                            return try resolveTypeExpr(a, types, fld.ty, diags);
-                        }
+                    if (findFieldDecl(structs, sd, f.name)) |fty| {
+                        try checkPrivateFieldAccess(a, structs, diags, f.base, base, f.name);
+                        return try resolveTypeExpr(a, types, fty, diags);
                     }
                 }
             }
@@ -996,11 +1020,9 @@ fn checkExpr(
                 if (base.pointee) |po| {
                     if (po.kind == .struct_ty) {
                         if (structs.get(po.name)) |sd| {
-                            for (sd.fields) |fld| {
-                                if (std.mem.eql(u8, fld.name, f.name)) {
-                                    try checkPrivateFieldAccess(a, structs, diags, f.base, base, f.name);
-                                    return try resolveTypeExpr(a, types, fld.ty, diags);
-                                }
+                            if (findFieldDecl(structs, sd, f.name)) |fty| {
+                                try checkPrivateFieldAccess(a, structs, diags, f.base, base, f.name);
+                                return try resolveTypeExpr(a, types, fty, diags);
                             }
                         }
                     }

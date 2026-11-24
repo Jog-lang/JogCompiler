@@ -120,6 +120,9 @@ pub const Field = struct {
     ty: *TypeExpr,
     /// `private name: T` — readable/writable only as `self.name` in methods.
     is_private: bool = false,
+    /// Bare type name in a struct body (`Entity`) — stored under that type's
+    /// name; fields/methods are promoted onto the outer type.
+    is_embedded: bool = false,
 };
 
 pub const StructDecl = struct {
@@ -241,11 +244,14 @@ pub const Destructure = struct {
 };
 
 pub const Assign = struct {
-    /// Simple `name = value`, field store (`base.name = value`), or index store (`base[i] = value`).
+    /// Simple `name = value`, field store (`base.name = value`), index store
+    /// (`base[i] = value`), or deref store (`*p = value`).
     name: []const u8,
     value: *Expr,
     field: ?FieldAssign = null,
     index: ?IndexAssign = null,
+    /// `*ptr = value` — pointer expression being stored through.
+    deref: ?*Expr = null,
     /// Compound `+=` etc.; null means plain `=`.
     compound: ?BinaryOp = null,
 };

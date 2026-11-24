@@ -1,0 +1,14 @@
+// Deref assign `*p =` / `*p +=` (JOG-223 / Types.md pointers).
+// Relies on the Grammar newline → SEP rule so `*p` starts a new statement.
+
+fn main() {
+    var x: i64 = 1
+    var p: *i64 = &x
+    *p = 42
+    *p += 1
+    if (x == 43) {
+        print("deref assign ok\n")
+    } else {
+        panic("x\n")
+    }
+}

@@ -854,6 +854,8 @@ fn ensureGenericStruct(
         try fields.append(a, .{
             .name = f.name,
             .ty = try substTypeExpr(a, f.ty, tmpl.type_params, args),
+            .is_private = f.is_private,
+            .is_embedded = f.is_embedded,
         });
     }
     try structs.put(a, mangled, .{ .fields = try fields.toOwnedSlice(a) });
@@ -1213,6 +1215,7 @@ fn walkStmtInstantiate(ic: *InstCtx, stmt: ast.Stmt) anyerror!void {
                 try walkExprInstantiate(ic, ix.base);
                 try walkExprInstantiate(ic, ix.index);
             }
+            if (as.deref) |d| try walkExprInstantiate(ic, d);
         },
         .expr => |e| try walkExprInstantiate(ic, e),
         .return_stmt => |re| if (re) |e| try walkExprInstantiate(ic, e),
@@ -2093,6 +2096,11 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
                         const d = try ctx.fresh();
                         try ctx.emit(.{ .op = .load, .dst = d, .src0 = addr });
                         break :blk d;
+                    } else if (as.deref) |ptr_e| {
+                        const addr = try lowerExpr(ctx, ptr_e);
+                        const d = try ctx.fresh();
+                        try ctx.emit(.{ .op = .load, .dst = d, .src0 = addr });
+                        break :blk d;
                     } else if (ctx.slots.get(as.name)) |slot| {
                         break :blk slot;
                     } else if (ctx.global_map.get(as.name)) |gi| {
@@ -2140,6 +2148,9 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
                 } else {
                     try ctx.emit(.{ .op = .store, .src0 = addr, .src1 = v });
                 }
+            } else if (as.deref) |ptr_e| {
+                const addr = try lowerExpr(ctx, ptr_e);
+                try ctx.emit(.{ .op = .store, .src0 = addr, .src1 = v });
             } else if (ctx.slots.get(as.name)) |slot| {
                 try ctx.emit(.{ .op = .copy, .dst = slot, .src0 = v });
             } else if (ctx.global_map.get(as.name)) |gi| {
@@ -2370,11 +2381,8 @@ fn inferMetaFromExpr(ctx: *Ctx, e: *ast.Expr) ?SlotMeta {
                 elem.* = .{ .name = "byte" };
                 base_tn = ensureSliceStruct(ctx.a, ctx.structs, elem) catch return null;
             }
-            const sd = ctx.structs.get(base_tn) orelse return null;
-            for (sd.fields) |fld| {
-                if (std.mem.eql(u8, fld.name, f.name)) {
-                    return metaForTypeExpr(ctx.a, fld.ty, ctx.structs, ctx.ifaces) catch null;
-                }
+            if (findFieldInStruct(ctx, base_tn, f.name)) |hit| {
+                return metaForTypeExpr(ctx.a, hit.ty, ctx.structs, ctx.ifaces) catch null;
             }
             return null;
         },
@@ -2901,30 +2909,90 @@ fn fieldStructName(ctx: *Ctx, base_expr: *ast.Expr) LowerError![]const u8 {
     return tn;
 }
 
+fn typeExprStructLeaf(ctx: *Ctx, te: *ast.TypeExpr) ?[]const u8 {
+    return switch (te.*) {
+        .name => |n| typeNameLeaf(resolveTypeSubst(ctx, n)),
+        .named_app => |na| blk: {
+            const mangled = mangleNamedApp(ctx.a, na.name, na.args) catch break :blk null;
+            break :blk mangled;
+        },
+        else => null,
+    };
+}
+
+const FieldHit = struct {
+    offset: i64,
+    ty: *ast.TypeExpr,
+};
+
+/// Direct field or promoted through `is_embedded` fields (Structs.md).
+const PromotedMethod = struct {
+    mi: MethodInfo,
+    embed_off: i64,
+};
+
+fn findPromotedMethod(ctx: *Ctx, tn: []const u8, method: []const u8) ?PromotedMethod {
+    const sd = ctx.structs.get(tn) orelse return null;
+    var found: ?PromotedMethod = null;
+    var off: i64 = 0;
+    for (sd.fields) |f| {
+        const fsz = fieldSlotSizeOf(ctx, f.ty);
+        defer off += fsz;
+        if (!f.is_embedded) continue;
+        const etn = typeExprStructLeaf(ctx, f.ty) orelse continue;
+        const key = std.fmt.allocPrint(ctx.a, "{s}.{s}", .{ typeNameLeaf(etn), method }) catch continue;
+        if (ctx.methods.get(key)) |mi| {
+            const hit: PromotedMethod = .{ .mi = mi, .embed_off = off };
+            if (found != null) return null;
+            found = hit;
+            continue;
+        }
+        if (findPromotedMethod(ctx, etn, method)) |inner| {
+            const hit: PromotedMethod = .{ .mi = inner.mi, .embed_off = off + inner.embed_off };
+            if (found != null) return null;
+            found = hit;
+        }
+    }
+    return found;
+}
+
+fn findFieldInStruct(ctx: *Ctx, tn: []const u8, field: []const u8) ?FieldHit {
+    const sd = ctx.structs.get(tn) orelse return null;
+    var off: i64 = 0;
+    for (sd.fields) |f| {
+        if (std.mem.eql(u8, f.name, field)) return .{ .offset = off, .ty = f.ty };
+        off += fieldSlotSizeOf(ctx, f.ty);
+    }
+    // Promotion: one level of embedding at a time; shallowest wins; ambiguous → null.
+    var found: ?FieldHit = null;
+    off = 0;
+    for (sd.fields) |f| {
+        const fsz = fieldSlotSizeOf(ctx, f.ty);
+        defer off += fsz;
+        if (!f.is_embedded) continue;
+        const etn = typeExprStructLeaf(ctx, f.ty) orelse continue;
+        if (findFieldInStruct(ctx, etn, field)) |inner| {
+            const hit: FieldHit = .{ .offset = off + inner.offset, .ty = inner.ty };
+            if (found != null) return null; // ambiguous at this depth
+            found = hit;
+        }
+    }
+    return found;
+}
+
 fn fieldOffset(ctx: *Ctx, base_expr: *ast.Expr, field: []const u8) LowerError!i64 {
     const tn = fieldStructName(ctx, base_expr) catch {
         std.debug.print("lower UnknownName fieldOffset type for field {s}\n", .{field});
         return error.UnknownName;
     };
-    const sd = ctx.structs.get(tn) orelse {
-        std.debug.print("lower UnknownName struct {s} field {s}\n", .{ tn, field });
-        return error.UnknownName;
-    };
-    var off: i64 = 0;
-    for (sd.fields) |f| {
-        if (std.mem.eql(u8, f.name, field)) return off;
-        off += fieldSlotSizeOf(ctx, f.ty);
-    }
+    if (findFieldInStruct(ctx, tn, field)) |hit| return hit.offset;
     std.debug.print("lower UnknownName missing field {s}.{s}\n", .{ tn, field });
     return error.UnknownName;
 }
 
 fn fieldSizeBytes(ctx: *Ctx, base_expr: *ast.Expr, field: []const u8) LowerError!i64 {
     const tn = try fieldStructName(ctx, base_expr);
-    const sd = ctx.structs.get(tn) orelse return error.UnknownName;
-    for (sd.fields) |f| {
-        if (std.mem.eql(u8, f.name, field)) return fieldSlotSizeOf(ctx, f.ty);
-    }
+    if (findFieldInStruct(ctx, tn, field)) |hit| return fieldSlotSizeOf(ctx, hit.ty);
     return error.UnknownName;
 }
 
@@ -4377,14 +4445,18 @@ fn lowerMethodOrIfaceCall(
     // `__Slice_byte` is the layout name for `str`/`bytes`; methods attach to `str`.
     const recv = if (std.mem.eql(u8, concrete, "__Slice_byte")) "str" else concrete;
     const recv_leaf = typeNameLeaf(recv);
-    const key = try std.fmt.allocPrint(ctx.a, "{s}.{s}", .{ recv_leaf, method });
-    const mi = ctx.methods.get(key) orelse blk: {
+    const resolved: PromotedMethod = blk: {
+        const key = try std.fmt.allocPrint(ctx.a, "{s}.{s}", .{ recv_leaf, method });
+        if (ctx.methods.get(key)) |mi| break :blk .{ .mi = mi, .embed_off = 0 };
         if (std.mem.eql(u8, recv_leaf, "str")) {
             const alt = try std.fmt.allocPrint(ctx.a, "bytes.{s}", .{method});
-            break :blk ctx.methods.get(alt) orelse return error.UnknownName;
+            if (ctx.methods.get(alt)) |mi| break :blk .{ .mi = mi, .embed_off = 0 };
         }
+        // Promoted methods through embedded structs (Structs.md).
+        if (findPromotedMethod(ctx, recv_leaf, method)) |pm| break :blk pm;
         return error.UnknownName;
     };
+    const mi = resolved.mi;
     const cid = ctx.callee_map.get(mi.mangled) orelse return error.UnknownName;
 
     var arg_slots: [16]u32 = .{none} ** 16;
@@ -4398,10 +4470,17 @@ fn lowerMethodOrIfaceCall(
     }
     // `*T` methods need the address of the receiver storage. Field loads of wide
     // structs (`h.fields`) return a ret_alloc copy — mutating that leaves `h` unchanged.
-    const self_slot = if (mi.pointer_recv)
+    var self_slot = if (mi.pointer_recv)
         try lowerPointerReceiver(ctx, base_expr, base_slot)
     else
         base_slot;
+    if (resolved.embed_off != 0) {
+        const adj = try ctx.fresh();
+        const off_s = try ctx.fresh();
+        try ctx.emit(.{ .op = .iconst, .dst = off_s, .aux = resolved.embed_off });
+        try ctx.emit(.{ .op = .add, .dst = adj, .src0 = self_slot, .src1 = off_s });
+        self_slot = adj;
+    }
     arg_slots[arity] = self_slot;
     arity += 1;
     if (mi.pack_index) |pi| {
