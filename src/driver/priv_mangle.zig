@@ -159,11 +159,19 @@ fn rewriteExpr(e: *ast.Expr, renames: *const std.StringHashMapUnmanaged([]const 
         .struct_lit => |*sl| {
             for (sl.fields) |*f| rewriteExpr(f.value, renames);
         },
+        .enum_lit => |*el| {
+            for (el.fields) |*f| rewriteExpr(f.value, renames);
+        },
         .panic_call => |*p| rewriteExpr(p.message, renames),
         .when_expr => |*w| {
             rewriteExpr(w.scrutinee, renames);
             for (w.arms) |*arm| rewriteExpr(arm.body, renames);
             if (w.else_body) |eb| rewriteExpr(eb, renames);
+        },
+        .if_expr => |*ifs| {
+            rewriteExpr(ifs.cond, renames);
+            rewriteBlock(ifs.then_block, renames);
+            if (ifs.else_block) |eb| rewriteBlock(eb, renames);
         },
         .tuple => |elems| {
             for (elems) |el| rewriteExpr(el, renames);

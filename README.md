@@ -69,6 +69,9 @@ zig build
 ./zig-out/bin/jog check std/c
 ./zig-out/bin/jog build examples/std_math_smoke.jog -o out/std_math_smoke && ./out/std_math_smoke
 ./zig-out/bin/jog build examples/object_flags.jog -o out/object_flags && ./out/object_flags
+./zig-out/bin/jog build examples/if_expr.jog -o out/if_expr && ./out/if_expr
+./zig-out/bin/jog build examples/defer_break_cont.jog -o out/defer_break_cont && ./out/defer_break_cont
+./zig-out/bin/jog build examples/defer_enum.jog -o out/defer_enum && ./out/defer_enum
 
 # Emscripten (JOG-90) — source emsdk first
 source ~/emsdk/emsdk_env.sh

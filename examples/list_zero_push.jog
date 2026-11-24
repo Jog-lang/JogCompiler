@@ -1,0 +1,36 @@
+// Zero-value `var xs: List<T>` then push-loop (heapDemo style) must not SEGV.
+
+import std.list
+import std.mem
+
+fn squares(n: i64): list.List<i64> with (a: mem.Allocator) {
+    var xs: list.List<i64>
+    for i in 0..n {
+        xs.push(i * i)
+    }
+    return xs
+}
+
+fn main() {
+    var total: i64 = 0
+    with (mem.heap()) {
+        var xs = squares(4)
+        for i in 0 as usize..xs.len {
+            total += xs.get(i)
+        }
+        xs.free()
+    }
+    // 0+1+4+9
+    if (total != 14) {
+        panic("list sum fail\n")
+    }
+    with (mem.heap()) {
+        var ys: list.List<i64>
+        ys.push(7)
+        if (ys.len != 1 || ys.get(0) != 7) {
+            panic("zero push fail\n")
+        }
+        ys.free()
+    }
+    print("list zero push ok\n")
+}

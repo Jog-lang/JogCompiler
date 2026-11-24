@@ -1,0 +1,21 @@
+// Distinct float types keep f64 bits under `as` and arithmetic (toF).
+
+type Celsius: f64
+
+fn toF(c: Celsius): f64 = c as f64 * 1.8 + 32.0
+
+fn main() {
+    val c = 100.0 as Celsius
+    if ((c as f64) != 100.0) {
+        panic("celsius cast fail\n")
+    }
+    val f = toF(c)
+    if (f != 212.0) {
+        panic("toF fail\n")
+    }
+    val z = 0.0 as Celsius
+    if (toF(z) != 32.0) {
+        panic("toF zero fail\n")
+    }
+    print("tof distinct ok\n")
+}

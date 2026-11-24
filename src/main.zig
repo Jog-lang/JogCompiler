@@ -463,6 +463,7 @@ pub fn main() !void {
 
 test {
     _ = @import("lex/lex.zig");
+    _ = @import("parse/parse.zig");
     _ = @import("check/check.zig");
     _ = @import("codegen/asm.zig");
     _ = @import("mod/mod.zig");

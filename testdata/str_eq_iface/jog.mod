@@ -1,0 +1,1 @@
+module str_eq_iface

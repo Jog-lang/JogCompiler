@@ -264,6 +264,64 @@ fn bool.op==(o: bool): bool = @eq(self, o)
 fn bool.op!=(o: bool): bool = @ne(self, o)
 fn bool.op!(): bool = @not(self)
 
+// Content equality for slice headers (`str` / `bytes`). Pointer identity is not
+// enough: each string literal builds its own `{ptr,len}` header.
+fn str.op==(o: str): bool {
+    if self.len != o.len {
+        return false
+    }
+    var i: usize = 0
+    while i < self.len {
+        if self.ptr[i] != o.ptr[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn str.op!=(o: str): bool {
+    if self.len != o.len {
+        return true
+    }
+    var i: usize = 0
+    while i < self.len {
+        if self.ptr[i] != o.ptr[i] {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn bytes.op==(o: bytes): bool {
+    if self.len != o.len {
+        return false
+    }
+    var i: usize = 0
+    while i < self.len {
+        if self.ptr[i] != o.ptr[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn bytes.op!=(o: bytes): bool {
+    if self.len != o.len {
+        return true
+    }
+    var i: usize = 0
+    while i < self.len {
+        if self.ptr[i] != o.ptr[i] {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
 struct void {}
 
 enum Option<T> {

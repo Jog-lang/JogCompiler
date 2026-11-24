@@ -1,0 +1,22 @@
+// `import … as alias` binds types and package vals under the alias
+// (flattened merge; Syntax.md).
+
+import std.c as libc
+import std.error as errors
+
+fn main() {
+    val e = errors.ErrNotFound
+    if e == null {
+        panic("null\n")
+    }
+    val n = libc.strlen(c"hi")
+    if n != 2 {
+        panic("strlen\n")
+    }
+    var x: libc.int = 0
+    x = 7
+    if x != 7 {
+        panic("c.int\n")
+    }
+    print("import alias ok\n")
+}
