@@ -1,0 +1,40 @@
+// Open-slice `a[..]` must yield correct runtime data under `xs[i]` (not only `.ptr`).
+
+fn sumSlice(xs: []i64): i64 {
+    var total: i64 = 0
+    for i in 0 as usize..xs.len {
+        total += xs[i]
+    }
+    return total
+}
+
+fn at(xs: []i64, i: usize): i64 = xs[i]
+
+fn main() {
+    var a: [4]i64
+    a[0] = 10
+    a[1] = 20
+    a[2] = 30
+    a[3] = 40
+    val whole = a[..]
+    if (whole.len != 4) {
+        panic("len fail\n")
+    }
+    if (whole[0] != 10 || whole[1] != 20 || whole[3] != 40) {
+        panic("index fail\n")
+    }
+    if (sumSlice(whole) != 100) {
+        panic("sum fail\n")
+    }
+    if (sumSlice(a[..]) != 100) {
+        panic("direct sum fail\n")
+    }
+    val mid = a[1..3]
+    if (mid.len != 2 || mid[0] != 20 || mid[1] != 30) {
+        panic("mid fail\n")
+    }
+    if (at(a[2..], 0) != 30 || at(a[2..], 1) != 40) {
+        panic("at fail\n")
+    }
+    print("slice index runtime ok\n")
+}

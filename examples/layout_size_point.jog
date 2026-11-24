@@ -1,0 +1,32 @@
+// size(Point) must be 16 (two i64 fields), not 8 from the P… mangling heuristic.
+
+struct Point {
+    x: i64
+    y: i64
+}
+
+struct Player {
+    x: i64
+    y: i64
+}
+
+struct Apex {
+    x: i64
+    y: i64
+}
+
+fn main() {
+    if (size(Point) != 16) {
+        panic("size(Point) fail\n")
+    }
+    if (size(Player) != 16) {
+        panic("size(Player) fail\n")
+    }
+    if (size(Apex) != 16) {
+        panic("size(Apex) fail\n")
+    }
+    if (align(Point) != 8) {
+        panic("align(Point) fail\n")
+    }
+    print("layout size point ok\n")
+}
