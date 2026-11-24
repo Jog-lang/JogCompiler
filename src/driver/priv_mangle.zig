@@ -165,6 +165,11 @@ fn rewriteExpr(e: *ast.Expr, renames: *const std.StringHashMapUnmanaged([]const 
             for (w.arms) |*arm| rewriteExpr(arm.body, renames);
             if (w.else_body) |eb| rewriteExpr(eb, renames);
         },
+        .if_expr => |*ifs| {
+            rewriteExpr(ifs.cond, renames);
+            rewriteBlock(ifs.then_block, renames);
+            if (ifs.else_block) |eb| rewriteBlock(eb, renames);
+        },
         .tuple => |elems| {
             for (elems) |el| rewriteExpr(el, renames);
         },
