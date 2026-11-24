@@ -1,0 +1,18 @@
+// Top-level `val ErrX = &global` (std.error sentinel pattern).
+
+struct Marker {
+    tag: u8
+}
+
+var marker: Marker
+val ErrX = &marker
+
+fn main() {
+    if ErrX == null {
+        panic("null sentinel\n")
+    }
+    if ErrX != &marker {
+        panic("identity\n")
+    }
+    print("err sentinel ok\n")
+}
