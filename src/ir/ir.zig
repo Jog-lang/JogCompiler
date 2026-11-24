@@ -1170,6 +1170,11 @@ fn walkExprInstantiate(ic: *InstCtx, e: *ast.Expr) anyerror!void {
             for (w.arms) |arm| try walkExprInstantiate(ic, arm.body);
             if (w.else_body) |eb| try walkExprInstantiate(ic, eb);
         },
+        .if_expr => |ifs| {
+            try walkExprInstantiate(ic, ifs.cond);
+            for (ifs.then_block.stmts) |s| try walkStmtInstantiate(ic, s);
+            if (ifs.else_block) |eb| for (eb.stmts) |s| try walkStmtInstantiate(ic, s);
+        },
         .optional_call => |oc| {
             try walkExprInstantiate(ic, oc.base);
             for (oc.args) |arg| try walkExprInstantiate(ic, arg);
@@ -1384,6 +1389,8 @@ const Ctx = struct {
     /// Indices of `jmp` insts from `continue`; patched to loop head.
     continue_jmps: *std.ArrayListUnmanaged(usize),
     defer_stack: *std.ArrayListUnmanaged(std.ArrayListUnmanaged(DeferItem)),
+    /// `defer_stack.items.len` before each loop body — break/continue unwind down to this.
+    loop_defer_depths: *std.ArrayListUnmanaged(usize),
     /// When set, `return` values are coerced to this interface fat pointer.
     ret_iface: ?[]const u8 = null,
     /// Generic method/fn type-param → concrete name (`T` → `i64`). Empty for non-generic.
@@ -1474,6 +1481,7 @@ fn lowerFn(
     var break_jmps: std.ArrayListUnmanaged(usize) = .{};
     var continue_jmps: std.ArrayListUnmanaged(usize) = .{};
     var defer_stack: std.ArrayListUnmanaged(std.ArrayListUnmanaged(DeferItem)) = .{};
+    var loop_defer_depths: std.ArrayListUnmanaged(usize) = .{};
     var empty_subst: std.StringHashMapUnmanaged([]const u8) = .{};
     const subst_ptr: *const std.StringHashMapUnmanaged([]const u8) = fl.type_subst orelse &empty_subst;
     // Resolve type-param names in param meta (T → i64) and fix pack elem sizes.
@@ -1511,6 +1519,7 @@ fn lowerFn(
         .break_jmps = &break_jmps,
         .continue_jmps = &continue_jmps,
         .defer_stack = &defer_stack,
+        .loop_defer_depths = &loop_defer_depths,
         .ret_iface = fl.ret_iface,
         .type_subst = subst_ptr,
     };
@@ -1884,6 +1893,27 @@ fn lowerBlock(ctx: *Ctx, block: *ast.Block) LowerError!void {
     _ = ctx.defer_stack.pop();
 }
 
+/// Lower a block whose value is the last expression statement; copy into `result`.
+fn lowerBlockAsValue(ctx: *Ctx, block: *ast.Block, result: u32) LowerError!void {
+    try ctx.defer_stack.append(ctx.a, .{});
+    if (block.stmts.len == 0) {
+        try ctx.emit(.{ .op = .iconst, .dst = result, .aux = 0 });
+    } else {
+        const last_i = block.stmts.len - 1;
+        for (block.stmts[0..last_i]) |stmt| try lowerStmt(ctx, stmt);
+        const last = block.stmts[last_i];
+        if (last == .expr) {
+            const v = try lowerExpr(ctx, last.expr);
+            try ctx.emit(.{ .op = .copy, .dst = result, .src0 = v });
+        } else {
+            try lowerStmt(ctx, last);
+            try ctx.emit(.{ .op = .iconst, .dst = result, .aux = 0 });
+        }
+    }
+    try emitCurrentDefers(ctx);
+    _ = ctx.defer_stack.pop();
+}
+
 fn emitDeferItem(ctx: *Ctx, item: DeferItem) LowerError!void {
     if (item.kind == .expr) {
         if (item.expr) |ex| _ = try lowerExpr(ctx, ex);
@@ -1895,19 +1925,24 @@ fn emitDeferItem(ctx: *Ctx, item: DeferItem) LowerError!void {
 fn emitCurrentDefers(ctx: *Ctx) LowerError!void {
     if (ctx.defer_stack.items.len == 0) return;
     const frame = &ctx.defer_stack.items[ctx.defer_stack.items.len - 1];
-    var i: usize = frame.items.len;
+    // Snapshot: emitDeferItem → lowerBlock may reallocate defer_stack.
+    const snapshot = try ctx.a.dupe(DeferItem, frame.items);
+    defer ctx.a.free(snapshot);
+    var i: usize = snapshot.len;
     while (i > 0) {
         i -= 1;
         // Scope-exit defers: skip errdefer (those only run on error return).
-        if (!frame.items[i].on_error_only) try emitDeferItem(ctx, frame.items[i]);
+        if (!snapshot[i].on_error_only) try emitDeferItem(ctx, snapshot[i]);
     }
     // Keep errdefer items for return paths; clear normal ones.
     var kept: std.ArrayListUnmanaged(DeferItem) = .{};
-    for (frame.items) |it| {
+    for (snapshot) |it| {
         if (it.on_error_only) try kept.append(ctx.a, it);
     }
-    frame.clearRetainingCapacity();
-    try frame.appendSlice(ctx.a, kept.items);
+    // Re-fetch frame after possible realloc.
+    const frame2 = &ctx.defer_stack.items[ctx.defer_stack.items.len - 1];
+    frame2.clearRetainingCapacity();
+    try frame2.appendSlice(ctx.a, kept.items);
 }
 
 fn emitAllDefers(ctx: *Ctx) LowerError!void {
@@ -1915,18 +1950,23 @@ fn emitAllDefers(ctx: *Ctx) LowerError!void {
 }
 
 fn emitAllDefersFiltered(ctx: *Ctx, error_path: bool) LowerError!void {
+    try emitDefersDownTo(ctx, 0, error_path);
+}
+
+/// Emit deferred work for frames with index >= `keep_frames` (LIFO), without clearing.
+/// Used by return / break / continue. Nested `lowerBlock` may grow `defer_stack`, so each
+/// frame's items are snapshotted first.
+fn emitDefersDownTo(ctx: *Ctx, keep_frames: usize, error_path: bool) LowerError!void {
     var fi: usize = ctx.defer_stack.items.len;
-    while (fi > 0) {
+    while (fi > keep_frames) {
         fi -= 1;
-        const frame = &ctx.defer_stack.items[fi];
-        var i: usize = frame.items.len;
+        const snapshot = try ctx.a.dupe(DeferItem, ctx.defer_stack.items[fi].items);
+        defer ctx.a.free(snapshot);
+        var i: usize = snapshot.len;
         while (i > 0) {
             i -= 1;
-            const it = frame.items[i];
+            const it = snapshot[i];
             if (it.on_error_only and !error_path) continue;
-            if (!it.on_error_only and error_path) {
-                // On error path still run normal defers too (LIFO with errdefer).
-            }
             try emitDeferItem(ctx, it);
         }
     }
@@ -2266,7 +2306,10 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
             const cond = try lowerExpr(ctx, ws.cond);
             const jz_i = ctx.insts.items.len;
             try ctx.emit(.{ .op = .jz, .src0 = cond, .aux = 0 });
+            // Depth before body frame: break/continue run body (+ nested) defers.
+            try ctx.loop_defer_depths.append(ctx.a, ctx.defer_stack.items.len);
             try lowerBlock(ctx, ws.body);
+            _ = ctx.loop_defer_depths.pop();
             try ctx.emit(.{ .op = .jmp, .aux = head });
             const end_pos: i64 = @intCast(ctx.insts.items.len);
             ctx.insts.items[jz_i].aux = end_pos;
@@ -2280,11 +2323,19 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
             }
         },
         .break_stmt => {
+            if (ctx.loop_defer_depths.items.len > 0) {
+                const keep = ctx.loop_defer_depths.items[ctx.loop_defer_depths.items.len - 1];
+                try emitDefersDownTo(ctx, keep, false);
+            }
             const ji = ctx.insts.items.len;
             try ctx.emit(.{ .op = .jmp, .aux = 0 });
             try ctx.break_jmps.append(ctx.a, ji);
         },
         .continue_stmt => {
+            if (ctx.loop_defer_depths.items.len > 0) {
+                const keep = ctx.loop_defer_depths.items[ctx.loop_defer_depths.items.len - 1];
+                try emitDefersDownTo(ctx, keep, false);
+            }
             const ji = ctx.insts.items.len;
             try ctx.emit(.{ .op = .jmp, .aux = 0 });
             try ctx.continue_jmps.append(ctx.a, ji);
@@ -2827,7 +2878,9 @@ fn lowerForIn(ctx: *Ctx, fs: ast.ForInStmt) LowerError!void {
         try ctx.emit(.{ .op = .lt, .dst = cmp, .src0 = iv, .src1 = end });
         const jz_i = ctx.insts.items.len;
         try ctx.emit(.{ .op = .jz, .src0 = cmp, .aux = 0 });
+        try ctx.loop_defer_depths.append(ctx.a, ctx.defer_stack.items.len);
         try lowerBlock(ctx, fs.body);
+        _ = ctx.loop_defer_depths.pop();
         const cont_pos: i64 = @intCast(ctx.insts.items.len);
         const one = try ctx.fresh();
         try ctx.emit(.{ .op = .iconst, .dst = one, .aux = 1 });
@@ -2888,7 +2941,9 @@ fn lowerForIn(ctx: *Ctx, fs: ast.ForInStmt) LowerError!void {
     }
     try ctx.slots.put(ctx.a, fs.name, elem);
     try ctx.meta.put(ctx.a, fs.name, .{ .kind = .scalar, .type_name = "i64" });
+    try ctx.loop_defer_depths.append(ctx.a, ctx.defer_stack.items.len);
     try lowerBlock(ctx, fs.body);
+    _ = ctx.loop_defer_depths.pop();
     const cont_pos: i64 = @intCast(ctx.insts.items.len);
     const one = try ctx.fresh();
     try ctx.emit(.{ .op = .iconst, .dst = one, .aux = 1 });
@@ -3517,6 +3572,25 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
             const d = try ctx.fresh();
             try ctx.emit(.{ .op = .load, .dst = d, .src0 = addr });
             return d;
+        },
+        .if_expr => |ifs| {
+            const cond = try lowerExpr(ctx, ifs.cond);
+            const result = try ctx.fresh();
+            const jz_i = ctx.insts.items.len;
+            try ctx.emit(.{ .op = .jz, .src0 = cond, .aux = 0 });
+            try lowerBlockAsValue(ctx, ifs.then_block, result);
+            const jmp_i = ctx.insts.items.len;
+            try ctx.emit(.{ .op = .jmp, .aux = 0 });
+            const else_pos: i64 = @intCast(ctx.insts.items.len);
+            ctx.insts.items[jz_i].aux = else_pos;
+            if (ifs.else_block) |eb| {
+                try lowerBlockAsValue(ctx, eb, result);
+            } else {
+                try ctx.emit(.{ .op = .iconst, .dst = result, .aux = 0 });
+            }
+            const end_pos: i64 = @intCast(ctx.insts.items.len);
+            ctx.insts.items[jmp_i].aux = end_pos;
+            return result;
         },
         .when_expr => |w| {
             const scrut = try lowerExpr(ctx, w.scrutinee);

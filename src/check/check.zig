@@ -571,14 +571,36 @@ fn checkBlock(
     diags: *std.ArrayListUnmanaged(Diagnostic),
     parent_scope: ?*Scope,
 ) CheckError!void {
+    _ = try checkBlockValue(a, types, fns, structs, methods, block, diags, parent_scope);
+}
+
+/// Typecheck a block; return the type of its last expression statement (block value), or void.
+fn checkBlockValue(
+    a: std.mem.Allocator,
+    types: *std.StringHashMapUnmanaged(*TypeInfo),
+    fns: *std.StringHashMapUnmanaged(*ast.FnDecl),
+    structs: *std.StringHashMapUnmanaged(*ast.StructDecl),
+    methods: *std.StringHashMapUnmanaged(*ast.MethodDecl),
+    block: *ast.Block,
+    diags: *std.ArrayListUnmanaged(Diagnostic),
+    parent_scope: ?*Scope,
+) CheckError!*TypeInfo {
     var scope = Scope{
         .parent = parent_scope,
         .vars = .{},
         .narrowed = .{},
     };
-    for (block.stmts) |stmt| {
+    if (block.stmts.len == 0) return try voidType(a);
+    const last_i = block.stmts.len - 1;
+    for (block.stmts[0..last_i]) |stmt| {
         try checkStmt(a, types, fns, structs, methods, &scope, stmt, diags);
     }
+    const last = block.stmts[last_i];
+    if (last == .expr) {
+        return try checkExpr(a, types, fns, structs, methods, &scope, last.expr, diags);
+    }
+    try checkStmt(a, types, fns, structs, methods, &scope, last, diags);
+    return try voidType(a);
 }
 
 fn checkStmt(
@@ -1064,6 +1086,24 @@ fn checkExpr(
                 if (result == null) result = bt;
             }
             return result orelse try voidType(a);
+        },
+        .if_expr => |ifs| {
+            _ = try checkExpr(a, types, fns, structs, methods, scope, ifs.cond, diags);
+            // Value `if` requires else; branch value is the last expression in each block.
+            var then_scope = Scope{ .parent = scope, .vars = .{}, .narrowed = .{} };
+            if (nullCheckIdent(ifs.cond)) |name| {
+                try then_scope.narrowed.put(a, name, {});
+            }
+            const then_t = try checkBlockValue(a, types, fns, structs, methods, ifs.then_block, diags, &then_scope);
+            if (ifs.else_block) |eb| {
+                const else_t = try checkBlockValue(a, types, fns, structs, methods, eb, diags, scope);
+                if (!canAssign(then_t, else_t) and !canAssign(else_t, then_t)) {
+                    try emitDiag(a, diags, e, 1, 1, "if expression branches have different types");
+                }
+                return then_t;
+            }
+            try emitDiag(a, diags, e, 1, 1, "if expression requires else");
+            return then_t;
         },
         .index => |ix| {
             const base = try checkExpr(a, types, fns, structs, methods, scope, ix.base, diags);

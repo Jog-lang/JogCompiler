@@ -304,6 +304,9 @@ pub const Expr = union(enum) {
     enum_lit: EnumLit,
     panic_call: PanicCall,
     when_expr: WhenExpr,
+    /// `if cond { … } else { … }` used as a value (Grammar ifExpr).
+    /// Branch value is the last expression statement in each block.
+    if_expr: IfStmt,
     /// `(a, b, …)` product value.
     tuple: []*Expr,
     /// `a..b` half-open range (start inclusive, end exclusive).
