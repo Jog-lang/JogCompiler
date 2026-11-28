@@ -188,6 +188,9 @@ pub fn main() !void {
         var path: []const u8 = ".";
         var saw_path = false;
         var all = false;
+        var fuzz_target: ?[]const u8 = null;
+        var fuzz_iters: u32 = 0;
+        var fuzz_seed: u64 = 1;
         var libdirs: std.ArrayListUnmanaged([]const u8) = .{};
         defer libdirs.deinit(allocator);
         var modules: std.ArrayListUnmanaged(driver.ModuleMapping) = .{};
@@ -201,10 +204,45 @@ pub fn main() !void {
         while (args.next()) |a| {
             if (std.mem.eql(u8, a, "--all")) {
                 if (all or saw_path) {
-                    try stderr.writeAll("usage: jog test [package | --all] [--module name=dir ...] [--libdir dir | -L dir ...]\n");
+                    try stderr.writeAll("usage: jog test [package | --all] [--fuzz name] [--fuzz-iters n] [--module name=dir ...] [--libdir dir | -L dir ...]\n");
                     std.process.exit(2);
                 }
                 all = true;
+            } else if (std.mem.eql(u8, a, "--fuzz")) {
+                fuzz_target = args.next() orelse {
+                    try stderr.writeAll("test: --fuzz needs a target name\n");
+                    std.process.exit(2);
+                };
+            } else if (std.mem.startsWith(u8, a, "--fuzz=")) {
+                fuzz_target = a["--fuzz=".len..];
+            } else if (std.mem.eql(u8, a, "--fuzz-iters")) {
+                const v = args.next() orelse {
+                    try stderr.writeAll("test: --fuzz-iters needs a number\n");
+                    std.process.exit(2);
+                };
+                fuzz_iters = std.fmt.parseInt(u32, v, 10) catch {
+                    try stderr.writeAll("test: --fuzz-iters needs a number\n");
+                    std.process.exit(2);
+                };
+            } else if (std.mem.startsWith(u8, a, "--fuzz-iters=")) {
+                fuzz_iters = std.fmt.parseInt(u32, a["--fuzz-iters=".len..], 10) catch {
+                    try stderr.writeAll("test: --fuzz-iters needs a number\n");
+                    std.process.exit(2);
+                };
+            } else if (std.mem.eql(u8, a, "--fuzz-seed")) {
+                const v = args.next() orelse {
+                    try stderr.writeAll("test: --fuzz-seed needs a number\n");
+                    std.process.exit(2);
+                };
+                fuzz_seed = std.fmt.parseInt(u64, v, 10) catch {
+                    try stderr.writeAll("test: --fuzz-seed needs a number\n");
+                    std.process.exit(2);
+                };
+            } else if (std.mem.startsWith(u8, a, "--fuzz-seed=")) {
+                fuzz_seed = std.fmt.parseInt(u64, a["--fuzz-seed=".len..], 10) catch {
+                    try stderr.writeAll("test: --fuzz-seed needs a number\n");
+                    std.process.exit(2);
+                };
             } else if (std.mem.eql(u8, a, "--module")) {
                 const v = args.next() orelse {
                     try stderr.writeAll("test: --module needs name=dir\n");
@@ -238,13 +276,16 @@ pub fn main() !void {
                 path = a;
                 saw_path = true;
             } else {
-                try stderr.writeAll("usage: jog test [package | --all] [--module name=dir ...] [--libdir dir | -L dir ...]\n");
+                try stderr.writeAll("usage: jog test [package | --all] [--fuzz name] [--fuzz-iters n] [--module name=dir ...] [--libdir dir | -L dir ...]\n");
                 std.process.exit(2);
             }
         }
         try driver.cmdTest(allocator, path, .{
             .modules = modules.items,
             .cli_libdirs = libdirs.items,
+            .fuzz_target = fuzz_target,
+            .fuzz_iters = fuzz_iters,
+            .fuzz_seed = fuzz_seed,
         }, stdout);
         return;
     }
@@ -472,4 +513,5 @@ test {
     _ = @import("codegen/asm.zig");
     _ = @import("mod/mod.zig");
     _ = @import("driver/ide.zig");
+    _ = @import("driver/fuzz.zig");
 }

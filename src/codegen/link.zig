@@ -63,6 +63,8 @@ fn buildNative(
     defer allocator.free(rt_race);
     const rt_io = try std.fs.path.join(allocator, &.{ rt, "jogrt_io.c" });
     defer allocator.free(rt_io);
+    const rt_fuzz = try std.fs.path.join(allocator, &.{ rt, "jogrt_fuzz.c" });
+    defer allocator.free(rt_fuzz);
     const rt_start = try std.fs.path.join(allocator, &.{ rt, "linux_x64_start.s" });
     defer allocator.free(rt_start);
 
@@ -73,6 +75,10 @@ fn buildNative(
     // std.io / std.fs need errno + stdin helpers; only with libc (fopen path).
     if (program.needs_libc) {
         try argv.append(allocator, rt_io);
+    }
+    // Coverage-guided fuzz runtime (fopen + printf); only when instrumenting.
+    if (program.fuzz_instrument) {
+        try argv.append(allocator, rt_fuzz);
     }
     if (!program.needs_libc) {
         try argv.appendSlice(allocator, &.{ rt_start, "-nostdlib", "-fno-stack-protector" });

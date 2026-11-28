@@ -133,6 +133,12 @@ pub const Parser = struct {
                 fd.is_test = true;
                 fd.is_private = is_private;
                 return .{ .fn_decl = fd };
+            } else if (std.mem.eql(u8, attr, "fuzz")) {
+                self.skipSeps();
+                var fd = try self.parseFn();
+                fd.is_fuzz = true;
+                fd.is_private = is_private;
+                return .{ .fn_decl = fd };
             } else if (std.mem.eql(u8, attr, "packed")) {
                 self.skipSeps();
                 var sd = try self.parseStruct();
@@ -950,6 +956,17 @@ pub const Parser = struct {
             }
             const ty = try self.allocator.create(ast.TypeExpr);
             ty.* = .{ .tuple = try elems.toOwnedSlice(self.allocator) };
+            return ty;
+        }
+        // Spec sugar: `const bytes` → `[]const byte` (Syntax fuzz / Types).
+        if (self.tok.kind == .ident and std.mem.eql(u8, self.tok.text, "const")) {
+            self.advance();
+            if (self.tok.kind != .ident or !std.mem.eql(u8, self.tok.text, "bytes")) return error.UnexpectedToken;
+            self.advance();
+            const elem = try self.allocator.create(ast.TypeExpr);
+            elem.* = .{ .name = "byte" };
+            const ty = try self.allocator.create(ast.TypeExpr);
+            ty.* = .{ .slice_view = .{ .elem = elem, .is_const = true } };
             return ty;
         }
         if (self.tok.kind != .ident) return error.UnexpectedToken;

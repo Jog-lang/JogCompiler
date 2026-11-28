@@ -15,7 +15,11 @@ pub fn emit(allocator: std.mem.Allocator, program: *const ir.Program, writer: an
             try writer.print(".extern {s}\n", .{c.name});
         }
     }
+    if (program.fuzz_instrument) {
+        try writer.writeAll(".extern jogrt_fuzz_hit\n");
+    }
 
+    var fuzz_edge: u32 = 1;
     for (program.funcs) |f| {
         if (f.exported) {
             try writer.print(".globl {s}\n", .{mangle(f.name)});
@@ -54,9 +58,21 @@ pub fn emit(allocator: std.mem.Allocator, program: *const ir.Program, writer: an
             try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{(pi + 1) * 8});
         }
 
+        // JOG-232: function-entry coverage edge (skip tiny runtime-ish helpers later if needed).
+        if (program.fuzz_instrument) {
+            try writer.print("  mov rdi, {d}\n", .{fuzz_edge});
+            fuzz_edge += 1;
+            try writer.writeAll("  call jogrt_fuzz_hit\n");
+        }
+
         const ninst = f.insts.len;
         for (f.insts, 0..) |inst, ii| {
             try writer.print(".L{s}_{d}:\n", .{ mangle(f.name), ii });
+            if (program.fuzz_instrument and inst.op == .jz) {
+                try writer.print("  mov rdi, {d}\n", .{fuzz_edge});
+                fuzz_edge += 1;
+                try writer.writeAll("  call jogrt_fuzz_hit\n");
+            }
             try emitInst(writer, program, f.name, ninst, inst);
         }
 

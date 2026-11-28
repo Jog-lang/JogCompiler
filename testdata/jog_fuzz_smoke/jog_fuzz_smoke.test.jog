@@ -1,0 +1,16 @@
+import std.testing
+
+@test
+fn sanity() with (t: testing.Testing) {
+    t.expect(sumAscii("A") == 65)
+}
+
+@fuzz
+fn sumNeverNegative(input: const bytes) with (t: testing.Testing) {
+    t.expect(sumAscii(input) >= 0)
+}
+
+@fuzz
+fn pairStructured(n: i32, s: str) with (t: testing.Testing) {
+    t.expect(pairOk(n, s))
+}

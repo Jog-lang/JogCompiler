@@ -1,0 +1,6 @@
+import std.testing
+
+@fuzz
+fn noBoom(input: const bytes) with (t: testing.Testing) {
+    t.expect(badIfBoom(input))
+}
