@@ -27,6 +27,9 @@ pub fn emit(allocator: std.mem.Allocator, program: *const ir.Program, writer: an
             try writer.writeAll("  mov qword ptr [rip + jogrt_argc_val], rdi\n");
             try writer.writeAll("  mov qword ptr [rip + jogrt_argv_base], rsi\n");
             try writer.writeAll("  mov qword ptr [rip + jogrt_envp_base], rdx\n");
+            if (program.race) {
+                try writer.writeAll("  call jogrt_race_enable\n");
+            }
         }
         // prologue
         try writer.writeAll("  push rbp\n");
@@ -243,7 +246,20 @@ fn emitInst(writer: anytype, prog: *const ir.Program, fname: []const u8, ninst: 
         },
         .gload => {
             const gi: usize = @intCast(inst.aux);
-            if (gi < prog.globals.len and prog.globals[gi].thread_local) {
+            const is_tls = gi < prog.globals.len and prog.globals[gi].thread_local;
+            if (prog.race) {
+                if (is_tls) {
+                    try writer.print("  lea rdi, [rip + jog_global_{d}]\n", .{inst.aux});
+                    try writer.print("  mov esi, {d}\n", .{prog.globals[gi].nquads});
+                    try writer.writeAll("  call jogrt_tls_addr\n");
+                    try writer.writeAll("  mov rdi, rax\n");
+                } else {
+                    try writer.print("  lea rdi, [rip + jog_global_{d}]\n", .{inst.aux});
+                }
+                try writer.writeAll("  mov esi, 8\n");
+                try writer.writeAll("  call jogrt_race_read\n");
+            }
+            if (is_tls) {
                 try writer.print("  lea rdi, [rip + jog_global_{d}]\n", .{inst.aux});
                 try writer.print("  mov esi, {d}\n", .{prog.globals[gi].nquads});
                 try writer.writeAll("  call jogrt_tls_addr\n");
@@ -255,7 +271,20 @@ fn emitInst(writer: anytype, prog: *const ir.Program, fname: []const u8, ninst: 
         },
         .gstore => {
             const gi: usize = @intCast(inst.aux);
-            if (gi < prog.globals.len and prog.globals[gi].thread_local) {
+            const is_tls = gi < prog.globals.len and prog.globals[gi].thread_local;
+            if (prog.race) {
+                if (is_tls) {
+                    try writer.print("  lea rdi, [rip + jog_global_{d}]\n", .{inst.aux});
+                    try writer.print("  mov esi, {d}\n", .{prog.globals[gi].nquads});
+                    try writer.writeAll("  call jogrt_tls_addr\n");
+                    try writer.writeAll("  mov rdi, rax\n");
+                } else {
+                    try writer.print("  lea rdi, [rip + jog_global_{d}]\n", .{inst.aux});
+                }
+                try writer.writeAll("  mov esi, 8\n");
+                try writer.writeAll("  call jogrt_race_write\n");
+            }
+            if (is_tls) {
                 try writer.print("  lea rdi, [rip + jog_global_{d}]\n", .{inst.aux});
                 try writer.print("  mov esi, {d}\n", .{prog.globals[gi].nquads});
                 try writer.writeAll("  call jogrt_tls_addr\n");

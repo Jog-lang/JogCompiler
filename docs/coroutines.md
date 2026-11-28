@@ -96,6 +96,24 @@ Runtime: `runtime/jogrt_scope.c` + `runtime/jogrt_chan.c` (BSS pools, freestandi
 - **`@threadLocal` globals** — landed for package `var` (scalar). Backed by a per-worker replica table, not ELF `%fs` TLS (runtime already owns GS; freestanding `clone` workers have no libc TLS init).
 - **Still out:** ELF/`__thread` interop for C libraries that expect true TLS on Jog-created workers; `@blocking` / `@systemStack`; defaulting the primary pool without an explicit `dispatcher_pool` call; wasm M:N / stackful yield.
 
+## Debug race detector (JOG-233, first slice)
+
+`jog build --race` enables a freestanding vector-clock detector (`runtime/jogrt_race.c`):
+
+- Instruments **global** loads/stores (`gload` / `gstore`); calls `jogrt_race_enable` from `main`.
+- Actors are coroutine ids (covers cooperative interleaving and multi-worker).
+- Chan `send` → release, `recv` → acquire (select send/recv cases too).
+- On conflict: panics with `DATA RACE: unsynchronized shared access`.
+- Host selftest: `zig build test` runs `src/race_selftest.zig`.
+- Examples: `race_detect.jog` (expects abort under `--race`), `race_chan_ok.jog` (quiet under `--race`).
+
+### Leftovers
+
+- Heap / pointer `load`/`store` instrumentation (stack captures false-positive without go-launch HB).
+- Happens-before on `go` launch / Task.join / Mutex / atomics (Mutex not in std yet).
+- Source locations in the race report; `--starve-ms` / starvation warning still unwired.
+- Shadow/sync table overflow drops tracking; multi-reader sets are simplified to one slot.
+
 ## Limits (not in this step)
 
 - Trailing-lambda `scope() { }` (spec std form) is not wired — use `scope { }` keyword block. Lambdas landed (JOG-221 / #62); binding `scope` as a callable remains.

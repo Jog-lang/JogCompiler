@@ -21,7 +21,7 @@ jog version
 jog roots
 jog parse <path>
 jog check <path>
-jog build <path> -o <out> [--keep-asm] [--keep-c]
+jog build <path> -o <out> [--keep-asm] [--keep-c] [--race]
               [--target wasm32-emscripten] [--libdir DIR | -L DIR]...
 jog deps [path]
 ```

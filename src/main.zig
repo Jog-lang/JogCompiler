@@ -254,6 +254,7 @@ pub fn main() !void {
         var out_path: ?[]const u8 = null;
         var keep_asm = false;
         var keep_c = false;
+        var race = false;
         var target: link.Target = .native;
         var libdirs: std.ArrayListUnmanaged([]const u8) = .{};
         defer libdirs.deinit(allocator);
@@ -275,6 +276,8 @@ pub fn main() !void {
                 keep_asm = true;
             } else if (std.mem.eql(u8, a, "--keep-c")) {
                 keep_c = true;
+            } else if (std.mem.eql(u8, a, "--race")) {
+                race = true;
             } else if (std.mem.eql(u8, a, "--target")) {
                 const t = args.next() orelse {
                     try stderr.writeAll("build: --target needs wasm32-emscripten\n");
@@ -337,6 +340,7 @@ pub fn main() !void {
         }, out_path orelse default_out, .{
             .keep_asm = keep_asm,
             .keep_c = keep_c,
+            .race = race,
             .target = target,
             .cli_libdirs = libdirs.items,
             .modules = modules.items,
