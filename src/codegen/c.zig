@@ -98,12 +98,38 @@ pub fn emit(allocator: std.mem.Allocator, program: *const ir.Program, writer: an
     }
     if (program.globals.len > 0) try writer.writeAll("\n");
 
-    // Vtables
+    // TypeInfo name strings + records (JOG-229).
+    for (program.type_infos, 0..) |ti, i| {
+        try writer.print("static const unsigned char jog_ti_{d}_name[] = {{", .{i});
+        for (ti.name, 0..) |b, bi| {
+            if (bi > 0) try writer.writeAll(", ");
+            try writer.print("{d}", .{b});
+        }
+        if (ti.name.len == 0) {
+            try writer.writeAll("0");
+        } else {
+            try writer.writeAll(", 0");
+        }
+        try writer.writeAll("};\n");
+    }
+    for (program.type_infos, 0..) |ti, i| {
+        try writer.print(
+            "static const struct {{ int64_t kind; const void *name_ptr; int64_t name_len; int64_t size; }} jog_ti_{d} = {{ {d}, jog_ti_{d}_name, {d}, {d} }};\n",
+            .{ i, @intFromEnum(ti.kind), i, ti.name.len, ti.size },
+        );
+    }
+    if (program.type_infos.len > 0) try writer.writeAll("\n");
+
+    // Vtables — word 0 is type_id (*TypeInfo); methods follow.
     for (program.vtables, 0..) |vt, i| {
         try writer.print("static void *jog_vt_{d}[] = {{", .{i});
-        for (vt.methods, 0..) |m, mi| {
-            if (mi > 0) try writer.writeAll(", ");
-            try writer.writeAll("(void*)");
+        if (vt.type_info_index != ir.none) {
+            try writer.print("(void*)&jog_ti_{d}", .{vt.type_info_index});
+        } else {
+            try writer.writeAll("(void*)0");
+        }
+        for (vt.methods) |m| {
+            try writer.writeAll(", (void*)");
             try writeJogFnName(writer, m);
         }
         try writer.writeAll("};\n");
@@ -340,6 +366,7 @@ fn emitInst(writer: anytype, prog: *const ir.Program, fname: []const u8, ninst: 
             try writer.writeAll("  }\n");
         },
         .vtaddr => try writer.print("  s[{d}] = (int64_t)(intptr_t)(void*)jog_vt_{d};\n", .{ inst.dst, inst.aux }),
+        .tiaddr => try writer.print("  s[{d}] = (int64_t)(intptr_t)(void*)&jog_ti_{d};\n", .{ inst.dst, inst.aux }),
         .ret => {
             if (inst.src0 != ir.none) {
                 if (is_main) {

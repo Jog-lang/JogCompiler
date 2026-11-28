@@ -1551,7 +1551,7 @@ pub const Parser = struct {
             if (self.tok.kind == .lparen) {
                 // `size(T)` / `align(T)` take a type, including `Slot<K,V>` — not a value expr
                 // (`Slot < K` would parse as comparison). Encode the type as call type_args.
-                const size_align = e.* == .ident and (std.mem.eql(u8, e.ident, "size") or std.mem.eql(u8, e.ident, "align"));
+                const size_align = e.* == .ident and (std.mem.eql(u8, e.ident, "size") or std.mem.eql(u8, e.ident, "align") or std.mem.eql(u8, e.ident, "typeInfo"));
                 if (size_align and pending_targs.len == 0) {
                     self.advance();
                     const ty = try self.parseTypeExpr();

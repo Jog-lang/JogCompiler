@@ -1,0 +1,54 @@
+// JOG-229: runtime TypeInfo records + typeInfo/typeName + iface `is` via type_id.
+
+interface struct Counter {
+    fn get(): i64
+}
+
+struct Box {
+    n: i64
+}
+
+struct Other {
+    n: i64
+}
+
+fn *Box.get(): i64 {
+    return self.n
+}
+
+fn *Other.get(): i64 {
+    return self.n
+}
+
+fn main() {
+    val ti = typeInfo(Box)
+    val tj = typeInfo(Box)
+    if (ti != tj) {
+        panic("typeInfo identity fail\n")
+    }
+    val name = typeName(ti)
+    if (!(name == "Box")) {
+        panic("typeName fail\n")
+    }
+    if (typeInfo(Other) == ti) {
+        panic("distinct types share TypeInfo\n")
+    }
+
+    val b = Box(n: 7)
+    val o = Other(n: 3)
+    val c: Counter = b as Counter
+    if (!(c is Box)) {
+        panic("iface is Box fail\n")
+    }
+    if (c is Other) {
+        panic("iface is Other false positive\n")
+    }
+    val d: Counter = o as Counter
+    if (!(d is Other)) {
+        panic("iface is Other fail\n")
+    }
+    if (d.get() != 3) {
+        panic("vtable after type_id fail\n")
+    }
+    print("reflect typeinfo ok\n")
+}

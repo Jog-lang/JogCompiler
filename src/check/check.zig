@@ -945,6 +945,27 @@ fn checkExpr(
                 }
                 return types.get("usize").?;
             }
+            // JOG-229: typeInfo(T) → *byte (TypeInfo address); typeName(ti) → str.
+            if (c.callee.* == .ident and std.mem.eql(u8, c.callee.ident, "typeInfo")) {
+                if (c.type_args.len == 1) {
+                    // Type form.
+                } else if (c.args.len == 1) {
+                    _ = try checkExpr(a, types, fns, structs, methods, scope, c.args[0], diags);
+                } else {
+                    try emitDiag(a, diags, e, 1, 1, "typeInfo takes one type argument");
+                }
+                const ti = try a.create(TypeInfo);
+                ti.* = .{ .kind = .pointer, .name = "ptr", .pointee = types.get("byte") };
+                return ti;
+            }
+            if (c.callee.* == .ident and std.mem.eql(u8, c.callee.ident, "typeName")) {
+                if (c.args.len != 1) {
+                    try emitDiag(a, diags, e, 1, 1, "typeName takes one argument");
+                } else {
+                    _ = try checkExpr(a, types, fns, structs, methods, scope, c.args[0], diags);
+                }
+                return types.get("str").?;
+            }
             if (c.callee.* == .ident and std.mem.eql(u8, c.callee.ident, "alloc")) {
                 for (c.args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
                 const ti = try a.create(TypeInfo);
@@ -1817,4 +1838,24 @@ test "iface_fn assign" {
     var a = TypeInfo{ .kind = .iface_fn, .name = "iface_fn" };
     var b = TypeInfo{ .kind = .iface_fn, .name = "iface_fn" };
     try std.testing.expect(canAssign(&a, &b));
+}
+
+test "typeInfo and typeName builtins" {
+    const parse = @import("../parse/parse.zig");
+    const src =
+        \\struct Box { n: i64 }
+        \\fn main() {
+        \\    val ti = typeInfo(Box)
+        \\    val n = typeName(ti)
+        \\    if (!(n == "Box")) {
+        \\        panic("bad\n")
+        \\    }
+        \\}
+        \\
+    ;
+    var file = try parse.Parser.parseFile(std.testing.allocator, src);
+    defer file.deinit();
+    var cr = try check(std.testing.allocator, &file);
+    defer cr.deinit();
+    try std.testing.expect(cr.ok);
 }

@@ -90,9 +90,34 @@ pub fn emit(allocator: std.mem.Allocator, program: *const ir.Program, writer: an
 
     try writer.writeAll(".section .rodata\n");
     try writer.writeAll(".align 8\n");
+    // TypeInfo name strings first so records can point at them.
+    for (program.type_infos, 0..) |ti, i| {
+        try writer.print("jog_ti_{d}_name:\n", .{i});
+        try writer.writeAll("  .byte ");
+        for (ti.name, 0..) |b, bi| {
+            if (bi > 0) try writer.writeAll(", ");
+            try writer.print("{d}", .{b});
+        }
+        if (ti.name.len == 0) try writer.writeAll("0");
+        try writer.writeAll("\n");
+    }
+    // TypeInfo records: kind, name.ptr, name.len, size (JOG-229).
+    for (program.type_infos, 0..) |ti, i| {
+        try writer.print("jog_ti_{d}:\n", .{i});
+        try writer.print("  .quad {d}\n", .{@intFromEnum(ti.kind)});
+        try writer.print("  .quad jog_ti_{d}_name\n", .{i});
+        try writer.print("  .quad {d}\n", .{ti.name.len});
+        try writer.print("  .quad {d}\n", .{ti.size});
+    }
     for (program.vtables, 0..) |vt, i| {
         _ = vt.symbol;
         try writer.print("jog_vt_{d}:\n", .{i});
+        // Word 0: type_id (*TypeInfo). Methods follow (Interfaces.md).
+        if (vt.type_info_index != ir.none) {
+            try writer.print("  .quad jog_ti_{d}\n", .{vt.type_info_index});
+        } else {
+            try writer.writeAll("  .quad 0\n");
+        }
         for (vt.methods) |m| {
             try writer.print("  .quad {s}\n", .{m});
         }
@@ -490,6 +515,10 @@ fn emitInst(writer: anytype, prog: *const ir.Program, fname: []const u8, ninst: 
         },
         .vtaddr => {
             try writer.print("  lea rax, [rip + jog_vt_{d}]\n", .{inst.aux});
+            try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{slot(inst.dst)});
+        },
+        .tiaddr => {
+            try writer.print("  lea rax, [rip + jog_ti_{d}]\n", .{inst.aux});
             try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{slot(inst.dst)});
         },
         .ret => {

@@ -51,6 +51,8 @@ pub const Op = enum {
     call,
     icall,
     vtaddr,
+    /// Address of runtime TypeInfo record (aux = type_infos index).
+    tiaddr,
     /// Load package-level `var` (aux = global index).
     gload,
     /// Store package-level `var` (aux = global index, src0 = value).
@@ -65,7 +67,23 @@ pub const Op = enum {
 
 pub const VTable = struct {
     symbol: []const u8,
+    /// Index into `Program.type_infos` for the concrete type (`type_id`).
+    type_info_index: u32 = none,
     methods: [][]const u8,
+};
+
+/// Runtime TypeInfo record emitted into rodata (JOG-229 / Modules.md).
+/// Layout (32 bytes): kind:i64, name.ptr:*byte, name.len:i64, size:i64.
+pub const TypeInfoKind = enum(u8) {
+    struct_ty = 1,
+    enum_ty = 2,
+    iface_ty = 3,
+};
+
+pub const TypeInfoRec = struct {
+    name: []const u8,
+    kind: TypeInfoKind,
+    size: i64,
 };
 
 pub const none: u32 = std.math.maxInt(u32);
@@ -136,6 +154,7 @@ pub const Program = struct {
     callees: []Callee,
     funcs: []Func,
     vtables: []VTable,
+    type_infos: []TypeInfoRec,
     globals: []Global,
     needs_libc: bool,
     /// `-l` names from `@link` / jog.mod link.* lines.
@@ -346,6 +365,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
         .callees = &[_]Callee{},
         .funcs = &[_]Func{},
         .vtables = &[_]VTable{},
+        .type_infos = &[_]TypeInfoRec{},
         .globals = &[_]Global{},
         .needs_libc = false,
         .link_libs = &[_][]const u8{},
@@ -366,6 +386,8 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
     var fn_infos: std.StringHashMapUnmanaged(FnInfo) = .{};
     var vtables: std.ArrayListUnmanaged(VTable) = .{};
     var vtable_map: std.StringHashMapUnmanaged(u32) = .{};
+    var type_infos: std.ArrayListUnmanaged(TypeInfoRec) = .{};
+    var type_info_map: std.StringHashMapUnmanaged(u32) = .{};
     var globals: std.ArrayListUnmanaged(Global) = .{};
     var global_map: std.StringHashMapUnmanaged(u32) = .{};
     var object_map: std.StringHashMapUnmanaged(u32) = .{}; // object name → global index
@@ -714,7 +736,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                 .self_type = null,
                 .pointer_recv = false,
                 .ret_iface = retIfaceName(&ifaces, fd.ret),
-            }, &strings, &callees, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &addr_consts, &global_map, globals.items, &object_map, &import_binds, &type_aliases, &pending_gos, &go_seq, &pending_funcs, &lambda_seq);
+            }, &strings, &callees, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &type_infos, &type_info_map, &const_vals, &addr_consts, &global_map, globals.items, &object_map, &import_binds, &type_aliases, &pending_gos, &go_seq, &pending_funcs, &lambda_seq);
             try funcs.append(a, f);
         } else if (d == .method and d.method.body != null and d.method.type_params.len == 0) {
             const md = d.method;
@@ -729,7 +751,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                 .self_type = md.type_name,
                 .pointer_recv = md.pointer_recv,
                 .ret_iface = retIfaceName(&ifaces, md.ret),
-            }, &strings, &callees, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &addr_consts, &global_map, globals.items, &object_map, &import_binds, &type_aliases, &pending_gos, &go_seq, &pending_funcs, &lambda_seq);
+            }, &strings, &callees, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &type_infos, &type_info_map, &const_vals, &addr_consts, &global_map, globals.items, &object_map, &import_binds, &type_aliases, &pending_gos, &go_seq, &pending_funcs, &lambda_seq);
             try funcs.append(a, f);
         }
     }
@@ -745,7 +767,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
             .pointer_recv = false,
             .ret_iface = retIfaceName(&ifaces, fd.ret),
             .type_subst = &sf.type_subst,
-        }, &strings, &callees, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &addr_consts, &global_map, globals.items, &object_map, &import_binds, &type_aliases, &pending_gos, &go_seq, &pending_funcs, &lambda_seq);
+        }, &strings, &callees, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &type_infos, &type_info_map, &const_vals, &addr_consts, &global_map, globals.items, &object_map, &import_binds, &type_aliases, &pending_gos, &go_seq, &pending_funcs, &lambda_seq);
         try funcs.append(a, f);
     }
     for (specialized_methods.items) |*sm| {
@@ -759,7 +781,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
             .pointer_recv = sm.pointer_recv,
             .ret_iface = retIfaceName(&ifaces, sm.ret),
             .type_subst = &sm.type_subst,
-        }, &strings, &callees, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &addr_consts, &global_map, globals.items, &object_map, &import_binds, &type_aliases, &pending_gos, &go_seq, &pending_funcs, &lambda_seq) catch |err| {
+        }, &strings, &callees, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &type_infos, &type_info_map, &const_vals, &addr_consts, &global_map, globals.items, &object_map, &import_binds, &type_aliases, &pending_gos, &go_seq, &pending_funcs, &lambda_seq) catch |err| {
             // Callback / unsupported bodies (each, map, fold, …) — drop so callers error clearly.
             std.debug.print("skip specialized method {s}: {s}\n", .{ sm.mangled, @errorName(err) });
             const key = try std.fmt.allocPrint(a, "{s}.{s}", .{ sm.type_name, sm.method_name });
@@ -779,7 +801,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
             .contexts = &[_]ast.ContextParam{},
             .exported = false,
         });
-        const f = try lowerGoChild(a, pg, &strings, &callees, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &const_vals, &global_map, globals.items, &object_map, &addr_consts, &import_binds, &type_aliases, &pending_gos, &go_seq, &pending_funcs, &lambda_seq);
+        const f = try lowerGoChild(a, pg, &strings, &callees, &callee_map, &structs, &enums, &methods, &ifaces, &fn_infos, &vtables, &vtable_map, &type_infos, &type_info_map, &const_vals, &global_map, globals.items, &object_map, &addr_consts, &import_binds, &type_aliases, &pending_gos, &go_seq, &pending_funcs, &lambda_seq);
         try funcs.append(a, f);
     }
     try funcs.appendSlice(a, pending_funcs.items);
@@ -788,6 +810,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
     program.callees = try callees.toOwnedSlice(a);
     program.funcs = try funcs.toOwnedSlice(a);
     program.vtables = try vtables.toOwnedSlice(a);
+    program.type_infos = try type_infos.toOwnedSlice(a);
     program.globals = try globals.toOwnedSlice(a);
     program.link_libs = try link_libs.toOwnedSlice(a);
     return program;
@@ -1488,6 +1511,8 @@ const Ctx = struct {
     fn_infos: *std.StringHashMapUnmanaged(FnInfo),
     vtables: *std.ArrayListUnmanaged(VTable),
     vtable_map: *std.StringHashMapUnmanaged(u32),
+    type_infos: *std.ArrayListUnmanaged(TypeInfoRec),
+    type_info_map: *std.StringHashMapUnmanaged(u32),
     const_vals: *std.StringHashMapUnmanaged(ConstVal),
     /// `val Name = &global` → emit gaddr of the mapped global index.
     addr_consts: *std.StringHashMapUnmanaged(u32),
@@ -1553,6 +1578,8 @@ fn lowerFn(
     fn_infos: *std.StringHashMapUnmanaged(FnInfo),
     vtables: *std.ArrayListUnmanaged(VTable),
     vtable_map: *std.StringHashMapUnmanaged(u32),
+    type_infos: *std.ArrayListUnmanaged(TypeInfoRec),
+    type_info_map: *std.StringHashMapUnmanaged(u32),
     const_vals: *std.StringHashMapUnmanaged(ConstVal),
     addr_consts: *std.StringHashMapUnmanaged(u32),
     global_map: *std.StringHashMapUnmanaged(u32),
@@ -1650,6 +1677,8 @@ fn lowerFn(
         .fn_infos = fn_infos,
         .vtables = vtables,
         .vtable_map = vtable_map,
+        .type_infos = type_infos,
+        .type_info_map = type_info_map,
         .const_vals = const_vals,
         .addr_consts = addr_consts,
         .global_map = global_map,
@@ -1705,6 +1734,8 @@ fn lowerGoChild(
     fn_infos: *std.StringHashMapUnmanaged(FnInfo),
     vtables: *std.ArrayListUnmanaged(VTable),
     vtable_map: *std.StringHashMapUnmanaged(u32),
+    type_infos: *std.ArrayListUnmanaged(TypeInfoRec),
+    type_info_map: *std.StringHashMapUnmanaged(u32),
     const_vals: *std.StringHashMapUnmanaged(ConstVal),
     global_map: *std.StringHashMapUnmanaged(u32),
     globals: []const Global,
@@ -1737,7 +1768,7 @@ fn lowerGoChild(
         .self_type = null,
         .pointer_recv = false,
         .go_captures = &capture_map,
-    }, strings, callees, callee_map, structs, enums, methods, ifaces, fn_infos, vtables, vtable_map, const_vals, addr_consts, global_map, globals, object_map, import_binds, type_aliases, pending_gos, go_seq, pending_funcs, lambda_seq);
+    }, strings, callees, callee_map, structs, enums, methods, ifaces, fn_infos, vtables, vtable_map, type_infos, type_info_map, const_vals, addr_consts, global_map, globals, object_map, import_binds, type_aliases, pending_gos, go_seq, pending_funcs, lambda_seq);
 }
 
 fn loadCapturePtr(ctx: *Ctx, name: []const u8) LowerError!?u32 {
@@ -2993,6 +3024,10 @@ fn inferMetaFromExpr(ctx: *Ctx, e: *ast.Expr) ?SlotMeta {
             }
             if (c.callee.* == .ident and std.mem.eql(u8, c.callee.ident, "alloc"))
                 return .{ .kind = .raw_ptr, .type_name = "byte" };
+            if (c.callee.* == .ident and std.mem.eql(u8, c.callee.ident, "typeInfo"))
+                return .{ .kind = .raw_ptr, .type_name = "byte", .elem_size = 1 };
+            if (c.callee.* == .ident and std.mem.eql(u8, c.callee.ident, "typeName"))
+                return .{ .kind = .struct_ptr, .type_name = "str" };
             if (c.callee.* == .ident and (std.mem.eql(u8, c.callee.ident, "dispatcher_pool") or
                 std.mem.eql(u8, c.callee.ident, "dispatcher_single") or
                 std.mem.eql(u8, c.callee.ident, "dispatcher_new") or
@@ -4276,6 +4311,26 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
                     }
                 }
             }
+            // Interface value: compare vtable type_id with TypeInfo for T (Interfaces.md).
+            if (inferMetaFromExpr(ctx, it.expr)) |m| {
+                if (m.kind == .iface_ptr) {
+                    const fat = try lowerExpr(ctx, it.expr);
+                    const eight = try ctx.fresh();
+                    try ctx.emit(.{ .op = .iconst, .dst = eight, .aux = 8 });
+                    const vt_slot = try ctx.fresh();
+                    try ctx.emit(.{ .op = .add, .dst = vt_slot, .src0 = fat, .src1 = eight });
+                    const vt = try ctx.fresh();
+                    try ctx.emit(.{ .op = .load, .dst = vt, .src0 = vt_slot });
+                    const got_id = try ctx.fresh();
+                    try ctx.emit(.{ .op = .load, .dst = got_id, .src0 = vt });
+                    const ti = try ensureTypeInfo(ctx, want);
+                    const want_id = try ctx.fresh();
+                    try ctx.emit(.{ .op = .tiaddr, .dst = want_id, .aux = ti });
+                    const d = try ctx.fresh();
+                    try ctx.emit(.{ .op = .eq, .dst = d, .src0 = got_id, .src1 = want_id });
+                    return d;
+                }
+            }
             // Structural: true if meta type_name matches T name.
             _ = try lowerExpr(ctx, it.expr);
             const got = inferTypeNameFromExpr(ctx, it.expr) orelse "";
@@ -5437,6 +5492,45 @@ fn lowerCall(ctx: *Ctx, c: ast.Call) LowerError!u32 {
             try ctx.emit(.{ .op = .iconst, .dst = d, .aux = n });
             return d;
         }
+        // JOG-229: `typeInfo(T)` → *TypeInfo (rodata); `typeName(ti)` → str from record.
+        if (std.mem.eql(u8, name, "typeInfo")) {
+            const tname = blk: {
+                if (c.type_args.len == 1) break :blk try resolveTypeExprName(ctx, c.type_args[0]);
+                if (c.args.len == 1 and c.args[0].* == .ident) break :blk resolveTypeSubst(ctx, c.args[0].ident);
+                return error.TypeError;
+            };
+            const ti = try ensureTypeInfo(ctx, tname);
+            const d = try ctx.fresh();
+            try ctx.emit(.{ .op = .tiaddr, .dst = d, .aux = ti });
+            return d;
+        }
+        if (std.mem.eql(u8, name, "typeName")) {
+            if (c.args.len != 1) return error.TypeError;
+            const ti_ptr = try lowerExpr(ctx, c.args[0]);
+            // Layout: kind@0, name.ptr@8, name.len@16, size@24
+            const eight = try ctx.fresh();
+            try ctx.emit(.{ .op = .iconst, .dst = eight, .aux = 8 });
+            const name_ptr_addr = try ctx.fresh();
+            try ctx.emit(.{ .op = .add, .dst = name_ptr_addr, .src0 = ti_ptr, .src1 = eight });
+            const name_ptr = try ctx.fresh();
+            try ctx.emit(.{ .op = .load, .dst = name_ptr, .src0 = name_ptr_addr });
+            const sixteen = try ctx.fresh();
+            try ctx.emit(.{ .op = .iconst, .dst = sixteen, .aux = 16 });
+            const name_len_addr = try ctx.fresh();
+            try ctx.emit(.{ .op = .add, .dst = name_len_addr, .src0 = ti_ptr, .src1 = sixteen });
+            const name_len = try ctx.fresh();
+            try ctx.emit(.{ .op = .load, .dst = name_len, .src0 = name_len_addr });
+            const hdr = try lowerEmptyStructValue(ctx, blk: {
+                const elem = try ctx.a.create(ast.TypeExpr);
+                elem.* = .{ .name = "byte" };
+                break :blk try ensureSliceStruct(ctx.a, ctx.structs, elem);
+            });
+            try ctx.emit(.{ .op = .store, .src0 = hdr, .src1 = name_ptr });
+            const len_addr = try ctx.fresh();
+            try ctx.emit(.{ .op = .add, .dst = len_addr, .src0 = hdr, .src1 = eight });
+            try ctx.emit(.{ .op = .store, .src0 = len_addr, .src1 = name_len });
+            return hdr;
+        }
         if (std.mem.eql(u8, name, "print")) {
             if (c.args.len != 1) return error.TooManyArgs;
             const ptr, const len = try lowerPrintArgs(ctx, c.args[0]);
@@ -6203,6 +6297,8 @@ fn lowerLambdaFn(
         .fn_infos = parent_ctx.fn_infos,
         .vtables = parent_ctx.vtables,
         .vtable_map = parent_ctx.vtable_map,
+        .type_infos = parent_ctx.type_infos,
+        .type_info_map = parent_ctx.type_info_map,
         .const_vals = parent_ctx.const_vals,
         .addr_consts = parent_ctx.addr_consts,
         .global_map = parent_ctx.global_map,
@@ -6467,6 +6563,27 @@ fn maybeCoerceArg(ctx: *Ctx, slot: u32, arg: *ast.Expr, want_ty: ?*ast.TypeExpr)
     return try coerceToIface(ctx, slot, concrete, want_meta.type_name);
 }
 
+
+fn ensureTypeInfo(ctx: *Ctx, type_name: []const u8) LowerError!u32 {
+    const leaf = typeNameLeaf(resolveTypeSubst(ctx, type_name));
+    if (ctx.type_info_map.get(leaf)) |i| return i;
+    const kind: TypeInfoKind = blk: {
+        if (ctx.structs.contains(leaf)) break :blk .struct_ty;
+        if (ctx.enums.contains(leaf)) break :blk .enum_ty;
+        if (ctx.ifaces.contains(leaf)) break :blk .iface_ty;
+        break :blk .struct_ty;
+    };
+    const sz = layoutSizeOf(ctx, leaf);
+    const idx: u32 = @intCast(ctx.type_infos.items.len);
+    try ctx.type_infos.append(ctx.a, .{
+        .name = try ctx.a.dupe(u8, leaf),
+        .kind = kind,
+        .size = sz,
+    });
+    try ctx.type_info_map.put(ctx.a, leaf, idx);
+    return idx;
+}
+
 fn coerceToIface(ctx: *Ctx, data_slot: u32, concrete: []const u8, iface_name: []const u8) LowerError!u32 {
     const iface = ctx.ifaces.get(iface_name) orelse return error.UnknownName;
     if (iface.methods.len == 0) return data_slot;
@@ -6480,9 +6597,11 @@ fn coerceToIface(ctx: *Ctx, data_slot: u32, concrete: []const u8, iface_name: []
             const mi = ctx.methods.get(key) orelse return error.UnknownName;
             try mnames.append(ctx.a, mi.mangled);
         }
+        const ti = try ensureTypeInfo(ctx, concrete);
         const idx: u32 = @intCast(ctx.vtables.items.len);
         try ctx.vtables.append(ctx.a, .{
             .symbol = try std.fmt.allocPrint(ctx.a, "jog_vt_{d}", .{idx}),
+            .type_info_index = ti,
             .methods = try mnames.toOwnedSlice(ctx.a),
         });
         try ctx.vtable_map.put(ctx.a, map_key, idx);
@@ -6685,7 +6804,8 @@ fn lowerIfaceMethod(ctx: *Ctx, fat: u32, method: []const u8, args: []*ast.Expr) 
     const vt = try ctx.fresh();
     try ctx.emit(.{ .op = .load, .dst = vt, .src0 = vt_slot });
     const off = try ctx.fresh();
-    try ctx.emit(.{ .op = .iconst, .dst = off, .aux = method_index * 8 });
+    // Vtable word 0 is type_id (*TypeInfo); methods start at word 1.
+    try ctx.emit(.{ .op = .iconst, .dst = off, .aux = (method_index + 1) * 8 });
     const fpp = try ctx.fresh();
     try ctx.emit(.{ .op = .add, .dst = fpp, .src0 = vt, .src1 = off });
     const fnptr = try ctx.fresh();
