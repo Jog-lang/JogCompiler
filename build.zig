@@ -42,6 +42,25 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);
+
+    // JOG-233: deterministic race-detector selftest (links runtime/jogrt_race.c).
+    const race_mod = b.createModule(.{
+        .root_source_file = b.path("src/race_selftest.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const race_tests = b.addTest(.{
+        .root_module = race_mod,
+        .name = "race_selftest",
+    });
+    race_tests.addCSourceFile(.{
+        .file = b.path("runtime/jogrt_race.c"),
+        .flags = &.{ "-fno-sanitize=all", "-std=c11" },
+    });
+    race_tests.linkLibC();
+    const run_race_tests = b.addRunArtifact(race_tests);
+
     const test_step = b.step("test", "Run host compiler tests");
     test_step.dependOn(&run_unit_tests.step);
+    test_step.dependOn(&run_race_tests.step);
 }

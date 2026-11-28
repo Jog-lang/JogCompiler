@@ -80,6 +80,13 @@ void jogrt_task_set(const void *ptr, uint64_t size);
 void jogrt_task_finish(void);
 void jogrt_task_join(int64_t task, void *out, uint64_t size);
 
+/* JOG-233 debug race detector (no-op stubs on wasm RTC). */
+void jogrt_race_enable(void);
+void jogrt_race_read(void *addr, uint64_t size);
+void jogrt_race_write(void *addr, uint64_t size);
+void jogrt_race_release(void *sync);
+void jogrt_race_acquire(void *sync);
+
 #ifdef __cplusplus
 }
 #endif

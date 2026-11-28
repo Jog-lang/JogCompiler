@@ -936,6 +936,8 @@ pub fn cmdCheck(allocator: std.mem.Allocator, path: []const u8, diag_json: bool,
 pub const BuildOptions = struct {
     keep_asm: bool = false,
     keep_c: bool = false,
+    /// JOG-233: enable debug race detector instrumentation.
+    race: bool = false,
     target: link.Target = .native,
     cli_libdirs: []const []const u8 = &.{},
     modules: []const ModuleMapping = &.{},
@@ -973,6 +975,7 @@ pub fn cmdBuildOpts(allocator: std.mem.Allocator, path: []const u8, out_path: []
         std.process.exit(1);
     };
     defer program.deinit();
+    program.race = opts.race;
 
     const mod_target: []const u8 = switch (opts.target) {
         .native => "linux",
@@ -1339,7 +1342,7 @@ pub fn usage(writer: anytype) !void {
         \\  test [package | --all] [--module name=dir ...]
         \\                          [--libdir DIR | -L DIR]...
         \\                          build+run @test in *.test.jog (seed/Spec)
-        \\  build <path> -o OUT [--keep-asm] [--keep-c]
+        \\  build <path> -o OUT [--keep-asm] [--keep-c] [--race]
         \\                          [--target wasm32-emscripten]
         \\                          [--libdir DIR | -L DIR]...
         \\                          [--module name=dir]...

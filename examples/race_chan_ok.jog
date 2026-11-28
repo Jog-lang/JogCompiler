@@ -1,0 +1,25 @@
+// JOG-233: Chan send/recv establishes happens-before; --race should stay quiet.
+
+var shared: i64 = 0
+
+fn main() {
+    dispatcher_single()
+    scope {
+        val ch = Chan<i64>.init(0)
+        go {
+            shared = 1
+            ch.send(1)
+        }
+        val (v, err) = ch.recv()
+        if err != null {
+            print("err\n")
+            return
+        }
+        shared = shared + v
+        if shared == 2 {
+            print("race ok\n")
+        } else {
+            print("bad\n")
+        }
+    }
+}

@@ -59,6 +59,8 @@ fn buildNative(
     defer allocator.free(rt_scope);
     const rt_chan = try std.fs.path.join(allocator, &.{ rt, "jogrt_chan.c" });
     defer allocator.free(rt_chan);
+    const rt_race = try std.fs.path.join(allocator, &.{ rt, "jogrt_race.c" });
+    defer allocator.free(rt_race);
     const rt_io = try std.fs.path.join(allocator, &.{ rt, "jogrt_io.c" });
     defer allocator.free(rt_io);
     const rt_start = try std.fs.path.join(allocator, &.{ rt, "linux_x64_start.s" });
@@ -66,8 +68,8 @@ fn buildNative(
 
     var argv: std.ArrayListUnmanaged([]const u8) = .{};
     defer argv.deinit(allocator);
-    // -fno-sanitize=all keeps jogrt_scope/chan.c freestanding (no ubsan→getauxval).
-    try argv.appendSlice(allocator, &.{ "zig", "cc", "-no-pie", "-fno-sanitize=all", "-o", out_path, asm_path, rt_main, rt_coro, rt_scope, rt_chan });
+    // -fno-sanitize=all keeps jogrt_scope/chan/race.c freestanding (no ubsan→getauxval).
+    try argv.appendSlice(allocator, &.{ "zig", "cc", "-no-pie", "-fno-sanitize=all", "-o", out_path, asm_path, rt_main, rt_coro, rt_scope, rt_chan, rt_race });
     // std.io / std.fs need errno + stdin helpers; only with libc (fopen path).
     if (program.needs_libc) {
         try argv.append(allocator, rt_io);

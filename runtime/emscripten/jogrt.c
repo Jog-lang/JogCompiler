@@ -237,3 +237,16 @@ void jogrt_task_join(int64_t task, void *out, uint64_t size) {
     (void)task;
     if (out && size) memset(out, 0, (size_t)size);
 }
+
+/* JOG-233: race detector is a no-op on wasm RTC (no stackful multi-coro). */
+void jogrt_race_enable(void) {}
+void jogrt_race_read(void *addr, uint64_t size) {
+    (void)addr;
+    (void)size;
+}
+void jogrt_race_write(void *addr, uint64_t size) {
+    (void)addr;
+    (void)size;
+}
+void jogrt_race_release(void *sync) { (void)sync; }
+void jogrt_race_acquire(void *sync) { (void)sync; }

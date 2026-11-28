@@ -79,6 +79,9 @@ extern void jogrt_coro_unpark(int64_t cid);
 extern int64_t jogrt_scope_cancelled(void *scope);
 extern void *jogrt_scope_current(void);
 extern void jogrt_sleep_ms(int64_t ms);
+/* JOG-233: happens-before edges for the debug race detector (no-ops until enabled). */
+extern void jogrt_race_release(void *sync);
+extern void jogrt_race_acquire(void *sync);
 
 /* ---- freestanding helpers ---- */
 
@@ -408,31 +411,43 @@ int32_t jogrt_chan_send(void *chan, const void *elem, uint64_t size) {
     Chan *target = (Chan *)chan;
     Waiter waiter;
     int ready;
+    int32_t status;
     if (!target) panic_msg("channel is null\n");
     if (size != target->elem || !elem) panic_msg("channel send size does not match\n");
     if (coro_cancelled()) return OP_CANCELLED;
     ready = poll_send(target, elem);
-    if (ready >= 0) return (int32_t)ready;
+    if (ready >= 0) {
+        if (ready == OP_OK) jogrt_race_release(target);
+        return (int32_t)ready;
+    }
     mem_set(&waiter, 0, sizeof(waiter));
     waiter.data = (void *)elem;
     waiter.size = size;
-    return park_op(target, &waiter, SEL_SEND);
+    status = park_op(target, &waiter, SEL_SEND);
+    if (status == OP_OK) jogrt_race_release(target);
+    return status;
 }
 
 int32_t jogrt_chan_recv(void *chan, void *elem, uint64_t size) {
     Chan *target = (Chan *)chan;
     Waiter waiter;
     int ready;
+    int32_t status;
     if (!target) panic_msg("channel is null\n");
     if (size != target->elem || !elem) panic_msg("channel receive size does not match\n");
     mem_set(elem, 0, target->elem);
     if (coro_cancelled()) return OP_CANCELLED;
     ready = poll_recv(target, elem);
-    if (ready >= 0) return (int32_t)ready;
+    if (ready >= 0) {
+        if (ready == OP_OK) jogrt_race_acquire(target);
+        return (int32_t)ready;
+    }
     mem_set(&waiter, 0, sizeof(waiter));
     waiter.data = elem;
     waiter.size = size;
-    return park_op(target, &waiter, SEL_RECV);
+    status = park_op(target, &waiter, SEL_RECV);
+    if (status == OP_OK) jogrt_race_acquire(target);
+    return status;
 }
 
 /* ---- select ---- */
@@ -551,9 +566,11 @@ int32_t jogrt_select_wait(void) {
                     status = poll_recv(selected->chan, selected->data);
                     if (status < 0) status = OP_OK;
                     if (status == OP_CLOSED) status = OP_OK; /* closed recv delivers zero + ok for select body */
+                    if (status == OP_OK && selected->chan) jogrt_race_acquire(selected->chan);
                 } else if (selected->op == SEL_SEND) {
                     status = poll_send(selected->chan, selected->data);
                     if (status < 0) status = OP_OK;
+                    if (status == OP_OK && selected->chan) jogrt_race_release(selected->chan);
                 }
                 side->sel_status = status;
                 side->sel_chosen = pick;
@@ -640,6 +657,12 @@ int32_t jogrt_select_wait(void) {
 
         unlink_select(side);
         if (side->sel_claimed) {
+            /* HB in this coro after wake (claim ran on the peer). */
+            if (side->sel_chosen >= 0 && side->sel_chosen < side->case_count && side->sel_status == OP_OK) {
+                Case *c = &side->cases[side->sel_chosen];
+                if (c->op == SEL_SEND && c->chan) jogrt_race_release(c->chan);
+                else if (c->op == SEL_RECV && c->chan) jogrt_race_acquire(c->chan);
+            }
             return (int32_t)side->sel_chosen;
         }
         if (coro_cancelled()) {

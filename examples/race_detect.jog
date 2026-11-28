@@ -1,0 +1,20 @@
+// JOG-233: unsynchronized global writes from two coroutines.
+// Build with --race; expect abort: DATA RACE: unsynchronized shared access
+
+var shared: i64 = 0
+
+fn main() {
+    dispatcher_single()
+    scope {
+        go {
+            shared = 1
+            yield()
+            shared = 2
+        }
+        go {
+            yield()
+            shared = 3
+        }
+    }
+    print("unreachable\n")
+}

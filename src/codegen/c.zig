@@ -162,6 +162,9 @@ pub fn emit(allocator: std.mem.Allocator, program: *const ir.Program, writer: an
         }
         if (is_main) {
             try writer.writeAll("int main(void) {\n");
+            if (program.race) {
+                try writer.writeAll("  jogrt_race_enable();\n");
+            }
         } else {
             try writer.writeAll("int64_t ");
             try writeJogFnName(writer, f.name);
@@ -295,8 +298,18 @@ fn emitInst(writer: anytype, prog: *const ir.Program, fname: []const u8, ninst: 
             }
             try writer.writeAll("  }\n");
         },
-        .gload => try writer.print("  s[{d}] = jog_global_{d};\n", .{ inst.dst, inst.aux }),
-        .gstore => try writer.print("  jog_global_{d} = s[{d}];\n", .{ inst.aux, inst.src0 }),
+        .gload => {
+            if (prog.race) {
+                try writer.print("  jogrt_race_read((void*)&jog_global_{d}, 8);\n", .{inst.aux});
+            }
+            try writer.print("  s[{d}] = jog_global_{d};\n", .{ inst.dst, inst.aux });
+        },
+        .gstore => {
+            if (prog.race) {
+                try writer.print("  jogrt_race_write((void*)&jog_global_{d}, 8);\n", .{inst.aux});
+            }
+            try writer.print("  jog_global_{d} = s[{d}];\n", .{ inst.aux, inst.src0 });
+        },
         .gaddr => try writer.print("  s[{d}] = (int64_t)(intptr_t)&jog_global_{d};\n", .{ inst.dst, inst.aux }),
         .add => try writer.print("  s[{d}] = s[{d}] + s[{d}];\n", .{ inst.dst, inst.src0, inst.src1 }),
         .sub => try writer.print("  s[{d}] = s[{d}] - s[{d}];\n", .{ inst.dst, inst.src0, inst.src1 }),
