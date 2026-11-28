@@ -1,0 +1,25 @@
+// JOG-228: user `@Annotation` + `quote` codegen (Zig expand of `c.add(quote{…})`).
+
+import std.meta
+
+@Annotation
+fn GenAnswer(target: *const meta.Fn) with (c: meta.Compiler) {
+    c.add(quote {
+        fn ${target.name}_gen(): i64 {
+            return 42
+        }
+    })
+}
+
+@GenAnswer
+fn foo(): i64 {
+    return 1
+}
+
+fn main() {
+    if (foo() == 1 && foo_gen() == 42) {
+        print("annotation quote ok\n")
+    } else {
+        panic("annotation quote fail\n")
+    }
+}

@@ -42,6 +42,8 @@ pub const TokenKind = enum {
     kw_private,
     kw_require,
     kw_is,
+    /// Reserved for quoted code in user annotations (JOG-228).
+    kw_quote,
     // punct
     at,
     slash,
@@ -555,6 +557,7 @@ fn keyword(text: []const u8) TokenKind {
         .{ "private", TokenKind.kw_private },
         .{ "require", TokenKind.kw_require },
         .{ "is", TokenKind.kw_is },
+        .{ "quote", TokenKind.kw_quote },
     };
     inline for (map) |e| {
         if (std.mem.eql(u8, text, e[0])) return e[1];

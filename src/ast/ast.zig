@@ -46,6 +46,25 @@ pub const Param = struct {
     default: ?*Expr = null,
 };
 
+/// `@name` / `@name(args)` on a declaration (built-in or user `@Annotation`).
+pub const Attr = struct {
+    name: []const u8,
+    args: []*Expr = &.{},
+    arg_names: []const ?[]const u8 = &.{},
+    line: u32 = 1,
+    col: u32 = 1,
+};
+
+/// One piece of a `quote { … }` body: raw source text or a `${expr}` splice.
+pub const QuotePart = union(enum) {
+    text: []const u8,
+    splice: *Expr,
+};
+
+pub const Quote = struct {
+    parts: []QuotePart,
+};
+
 pub const ContextParam = struct {
     name: ?[]const u8,
     ty: *TypeExpr,
@@ -77,6 +96,7 @@ pub const GlobalDecl = struct {
     thread_local: bool = false,
     line: u32 = 1,
     col: u32 = 1,
+    attrs: []Attr = &.{},
 };
 
 pub const ImportDecl = struct {
@@ -94,6 +114,8 @@ pub const EnumDecl = struct {
     variants: []EnumVariant,
     line: u32 = 1,
     col: u32 = 1,
+    /// User / retained annotations on this enum.
+    attrs: []Attr = &.{},
 };
 
 pub const EnumVariant = struct {
@@ -143,6 +165,8 @@ pub const StructDecl = struct {
     packed_attr: bool = false,
     /// `object Name { … }` — struct body + one static singleton (JOG-96).
     is_object: bool = false,
+    /// User annotations on this struct (not including `@packed` / `@opaque`).
+    attrs: []Attr = &.{},
 };
 
 pub const InterfaceFn = struct {
@@ -185,6 +209,12 @@ pub const FnDecl = struct {
     /// Name token location (for `jog symbols` / LSP).
     line: u32 = 1,
     col: u32 = 1,
+    /// `@Annotation` — this function defines a user annotation (JOG-228).
+    is_annotation: bool = false,
+    /// `@Annotation(repeatable: true)` — may appear more than once on one decl.
+    annotation_repeatable: bool = false,
+    /// User annotations applied to this function (e.g. `@Route("/x")`).
+    attrs: []Attr = &.{},
 };
 
 pub const MethodDecl = struct {
@@ -341,6 +371,8 @@ pub const Expr = union(enum) {
     type_value: NamedApp,
     /// `(params) [: Ret] -> body` anonymous function (Grammar lambda).
     lambda: Lambda,
+    /// `quote { … }` — compile-time code value (`meta.Code`) with `${…}` splices (JOG-228).
+    quote: Quote,
 };
 
 /// `go with (e1, …)? { stmts }` — body runs on a new stack; captures outer locals by address.

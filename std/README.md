@@ -12,6 +12,7 @@ The standard library is written in Jog. Each directory is one package. The compi
 - `map` — open-addressed `Map<K, V>`
 - `math` — libm plus `clamp` / `sign` helpers
 - `mem` — `Allocator`, the malloc heap, and the error arena
+- `meta` — annotation / quote surface (`Code`, `Fn`, `Struct`, `Compiler`, …)
 - `os` — `argc` / `argv`, env, pid, hostname, paths
 - `proc` — start a process and collect its output
 - `strbuilder` — growable byte buffer

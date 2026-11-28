@@ -1,0 +1,19 @@
+// JOG-228: marker `@Annotation` (empty body) — accepted, generates nothing.
+
+import std.meta
+
+@Annotation
+fn Route(target: *const meta.Fn, path: str) {}
+
+@Route("/users")
+fn getUser(): i64 {
+    return 7
+}
+
+fn main() {
+    if (getUser() == 7) {
+        print("annotation marker ok\n")
+    } else {
+        panic("annotation marker fail\n")
+    }
+}

@@ -94,112 +94,60 @@ pub const Parser = struct {
                 is_private = true;
             }
         }
-        // @link / @export / @test / @packed / @intrinsic
-        if (self.tok.kind == .at) {
-            self.advance();
-            // `export` is a keyword; other attrs are bare idents.
-            const attr = blk: {
-                if (self.tok.kind == .ident) break :blk self.tok.text;
-                if (self.tok.kind == .kw_export) break :blk @as([]const u8, "export");
+        // Grammar: `{ attribute }` before the declaration.
+        var attrs: std.ArrayListUnmanaged(ast.Attr) = .{};
+        while (self.tok.kind == .at) {
+            try attrs.append(self.allocator, try self.parseOneAttr());
+            self.skipSeps();
+        }
+        const attr_slice = try attrs.toOwnedSlice(self.allocator);
+
+        // `@link("…") extern { … }` — link is not a general user attr.
+        if (attr_slice.len == 1 and std.mem.eql(u8, attr_slice[0].name, "link")) {
+            if (attr_slice[0].args.len != 1 or attr_slice[0].args[0].* != .string)
                 return error.UnexpectedToken;
-            };
-            self.advance();
-            if (std.mem.eql(u8, attr, "link")) {
-                try self.expect(.lparen);
-                if (self.tok.kind != .string) return error.UnexpectedToken;
-                const raw = self.tok.text;
-                self.advance();
-                try self.expect(.rparen);
-                const lib = try unescape(self.allocator, if (raw.len >= 2) raw[1 .. raw.len - 1] else raw);
-                self.skipSeps();
-                var eb = try self.parseExternBlock();
-                eb.link_lib = lib;
-                return .{ .extern_block = eb };
-            } else if (std.mem.eql(u8, attr, "export")) {
-                self.skipSeps();
-                var fd = try self.parseFn();
-                fd.exported = true;
-                fd.is_private = is_private;
-                return .{ .fn_decl = fd };
-            } else if (std.mem.eql(u8, attr, "test")) {
-                // Optional `@test("display name")` — harness still uses the fn name.
-                if (self.tok.kind == .lparen) {
-                    self.advance();
-                    if (self.tok.kind == .string) self.advance();
-                    try self.expect(.rparen);
-                }
-                self.skipSeps();
-                var fd = try self.parseFn();
-                fd.is_test = true;
-                fd.is_private = is_private;
-                return .{ .fn_decl = fd };
-            } else if (std.mem.eql(u8, attr, "fuzz")) {
-                self.skipSeps();
-                var fd = try self.parseFn();
-                fd.is_fuzz = true;
-                fd.is_private = is_private;
-                return .{ .fn_decl = fd };
-            } else if (std.mem.eql(u8, attr, "packed")) {
-                self.skipSeps();
-                var sd = try self.parseStruct();
-                sd.packed_attr = true;
-                return .{ .struct_decl = sd };
-            } else if (std.mem.eql(u8, attr, "intrinsic")) {
-                // @intrinsic(...) type Name: …  — skip args, parse type alias
-                if (self.tok.kind == .lparen) {
-                    self.advance();
-                    var depth: u32 = 1;
-                    while (self.tok.kind != .eof and depth > 0) {
-                        if (self.tok.kind == .lparen) depth += 1;
-                        if (self.tok.kind == .rparen) depth -= 1;
-                        self.advance();
-                    }
-                }
-                self.skipSeps();
-                return .{ .type_alias = try self.parseTypeAlias() };
-            } else if (std.mem.eql(u8, attr, "opaque")) {
-                // `@opaque struct Name` — parse as ordinary struct (layout later).
-                self.skipSeps();
-                const sd = try self.parseStruct();
-                return .{ .struct_decl = sd };
-            } else if (std.mem.eql(u8, attr, "threadLocal")) {
-                // `@threadLocal var name: T = …` — per OS-worker storage (JOG-227).
-                self.skipSeps();
-                if (self.tok.kind != .kw_var) return error.UnexpectedToken;
-                self.advance();
-                if (self.tok.kind != .ident) return error.UnexpectedToken;
-                const name = self.tok.text;
-                const name_line = self.tok.line;
-                const name_col = self.tok.col;
-                self.advance();
-                var ty: ?*ast.TypeExpr = null;
-                if (self.tok.kind == .colon) {
-                    self.advance();
-                    ty = try self.parseTypeExpr();
-                }
-                var init_e: ?*ast.Expr = null;
-                if (self.tok.kind == .eq) {
-                    self.advance();
-                    init_e = try self.parseExpr();
-                }
-                return .{ .global_decl = .{
-                    .mutable = true,
-                    .name = name,
-                    .ty = ty,
-                    .init = init_e,
-                    .thread_local = true,
-                    .line = name_line,
-                    .col = name_col,
-                } };
-            } else {
-                return error.UnexpectedToken;
+            const lib = attr_slice[0].args[0].string;
+            var eb = try self.parseExternBlock();
+            eb.link_lib = lib;
+            return .{ .extern_block = eb };
+        }
+        if (hasAttrNamed(attr_slice, "intrinsic")) {
+            self.skipSeps();
+            return .{ .type_alias = try self.parseTypeAlias() };
+        }
+
+        var is_export = hasAttrNamed(attr_slice, "export");
+        const is_test = hasAttrNamed(attr_slice, "test");
+        const is_fuzz = hasAttrNamed(attr_slice, "fuzz");
+        const is_packed = hasAttrNamed(attr_slice, "packed");
+        const is_thread_local = hasAttrNamed(attr_slice, "threadLocal");
+        const is_annotation = hasAttrNamed(attr_slice, "Annotation");
+        var annotation_repeatable = false;
+        if (is_annotation) {
+            if (findAttr(attr_slice, "Annotation")) |ann| {
+                annotation_repeatable = attrBoolOpt(ann, "repeatable", false);
             }
         }
+        const user_attrs = try filterUserAttrs(self.allocator, attr_slice);
+
         switch (self.tok.kind) {
             .kw_type => return .{ .type_alias = try self.parseTypeAlias() },
-            .kw_struct => return .{ .struct_decl = try self.parseStruct() },
-            .kw_object => return .{ .struct_decl = try self.parseObject() },
-            .kw_enum => return .{ .enum_decl = try self.parseEnum() },
+            .kw_struct => {
+                var sd = try self.parseStruct();
+                sd.packed_attr = is_packed;
+                sd.attrs = user_attrs;
+                return .{ .struct_decl = sd };
+            },
+            .kw_object => {
+                var sd = try self.parseObject();
+                sd.attrs = user_attrs;
+                return .{ .struct_decl = sd };
+            },
+            .kw_enum => {
+                var ed = try self.parseEnum();
+                ed.attrs = user_attrs;
+                return .{ .enum_decl = ed };
+            },
             .kw_import => return .{ .import_decl = try self.parseImport() },
             .kw_require => {
                 self.advance();
@@ -232,17 +180,23 @@ pub const Parser = struct {
             },
             .kw_actual => {
                 self.advance();
-                return .{ .actual_fn = try self.parseFn() };
+                var fd = try self.parseFn();
+                fd.attrs = user_attrs;
+                return .{ .actual_fn = fd };
             },
             .kw_export => {
                 self.advance();
+                is_export = true;
                 var fd = try self.parseFn();
                 fd.exported = true;
                 fd.is_private = is_private;
+                fd.attrs = user_attrs;
                 return .{ .fn_decl = fd };
             },
             .kw_val, .kw_var => {
                 const mutable = self.tok.kind == .kw_var;
+                // `@threadLocal` only on package `var` (JOG-227).
+                if (is_thread_local and !mutable) return error.UnexpectedToken;
                 self.advance();
                 if (self.tok.kind != .ident) return error.UnexpectedToken;
                 const name = self.tok.text;
@@ -264,8 +218,10 @@ pub const Parser = struct {
                     .name = name,
                     .ty = ty,
                     .init = init_e,
+                    .thread_local = is_thread_local,
                     .line = name_line,
                     .col = name_col,
+                    .attrs = user_attrs,
                 } };
             },
             .kw_fn => {
@@ -296,10 +252,92 @@ pub const Parser = struct {
                 self.tok = save_tok;
                 var fd = try self.parseFn();
                 fd.is_private = is_private;
+                fd.exported = is_export;
+                fd.is_test = is_test;
+                fd.is_fuzz = is_fuzz;
+                fd.is_annotation = is_annotation;
+                fd.annotation_repeatable = annotation_repeatable;
+                fd.attrs = user_attrs;
                 return .{ .fn_decl = fd };
             },
             else => return error.UnexpectedToken,
         }
+    }
+
+    fn parseOneAttr(self: *Parser) ParseError!ast.Attr {
+        const line = self.tok.line;
+        const col = self.tok.col;
+        try self.expect(.at);
+        const name = blk: {
+            if (self.tok.kind == .ident) break :blk self.tok.text;
+            if (self.tok.kind == .kw_export) break :blk @as([]const u8, "export");
+            if (self.tok.kind == .kw_extern) break :blk @as([]const u8, "extern");
+            return error.UnexpectedToken;
+        };
+        self.advance();
+        var args: []*ast.Expr = &.{};
+        var arg_names: []const ?[]const u8 = &.{};
+        if (self.tok.kind == .lparen) {
+            self.advance();
+            // `@intrinsic(...)` — args are not real Jog exprs; skip balanced parens.
+            if (std.mem.eql(u8, name, "intrinsic")) {
+                var depth: u32 = 1;
+                while (self.tok.kind != .eof and depth > 0) {
+                    if (self.tok.kind == .lparen) depth += 1;
+                    if (self.tok.kind == .rparen) depth -= 1;
+                    self.advance();
+                }
+            } else {
+                const parsed = try self.parseArgList(.rparen);
+                args = parsed.args;
+                arg_names = parsed.names;
+                try self.expect(.rparen);
+            }
+        }
+        return .{ .name = name, .args = args, .arg_names = arg_names, .line = line, .col = col };
+    }
+
+    fn hasAttrNamed(attrs: []const ast.Attr, name: []const u8) bool {
+        for (attrs) |a| if (std.mem.eql(u8, a.name, name)) return true;
+        return false;
+    }
+
+    fn findAttr(attrs: []const ast.Attr, name: []const u8) ?ast.Attr {
+        for (attrs) |a| if (std.mem.eql(u8, a.name, name)) return a;
+        return null;
+    }
+
+    fn attrBoolOpt(attr: ast.Attr, key: []const u8, default: bool) bool {
+        if (attr.arg_names.len != attr.args.len) return default;
+        for (attr.arg_names, attr.args) |n, v| {
+            if (n) |name| {
+                if (std.mem.eql(u8, name, key)) {
+                    if (v.* == .int) return v.int != 0;
+                    return default;
+                }
+            }
+        }
+        return default;
+    }
+
+    fn filterUserAttrs(allocator: std.mem.Allocator, attrs: []const ast.Attr) ParseError![]ast.Attr {
+        const skip = [_][]const u8{
+            "link",     "export", "test",      "packed",    "intrinsic", "opaque",
+            "Annotation", "union", "align",    "unchecked", "extern",    "systemStack",
+            "blocking", "bench",  "fuzz",      "threadLocal",
+        };
+        var out: std.ArrayListUnmanaged(ast.Attr) = .{};
+        for (attrs) |a| {
+            var is_skip = false;
+            for (skip) |s| {
+                if (std.mem.eql(u8, a.name, s)) {
+                    is_skip = true;
+                    break;
+                }
+            }
+            if (!is_skip) try out.append(allocator, a);
+        }
+        return try out.toOwnedSlice(allocator);
     }
 
     fn parseExternBlock(self: *Parser) ParseError!ast.ExternBlock {
@@ -1770,6 +1808,9 @@ pub const Parser = struct {
     fn parsePrimary(self: *Parser) ParseError!*ast.Expr {
         const e = try self.allocExpr();
         switch (self.tok.kind) {
+            .kw_quote => {
+                return try self.parseQuote(e);
+            },
             .kw_when => {
                 self.advance();
                 // Scrutinee must not steal the arm-list `{` as a trailing lambda.
@@ -2167,6 +2208,93 @@ pub const Parser = struct {
         return .{ .args = owned_args, .names = try names.toOwnedSlice(self.allocator) };
     }
 
+    /// `quote { … }` with `${expr}` splices. Body is kept as source text plus splice ASTs
+    /// so expand can re-parse after substitution (JOG-228).
+    fn parseQuote(self: *Parser, e: *ast.Expr) ParseError!*ast.Expr {
+        try self.expect(.kw_quote);
+        if (self.tok.kind != .lbrace) return error.UnexpectedToken;
+        // `lx.i` is already past `{`. Do not `advance()` first — that would skipTrivia
+        // and consume `fn` before the raw scan starts.
+        const src = self.lx.src;
+        var i = self.lx.i;
+        var depth: i32 = 1;
+        var parts: std.ArrayListUnmanaged(ast.QuotePart) = .{};
+        var text_start = i;
+        while (i < src.len and depth > 0) {
+            const c = src[i];
+            // Strings: skip so braces/`${` inside literals are not special.
+            if (c == '"') {
+                i += 1;
+                while (i < src.len and src[i] != '"') {
+                    if (src[i] == '\\' and i + 1 < src.len) i += 1;
+                    i += 1;
+                }
+                if (i < src.len) i += 1;
+                continue;
+            }
+            if (c == '/' and i + 1 < src.len and src[i + 1] == '/') {
+                i += 2;
+                while (i < src.len and src[i] != '\n') i += 1;
+                continue;
+            }
+            if (c == '/' and i + 1 < src.len and src[i + 1] == '*') {
+                i += 2;
+                while (i + 1 < src.len and !(src[i] == '*' and src[i + 1] == '/')) i += 1;
+                if (i + 1 < src.len) i += 2;
+                continue;
+            }
+            if (c == '$' and i + 1 < src.len and src[i + 1] == '{') {
+                if (i > text_start) {
+                    try parts.append(self.allocator, .{ .text = src[text_start..i] });
+                }
+                i += 2; // skip `${`
+                // Parse splice expression from a nested parser on the remaining source.
+                var nested = Parser{
+                    .allocator = self.allocator,
+                    .lx = .{
+                        .src = src,
+                        .i = i,
+                        .line = self.lx.line,
+                        .col = self.lx.col,
+                    },
+                    .tok = undefined,
+                    .file = self.file,
+                    .allow_trailing = self.allow_trailing,
+                };
+                nested.tok = nested.lx.next();
+                const splice = try nested.parseExpr();
+                if (nested.tok.kind != .rbrace) return error.UnexpectedToken;
+                // Resume raw scan at the byte after this `}` — do not `advance()` or the
+                // following ident (e.g. `_gen` in `${target.name}_gen`) is skipped.
+                const rbrace_off = @intFromPtr(nested.tok.text.ptr) - @intFromPtr(src.ptr);
+                i = rbrace_off + nested.tok.text.len;
+                try parts.append(self.allocator, .{ .splice = splice });
+                self.lx.line = nested.lx.line;
+                self.lx.col = nested.lx.col;
+                text_start = i;
+                continue;
+            }
+            if (c == '{') depth += 1;
+            if (c == '}') {
+                depth -= 1;
+                if (depth == 0) {
+                    if (i > text_start) {
+                        try parts.append(self.allocator, .{ .text = src[text_start..i] });
+                    }
+                    i += 1; // consume closing `}`
+                    break;
+                }
+            }
+            i += 1;
+        }
+        if (depth != 0) return error.UnexpectedToken;
+        // Resync the main lexer past the quote body.
+        self.lx.i = i;
+        self.tok = self.lx.next();
+        e.* = .{ .quote = .{ .parts = try parts.toOwnedSlice(self.allocator) } };
+        return e;
+    }
+
     /// True when `(…)` is followed by `:` or `->` (lambda, not grouping/tuple).
     fn lookaheadLambda(self: *Parser) bool {
         if (self.tok.kind != .lparen) return false;
@@ -2489,4 +2617,37 @@ test "parse enum lit and when bindings" {
     var file = try Parser.parseFile(std.testing.allocator, src);
     defer file.deinit();
     try std.testing.expect(file.decls.len >= 2);
+}
+
+test "parse quote with splice" {
+    const src =
+        \\fn main() {
+        \\    val x = quote {
+        \\        fn ${target.name}_gen(): i64 {
+        \\            return 42
+        \\        }
+        \\    }
+        \\}
+    ;
+    var file = try Parser.parseFile(std.testing.allocator, src);
+    defer file.deinit();
+    const body = file.decls[0].fn_decl.body.?;
+    const init = body.stmts[0].var_decl.init.?;
+    try std.testing.expect(init.* == .quote);
+    const q = init.quote;
+    try std.testing.expect(q.parts.len >= 2);
+    // First text should contain "fn "
+    var found_fn = false;
+    var found_suffix = false;
+    for (q.parts) |p| {
+        switch (p) {
+            .text => |t| {
+                if (std.mem.indexOf(u8, t, "fn ") != null) found_fn = true;
+                if (std.mem.indexOf(u8, t, "_gen") != null) found_suffix = true;
+            },
+            .splice => {},
+        }
+    }
+    try std.testing.expect(found_fn);
+    try std.testing.expect(found_suffix);
 }
