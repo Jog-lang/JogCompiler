@@ -19,12 +19,14 @@ static JogrtScope jogrt_scope_root_storage;
 static JogrtScope *jogrt_scope_current_ptr;
 static int jogrt_scope_booted;
 
-extern void jogrt_go(void *fn, void *arg);
+extern int64_t jogrt_go(void *fn, void *arg); /* returns coro/task id */
 extern void jogrt_yield(void);
 extern int64_t jogrt_coro_id(void);
 extern void jogrt_coro_park(void);
 extern void jogrt_coro_unpark(int64_t cid);
 extern void jogrt_panic(const void *msg, int64_t len);
+extern int64_t jogrt_task_begin(int64_t cid);
+extern void jogrt_task_finish(void);
 
 static void scope_boot(void) {
     if (jogrt_scope_booted) return;
@@ -132,15 +134,18 @@ typedef struct JogrtGoWrap {
 
 void jogrt_scope_trampoline(void *p) {
     JogrtGoWrap *w = (JogrtGoWrap *)p;
+    jogrt_task_begin(jogrt_coro_id());
     if (w && w->fn) {
         w->fn(w->arg);
     }
+    jogrt_task_finish();
     if (w) {
         jogrt_scope_child_done(w->scope);
     }
 }
 
-void jogrt_scope_go(void *scope, void *fn, void *arg, void *wrap) {
+/* Returns Task id (coro slot). */
+int64_t jogrt_scope_go(void *scope, void *fn, void *arg, void *wrap) {
     JogrtGoWrap *w = (JogrtGoWrap *)wrap;
     scope_boot();
     if (!w) {
@@ -151,5 +156,5 @@ void jogrt_scope_go(void *scope, void *fn, void *arg, void *wrap) {
     w->arg = arg;
     w->scope = scope ? scope : jogrt_scope_current();
     jogrt_scope_child_inc(w->scope);
-    jogrt_go((void *)jogrt_scope_trampoline, w);
+    return jogrt_go((void *)jogrt_scope_trampoline, w);
 }

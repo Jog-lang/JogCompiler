@@ -396,6 +396,28 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_scope_current" });
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_scope_go" });
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_scope_trampoline" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_scope_cancel" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_scope_cancelled" });
+    // JOG-242 Chan / select / Task.
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_chan_init" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_chan_free" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_chan_close" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_chan_send" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_chan_recv" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_select_begin" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_select_add_recv" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_select_add_send" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_select_add_default" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_select_add_timeout" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_select_wait" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_select_status" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_sleep" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_err_cancelled" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_err_closed" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_task_set" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_task_join" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_task_finish" });
+    try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_task_begin" });
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_dispatcher_single" });
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_dispatcher_pool" });
     try internCallee(a, &callees, &callee_map, .{ .kind = .runtime, .name = "jogrt_dispatcher_new" });
@@ -1877,7 +1899,10 @@ fn scanExprCaptures(
             for (gb.with_args) |w| try scanExprCaptures(ctx, w, locals, caps, seen);
             try scanBlockCaptures(ctx, gb.body, locals, caps, seen);
         },
+        .go_expr => |ge| try scanExprCaptures(ctx, ge, locals, caps, seen),
         .scope_block => |sb| try scanBlockCaptures(ctx, sb.body, locals, caps, seen),
+        .select_block => |sb| try scanBlockCaptures(ctx, sb.body, locals, caps, seen),
+        .type_value => {},
         .enum_lit => |el| {
             for (el.fields) |f| try scanExprCaptures(ctx, f.value, locals, caps, seen);
         },
@@ -2698,11 +2723,13 @@ fn lowerStmt(ctx: *Ctx, stmt: ast.Stmt) LowerError!void {
                     try emitAllDefersFiltered(ctx, false);
                     const end_pos: i64 = @intCast(ctx.insts.items.len);
                     ctx.insts.items[jmp_i].aux = end_pos;
+                    try emitTaskSetIfGoChild(ctx, ret_slot);
                     try ctx.emit(.{ .op = .ret, .src0 = ret_slot });
                     return;
                 }
             }
             try emitAllDefersFiltered(ctx, error_path);
+            try emitTaskSetIfGoChild(ctx, ret_slot);
             try ctx.emit(.{ .op = .ret, .src0 = ret_slot });
         },
         .defer_stmt => |ds| {
@@ -2826,6 +2853,8 @@ fn metaFromCallRet(ctx: *Ctx, ret_meta: ?SlotMeta, ret_name: []const u8) ?SlotMe
 fn inferMetaFromExpr(ctx: *Ctx, e: *ast.Expr) ?SlotMeta {
     switch (e.*) {
         .lambda => return .{ .kind = .scalar, .type_name = "iface_fn" },
+        .go_block, .go_expr => return .{ .kind = .raw_ptr, .type_name = "Task" },
+        .type_value => return null,
         .struct_lit => |sl| {
             if (ctx.fn_infos.contains(sl.type_name)) {
                 // Named-arg function call — meta from return type.
@@ -2992,6 +3021,14 @@ fn inferMetaFromExpr(ctx: *Ctx, e: *ast.Expr) ?SlotMeta {
                 }
             }
             if (c.callee.* == .field) {
+                // Chan<T>.init → Chan__T opaque pointer.
+                if (c.callee.field.base.* == .type_value) {
+                    const tv = c.callee.field.base.type_value;
+                    if (std.mem.eql(u8, typeNameLeaf(tv.name), "Chan") and std.mem.eql(u8, c.callee.field.name, "init")) {
+                        const mangled = mangleNamedApp(ctx.a, "Chan", tv.args) catch "Chan__i64";
+                        return .{ .kind = .raw_ptr, .type_name = mangled };
+                    }
+                }
                 // `pkg.fn(...)` after import — same flatten rule as lowerCall.
                 if (c.callee.field.base.* == .ident) {
                     const base_name = c.callee.field.base.ident;
@@ -3456,8 +3493,68 @@ fn maybeBoundsCheck(ctx: *Ctx, base_expr: *ast.Expr, index_expr: *ast.Expr) Lowe
 
 fn lowerForIn(ctx: *Ctx, fs: ast.ForInStmt) LowerError!void {
     // `for x in a..b` → counter loop; `for x in arr` → index 0..len
+    // `for x in ch` (Chan) → recv until closed (JOG-242).
     const break_mark = ctx.break_jmps.items.len;
     const cont_mark = ctx.continue_jmps.items.len;
+    const iter_tn = inferTypeNameFromExpr(ctx, fs.iter) orelse "";
+    if (isChanTypeName(iter_tn)) {
+        const chan = try lowerExpr(ctx, fs.iter);
+        const esz = chanElemSize(ctx, iter_tn);
+        const head: i64 = @intCast(ctx.insts.items.len);
+        const dest = try ctx.fresh();
+        try ctx.emit(.{ .op = .iconst, .dst = dest, .aux = 0 });
+        const daddr = try ctx.fresh();
+        try ctx.emit(.{ .op = .lea_slot, .dst = daddr, .src0 = dest });
+        const sz = try ctx.fresh();
+        try ctx.emit(.{ .op = .iconst, .dst = sz, .aux = esz });
+        const cid = ctx.callee_map.get("jogrt_chan_recv").?;
+        const status = try ctx.fresh();
+        var inst = Inst{ .op = .call, .dst = status, .aux = cid, .arity = 3 };
+        inst.args[0] = chan;
+        inst.args[1] = daddr;
+        inst.args[2] = sz;
+        try ctx.emit(inst);
+        // status==2 → closed, break; status==1 → cancel, break; else bind and body
+        const two = try ctx.fresh();
+        try ctx.emit(.{ .op = .iconst, .dst = two, .aux = 2 });
+        const is_closed = try ctx.fresh();
+        try ctx.emit(.{ .op = .eq, .dst = is_closed, .src0 = status, .src1 = two });
+        const jz_closed = ctx.insts.items.len;
+        try ctx.emit(.{ .op = .jz, .src0 = is_closed, .aux = 0 }); // if not closed, continue
+        const jmp_end_closed = ctx.insts.items.len;
+        try ctx.emit(.{ .op = .jmp, .aux = 0 });
+        const not_closed: i64 = @intCast(ctx.insts.items.len);
+        ctx.insts.items[jz_closed].aux = not_closed;
+        const one = try ctx.fresh();
+        try ctx.emit(.{ .op = .iconst, .dst = one, .aux = 1 });
+        const is_canc = try ctx.fresh();
+        try ctx.emit(.{ .op = .eq, .dst = is_canc, .src0 = status, .src1 = one });
+        const jz_canc = ctx.insts.items.len;
+        try ctx.emit(.{ .op = .jz, .src0 = is_canc, .aux = 0 });
+        const jmp_end_canc = ctx.insts.items.len;
+        try ctx.emit(.{ .op = .jmp, .aux = 0 });
+        const ok_pos: i64 = @intCast(ctx.insts.items.len);
+        ctx.insts.items[jz_canc].aux = ok_pos;
+        try ctx.slots.put(ctx.a, fs.name, dest);
+        try ctx.meta.put(ctx.a, fs.name, .{ .kind = .scalar, .type_name = "i64" });
+        try ctx.loop_defer_depths.append(ctx.a, ctx.defer_stack.items.len);
+        try lowerBlock(ctx, fs.body);
+        _ = ctx.loop_defer_depths.pop();
+        const cont_pos: i64 = @intCast(ctx.insts.items.len);
+        try ctx.emit(.{ .op = .jmp, .aux = head });
+        const end_pos: i64 = @intCast(ctx.insts.items.len);
+        ctx.insts.items[jmp_end_closed].aux = end_pos;
+        ctx.insts.items[jmp_end_canc].aux = end_pos;
+        while (ctx.break_jmps.items.len > break_mark) {
+            const ji = ctx.break_jmps.pop().?;
+            ctx.insts.items[ji].aux = end_pos;
+        }
+        while (ctx.continue_jmps.items.len > cont_mark) {
+            const ji = ctx.continue_jmps.pop().?;
+            ctx.insts.items[ji].aux = cont_pos;
+        }
+        return;
+    }
     if (fs.iter.* == .range) {
         const start = try lowerExpr(ctx, fs.iter.range.start);
         const end = try lowerExpr(ctx, fs.iter.range.end);
@@ -3799,6 +3896,19 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
             // function address — fat pointer `{code, env=null}` for iface_fn values
             if (ctx.callee_map.contains(name)) {
                 return try lowerFnValuePair(ctx, name, none);
+            }
+            // JOG-242: ErrCancelled / ErrClosed as bare names (pointer sentinels).
+            if (std.mem.eql(u8, name, "ErrCancelled")) {
+                const cid = ctx.callee_map.get("jogrt_err_cancelled").?;
+                const d = try ctx.fresh();
+                try ctx.emit(.{ .op = .call, .dst = d, .aux = cid, .arity = 0 });
+                return d;
+            }
+            if (std.mem.eql(u8, name, "ErrClosed")) {
+                const cid = ctx.callee_map.get("jogrt_err_closed").?;
+                const d = try ctx.fresh();
+                try ctx.emit(.{ .op = .call, .dst = d, .aux = cid, .arity = 0 });
+                return d;
             }
             std.debug.print("lower UnknownName ident: {s}\n", .{name});
             return error.UnknownName;
@@ -4636,16 +4746,24 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
             try ctx.emit(wallo);
 
             const gcid = ctx.callee_map.get("jogrt_scope_go").?;
-            var ginst = Inst{ .op = .call, .dst = none, .aux = gcid, .arity = 4 };
+            const task = try ctx.fresh();
+            var ginst = Inst{ .op = .call, .dst = task, .aux = gcid, .arity = 4 };
             ginst.args[0] = scope;
             ginst.args[1] = fn_addr;
             ginst.args[2] = env_ptr;
             ginst.args[3] = wrap;
             try ctx.emit(ginst);
-
-            const zero = try ctx.fresh();
-            try ctx.emit(.{ .op = .iconst, .dst = zero, .aux = 0 });
-            return zero;
+            return task;
+        },
+        .go_expr => |ge| {
+            // Lower as go { return <expr> }.
+            const stmts = try ctx.a.alloc(ast.Stmt, 1);
+            stmts[0] = .{ .return_stmt = ge };
+            const body = try ctx.a.create(ast.Block);
+            body.* = .{ .stmts = stmts };
+            const wrapper = try ctx.a.create(ast.Expr);
+            wrapper.* = .{ .go_block = .{ .with_args = &.{}, .body = body } };
+            return try lowerExpr(ctx, wrapper);
         },
         .scope_block => |sb| {
             const ecid = ctx.callee_map.get("jogrt_scope_enter").?;
@@ -4663,7 +4781,343 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
             try ctx.emit(.{ .op = .iconst, .dst = zero, .aux = 0 });
             return zero;
         },
+        .select_block => |sb| return try lowerSelectBlock(ctx, sb),
+        .type_value => return error.TypeError, // only valid as Chan<T>.init receiver
     }
+}
+
+fn emitTaskSetIfGoChild(ctx: *Ctx, ret_slot: u32) LowerError!void {
+    if (ctx.capture_map == null or ret_slot == none) return;
+    const vaddr = try ctx.fresh();
+    try ctx.emit(.{ .op = .lea_slot, .dst = vaddr, .src0 = ret_slot });
+    const sz = try ctx.fresh();
+    try ctx.emit(.{ .op = .iconst, .dst = sz, .aux = 8 });
+    const tcid = ctx.callee_map.get("jogrt_task_set").?;
+    var tinst = Inst{ .op = .call, .dst = none, .aux = tcid, .arity = 2 };
+    tinst.args[0] = vaddr;
+    tinst.args[1] = sz;
+    try ctx.emit(tinst);
+}
+
+fn chanElemSize(ctx: *Ctx, mangled: []const u8) i64 {
+    // Chan__i64 → i64 size
+    if (std.mem.indexOf(u8, mangled, "__")) |sep| {
+        const elem = mangled[sep + 2 ..];
+        return layoutSizeOf(ctx, elem);
+    }
+    return 8;
+}
+
+fn isChanTypeName(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, "Chan__") or std.mem.eql(u8, name, "Chan");
+}
+
+fn isTaskTypeName(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, "Task__") or std.mem.eql(u8, name, "Task");
+}
+
+fn errorFromStatus(ctx: *Ctx, status: u32) LowerError!u32 {
+    // status 0 → null; 1 → ErrCancelled; 2 → ErrClosed (pointer sentinels).
+    const err = try ctx.fresh();
+    try ctx.emit(.{ .op = .iconst, .dst = err, .aux = 0 });
+    // if status == 0: err=0; else if status == 2: ErrClosed; else ErrCancelled
+    const jz_ok = ctx.insts.items.len;
+    try ctx.emit(.{ .op = .jz, .src0 = status, .aux = 0 }); // patch to end if status==0
+
+    const two = try ctx.fresh();
+    try ctx.emit(.{ .op = .iconst, .dst = two, .aux = 2 });
+    const is_closed = try ctx.fresh();
+    try ctx.emit(.{ .op = .eq, .dst = is_closed, .src0 = status, .src1 = two });
+    const jz_not_closed = ctx.insts.items.len;
+    try ctx.emit(.{ .op = .jz, .src0 = is_closed, .aux = 0 });
+
+    const cid_closed = ctx.callee_map.get("jogrt_err_closed").?;
+    const closed = try ctx.fresh();
+    try ctx.emit(.{ .op = .call, .dst = closed, .aux = cid_closed, .arity = 0 });
+    try ctx.emit(.{ .op = .copy, .dst = err, .src0 = closed });
+    const jmp_end = ctx.insts.items.len;
+    try ctx.emit(.{ .op = .jmp, .aux = 0 });
+
+    const cancelled_pos: i64 = @intCast(ctx.insts.items.len);
+    ctx.insts.items[jz_not_closed].aux = cancelled_pos;
+    const cid_canc = ctx.callee_map.get("jogrt_err_cancelled").?;
+    const canc = try ctx.fresh();
+    try ctx.emit(.{ .op = .call, .dst = canc, .aux = cid_canc, .arity = 0 });
+    try ctx.emit(.{ .op = .copy, .dst = err, .src0 = canc });
+
+    const end_pos: i64 = @intCast(ctx.insts.items.len);
+    ctx.insts.items[jz_ok].aux = end_pos;
+    ctx.insts.items[jmp_end].aux = end_pos;
+    return err;
+}
+
+fn lowerChanOrTaskCall(ctx: *Ctx, c: ast.Call) LowerError!?u32 {
+    if (c.callee.* != .field) return null;
+    const fname = c.callee.field.name;
+    const base_expr = c.callee.field.base;
+
+    // Chan<T>.init(cap)
+    if (base_expr.* == .type_value) {
+        const tv = base_expr.type_value;
+        if (!std.mem.eql(u8, tv.name, "Chan") and !std.mem.eql(u8, typeNameLeaf(tv.name), "Chan")) return null;
+        if (!std.mem.eql(u8, fname, "init")) return null;
+        if (c.args.len > 1) return error.TooManyArgs;
+        const mangled = try mangleNamedApp(ctx.a, "Chan", tv.args);
+        const esz = chanElemSize(ctx, mangled);
+        const es = try ctx.fresh();
+        try ctx.emit(.{ .op = .iconst, .dst = es, .aux = esz });
+        const cap = if (c.args.len == 1) try lowerExpr(ctx, c.args[0]) else blk: {
+            const z = try ctx.fresh();
+            try ctx.emit(.{ .op = .iconst, .dst = z, .aux = 0 });
+            break :blk z;
+        };
+        const cid = ctx.callee_map.get("jogrt_chan_init").?;
+        const d = try ctx.fresh();
+        var inst = Inst{ .op = .call, .dst = d, .aux = cid, .arity = 2 };
+        inst.args[0] = es;
+        inst.args[1] = cap;
+        try ctx.emit(inst);
+        // Record meta so later ch.send sees Chan__T.
+        return d;
+    }
+
+    const base_tn = inferTypeNameFromExpr(ctx, base_expr) orelse "";
+    // Also accept typed locals whose name starts with Chan__/Task__ after init meta.
+    // For untyped `val ch = Chan<i64>.init(…)`, set meta on the var_decl via type_name hack:
+    // we can't easily set it here. Infer from a preceding typed decl or force Chan__i64.
+    // Workaround: if method is send/recv/close/free/join, treat as Chan/Task when name matches
+    // OR when the base was produced by chan_init (raw pointer) — use Chan__i64 default.
+    const treat_chan = isChanTypeName(base_tn) or
+        (base_tn.len == 0 and (std.mem.eql(u8, fname, "send") or std.mem.eql(u8, fname, "recv") or
+            std.mem.eql(u8, fname, "close") or std.mem.eql(u8, fname, "free")));
+    const treat_task = isTaskTypeName(base_tn) or
+        (base_tn.len == 0 and std.mem.eql(u8, fname, "join"));
+
+    if (treat_task and std.mem.eql(u8, fname, "join")) {
+        const task = try lowerExpr(ctx, base_expr);
+        // Unit join: size 0. Valued: assume i64 (8) for this slice.
+        const out = try ctx.fresh();
+        try ctx.emit(.{ .op = .iconst, .dst = out, .aux = 0 });
+        const oaddr = try ctx.fresh();
+        try ctx.emit(.{ .op = .lea_slot, .dst = oaddr, .src0 = out });
+        const sz = try ctx.fresh();
+        try ctx.emit(.{ .op = .iconst, .dst = sz, .aux = 8 });
+        const cid = ctx.callee_map.get("jogrt_task_join").?;
+        var inst = Inst{ .op = .call, .dst = none, .aux = cid, .arity = 3 };
+        inst.args[0] = task;
+        inst.args[1] = oaddr;
+        inst.args[2] = sz;
+        try ctx.emit(inst);
+        return out;
+    }
+
+    if (!treat_chan) return null;
+    const chan = try lowerExpr(ctx, base_expr);
+    const tn = if (isChanTypeName(base_tn)) base_tn else "Chan__i64";
+    const esz = chanElemSize(ctx, tn);
+
+    if (std.mem.eql(u8, fname, "close")) {
+        const cid = ctx.callee_map.get("jogrt_chan_close").?;
+        var inst = Inst{ .op = .call, .dst = none, .aux = cid, .arity = 1 };
+        inst.args[0] = chan;
+        try ctx.emit(inst);
+        const z = try ctx.fresh();
+        try ctx.emit(.{ .op = .iconst, .dst = z, .aux = 0 });
+        return z;
+    }
+    if (std.mem.eql(u8, fname, "free")) {
+        const cid = ctx.callee_map.get("jogrt_chan_free").?;
+        var inst = Inst{ .op = .call, .dst = none, .aux = cid, .arity = 1 };
+        inst.args[0] = chan;
+        try ctx.emit(inst);
+        const z = try ctx.fresh();
+        try ctx.emit(.{ .op = .iconst, .dst = z, .aux = 0 });
+        return z;
+    }
+    if (std.mem.eql(u8, fname, "send")) {
+        if (c.args.len != 1) return error.TooManyArgs;
+        const val = try lowerExpr(ctx, c.args[0]);
+        const vslot = try ctx.fresh();
+        try ctx.emit(.{ .op = .copy, .dst = vslot, .src0 = val });
+        const vaddr = try ctx.fresh();
+        try ctx.emit(.{ .op = .lea_slot, .dst = vaddr, .src0 = vslot });
+        const sz = try ctx.fresh();
+        try ctx.emit(.{ .op = .iconst, .dst = sz, .aux = esz });
+        const cid = ctx.callee_map.get("jogrt_chan_send").?;
+        const status = try ctx.fresh();
+        var inst = Inst{ .op = .call, .dst = status, .aux = cid, .arity = 3 };
+        inst.args[0] = chan;
+        inst.args[1] = vaddr;
+        inst.args[2] = sz;
+        try ctx.emit(inst);
+        return try errorFromStatus(ctx, status);
+    }
+    if (std.mem.eql(u8, fname, "recv")) {
+        if (c.args.len != 0) return error.TooManyArgs;
+        const dest = try ctx.fresh();
+        try ctx.emit(.{ .op = .iconst, .dst = dest, .aux = 0 });
+        const daddr = try ctx.fresh();
+        try ctx.emit(.{ .op = .lea_slot, .dst = daddr, .src0 = dest });
+        const sz = try ctx.fresh();
+        try ctx.emit(.{ .op = .iconst, .dst = sz, .aux = esz });
+        const cid = ctx.callee_map.get("jogrt_chan_recv").?;
+        const status = try ctx.fresh();
+        var inst = Inst{ .op = .call, .dst = status, .aux = cid, .arity = 3 };
+        inst.args[0] = chan;
+        inst.args[1] = daddr;
+        inst.args[2] = sz;
+        try ctx.emit(inst);
+        const err = try errorFromStatus(ctx, status);
+        // Return tuple (T, error?) as __Tup2.
+        const tup_name = try ensureTupleStruct(ctx.a, ctx.structs, 2);
+        const hdr = try lowerEmptyStructValue(ctx, tup_name);
+        // store .0 = dest, .1 = err
+        const off0 = try ctx.fresh();
+        try ctx.emit(.{ .op = .iconst, .dst = off0, .aux = 0 });
+        const a0 = try ctx.fresh();
+        try ctx.emit(.{ .op = .add, .dst = a0, .src0 = hdr, .src1 = off0 });
+        try ctx.emit(.{ .op = .store, .src0 = a0, .src1 = dest });
+        const off1 = try ctx.fresh();
+        try ctx.emit(.{ .op = .iconst, .dst = off1, .aux = 8 });
+        const a1 = try ctx.fresh();
+        try ctx.emit(.{ .op = .add, .dst = a1, .src0 = hdr, .src1 = off1 });
+        try ctx.emit(.{ .op = .store, .src0 = a1, .src1 = err });
+        return hdr;
+    }
+    return null;
+}
+
+fn lowerSelectBlock(ctx: *Ctx, sb: ast.SelectBlock) LowerError!u32 {
+    const begin = ctx.callee_map.get("jogrt_select_begin").?;
+    try ctx.emit(.{ .op = .call, .dst = none, .aux = begin, .arity = 0 });
+
+    // Each stmt should be an expr call: recv/send/timeout/default with trailing lambda.
+    var case_ids: std.ArrayListUnmanaged(u32) = .{};
+    var case_lambdas: std.ArrayListUnmanaged(?*ast.Expr) = .{};
+    var case_slots: std.ArrayListUnmanaged(?u32) = .{};
+    defer case_ids.deinit(ctx.a);
+    defer case_lambdas.deinit(ctx.a);
+    defer case_slots.deinit(ctx.a);
+
+    for (sb.body.stmts) |st| {
+        const ex = switch (st) {
+            .expr => |e| e,
+            else => return error.TypeError,
+        };
+        if (ex.* != .call) return error.TypeError;
+        const c = ex.call;
+        const cname = blk: {
+            if (c.callee.* == .ident) break :blk c.callee.ident;
+            return error.TypeError;
+        };
+        // Trailing lambda is the last arg when present.
+        var lam: ?*ast.Expr = null;
+        var value_args: []*ast.Expr = c.args;
+        if (c.args.len > 0 and c.args[c.args.len - 1].* == .lambda) {
+            lam = c.args[c.args.len - 1];
+            value_args = c.args[0 .. c.args.len - 1];
+        }
+        const id = try ctx.fresh();
+        var slot: ?u32 = null;
+        if (std.mem.eql(u8, cname, "default")) {
+            const cid = ctx.callee_map.get("jogrt_select_add_default").?;
+            try ctx.emit(.{ .op = .call, .dst = id, .aux = cid, .arity = 0 });
+        } else if (std.mem.eql(u8, cname, "timeout")) {
+            if (value_args.len != 1) return error.TooManyArgs;
+            const ms = try lowerExpr(ctx, value_args[0]);
+            const cid = ctx.callee_map.get("jogrt_select_add_timeout").?;
+            var inst = Inst{ .op = .call, .dst = id, .aux = cid, .arity = 1 };
+            inst.args[0] = ms;
+            try ctx.emit(inst);
+        } else if (std.mem.eql(u8, cname, "recv")) {
+            if (value_args.len != 1) return error.TooManyArgs;
+            const chan = try lowerExpr(ctx, value_args[0]);
+            const tn = inferTypeNameFromExpr(ctx, value_args[0]) orelse "Chan__i64";
+            const esz = chanElemSize(ctx, tn);
+            const dest = try ctx.fresh();
+            try ctx.emit(.{ .op = .iconst, .dst = dest, .aux = 0 });
+            slot = dest;
+            const daddr = try ctx.fresh();
+            try ctx.emit(.{ .op = .lea_slot, .dst = daddr, .src0 = dest });
+            const sz = try ctx.fresh();
+            try ctx.emit(.{ .op = .iconst, .dst = sz, .aux = esz });
+            const cid = ctx.callee_map.get("jogrt_select_add_recv").?;
+            var inst = Inst{ .op = .call, .dst = id, .aux = cid, .arity = 3 };
+            inst.args[0] = chan;
+            inst.args[1] = daddr;
+            inst.args[2] = sz;
+            try ctx.emit(inst);
+        } else if (std.mem.eql(u8, cname, "send")) {
+            if (value_args.len != 2) return error.TooManyArgs;
+            const chan = try lowerExpr(ctx, value_args[0]);
+            const val = try lowerExpr(ctx, value_args[1]);
+            const tn = inferTypeNameFromExpr(ctx, value_args[0]) orelse "Chan__i64";
+            const esz = chanElemSize(ctx, tn);
+            // Spill value to a slot and pass its address.
+            const vslot = try ctx.fresh();
+            try ctx.emit(.{ .op = .copy, .dst = vslot, .src0 = val });
+            const vaddr = try ctx.fresh();
+            try ctx.emit(.{ .op = .lea_slot, .dst = vaddr, .src0 = vslot });
+            const sz = try ctx.fresh();
+            try ctx.emit(.{ .op = .iconst, .dst = sz, .aux = esz });
+            const cid = ctx.callee_map.get("jogrt_select_add_send").?;
+            var inst = Inst{ .op = .call, .dst = id, .aux = cid, .arity = 3 };
+            inst.args[0] = chan;
+            inst.args[1] = vaddr;
+            inst.args[2] = sz;
+            try ctx.emit(inst);
+        } else return error.TypeError;
+        try case_ids.append(ctx.a, id);
+        try case_lambdas.append(ctx.a, lam);
+        try case_slots.append(ctx.a, slot);
+    }
+
+    const wait_cid = ctx.callee_map.get("jogrt_select_wait").?;
+    const chosen = try ctx.fresh();
+    try ctx.emit(.{ .op = .call, .dst = chosen, .aux = wait_cid, .arity = 0 });
+    const st_cid = ctx.callee_map.get("jogrt_select_status").?;
+    const status = try ctx.fresh();
+    try ctx.emit(.{ .op = .call, .dst = status, .aux = st_cid, .arity = 0 });
+
+    // Dispatch case bodies.
+    var end_jmps: std.ArrayListUnmanaged(usize) = .{};
+    defer end_jmps.deinit(ctx.a);
+    for (case_ids.items, 0..) |cid, i| {
+        const eq = try ctx.fresh();
+        try ctx.emit(.{ .op = .eq, .dst = eq, .src0 = chosen, .src1 = cid });
+        const jz = ctx.insts.items.len;
+        try ctx.emit(.{ .op = .jz, .src0 = eq, .aux = 0 });
+        // status == 0 to run body
+        const ok = try ctx.fresh();
+        const zero = try ctx.fresh();
+        try ctx.emit(.{ .op = .iconst, .dst = zero, .aux = 0 });
+        try ctx.emit(.{ .op = .eq, .dst = ok, .src0 = status, .src1 = zero });
+        const jz_bad = ctx.insts.items.len;
+        try ctx.emit(.{ .op = .jz, .src0 = ok, .aux = 0 });
+        if (case_lambdas.items[i]) |lam_expr| {
+            if (lam_expr.* == .lambda) {
+                const lam = lam_expr.lambda;
+                // Bind first param to recv slot when present.
+                if (case_slots.items[i]) |sl| {
+                    if (lam.params.len > 0) {
+                        try ctx.slots.put(ctx.a, lam.params[0].name, sl);
+                        try ctx.meta.put(ctx.a, lam.params[0].name, .{ .kind = .scalar, .type_name = "i64" });
+                    }
+                }
+                if (lam.block) |b| try lowerBlock(ctx, b);
+                if (lam.expr_body) |eb| _ = try lowerExpr(ctx, eb);
+            }
+        }
+        const jmp = ctx.insts.items.len;
+        try ctx.emit(.{ .op = .jmp, .aux = 0 });
+        try end_jmps.append(ctx.a, jmp);
+        const next: i64 = @intCast(ctx.insts.items.len);
+        ctx.insts.items[jz].aux = next;
+        ctx.insts.items[jz_bad].aux = next;
+    }
+    const end_pos: i64 = @intCast(ctx.insts.items.len);
+    for (end_jmps.items) |ji| ctx.insts.items[ji].aux = end_pos;
+    return try errorFromStatus(ctx, status);
 }
 
 fn scalarBits(name: []const u8) i64 {
@@ -5067,17 +5521,17 @@ fn lowerCall(ctx: *Ctx, c: ast.Call) LowerError!u32 {
             return d;
         }
         // Stackful coro (gate step 1): go enqueues; yield round-robins on one OS thread.
+        // JOG-242: jogrt_go returns the coro/task id.
         if (std.mem.eql(u8, name, "go")) {
             if (c.args.len != 2) return error.TooManyArgs;
             const fp = try lowerExpr(ctx, c.args[0]);
             const arg = try lowerExpr(ctx, c.args[1]);
             const cid = ctx.callee_map.get("jogrt_go").?;
-            var inst = Inst{ .op = .call, .dst = none, .aux = cid, .arity = 2 };
+            const d = try ctx.fresh();
+            var inst = Inst{ .op = .call, .dst = d, .aux = cid, .arity = 2 };
             inst.args[0] = fp;
             inst.args[1] = arg;
             try ctx.emit(inst);
-            const d = try ctx.fresh();
-            try ctx.emit(.{ .op = .iconst, .dst = d, .aux = 0 });
             return d;
         }
         if (std.mem.eql(u8, name, "yield")) {
@@ -5198,6 +5652,46 @@ fn lowerCall(ctx: *Ctx, c: ast.Call) LowerError!u32 {
             try ctx.emit(.{ .op = .iconst, .dst = d, .aux = 0 });
             return d;
         }
+        // JOG-242: cooperative sleep (returns error? / null).
+        if (std.mem.eql(u8, name, "sleep")) {
+            if (c.args.len != 1) return error.TooManyArgs;
+            const ms = try lowerExpr(ctx, c.args[0]);
+            const cid = ctx.callee_map.get("jogrt_sleep").?;
+            const status = try ctx.fresh();
+            var inst = Inst{ .op = .call, .dst = status, .aux = cid, .arity = 1 };
+            inst.args[0] = ms;
+            try ctx.emit(inst);
+            return try errorFromStatus(ctx, status);
+        }
+        if (std.mem.eql(u8, name, "cancel")) {
+            if (c.args.len != 0) return error.TooManyArgs;
+            const scope = blk: {
+                if (ctx.scope_slot) |s| break :blk s;
+                const cid = ctx.callee_map.get("jogrt_scope_current").?;
+                const d = try ctx.fresh();
+                try ctx.emit(.{ .op = .call, .dst = d, .aux = cid, .arity = 0 });
+                break :blk d;
+            };
+            const cid = ctx.callee_map.get("jogrt_scope_cancel").?;
+            var inst = Inst{ .op = .call, .dst = none, .aux = cid, .arity = 1 };
+            inst.args[0] = scope;
+            try ctx.emit(inst);
+            const z = try ctx.fresh();
+            try ctx.emit(.{ .op = .iconst, .dst = z, .aux = 0 });
+            return z;
+        }
+        if (std.mem.eql(u8, name, "ErrCancelled")) {
+            const cid = ctx.callee_map.get("jogrt_err_cancelled").?;
+            const d = try ctx.fresh();
+            try ctx.emit(.{ .op = .call, .dst = d, .aux = cid, .arity = 0 });
+            return d;
+        }
+        if (std.mem.eql(u8, name, "ErrClosed")) {
+            const cid = ctx.callee_map.get("jogrt_err_closed").?;
+            const d = try ctx.fresh();
+            try ctx.emit(.{ .op = .call, .dst = d, .aux = cid, .arity = 0 });
+            return d;
+        }
         if (std.mem.eql(u8, name, "print_tid")) {
             if (c.args.len != 0) return error.TooManyArgs;
             const cid = ctx.callee_map.get("jogrt_print_tid").?;
@@ -5261,7 +5755,9 @@ fn lowerCall(ctx: *Ctx, c: ast.Call) LowerError!u32 {
         // When the base is an unresolved ident (import alias), look up the free function.
         if (c.callee.field.base.* == .ident) {
             const base_name = c.callee.field.base.ident;
-            const is_local = ctx.meta.contains(base_name) or ctx.global_map.contains(base_name) or ctx.object_map.contains(base_name) or ctx.const_vals.contains(base_name);
+            const is_capture = if (ctx.capture_map) |cm| cm.contains(base_name) else false;
+            const is_local = is_capture or ctx.meta.contains(base_name) or ctx.slots.contains(base_name) or
+                ctx.global_map.contains(base_name) or ctx.object_map.contains(base_name) or ctx.const_vals.contains(base_name);
             if (!is_local) {
                 const fname = c.callee.field.name;
                 if (c.type_args.len > 0) {
@@ -5306,6 +5802,8 @@ fn lowerCall(ctx: *Ctx, c: ast.Call) LowerError!u32 {
                 return error.UnknownName;
             }
         }
+        // JOG-242: Chan<T>.init / ch.send|recv|close|free / task.join
+        if (try lowerChanOrTaskCall(ctx, c)) |r| return r;
         const base = try lowerExpr(ctx, c.callee.field.base);
         return try lowerMethodOrIfaceCall(ctx, c.callee.field.base, base, c.callee.field.name, c.args, c.with_args);
     }
@@ -5437,6 +5935,14 @@ fn collectCaptures(
         },
         .cast, .try_cast => |c| collectCaptures(ctx, c.expr, param_names, out),
         .force_unwrap => |inner| collectCaptures(ctx, inner, param_names, out),
+        .go_block => |gb| {
+            for (gb.with_args) |w| collectCaptures(ctx, w, param_names, out);
+            collectCapturesBlock(ctx, gb.body, param_names, out);
+        },
+        .go_expr => |ge| collectCaptures(ctx, ge, param_names, out),
+        .scope_block => |sb| collectCapturesBlock(ctx, sb.body, param_names, out),
+        .select_block => |sb| collectCapturesBlock(ctx, sb.body, param_names, out),
+        .type_value => {},
         .lambda => |lam| {
             // Nested lambda: only scan free vars not bound by the inner params.
             var nested_params: std.ArrayListUnmanaged([]const u8) = .{};

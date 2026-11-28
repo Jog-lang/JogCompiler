@@ -847,6 +847,12 @@ fn checkExpr(
                 }
                 return v.ty;
             }
+            // JOG-242 lang-item error sentinels (pointer-shaped).
+            if (std.mem.eql(u8, name, "ErrCancelled") or std.mem.eql(u8, name, "ErrClosed")) {
+                const ti = try a.create(TypeInfo);
+                ti.* = .{ .kind = .pointer, .name = name, .pointee = try voidType(a) };
+                return ti;
+            }
             if (fns.contains(name)) {
                 const ti = try a.create(TypeInfo);
                 ti.* = .{ .kind = .iface_fn, .name = name };
@@ -978,10 +984,35 @@ fn checkExpr(
                 std.mem.eql(u8, c.callee.ident, "coro_drain") or
                 std.mem.eql(u8, c.callee.ident, "coro_park") or
                 std.mem.eql(u8, c.callee.ident, "print_tid") or
-                std.mem.eql(u8, c.callee.ident, "sleep_ms")))
+                std.mem.eql(u8, c.callee.ident, "sleep_ms") or
+                std.mem.eql(u8, c.callee.ident, "cancel")))
             {
                 for (c.args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
                 return try voidType(a);
+            }
+            // JOG-242: select cases + cooperative sleep.
+            if (c.callee.* == .ident and (std.mem.eql(u8, c.callee.ident, "recv") or
+                std.mem.eql(u8, c.callee.ident, "send") or
+                std.mem.eql(u8, c.callee.ident, "timeout") or
+                std.mem.eql(u8, c.callee.ident, "default") or
+                std.mem.eql(u8, c.callee.ident, "sleep")))
+            {
+                for (c.args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
+                return try voidType(a);
+            }
+            // Chan<T>.init / ch.send / task.join — accept; lower special-cases.
+            if (c.callee.* == .field) {
+                const fname = c.callee.field.name;
+                if (c.callee.field.base.* == .type_value or
+                    std.mem.eql(u8, fname, "send") or std.mem.eql(u8, fname, "recv") or
+                    std.mem.eql(u8, fname, "close") or std.mem.eql(u8, fname, "free") or
+                    std.mem.eql(u8, fname, "join") or std.mem.eql(u8, fname, "init") or
+                    std.mem.eql(u8, fname, "cancel"))
+                {
+                    _ = try checkExpr(a, types, fns, structs, methods, scope, c.callee.field.base, diags);
+                    for (c.args) |arg| _ = try checkExpr(a, types, fns, structs, methods, scope, arg, diags);
+                    return try voidType(a);
+                }
             }
             if (c.callee.* == .ident and (std.mem.eql(u8, c.callee.ident, "dispatcher_single") or
                 std.mem.eql(u8, c.callee.ident, "dispatcher_pool") or
@@ -1436,10 +1467,22 @@ fn checkExpr(
             for (gb.with_args) |w| _ = try checkExpr(a, types, fns, structs, methods, scope, w, diags);
             // Body sees parent locals (captures by address at lower time).
             try checkBlock(a, types, fns, structs, methods, gb.body, diags, scope);
+            return try voidType(a); // Task handle is opaque i64 at lower
+        },
+        .go_expr => |ge| {
+            _ = try checkExpr(a, types, fns, structs, methods, scope, ge, diags);
             return try voidType(a);
         },
         .scope_block => |sb| {
             try checkBlock(a, types, fns, structs, methods, sb.body, diags, scope);
+            return try voidType(a);
+        },
+        .select_block => |sb| {
+            try checkBlock(a, types, fns, structs, methods, sb.body, diags, scope);
+            return try voidType(a);
+        },
+        .type_value => {
+            // Only valid as receiver for `.init` etc.; type-check at the call site.
             return try voidType(a);
         },
         .lambda => {

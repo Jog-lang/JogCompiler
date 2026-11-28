@@ -1,0 +1,23 @@
+// JOG-242: cancel() → ErrCancelled on blocked recv.
+// Expected: cancelled
+
+fn main() {
+    dispatcher_single()
+    scope {
+        val ch = Chan<i64>.init(0)
+        go {
+            val (v, err) = ch.recv()
+            if err == ErrCancelled {
+                print("cancelled\n")
+            } else if err != null {
+                print("other\n")
+            } else {
+                print("got\n")
+            }
+            if v != 0 {
+                print("v\n")
+            }
+        }
+        cancel()
+    }
+}

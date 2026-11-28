@@ -69,21 +69,29 @@ No x86_64 stack switch / `clone` workers. `runtime/emscripten/jogrt.c`:
 - `dispatcher_*` — opaque non-null handles; no OS threads / steal.
 - Example: `examples/emscripten_go_rtc.jog`.
 
-## Structured concurrency (JOG-222 slice)
+## Structured concurrency (JOG-222 + JOG-242)
 
 | Form | Notes |
 |---|---|
 | `scope { … }` | Enter a child Scope, run the body, join children (yield-loop), leave. |
-| `go { … }` / `go with (…) { … }` | Block launch; captures parent locals by address. Registers with the current Scope via `jogrt_scope_go`. |
-| `go(fn, arg)` | Unchanged enqueue API (examples / Dispatcher demos). |
+| `go { … }` / `go with (…) { … }` | Block launch; captures parent locals by address. Registers with the current Scope via `jogrt_scope_go`. Returns a `Task` (coro id). |
+| `go <expr>` | Expression form → synthetic `go { return <expr> }` (e.g. `go answer()`). |
+| `go(fn, arg)` | Direct enqueue API (Dispatcher demos). Prefer `go { }` / `go expr` for Task/join. |
+| `t.join()` | Wait for a Task started with `go { }` / `go expr`; returns the child's return value. |
+| `cancel()` | Mark the current Scope cancelled; blocked `recv`/`send`/`select`/`sleep` observe `ErrCancelled`. |
+| `Chan<T>.init(cap)` | Buffered (`cap>0`) or rendezvous (`0`). Methods: `send`, `recv`, `close`, `free`. |
+| `for v in ch { … }` | Recv until closed (or cancelled). |
+| `select { … }` | Cases: `recv(ch) { v -> }`, `send(ch, v) { }`, `timeout(ms) { }`, `default { }`. |
+| `sleep(ms)` | Coro-parking sleep (returns `error?` / null). Distinct from worker-blocking `sleep_ms`. |
 
-Runtime: `runtime/jogrt_scope.c` (fixed BSS pool, freestanding). Examples: `examples/coro_scope_go.jog`, `examples/coro_scope_capture.jog`.
+Runtime: `runtime/jogrt_scope.c` + `runtime/jogrt_chan.c` (BSS pools, freestanding, park/unpark; cid 0 yield-spins). Examples: `coro_scope_go`, `coro_scope_capture`, `coro_chan`, `coro_chan_for`, `coro_select`, `coro_task_join`, `coro_cancel`.
 
 ## Limits (not in this step)
 
-- No `Task` / `join`, no `Chan` / `select`, no `for` over channels, no cancel/`ErrCancelled` plumbing yet.
-- `scope()` as a trailing-lambda call still needs general lambdas (JOG-221); this slice accepts the `scope { }` block form.
+- Trailing-lambda `scope() { }` (spec std form) is not wired — use `scope { }` keyword block. Lambdas landed (JOG-221 / #62); binding `scope` as a callable remains.
+- `go(fn, arg)` SEGV under `dispatcher_single` + `coro_drain` is pre-existing on current `v2` tip in some environments (`examples/coro_yield.jog`); `go { }` path is green.
+- Chan/select parking is cooperative (no multi-worker locks beyond the coro runtime); heavy cross-worker Chan stress is unproven.
 - Fixed max 32 coro slots, 16 workers, 4 Dispatcher pools; stacks via `mmap` (not charged to `alloc`).
 - Chase-Lev arrays are fixed-capacity (no grow); full queue panics.
 - IO pool shrink-beyond-min is deferred (grow only for now).
-- Freestanding linux x64 only (emscripten: RTC `go` only; see above).
+- Freestanding linux x64 only (emscripten: RTC `go` + Chan/select stubs; stackful park still aborts).

@@ -1,0 +1,23 @@
+// JOG-242: Task.join from go { } / go expr.
+// Expected: 42
+
+fn answer(): i64 {
+    return 40 + 2
+}
+
+fn main() {
+    dispatcher_single()
+    scope {
+        val t = go {
+            return 40 + 2
+        }
+        val v = t.join()
+        val t2 = go answer()
+        val v2 = t2.join()
+        if v == 42 && v2 == 42 {
+            print("42\n")
+        } else {
+            print("bad\n")
+        }
+    }
+}
