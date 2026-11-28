@@ -24,12 +24,15 @@ jog check <path>
 jog test [path] [--fuzz NAME] [--fuzz-iters N]
 jog build <path> -o <out> [--keep-asm] [--keep-c] [--race]
               [--target wasm32-emscripten] [--libdir DIR | -L DIR]...
+jog bindgen <header> [-o OUT] [--prefix P] [--link LIB] [-I DIR]... [-D MACRO]...
 jog deps [path]
 ```
 
 `jog test` runs `@test` and replays `@fuzz` corpus under `testdata/fuzz/<name>/`. `jog test --fuzz <name>` mutates with coverage guidance (JOG-232).
 
 `path` may be a `.jog` file, a directory with `jog.mod`, or a `jog.mod` file. Module sources listed in `jog.mod` (`root` + optional `source` lines) are parsed and typechecked together. `import std.*` resolves via library roots. `@link("lib")` and `jog.mod` `link.*` / `libdir.*` feed the linker (`-l` / `-L`; rpath on native). `link.emscripten` / `libdir.emscripten` apply only with `--target wasm32-emscripten`.
+
+`jog bindgen` (JOG-230) generates ordinary Jog `extern` binding files from C headers via libclang. It runs the sibling `jog-bindgen` binary (built by `zig build`; requires libclang). Existing `extern` / `@link` / `jog.mod` link lines are unchanged. `import c("…")` is not implemented. Smoke: `bash scripts/bindgen_smoke.sh`.
 
 ## Pipeline
 
