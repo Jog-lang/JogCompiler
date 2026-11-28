@@ -1,6 +1,6 @@
 # Coroutines (v2 / JOG-78)
 
-Stackful coroutines with `rsp` swap. Gate 1: single-thread yield. Gate 2: multi-worker pool + steal. Gate 3: `with (Dispatcher)` cross-pool migration. Gate 4: elastic blocking/IO Dispatcher pool. JOG-78: Chase-Lev lock-free work-stealing deques.
+Stackful coroutines with `rsp` swap. Gate 1: single-thread yield. Gate 2: multi-worker pool + steal. Gate 3: `with (Dispatcher)` cross-pool migration. Gate 4: elastic blocking/IO Dispatcher pool. JOG-78: Chase-Lev lock-free work-stealing deques. JOG-227: `@threadLocal` package vars (per OS worker).
 
 ## Builtins
 
@@ -20,6 +20,7 @@ Stackful coroutines with `rsp` swap. Gate 1: single-thread yield. Gate 2: multi-
 | `sleep_ms(n)` | `nanosleep` | Block the **current OS worker** for `n` milliseconds (no coro yield). Use on the IO pool so default workers stay free. |
 | `print_tid()` | `gettid` | Print `tid=… wid=… cid=…` (locked). Same `cid` + different `tid`/`wid` ⇒ hop. |
 | `worker_id()` / `gettid()` | i64 | Current worker index / Linux tid. |
+| `@threadLocal var x: T = …` | per-worker storage | One replica per OS worker (max 16). Access via `jogrt_tls_addr` + GS `wid`. **Not** per-coroutine: after `yield` a coro may resume on another worker and see that worker’s replica. Wasm/emscripten: ordinary global (single thread). |
 
 `spawn(fn, arg)` remains **synchronous** (call on this thread).
 
@@ -30,7 +31,7 @@ Main’s OS stack (cid 0) is **not** migratable: `with` on main only updates amb
 - N OS workers via `clone` (`CLONE_THREAD|…`); worker 0 is main. Cap 16 workers / 4 Dispatcher pools.
 - Multiple **Dispatcher pools** partition workers; steal stays in-pool.
 - Per-worker **Chase-Lev** deques (owner push/pop bottom; thieves CAS-steal top). In-pool `go`/yield push locally; cross-pool submits use a locked per-pool inbox. Idle workers take: local pop → inbox → steal.
-- TLS via `arch_prctl(ARCH_SET_FS)` (wid, current coro, home CCB, yield-requeue).
+- Runtime TLS via `arch_prctl(ARCH_SET_GS)` (wid, current coro, home CCB, yield-requeue); FS left for libc.
 - Yield / Dispatcher enter-leave hop through the worker home so a coro is never runnable on two threads.
 - **IO elastic pool:** `dispatcher_io()` marks a pool elastic; enqueue may `clone` an extra worker when backlog ≥ live count (up to `pool_max`). Once grown, workers stay for the process (shrink deferred).
 - Process exit uses `exit_group` so worker threads do not outlive main.
@@ -56,6 +57,9 @@ zig build
 
 ./zig-out/bin/jog build examples/coro_io_dispatcher.jog -o out/coro_io && ./out/coro_io
 # cpu wid∈{0,1} interleaves with block-enter/leave; blocker wid≥2; ≥2 IO wids under load
+
+./zig-out/bin/jog build examples/coro_threadlocal.jog -o out/coro_tls && ./out/coro_tls
+# threadLocal ok  (workers write their replicas; main’s stays 0 until main sets it)
 ```
 
 Rare single-`tid` under light load on gate-2 pool demos is valid. Treat hangs / lost wakeups as failures.
@@ -86,6 +90,12 @@ No x86_64 stack switch / `clone` workers. `runtime/emscripten/jogrt.c`:
 
 Runtime: `runtime/jogrt_scope.c` + `runtime/jogrt_chan.c` (BSS pools, freestanding, park/unpark; cid 0 yield-spins). Examples: `coro_scope_go`, `coro_scope_capture`, `coro_chan`, `coro_chan_for`, `coro_select`, `coro_task_join`, `coro_cancel`.
 
+## Multithreading status (JOG-227 / OpenQuestions After V1)
+
+- **M:N work-stealing** — landed (gates 2–4 + Chase-Lev). Default ambient Dispatcher is `dispatcher_pool`; use `dispatcher_single` for tests.
+- **`@threadLocal` globals** — landed for package `var` (scalar). Backed by a per-worker replica table, not ELF `%fs` TLS (runtime already owns GS; freestanding `clone` workers have no libc TLS init).
+- **Still out:** ELF/`__thread` interop for C libraries that expect true TLS on Jog-created workers; `@blocking` / `@systemStack`; defaulting the primary pool without an explicit `dispatcher_pool` call; wasm M:N / stackful yield.
+
 ## Limits (not in this step)
 
 - Trailing-lambda `scope() { }` (spec std form) is not wired — use `scope { }` keyword block. Lambdas landed (JOG-221 / #62); binding `scope` as a callable remains.
@@ -95,3 +105,4 @@ Runtime: `runtime/jogrt_scope.c` + `runtime/jogrt_chan.c` (BSS pools, freestandi
 - Chase-Lev arrays are fixed-capacity (no grow); full queue panics.
 - IO pool shrink-beyond-min is deferred (grow only for now).
 - Freestanding linux x64 only (emscripten: RTC `go` + Chan/select stubs; stackful park still aborts).
+- `@threadLocal` on `val` / multi-quad `object` / C `__thread` bridging not wired.
