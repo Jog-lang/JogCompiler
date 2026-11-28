@@ -33,7 +33,7 @@ fn isForeignPlatformSource(basename: []const u8) bool {
     return false;
 }
 
-pub const version_string = "jog 0.2.13-v2 (zig host, object+std/core; ir→asm→native | ir→c→emcc; jog test; @fuzz; jog ide JSON)";
+pub const version_string = "jog 0.2.13-v2 (zig host, object+std/core; ir→asm→native | ir→c→emcc; jog test; @fuzz; jog ide; jog bindgen)";
 
 pub fn cmdVersion(writer: anytype) !void {
     try writer.print("{s}\n", .{version_string});
@@ -1712,6 +1712,55 @@ fn runTestExe(allocator: std.mem.Allocator, exe_path: []const u8) !RunTestResult
     return .{ .stdout = body, .code = code };
 }
 
+/// JOG-230: locate and exec `jog-bindgen` with the remaining argv.
+pub fn cmdBindgen(allocator: std.mem.Allocator, args: *std.process.ArgIterator, stderr: anytype) !void {
+    const bindgen_path = try findJogBindgen(allocator);
+    defer allocator.free(bindgen_path);
+
+    var child_args: std.ArrayListUnmanaged([]const u8) = .{};
+    defer child_args.deinit(allocator);
+    try child_args.append(allocator, bindgen_path);
+    while (args.next()) |a| {
+        try child_args.append(allocator, a);
+    }
+
+    var child = std.process.Child.init(child_args.items, allocator);
+    child.stdin_behavior = .Inherit;
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+    const term = child.spawnAndWait() catch |err| {
+        try stderr.print("bindgen: failed to run {s}: {s}\n", .{ bindgen_path, @errorName(err) });
+        std.process.exit(1);
+    };
+    switch (term) {
+        .Exited => |code| std.process.exit(code),
+        else => {
+            try stderr.writeAll("bindgen: jog-bindgen terminated abnormally\n");
+            std.process.exit(1);
+        },
+    }
+}
+
+fn findJogBindgen(allocator: std.mem.Allocator) ![]u8 {
+    if (std.posix.getenv("JOG_BINDGEN")) |env| {
+        return try allocator.dupe(u8, env);
+    }
+    // Sibling of this executable: <dir>/jog-bindgen
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe = std.fs.selfExePath(&buf) catch {
+        return try allocator.dupe(u8, "jog-bindgen");
+    };
+    const dir = std.fs.path.dirname(exe) orelse ".";
+    const sibling = try std.fs.path.join(allocator, &.{ dir, "jog-bindgen" });
+    if (std.fs.cwd().access(sibling, .{})) |_| {
+        return sibling;
+    } else |_| {
+        allocator.free(sibling);
+    }
+    // Fall back to PATH lookup name.
+    return try allocator.dupe(u8, "jog-bindgen");
+}
+
 pub fn usage(writer: anytype) !void {
     try writer.writeAll(
         \\usage: jog <command> [args]
@@ -1738,6 +1787,9 @@ pub fn usage(writer: anytype) !void {
         \\                          wasm32-emscripten: IR → C → emcc (.html/.js)
         \\                          @link / jog.mod link.* → -l; libdir → -L (+ rpath native)
         \\                          jog.mod require path| --module for deps
+        \\  bindgen <header> [-o OUT] [--prefix P] [--link LIB] [-I DIR]... [-D MACRO]...
+        \\                          generate Jog extern bindings via libclang
+        \\                          (runs sibling jog-bindgen; compiler stays free of libclang)
         \\  deps [--flags] [--test] [path]
         \\                          source paths, or path-folder --module flags
         \\                          (.jogz → jog-build deps --flags)

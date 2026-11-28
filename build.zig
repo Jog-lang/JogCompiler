@@ -30,6 +30,27 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(abi_lib);
 
+    // JOG-230: `jog-bindgen` is a separate tool so the compiler binary does not
+    // link libclang (design/Compiler.md). `jog bindgen` re-execs this sibling.
+    const bindgen_mod = b.createModule(.{
+        .root_source_file = b.path("src/bindgen/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const bindgen_exe = b.addExecutable(.{
+        .name = "jog-bindgen",
+        .root_module = bindgen_mod,
+    });
+    bindgen_exe.linkLibC();
+    bindgen_exe.linkSystemLibrary("clang");
+    // Distro layouts for libclang (Ubuntu llvm-N, Fedora /usr/include + lib64).
+    bindgen_exe.addIncludePath(.{ .cwd_relative = "/usr/lib/llvm-18/include" });
+    bindgen_exe.addIncludePath(.{ .cwd_relative = "/usr/include" });
+    bindgen_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/llvm-18/lib" });
+    bindgen_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib64" });
+    bindgen_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
+    b.installArtifact(bindgen_exe);
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
@@ -63,4 +84,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run host compiler tests");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_race_tests.step);
+
+    // Emit-only tests (no libclang) live under bindgen/emit.zig — pull into jog tests.
+    // Full header smoke: `zig build && ./zig-out/bin/jog bindgen testdata/bindgen/sample.h …`
 }

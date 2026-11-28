@@ -407,6 +407,11 @@ pub fn main() !void {
         try driver.cmdDepsOpts(allocator, path, stdout, flags, include_test);
         return;
     }
+    if (std.mem.eql(u8, cmd, "bindgen")) {
+        // JOG-230: re-exec sibling `jog-bindgen` so this binary does not link libclang.
+        try driver.cmdBindgen(allocator, &args, stderr);
+        return;
+    }
     if (std.mem.eql(u8, cmd, "ide")) {
         const ide = @import("driver/ide.zig");
         const sub = args.next() orelse {
@@ -514,4 +519,6 @@ test {
     _ = @import("mod/mod.zig");
     _ = @import("driver/ide.zig");
     _ = @import("driver/fuzz.zig");
+    _ = @import("bindgen/emit.zig");
+    _ = @import("bindgen/model.zig");
 }
