@@ -207,5 +207,13 @@ fn rewriteExpr(e: *ast.Expr, renames: *const std.StringHashMapUnmanaged([]const 
             if (lam.expr_body) |eb| rewriteExpr(eb, renames);
             if (lam.block) |b| rewriteBlock(b, renames);
         },
+        .quote => |*q| {
+            for (q.parts) |*part| {
+                switch (part.*) {
+                    .text => {},
+                    .splice => |ex| rewriteExpr(ex, renames),
+                }
+            }
+        },
     }
 }

@@ -631,6 +631,8 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                 }
             },
             .fn_decl, .actual_fn => |fd| {
+                // `@Annotation` defs are expand-time only (JOG-228).
+                if (fd.is_annotation) continue;
                 if (fd.body != null and fd.type_params.len > 0) {
                     const gop = try generic_fns.getOrPut(a, fd.name);
                     if (!gop.found_existing) gop.value_ptr.* = .{};
@@ -725,8 +727,8 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
     var lambda_seq: u32 = 0;
     for (file.decls) |d| {
         const maybe_fd: ?ast.FnDecl = switch (d) {
-            .fn_decl => |fd| if (fd.body != null and fd.type_params.len == 0) fd else null,
-            .actual_fn => |fd| if (fd.body != null and fd.type_params.len == 0) fd else null,
+            .fn_decl => |fd| if (fd.body != null and fd.type_params.len == 0 and !fd.is_annotation) fd else null,
+            .actual_fn => |fd| if (fd.body != null and fd.type_params.len == 0 and !fd.is_annotation) fd else null,
             else => null,
         };
         if (maybe_fd) |fd| {
@@ -1461,6 +1463,7 @@ fn instantiateGenerics(
     for (file.decls) |d| {
         switch (d) {
             .fn_decl, .actual_fn => |fd| {
+                if (fd.is_annotation) continue; // expand-time only (JOG-228)
                 if (fd.type_params.len > 0) continue; // templates specialized on demand
                 if (fd.ret) |r| try walkTypeInstantiateFull(&ic, r);
                 for (fd.params) |p| try walkTypeInstantiateFull(&ic, p.ty);
@@ -1956,6 +1959,12 @@ fn scanExprCaptures(
             }
             if (lam.expr_body) |eb| try scanExprCaptures(ctx, eb, locals, caps, seen);
             if (lam.block) |bb| try scanBlockCaptures(ctx, bb, locals, caps, seen);
+        },
+        .quote => |q| {
+            for (q.parts) |part| switch (part) {
+                .text => {},
+                .splice => |ex| try scanExprCaptures(ctx, ex, locals, caps, seen),
+            };
         },
         .int, .float, .string, .cstring, .null_lit => {},
     }
@@ -4667,6 +4676,10 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
             return error.UnknownName;
         },
         .lambda => |lam| return try lowerLambda(ctx, lam),
+        .quote => {
+            std.debug.print("quote expression cannot be lowered at runtime\n", .{});
+            return error.TypeError;
+        },
         .struct_lit => |sl| {
             // Named-arg call parsed as struct_lit: `connect(host: "db")`.
             if (ctx.fn_infos.get(sl.type_name)) |fi| {

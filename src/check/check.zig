@@ -340,8 +340,11 @@ pub fn check(parent: std.mem.Allocator, file: *const ast.File) CheckError!CheckR
                 main_str = findPrintString(body);
             }
         }
+        // `@Annotation` bodies run only at expand/comptime; skip ordinary check (JOG-228).
         if (fd.body) |body| {
-            try checkFunctionBody(a, &types, &fns, &structs, &methods, fd.params, fd.contexts, body, &diags, &globals_scope);
+            if (!fd.is_annotation) {
+                try checkFunctionBody(a, &types, &fns, &structs, &methods, fd.params, fd.contexts, body, &diags, &globals_scope);
+            }
         }
         for (bound.items) |tp| _ = types.remove(tp);
     }
@@ -1508,6 +1511,12 @@ fn checkExpr(
         },
         .lambda => {
             return try checkLambda(a, types, fns, structs, methods, scope, e, null, diags);
+        },
+        .quote => {
+            // `meta.Code` — only meaningful inside `@Annotation` bodies (expand phase).
+            const ti = try a.create(TypeInfo);
+            ti.* = .{ .kind = .named, .name = "Code" };
+            return ti;
         },
     }
 }

@@ -1,0 +1,44 @@
+// Package std.meta — reflection / annotation surface (JOG-228).
+//
+// Quote codegen and `@Annotation` expand run in the Zig host for now; these
+// types exist so annotation signatures type-check (`*const meta.Fn`, …) and so
+// `quote { … }` can be typed as `Code`. Methods such as `Compiler.add` are not
+// lowered: the expand pass pattern-matches `c.add(quote { … })` in annotation
+// bodies. Full comptime interpretation of annotation functions is a leftover.
+
+/// Quoted Jog code produced by `quote { … }`.
+struct Code {}
+
+/// An identifier or name token in a quote splice.
+struct Name {
+    text: str
+}
+
+/// Any annotated declaration (placement target).
+struct Decl {
+    name: str
+}
+
+/// A function declaration (placement target for `*const meta.Fn`).
+struct Fn {
+    name: str
+}
+
+/// A struct declaration.
+struct Struct {
+    name: str
+}
+
+/// An enum declaration.
+struct Enum {
+    name: str
+}
+
+/// A struct/enum field (field attrs not wired in the first slice).
+struct Field {
+    name: str
+}
+
+/// Compile-time context passed to annotation functions (`with (c: meta.Compiler)`).
+/// `add` is recognized by the expand pass; it is not a runtime method yet.
+struct Compiler {}

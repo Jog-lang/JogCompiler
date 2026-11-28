@@ -9,6 +9,7 @@ const mod = @import("../mod/mod.zig");
 const roots_mod = @import("roots.zig");
 const priv_mangle = @import("priv_mangle.zig");
 const fuzz = @import("fuzz.zig");
+const expand_mod = @import("../meta/expand.zig");
 
 /// True when `basename` is a platform file for an OS other than this host.
 /// Keeps `.posix.jog` on linux/macos; drops `.windows.jog` on linux, etc.
@@ -917,6 +918,17 @@ pub fn cmdSymbols(allocator: std.mem.Allocator, path: []const u8, json: bool, wr
 pub fn cmdCheck(allocator: std.mem.Allocator, path: []const u8, diag_json: bool, writer: anytype, opts: LoadOptions) !void {
     var unit = try loadPathOpts(allocator, path, writer, opts);
     defer unit.deinit();
+    const expanded = try expand_mod.expandAnnotations(&unit.file);
+    if (expanded.diagnostics.len > 0) {
+        for (expanded.diagnostics) |d| {
+            if (diag_json) {
+                try writeDiag(allocator, writer, path, d.line, d.col, 0, 0, "error", d.message);
+            } else {
+                try writer.print("error: {s}\n", .{d.message});
+            }
+        }
+        std.process.exit(1);
+    }
     var result = try check_mod.check(allocator, &unit.file);
     defer result.deinit();
     if (!result.ok) {
@@ -958,6 +970,13 @@ pub fn cmdBuildOpts(allocator: std.mem.Allocator, path: []const u8, out_path: []
         .include_test_requires = opts.include_test_requires,
     });
     defer unit.deinit();
+    const expanded = try expand_mod.expandAnnotations(&unit.file);
+    if (expanded.diagnostics.len > 0) {
+        for (expanded.diagnostics) |d| {
+            try writer.print("error: {s}\n", .{d.message});
+        }
+        std.process.exit(1);
+    }
     var result = try check_mod.check(allocator, &unit.file);
     defer result.deinit();
     if (!result.ok) {
@@ -1161,6 +1180,13 @@ pub fn cmdTest(allocator: std.mem.Allocator, path: []const u8, opts: TestOptions
         .include_tests = true,
     });
     defer unit.deinit();
+    const expanded = try expand_mod.expandAnnotations(&unit.file);
+    if (expanded.diagnostics.len > 0) {
+        for (expanded.diagnostics) |d| {
+            try writer.print("error: {s}\n", .{d.message});
+        }
+        std.process.exit(1);
+    }
 
     var tests: std.ArrayListUnmanaged(TestFn) = .{};
     defer tests.deinit(allocator);
