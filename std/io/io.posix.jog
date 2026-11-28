@@ -10,7 +10,7 @@ actual fn open_c_file(path: str, mode: *const c.char): (*c.FILE?, error?) {
     if path.len == 0 || path.len >= 4096 {
         return null, errors.ErrIO
     }
-    // v2: open slice + deref-assign gaps — index + &buf[0].
+    // NUL-terminate a stack path copy for fopen (JOG-243: `&buf[0]` + index store).
     val dest = &buf[0]
     if path.len > 0 {
         c.memcpy(dest as *void, path.ptr as *const void, path.len)

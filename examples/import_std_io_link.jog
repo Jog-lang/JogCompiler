@@ -1,0 +1,7 @@
+// JOG-243: full `import std.io` must lower+link (open_c_file `&buf[0]` index store).
+
+import std.io
+
+fn main() {
+    print("import std.io link ok\n")
+}

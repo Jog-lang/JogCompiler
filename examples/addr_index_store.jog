@@ -1,0 +1,13 @@
+// JOG-243: `&buf[0]` yields a `*byte` that supports index store (posix open_c_file).
+
+fn main() {
+    var buf: [16]byte
+    val dest = &buf[0]
+    dest[0] = 65
+    dest[1] = 66
+    dest[2] = 0
+    if (buf[0] != 65 || buf[1] != 66 || buf[2] != 0) {
+        panic("addr index store fail\n")
+    }
+    print("addr index store ok\n")
+}

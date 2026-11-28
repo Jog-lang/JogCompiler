@@ -3069,6 +3069,63 @@ fn inferMetaFromExpr(ctx: *Ctx, e: *ast.Expr) ?SlotMeta {
             }
             return null;
         },
+        .unary => |u| {
+            if (u.op != .addr) return null;
+            // `&x` / `&base[i]` / `&base.field` → raw pointer to the element/value.
+            // Critical for `val dest = &buf[0]; dest[n] = 0` (posix open_c_file).
+            switch (u.expr.*) {
+                .ident => {
+                    if (inferMetaFromExpr(ctx, u.expr)) |m| {
+                        if (m.kind == .array_ptr)
+                            return .{ .kind = .raw_ptr, .type_name = m.type_name, .elem_size = if (m.elem_size > 0) m.elem_size else 8 };
+                        if (m.kind == .struct_ptr or m.kind == .iface_ptr)
+                            return m;
+                        const es: u32 = if (m.elem_size > 0)
+                            m.elem_size
+                        else if (std.mem.eql(u8, m.type_name, "byte") or std.mem.eql(u8, m.type_name, "u8") or std.mem.eql(u8, m.type_name, "bool"))
+                            1
+                        else
+                            8;
+                        return .{ .kind = .raw_ptr, .type_name = m.type_name, .elem_size = es };
+                    }
+                    return .{ .kind = .raw_ptr };
+                },
+                .index => |ix| {
+                    if (indexBaseMeta(ctx, ix.base)) |bm| {
+                        if (isSliceHeaderMeta(bm)) {
+                            const stride = sliceHeaderElemStride(ctx, bm);
+                            const elem = sliceElemTypeName(ctx, ix.base) orelse "i64";
+                            return .{ .kind = .raw_ptr, .type_name = elem, .elem_size = stride };
+                        }
+                        const es: u32 = if (bm.elem_size > 0)
+                            bm.elem_size
+                        else if (std.mem.eql(u8, bm.type_name, "byte") or std.mem.eql(u8, bm.type_name, "u8") or std.mem.eql(u8, bm.type_name, "bool"))
+                            1
+                        else
+                            8;
+                        return .{ .kind = .raw_ptr, .type_name = bm.type_name, .elem_size = es };
+                    }
+                    return .{ .kind = .raw_ptr, .elem_size = 8 };
+                },
+                .field => {
+                    if (inferMetaFromExpr(ctx, u.expr)) |fm| {
+                        const es: u32 = if (fm.elem_size > 0)
+                            fm.elem_size
+                        else if (std.mem.eql(u8, fm.type_name, "byte") or std.mem.eql(u8, fm.type_name, "u8") or std.mem.eql(u8, fm.type_name, "bool"))
+                            1
+                        else
+                            8;
+                        if (fm.kind == .struct_ptr)
+                            return .{ .kind = .raw_ptr, .type_name = fm.type_name, .elem_size = es };
+                        if (fm.kind == .iface_ptr)
+                            return .{ .kind = .raw_ptr, .type_name = fm.type_name, .elem_size = 8 };
+                        return .{ .kind = .raw_ptr, .type_name = fm.type_name, .elem_size = es };
+                    }
+                    return .{ .kind = .raw_ptr };
+                },
+                else => return null,
+            }
+        },
         else => return null,
     }
 }
@@ -3897,33 +3954,50 @@ fn lowerExpr(ctx: *Ctx, e: *ast.Expr) LowerError!u32 {
         },
         .unary => |u| {
             // Address-of: resolve lvalue before evaluating operand (package &ident → gaddr).
+            // Also `&base[i]` / `&base.field` — needed by posix `open_c_file` (`&buf[0]`).
             if (u.op == .addr) {
-                if (u.expr.* != .ident) return error.TypeError;
-                const name = u.expr.ident;
-                if (try loadCapturePtr(ctx, name)) |ptr| return ptr;
-                const d = try ctx.fresh();
-                if (ctx.slots.get(name)) |slot| {
-                    // Array / struct / iface slots already hold a data pointer; &x is that pointer
-                    // (LEA of the slot would pass a **T to C and break SDL createinfo / FRect FFI).
-                    if (ctx.meta.get(name)) |m| {
-                        if (m.kind == .array_ptr or m.kind == .struct_ptr or m.kind == .iface_ptr or m.kind == .capture_ptr) {
-                            try ctx.emit(.{ .op = .copy, .dst = d, .src0 = slot });
+                switch (u.expr.*) {
+                    .ident => |name| {
+                        if (try loadCapturePtr(ctx, name)) |ptr| return ptr;
+                        const d = try ctx.fresh();
+                        if (ctx.slots.get(name)) |slot| {
+                            // Array / struct / iface slots already hold a data pointer; &x is that pointer
+                            // (LEA of the slot would pass a **T to C and break SDL createinfo / FRect FFI).
+                            if (ctx.meta.get(name)) |m| {
+                                if (m.kind == .array_ptr or m.kind == .struct_ptr or m.kind == .iface_ptr or m.kind == .capture_ptr) {
+                                    try ctx.emit(.{ .op = .copy, .dst = d, .src0 = slot });
+                                    return d;
+                                }
+                            }
+                            try ctx.emit(.{ .op = .lea_slot, .dst = d, .src0 = slot });
                             return d;
                         }
-                    }
-                    try ctx.emit(.{ .op = .lea_slot, .dst = d, .src0 = slot });
-                    return d;
+                        if (ctx.global_map.get(name)) |gi| {
+                            try ctx.emit(.{ .op = .gaddr, .dst = d, .aux = @intCast(gi) });
+                            return d;
+                        }
+                        if (ctx.object_map.get(name)) |gi| {
+                            try ctx.emit(.{ .op = .gaddr, .dst = d, .aux = @intCast(gi) });
+                            return d;
+                        }
+                        std.debug.print("lower UnknownName addr: {s}\n", .{name});
+                        return error.UnknownName;
+                    },
+                    .index => |ix| return try lowerIndexAddr(ctx, ix.base, ix.index),
+                    .field => |f| {
+                        const base = try lowerExpr(ctx, f.base);
+                        const off = try fieldOffset(ctx, f.base, f.name);
+                        const addr = try ctx.fresh();
+                        const off_s = try ctx.fresh();
+                        try ctx.emit(.{ .op = .iconst, .dst = off_s, .aux = off });
+                        try ctx.emit(.{ .op = .add, .dst = addr, .src0 = base, .src1 = off_s });
+                        return addr;
+                    },
+                    else => {
+                        std.debug.print("lower TypeError addr: non-lvalue\n", .{});
+                        return error.TypeError;
+                    },
                 }
-                if (ctx.global_map.get(name)) |gi| {
-                    try ctx.emit(.{ .op = .gaddr, .dst = d, .aux = @intCast(gi) });
-                    return d;
-                }
-                if (ctx.object_map.get(name)) |gi| {
-                    try ctx.emit(.{ .op = .gaddr, .dst = d, .aux = @intCast(gi) });
-                    return d;
-                }
-                std.debug.print("lower UnknownName addr: {s}\n", .{name});
-                return error.UnknownName;
             }
             const v = try lowerExpr(ctx, u.expr);
             const d = try ctx.fresh();

@@ -1,7 +1,7 @@
 // Binding shape used by `std.io`: leaf `std.c` types and `std.error as`
 // alias vals must resolve under flattened merge (Friction 2026-11-23).
-// `jog check std/io` is the package gate; this smoke links without pulling
-// the posix `open_c_file` actual (deref-index assign still a separate gap).
+// `jog check std/io` is the package gate. Full `import std.io` link is
+// covered by `import_std_io_link.jog` / `addr_index_store.jog` (JOG-243).
 
 import std.c
 import std.error as errors
