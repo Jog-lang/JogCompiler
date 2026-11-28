@@ -127,6 +127,8 @@ pub const Global = struct {
     iface_type_name: []const u8 = "",
     /// Declared type leaf name when known (`Malloc`, `i64`, …) for `&global` iface coerce.
     type_name: []const u8 = "",
+    /// `@threadLocal` — native asm stores `JOGRT_MAX_WORKERS` copies; access via worker id.
+    thread_local: bool = false,
 };
 
 pub const Program = struct {
@@ -597,6 +599,7 @@ pub fn lower(parent: std.mem.Allocator, file: *const ast.File, cr: *const check.
                         .is_raw_byte_ptr = is_raw_byte_ptr,
                         .iface_type_name = iface_type_name,
                         .type_name = type_name,
+                        .thread_local = gd.thread_local,
                     });
                     try global_map.put(a, gd.name, idx);
                 }

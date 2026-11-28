@@ -156,6 +156,35 @@ pub const Parser = struct {
                 self.skipSeps();
                 const sd = try self.parseStruct();
                 return .{ .struct_decl = sd };
+            } else if (std.mem.eql(u8, attr, "threadLocal")) {
+                // `@threadLocal var name: T = …` — per OS-worker storage (JOG-227).
+                self.skipSeps();
+                if (self.tok.kind != .kw_var) return error.UnexpectedToken;
+                self.advance();
+                if (self.tok.kind != .ident) return error.UnexpectedToken;
+                const name = self.tok.text;
+                const name_line = self.tok.line;
+                const name_col = self.tok.col;
+                self.advance();
+                var ty: ?*ast.TypeExpr = null;
+                if (self.tok.kind == .colon) {
+                    self.advance();
+                    ty = try self.parseTypeExpr();
+                }
+                var init_e: ?*ast.Expr = null;
+                if (self.tok.kind == .eq) {
+                    self.advance();
+                    init_e = try self.parseExpr();
+                }
+                return .{ .global_decl = .{
+                    .mutable = true,
+                    .name = name,
+                    .ty = ty,
+                    .init = init_e,
+                    .thread_local = true,
+                    .line = name_line,
+                    .col = name_col,
+                } };
             } else {
                 return error.UnexpectedToken;
             }
@@ -2360,6 +2389,22 @@ fn unescape(allocator: std.mem.Allocator, s: []const u8) ParseError![]const u8 {
         }
     }
     return try out.toOwnedSlice(allocator);
+}
+
+test "parse threadLocal var" {
+    const src =
+        \\@threadLocal var tls_x: i64 = 0
+        \\
+        \\fn main() {}
+        \\
+    ;
+    var file = try Parser.parseFile(std.testing.allocator, src);
+    defer file.deinit();
+    try std.testing.expectEqual(@as(usize, 2), file.decls.len);
+    const gd = file.decls[0].global_decl;
+    try std.testing.expect(gd.mutable);
+    try std.testing.expect(gd.thread_local);
+    try std.testing.expectEqualStrings("tls_x", gd.name);
 }
 
 test "parse scope and go blocks" {

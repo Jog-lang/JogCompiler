@@ -73,6 +73,8 @@ pub const GlobalDecl = struct {
     name: []const u8,
     ty: ?*TypeExpr,
     init: ?*Expr,
+    /// `@threadLocal var` — one storage slot per OS worker (M:N), not per coroutine.
+    thread_local: bool = false,
     line: u32 = 1,
     col: u32 = 1,
 };

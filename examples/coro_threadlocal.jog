@@ -1,0 +1,31 @@
+// JOG-227: `@threadLocal var` is per OS worker, not per coroutine / process.
+// Writers run only on a secondary Dispatcher so they never touch main's replica.
+// Prefer `go { }` — `go(fn,arg)` + coro_drain SEGV is a known v2 tip issue.
+
+@threadLocal var tls_flag: i64 = 0
+
+fn main() {
+    // Primary: workers 0..1 (includes main). Secondary: 2..3 for TLS writers.
+    dispatcher_pool(2)
+    val other = dispatcher_new(2)
+    with (other) {
+        scope {
+            go { tls_flag = 1 }
+            go { tls_flag = 1 }
+            go { tls_flag = 1 }
+            go { tls_flag = 1 }
+            go { tls_flag = 1 }
+            go { tls_flag = 1 }
+            go { tls_flag = 1 }
+            go { tls_flag = 1 }
+        }
+    }
+    if tls_flag != 0 {
+        panic("main threadLocal leaked\n")
+    }
+    tls_flag = 9
+    if tls_flag != 9 {
+        panic("main threadLocal read/write failed\n")
+    }
+    print("threadLocal ok\n")
+}

@@ -1801,6 +1801,21 @@ jogrt_worker_id:
   mov rax, qword ptr gs:[TLS_OFF_WID]
   ret
 
+# rdi = base of jog_global_N (wid 0 replica), rsi = nquads stride
+# → rax = &replica[wid]  (ensures GS TLS via jogrt_coro_init)
+.globl jogrt_tls_addr
+.type jogrt_tls_addr, @function
+jogrt_tls_addr:
+  push rdi
+  push rsi
+  call jogrt_coro_init
+  pop rsi
+  pop rdi
+  mov rax, qword ptr gs:[TLS_OFF_WID]
+  imul rax, rsi
+  lea rax, [rdi + rax * 8]
+  ret
+
 .globl jogrt_gettid
 .type jogrt_gettid, @function
 jogrt_gettid:

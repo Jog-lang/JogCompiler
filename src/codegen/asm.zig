@@ -67,13 +67,19 @@ pub fn emit(allocator: std.mem.Allocator, program: *const ir.Program, writer: an
     if (program.globals.len > 0) {
         try writer.writeAll(".section .data\n");
         try writer.writeAll(".align 8\n");
+        // Match runtime/linux_x64_coro.s JOGRT_MAX_WORKERS — one replica per OS worker.
+        const max_workers: u32 = 16;
         for (program.globals, 0..) |g, i| {
             try writer.print(".globl jog_global_{d}\n", .{i});
             try writer.print("jog_global_{d}:\n", .{i});
-            var qi: u32 = 0;
-            while (qi < g.nquads) : (qi += 1) {
-                const bits: i64 = if (qi == 0) g.init_bits else 0;
-                try writer.print("  .quad {d}\n", .{bits});
+            const replicas: u32 = if (g.thread_local) max_workers else 1;
+            var r: u32 = 0;
+            while (r < replicas) : (r += 1) {
+                var qi: u32 = 0;
+                while (qi < g.nquads) : (qi += 1) {
+                    const bits: i64 = if (qi == 0) g.init_bits else 0;
+                    try writer.print("  .quad {d}\n", .{bits});
+                }
             }
             _ = g.name;
             _ = g.mutable;
@@ -211,15 +217,39 @@ fn emitInst(writer: anytype, prog: *const ir.Program, fname: []const u8, ninst: 
             try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{slot(inst.dst)});
         },
         .gload => {
-            try writer.print("  mov rax, qword ptr [rip + jog_global_{d}]\n", .{inst.aux});
+            const gi: usize = @intCast(inst.aux);
+            if (gi < prog.globals.len and prog.globals[gi].thread_local) {
+                try writer.print("  lea rdi, [rip + jog_global_{d}]\n", .{inst.aux});
+                try writer.print("  mov esi, {d}\n", .{prog.globals[gi].nquads});
+                try writer.writeAll("  call jogrt_tls_addr\n");
+                try writer.writeAll("  mov rax, qword ptr [rax]\n");
+            } else {
+                try writer.print("  mov rax, qword ptr [rip + jog_global_{d}]\n", .{inst.aux});
+            }
             try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{slot(inst.dst)});
         },
         .gstore => {
-            try writer.print("  mov rax, qword ptr [rbp - {d}]\n", .{slot(inst.src0)});
-            try writer.print("  mov qword ptr [rip + jog_global_{d}], rax\n", .{inst.aux});
+            const gi: usize = @intCast(inst.aux);
+            if (gi < prog.globals.len and prog.globals[gi].thread_local) {
+                try writer.print("  lea rdi, [rip + jog_global_{d}]\n", .{inst.aux});
+                try writer.print("  mov esi, {d}\n", .{prog.globals[gi].nquads});
+                try writer.writeAll("  call jogrt_tls_addr\n");
+                try writer.print("  mov rcx, qword ptr [rbp - {d}]\n", .{slot(inst.src0)});
+                try writer.writeAll("  mov qword ptr [rax], rcx\n");
+            } else {
+                try writer.print("  mov rax, qword ptr [rbp - {d}]\n", .{slot(inst.src0)});
+                try writer.print("  mov qword ptr [rip + jog_global_{d}], rax\n", .{inst.aux});
+            }
         },
         .gaddr => {
-            try writer.print("  lea rax, [rip + jog_global_{d}]\n", .{inst.aux});
+            const gi: usize = @intCast(inst.aux);
+            if (gi < prog.globals.len and prog.globals[gi].thread_local) {
+                try writer.print("  lea rdi, [rip + jog_global_{d}]\n", .{inst.aux});
+                try writer.print("  mov esi, {d}\n", .{prog.globals[gi].nquads});
+                try writer.writeAll("  call jogrt_tls_addr\n");
+            } else {
+                try writer.print("  lea rax, [rip + jog_global_{d}]\n", .{inst.aux});
+            }
             try writer.print("  mov qword ptr [rbp - {d}], rax\n", .{slot(inst.dst)});
         },
         .add => {

@@ -75,15 +75,24 @@ pub fn emit(allocator: std.mem.Allocator, program: *const ir.Program, writer: an
     }
     try writer.writeAll("\n");
 
-    // Globals (scalar or object multi-slot)
+    // Globals (scalar or object multi-slot). `@threadLocal` is a no-op on
+    // wasm32-emscripten (single OS thread / RTC go); keep ordinary storage.
     for (program.globals, 0..) |g, i| {
         if (g.nquads <= 1) {
-            try writer.print("int64_t jog_global_{d} = {d}; /* {s} */\n", .{ i, g.init_bits, g.name });
+            try writer.print("int64_t jog_global_{d} = {d}; /* {s}{s} */\n", .{
+                i,
+                g.init_bits,
+                g.name,
+                if (g.thread_local) " threadLocal→plain" else "",
+            });
         } else {
             try writer.print("int64_t jog_global_{d}[{d}] = {{ {d}", .{ i, g.nquads, g.init_bits });
             var qi: u32 = 1;
             while (qi < g.nquads) : (qi += 1) try writer.writeAll(", 0");
-            try writer.print(" }}; /* object {s} */\n", .{g.name});
+            try writer.print(" }}; /* object {s}{s} */\n", .{
+                g.name,
+                if (g.thread_local) " threadLocal→plain" else "",
+            });
         }
         _ = g.is_object;
     }
