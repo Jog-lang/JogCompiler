@@ -1,0 +1,8 @@
+fn badIfBoom(input: const bytes): bool {
+    if input.len >= 4 {
+        if input.ptr[0] == 66 && input.ptr[1] == 79 && input.ptr[2] == 79 && input.ptr[3] == 77 {
+            return false
+        }
+    }
+    return true
+}

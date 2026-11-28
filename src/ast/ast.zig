@@ -178,6 +178,8 @@ pub const FnDecl = struct {
     exported: bool = false,
     /// `@test` — test entry; not linked as main.
     is_test: bool = false,
+    /// `@fuzz` — fuzz target; corpus under `testdata/fuzz/<name>/`.
+    is_fuzz: bool = false,
     /// `private` — file-local (enforced when multi-file).
     is_private: bool = false,
     /// Name token location (for `jog symbols` / LSP).

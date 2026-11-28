@@ -8,6 +8,7 @@ const link = @import("../codegen/link.zig");
 const mod = @import("../mod/mod.zig");
 const roots_mod = @import("roots.zig");
 const priv_mangle = @import("priv_mangle.zig");
+const fuzz = @import("fuzz.zig");
 
 /// True when `basename` is a platform file for an OS other than this host.
 /// Keeps `.posix.jog` on linux/macos; drops `.windows.jog` on linux, etc.
@@ -31,7 +32,7 @@ fn isForeignPlatformSource(basename: []const u8) bool {
     return false;
 }
 
-pub const version_string = "jog 0.2.12-v2 (zig host, object+std/core; ir→asm→native | ir→c→emcc; jog test; jog ide JSON)";
+pub const version_string = "jog 0.2.13-v2 (zig host, object+std/core; ir→asm→native | ir→c→emcc; jog test; @fuzz; jog ide JSON)";
 
 pub fn cmdVersion(writer: anytype) !void {
     try writer.print("{s}\n", .{version_string});
@@ -1080,6 +1081,11 @@ pub fn cmdDepsOpts(allocator: std.mem.Allocator, path: []const u8, writer: anyty
 pub const TestOptions = struct {
     modules: []const ModuleMapping = &.{},
     cli_libdirs: []const []const u8 = &.{},
+    /// When set, run coverage-guided mutation on this `@fuzz` target (`jog test --fuzz name`).
+    fuzz_target: ?[]const u8 = null,
+    /// Iteration cap for `--fuzz` (0 = default 200). Spec is "until stopped"; agents use a cap.
+    fuzz_iters: u32 = 0,
+    fuzz_seed: u64 = 1,
 };
 
 const TestFn = struct {
@@ -1087,9 +1093,67 @@ const TestFn = struct {
     ncontexts: usize,
 };
 
+fn findTestDirForName(unit: *const Unit, name: []const u8) []const u8 {
+    if (unit.parts.len > 0) {
+        for (unit.parts, 0..) |part, i| {
+            if (i >= unit.paths.len) break;
+            for (part.decls) |d| {
+                const fd: ?ast.FnDecl = switch (d) {
+                    .fn_decl => |f| f,
+                    .actual_fn => |f| f,
+                    else => null,
+                };
+                if (fd) |f| {
+                    if ((f.is_fuzz or f.is_test) and std.mem.eql(u8, f.name, name)) {
+                        return std.fs.path.dirname(unit.paths[i]) orelse ".";
+                    }
+                }
+            }
+        }
+    }
+    if (unit.paths.len > 0) return std.fs.path.dirname(unit.paths[0]) orelse ".";
+    return ".";
+}
+
+fn collectFuzzTargets(allocator: std.mem.Allocator, unit: *const Unit, writer: anytype) ![]fuzz.FuzzTarget {
+    var out: std.ArrayListUnmanaged(fuzz.FuzzTarget) = .{};
+    errdefer {
+        for (out.items) |t| allocator.free(t.params);
+        out.deinit(allocator);
+    }
+    for (unit.file.decls) |d| {
+        const fd: ?ast.FnDecl = switch (d) {
+            .fn_decl => |f| f,
+            .actual_fn => |f| f,
+            else => null,
+        };
+        if (fd) |f| {
+            if (!f.is_fuzz or f.body == null) continue;
+            const class = fuzz.classifyFuzzFn(&f) orelse {
+                try writer.print("error: @fuzz '{s}' has unsupported parameter types\n", .{f.name});
+                std.process.exit(1);
+            };
+            if (f.contexts.len > 1) {
+                try writer.print("error: @fuzz '{s}' has {d} contexts; only 0 or 1 supported\n", .{ f.name, f.contexts.len });
+                std.process.exit(1);
+            }
+            const params = try allocator.dupe(fuzz.ParamKind, class[1]);
+            try out.append(allocator, .{
+                .name = f.name,
+                .ncontexts = f.contexts.len,
+                .kind = class[0],
+                .params = params,
+                .test_dir = findTestDirForName(unit, f.name),
+            });
+        }
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
 /// `jog test`: load root-module `*.test.jog`, synthesize a harness `main` that calls every
-/// `@test` (with `testing()` context supply), build, run, and fail the process on a nonzero
-/// exit or `// expect:` stdout mismatch. Matches seed / Spec Syntax tests behavior.
+/// `@test` (with `testing()` context supply), replay `@fuzz` corpus inputs, build, run, and
+/// fail the process on a nonzero exit or `// expect:` stdout mismatch.
+/// `jog test --fuzz name` builds an instrumented binary and mutates until `--fuzz-iters`.
 pub fn cmdTest(allocator: std.mem.Allocator, path: []const u8, opts: TestOptions, writer: anytype) !void {
     var unit = try loadPathOpts(allocator, path, writer, .{
         .modules = opts.modules,
@@ -1111,7 +1175,30 @@ pub fn cmdTest(allocator: std.mem.Allocator, path: []const u8, opts: TestOptions
             try tests.append(allocator, .{ .name = f.name, .ncontexts = f.contexts.len });
         }
     }
-    if (tests.items.len == 0) {
+
+    const fuzz_targets = try collectFuzzTargets(allocator, &unit, writer);
+    defer {
+        for (fuzz_targets) |t| allocator.free(t.params);
+        allocator.free(fuzz_targets);
+    }
+
+    if (opts.fuzz_target) |want| {
+        var found: ?fuzz.FuzzTarget = null;
+        for (fuzz_targets) |t| {
+            if (std.mem.eql(u8, t.name, want)) {
+                found = t;
+                break;
+            }
+        }
+        if (found == null) {
+            try writer.print("error: no @fuzz target named '{s}'\n", .{want});
+            std.process.exit(1);
+        }
+        try runFuzzMode(allocator, path, &unit, found.?, opts, writer);
+        return;
+    }
+
+    if (tests.items.len == 0 and fuzz_targets.len == 0) {
         try writer.writeAll("no tests\n");
         return;
     }
@@ -1119,6 +1206,7 @@ pub fn cmdTest(allocator: std.mem.Allocator, path: []const u8, opts: TestOptions
     var harness_src: std.ArrayListUnmanaged(u8) = .{};
     defer harness_src.deinit(allocator);
     try harness_src.appendSlice(allocator, "fn main() {\n");
+    var ran: usize = 0;
     for (tests.items) |t| {
         try harness_src.writer(allocator).print("  note(\"{s}\")\n", .{t.name});
         if (t.ncontexts == 0) {
@@ -1129,18 +1217,73 @@ pub fn cmdTest(allocator: std.mem.Allocator, path: []const u8, opts: TestOptions
             try writer.print("error: @test '{s}' has {d} contexts; only 0 or 1 supported\n", .{ t.name, t.ncontexts });
             std.process.exit(1);
         }
+        ran += 1;
     }
-    try harness_src.writer(allocator).print("  report({d})\n", .{tests.items.len});
+    // Corpus replay: each saved input runs once like an ordinary test.
+    for (fuzz_targets) |ft| {
+        const corpus_dir = try fuzz.findCorpusDir(allocator, ft.test_dir, ft.name);
+        defer allocator.free(corpus_dir);
+        const seeds = try fuzz.loadCorpus(allocator, corpus_dir);
+        defer {
+            for (seeds) |s| allocator.free(s);
+            allocator.free(seeds);
+        }
+        for (seeds, 0..) |seed, si| {
+            const lit = try fuzz.escapeJogString(allocator, seed);
+            defer allocator.free(lit);
+            try harness_src.writer(allocator).print("  note(\"fuzz:{s}:{d}\")\n", .{ ft.name, si });
+            try fuzz.appendDecodeAndCall(allocator, &harness_src, ft, lit);
+            ran += 1;
+        }
+    }
+    try harness_src.writer(allocator).print("  report({d})\n", .{ran});
     try harness_src.appendSlice(allocator, "}\n");
 
-    var harness_file = parse.Parser.parseFile(allocator, harness_src.items) catch |err| {
+    try buildAndRunHarness(allocator, path, &unit, harness_src.items, .{
+        .fuzz_instrument = false,
+        .cli_libdirs = opts.cli_libdirs,
+    }, writer);
+}
+
+const HarnessBuildOpts = struct {
+    fuzz_instrument: bool,
+    cli_libdirs: []const []const u8,
+};
+
+fn injectFuzzExtern(allocator: std.mem.Allocator, decls: *std.ArrayListUnmanaged(ast.Decl)) !void {
+    const src =
+        \\extern {
+        \\    fn jogrt_fuzz_prepare(): i64
+        \\    fn jogrt_fuzz_ptr(): *u8
+        \\    fn jogrt_fuzz_report()
+        \\}
+        \\
+    ;
+    // Process-scoped: AST nodes must outlive Unit (decls point here). page_allocator avoids GPA leak noise.
+    const file = try parse.Parser.parseFile(std.heap.page_allocator, src);
+    try decls.appendSlice(allocator, file.decls);
+}
+
+fn buildAndRunHarness(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    unit: *Unit,
+    harness_src: []const u8,
+    hopts: HarnessBuildOpts,
+    writer: anytype,
+) !void {
+    var harness_file = parse.Parser.parseFile(allocator, harness_src) catch |err| {
         try writer.print("test harness parse error: {s}\n", .{@errorName(err)});
+        try writer.writeAll(harness_src);
         std.process.exit(1);
     };
     defer harness_file.deinit();
 
     var new_decls: std.ArrayListUnmanaged(ast.Decl) = .{};
     errdefer new_decls.deinit(allocator);
+    if (hopts.fuzz_instrument) {
+        try injectFuzzExtern(allocator, &new_decls);
+    }
     for (unit.file.decls) |d| {
         const skip_main = switch (d) {
             .fn_decl => |f| std.mem.eql(u8, f.name, "main"),
@@ -1171,11 +1314,16 @@ pub fn cmdTest(allocator: std.mem.Allocator, path: []const u8, opts: TestOptions
     };
     defer program.deinit();
 
+    if (hopts.fuzz_instrument) {
+        program.fuzz_instrument = true;
+        program.needs_libc = true;
+    }
+
     const mod_name, const mod_root = try resolveTestModuleIdentity(allocator, path);
     defer allocator.free(mod_name);
     defer allocator.free(mod_root);
 
-    try mergeLinkMeta(allocator, &program, path, opts.cli_libdirs, "linux");
+    try mergeLinkMeta(allocator, &program, path, hopts.cli_libdirs, "linux");
 
     const out_dir = try std.fs.path.join(allocator, &.{ mod_root, "out" });
     defer allocator.free(out_dir);
@@ -1185,7 +1333,7 @@ pub fn cmdTest(allocator: std.mem.Allocator, path: []const u8, opts: TestOptions
 
     try link.buildExecutableTargeted(allocator, &program, exe_path, false, false, .native, writer);
 
-    const expects = try collectExpectLines(allocator, &unit);
+    const expects = try collectExpectLines(allocator, unit);
     defer {
         for (expects) |e| allocator.free(e);
         allocator.free(expects);
@@ -1206,6 +1354,218 @@ pub fn cmdTest(allocator: std.mem.Allocator, path: []const u8, opts: TestOptions
         if (status == 0) status = 1;
     }
     if (status != 0) std.process.exit(status);
+}
+
+fn runFuzzMode(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    unit: *Unit,
+    target: fuzz.FuzzTarget,
+    opts: TestOptions,
+    writer: anytype,
+) !void {
+    var harness_src: std.ArrayListUnmanaged(u8) = .{};
+    defer harness_src.deinit(allocator);
+    try harness_src.appendSlice(allocator, "fn main() {\n");
+    try fuzz.appendFileInputCall(allocator, &harness_src, target);
+    try harness_src.appendSlice(allocator, "}\n");
+
+    // Build instrumented exe (do not exit on test failures inside mutation — handle below).
+    var harness_file = parse.Parser.parseFile(allocator, harness_src.items) catch |err| {
+        try writer.print("fuzz harness parse error: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer harness_file.deinit();
+
+    var new_decls: std.ArrayListUnmanaged(ast.Decl) = .{};
+    errdefer new_decls.deinit(allocator);
+    try injectFuzzExtern(allocator, &new_decls);
+    for (unit.file.decls) |d| {
+        const skip_main = switch (d) {
+            .fn_decl => |f| std.mem.eql(u8, f.name, "main"),
+            .actual_fn => |f| std.mem.eql(u8, f.name, "main"),
+            else => false,
+        };
+        if (skip_main) continue;
+        try new_decls.append(allocator, d);
+    }
+    try new_decls.appendSlice(allocator, harness_file.decls);
+    if (unit.merged_decls) |old| allocator.free(old);
+    const owned = try new_decls.toOwnedSlice(allocator);
+    unit.merged_decls = owned;
+    unit.file.decls = owned;
+
+    var result = try check_mod.check(allocator, &unit.file);
+    defer result.deinit();
+    if (!result.ok) {
+        for (result.diagnostics) |d| {
+            try writer.print("error: {s}\n", .{d.message});
+        }
+        std.process.exit(1);
+    }
+
+    var program = ir.lower(allocator, &unit.file, &result) catch |err| {
+        try writer.print("lower error: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer program.deinit();
+    program.fuzz_instrument = true;
+    program.needs_libc = true;
+
+    const mod_name, const mod_root = try resolveTestModuleIdentity(allocator, path);
+    defer allocator.free(mod_name);
+    defer allocator.free(mod_root);
+
+    try mergeLinkMeta(allocator, &program, path, opts.cli_libdirs, "linux");
+
+    const out_dir = try std.fs.path.join(allocator, &.{ mod_root, "out" });
+    defer allocator.free(out_dir);
+    std.fs.cwd().makePath(out_dir) catch {};
+    const exe_path = try std.fmt.allocPrint(allocator, "{s}/{s}_fuzz.exe", .{ out_dir, mod_name });
+    defer allocator.free(exe_path);
+
+    try link.buildExecutableTargeted(allocator, &program, exe_path, false, false, .native, writer);
+
+    const corpus_dir = try fuzz.findCorpusDir(allocator, target.test_dir, target.name);
+    defer allocator.free(corpus_dir);
+    std.fs.cwd().makePath(corpus_dir) catch {};
+
+    var corpus = try fuzz.loadCorpus(allocator, corpus_dir);
+    defer {
+        for (corpus) |s| allocator.free(s);
+        allocator.free(corpus);
+    }
+    if (corpus.len == 0) {
+        allocator.free(corpus);
+        var list: std.ArrayListUnmanaged([]u8) = .{};
+        try list.append(allocator, try allocator.dupe(u8, ""));
+        try list.append(allocator, try allocator.dupe(u8, &[_]u8{0}));
+        try list.append(allocator, try allocator.dupe(u8, "AAAA"));
+        corpus = try list.toOwnedSlice(allocator);
+    }
+
+    const tmp_input = try std.fs.path.join(allocator, &.{ out_dir, "fuzz_input.bin" });
+    defer allocator.free(tmp_input);
+
+    var prng = std.Random.DefaultPrng.init(opts.fuzz_seed);
+    var rng = prng.random();
+    const iters: u32 = if (opts.fuzz_iters == 0) 200 else opts.fuzz_iters;
+
+    var interesting: std.ArrayListUnmanaged([]u8) = .{};
+    defer {
+        for (interesting.items) |s| allocator.free(s);
+        interesting.deinit(allocator);
+    }
+    for (corpus) |s| try interesting.append(allocator, try allocator.dupe(u8, s));
+
+    var seen_hashes: std.AutoHashMapUnmanaged(u64, void) = .{};
+    defer seen_hashes.deinit(allocator);
+
+    var crashes: u32 = 0;
+    var kept: u32 = 0;
+
+    // Replay current corpus once (also catches saved crash seeds on the next `jog test --fuzz`).
+    for (interesting.items) |seed| {
+        {
+            const f = try std.fs.cwd().createFile(tmp_input, .{});
+            defer f.close();
+            try f.writeAll(seed);
+        }
+        const run = try runTestExeArgs(allocator, &.{ exe_path, tmp_input });
+        defer allocator.free(run.stdout);
+        if (run.code != 0) {
+            crashes += 1;
+            try writer.print("fuzz: corpus seed failed for {s}\n", .{target.name});
+        } else if (parseCovHash(run.stdout)) |h| {
+            _ = try seen_hashes.getOrPut(allocator, h);
+        }
+    }
+
+    var i: u32 = 0;
+    while (i < iters) : (i += 1) {
+        const base = interesting.items[rng.intRangeLessThan(usize, 0, interesting.items.len)];
+        var buf: std.ArrayListUnmanaged(u8) = .{};
+        defer buf.deinit(allocator);
+        try buf.appendSlice(allocator, base);
+        try fuzz.mutate(&buf, allocator, &rng);
+
+        {
+            const f = try std.fs.cwd().createFile(tmp_input, .{});
+            defer f.close();
+            try f.writeAll(buf.items);
+        }
+
+        const run = try runTestExeArgs(allocator, &.{ exe_path, tmp_input });
+        defer allocator.free(run.stdout);
+
+        if (run.code != 0) {
+            crashes += 1;
+            // Save failing input into the corpus dir.
+            const name = try std.fmt.allocPrint(allocator, "crash-{d}-{d}", .{ opts.fuzz_seed, i });
+            defer allocator.free(name);
+            const dest = try std.fs.path.join(allocator, &.{ corpus_dir, name });
+            defer allocator.free(dest);
+            const outf = try std.fs.cwd().createFile(dest, .{});
+            defer outf.close();
+            try outf.writeAll(buf.items);
+            try writer.print("fuzz: saved failing input {s}\n", .{dest});
+            // Keep going; Spec saves and continues until stopped.
+            continue;
+        }
+
+        // Parse __JOG_COV__ <popcount> <hash64>; keep inputs that show a new edge-set hash.
+        if (parseCovHash(run.stdout)) |h| {
+            const gop = try seen_hashes.getOrPut(allocator, h);
+            if (!gop.found_existing) {
+                try interesting.append(allocator, try allocator.dupe(u8, buf.items));
+                kept += 1;
+            }
+        }
+    }
+
+    try writer.print("fuzz: {s}: {d} iters, {d} new-coverage keeps, {d} crashes, corpus={d}\n", .{
+        target.name,
+        iters,
+        kept,
+        crashes,
+        interesting.items.len,
+    });
+    if (crashes > 0) std.process.exit(1);
+}
+
+fn parseCovHash(stdout_text: []const u8) ?u64 {
+    var at: usize = 0;
+    while (at < stdout_text.len) {
+        const start = at;
+        while (at < stdout_text.len and stdout_text[at] != '\n' and stdout_text[at] != '\r') : (at += 1) {}
+        const line = stdout_text[start..at];
+        if (std.mem.startsWith(u8, line, "__JOG_COV__ ")) {
+            var it = std.mem.tokenizeScalar(u8, line["__JOG_COV__ ".len..], ' ');
+            _ = it.next(); // popcount
+            const h = it.next() orelse return null;
+            return std.fmt.parseInt(u64, h, 10) catch null;
+        }
+        if (at < stdout_text.len and stdout_text[at] == '\r') at += 1;
+        if (at < stdout_text.len and stdout_text[at] == '\n') at += 1;
+    }
+    return null;
+}
+
+fn runTestExeArgs(allocator: std.mem.Allocator, argv: []const []const u8) !RunTestResult {
+    var child = std.process.Child.init(argv, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Inherit;
+    try child.spawn();
+    const stdout = child.stdout orelse return error.MissingStdout;
+    const body = try stdout.readToEndAlloc(allocator, 16 * 1024 * 1024);
+    errdefer allocator.free(body);
+    const term = try child.wait();
+    const code: u8 = switch (term) {
+        .Exited => |c| @intCast(@min(c, 255)),
+        else => 1,
+    };
+    return .{ .stdout = body, .code = code };
 }
 
 fn expectsMatch(allocator: std.mem.Allocator, expects: []const []const u8, stdout_text: []const u8, writer: anytype) bool {
@@ -1341,7 +1701,9 @@ pub fn usage(writer: anytype) !void {
         \\                          typecheck subset (JSON diags for LSP)
         \\  test [package | --all] [--module name=dir ...]
         \\                          [--libdir DIR | -L DIR]...
-        \\                          build+run @test in *.test.jog (seed/Spec)
+        \\                          [--fuzz NAME] [--fuzz-iters N] [--fuzz-seed N]
+        \\                          build+run @test / @fuzz corpus in *.test.jog
+        \\                          --fuzz: coverage-guided mutation of one @fuzz target
         \\  build <path> -o OUT [--keep-asm] [--keep-c] [--race]
         \\                          [--target wasm32-emscripten]
         \\                          [--libdir DIR | -L DIR]...

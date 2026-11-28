@@ -159,6 +159,8 @@ pub const Program = struct {
     needs_libc: bool,
     /// JOG-233: `--race` instruments loads/stores and enables the debug detector.
     race: bool = false,
+    /// When true, asm emit inserts `jogrt_fuzz_hit` probes (JOG-232 coverage).
+    fuzz_instrument: bool = false,
     /// `-l` names from `@link` / jog.mod link.* lines.
     link_libs: [][]const u8,
     /// `-L` / rpath dirs from CLI `--libdir` / jog.mod libdir.* lines.

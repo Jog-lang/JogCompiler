@@ -21,10 +21,13 @@ jog version
 jog roots
 jog parse <path>
 jog check <path>
+jog test [path] [--fuzz NAME] [--fuzz-iters N]
 jog build <path> -o <out> [--keep-asm] [--keep-c] [--race]
               [--target wasm32-emscripten] [--libdir DIR | -L DIR]...
 jog deps [path]
 ```
+
+`jog test` runs `@test` and replays `@fuzz` corpus under `testdata/fuzz/<name>/`. `jog test --fuzz <name>` mutates with coverage guidance (JOG-232).
 
 `path` may be a `.jog` file, a directory with `jog.mod`, or a `jog.mod` file. Module sources listed in `jog.mod` (`root` + optional `source` lines) are parsed and typechecked together. `import std.*` resolves via library roots. `@link("lib")` and `jog.mod` `link.*` / `libdir.*` feed the linker (`-l` / `-L`; rpath on native). `link.emscripten` / `libdir.emscripten` apply only with `--target wasm32-emscripten`.
 

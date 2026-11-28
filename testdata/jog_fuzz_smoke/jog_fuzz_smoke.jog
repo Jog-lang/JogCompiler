@@ -1,0 +1,19 @@
+// Helpers for @fuzz smoke (JOG-232).
+
+fn sumAscii(input: const bytes): i32 {
+    var n: i32 = 0
+    for i in 0 as usize..input.len {
+        n = n + (input.ptr[i] as i32)
+    }
+    return n
+}
+
+fn pairOk(n: i32, s: str): bool {
+    if n == 0 {
+        return true
+    }
+    if s.len == 0 {
+        return true
+    }
+    return (n as i64) != (s.ptr[0] as i64) * 1000
+}
