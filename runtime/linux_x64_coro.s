@@ -1644,7 +1644,7 @@ jogrt_go:
   mov rdi, r12
   mov rsi, r14
   call jogrt_pool_enqueue
-  xor eax, eax
+  mov rax, r14                              # JOG-242: return coro/task id
   pop r14
   pop r13
   pop r12

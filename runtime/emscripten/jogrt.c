@@ -120,8 +120,9 @@ void jogrt_spawn(void *fn, void *arg) {
     jogrt_call_rtc(fn, arg);
 }
 void jogrt_dispatcher_stub(void) {}
-void jogrt_go(void *fn, void *arg) {
+int64_t jogrt_go(void *fn, void *arg) {
     jogrt_call_rtc(fn, arg);
+    return 0;
 }
 void jogrt_yield(void) { jogrt_coro_unsupported("yield / stackful coroutine switch"); }
 void jogrt_coro_drain(void) {}
@@ -172,9 +173,67 @@ int64_t jogrt_scope_cancelled(void *scope) {
     return 0;
 }
 void jogrt_scope_trampoline(void *p) { (void)p; }
-void jogrt_scope_go(void *scope, void *fn, void *arg, void *wrap) {
+int64_t jogrt_scope_go(void *scope, void *fn, void *arg, void *wrap) {
     (void)scope;
     (void)wrap;
     /* RTC: run now; child_inc/done are no-ops. */
-    jogrt_go(fn, arg);
+    return jogrt_go(fn, arg);
+}
+
+/* JOG-242 stubs: no parking Chan/select under RTC emscripten. */
+static const char jogrt_em_err_cancelled[] = "ErrCancelled";
+static const char jogrt_em_err_closed[] = "ErrClosed";
+void *jogrt_chan_init(uint64_t elem_size, uint64_t cap) {
+    (void)elem_size;
+    (void)cap;
+    return jogrt_alloc(8);
+}
+void jogrt_chan_free(void *chan) { (void)chan; }
+void jogrt_chan_close(void *chan) { (void)chan; }
+int32_t jogrt_chan_send(void *chan, const void *elem, uint64_t size) {
+    (void)chan;
+    (void)elem;
+    (void)size;
+    return 0;
+}
+int32_t jogrt_chan_recv(void *chan, void *elem, uint64_t size) {
+    (void)chan;
+    if (elem && size) memset(elem, 0, (size_t)size);
+    return 2; /* closed */
+}
+void jogrt_select_begin(void) {}
+int32_t jogrt_select_add_recv(void *chan, void *dest, uint64_t size) {
+    (void)chan;
+    (void)dest;
+    (void)size;
+    return 0;
+}
+int32_t jogrt_select_add_send(void *chan, const void *elem, uint64_t size) {
+    (void)chan;
+    (void)elem;
+    (void)size;
+    return 0;
+}
+int32_t jogrt_select_add_default(void) { return 0; }
+int32_t jogrt_select_add_timeout(int64_t ms) {
+    (void)ms;
+    return 0;
+}
+int32_t jogrt_select_wait(void) { return 0; }
+int32_t jogrt_select_status(void) { return 0; }
+int32_t jogrt_sleep(int64_t ms) {
+    (void)ms;
+    return 0;
+}
+void *jogrt_err_cancelled(void) { return (void *)jogrt_em_err_cancelled; }
+void *jogrt_err_closed(void) { return (void *)jogrt_em_err_closed; }
+int64_t jogrt_task_begin(int64_t cid) { return cid; }
+void jogrt_task_set(const void *ptr, uint64_t size) {
+    (void)ptr;
+    (void)size;
+}
+void jogrt_task_finish(void) {}
+void jogrt_task_join(int64_t task, void *out, uint64_t size) {
+    (void)task;
+    if (out && size) memset(out, 0, (size_t)size);
 }

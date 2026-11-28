@@ -1,0 +1,22 @@
+// JOG-242: Chan send/recv with scope + go { }.
+// Expected: 42
+
+fn main() {
+    dispatcher_single()
+    scope {
+        val ch = Chan<i64>.init(0)
+        go {
+            ch.send(42)
+        }
+        val (v, err) = ch.recv()
+        if err != null {
+            print("err\n")
+            return
+        }
+        if v == 42 {
+            print("42\n")
+        } else {
+            print("bad\n")
+        }
+    }
+}

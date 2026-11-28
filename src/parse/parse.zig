@@ -1784,6 +1784,7 @@ pub const Parser = struct {
                 const name = self.tok.text;
                 self.advance();
                 // JOG-222: `go { … }` / `go with (…) { … }` — `go(fn, arg)` stays a normal call.
+                // JOG-242: `go f(x)` expression form (not `go(` which is the fn+arg builtin).
                 if (std.mem.eql(u8, name, "go") and (self.tok.kind == .kw_with or self.tok.kind == .lbrace)) {
                     var with_args: []*ast.Expr = &.{};
                     if (self.tok.kind == .kw_with) {
@@ -1808,10 +1809,26 @@ pub const Parser = struct {
                     e.* = .{ .go_block = .{ .with_args = with_args, .body = body } };
                     return e;
                 }
+                if (std.mem.eql(u8, name, "go") and self.tok.kind != .lparen and self.tok.kind != .lt and
+                    self.tok.kind != .dot and self.tok.kind != .lbracket and
+                    (self.tok.kind == .ident or self.tok.kind == .lparen or self.tok.kind == .int or
+                        self.tok.kind == .float or self.tok.kind == .string or self.tok.kind == .kw_true or
+                        self.tok.kind == .kw_false))
+                {
+                    const inner = try self.parseUnary();
+                    e.* = .{ .go_expr = inner };
+                    return e;
+                }
                 // JOG-222: `scope { … }` (trailing-lambda `scope()` waits on JOG-221).
                 if (std.mem.eql(u8, name, "scope") and self.tok.kind == .lbrace) {
                     const body = try self.parseBlock();
                     e.* = .{ .scope_block = .{ .body = body } };
+                    return e;
+                }
+                // JOG-242: `select { … }` — cases are recv/send/timeout/default calls.
+                if (std.mem.eql(u8, name, "select") and self.tok.kind == .lbrace) {
+                    const body = try self.parseBlock();
+                    e.* = .{ .select_block = .{ .body = body } };
                     return e;
                 }
                 // Optional type args before struct lit / call: Name<…>(…)
@@ -1889,7 +1906,11 @@ pub const Parser = struct {
                         return e;
                     }
                 } else if (type_args.len != 0) {
-                    // Bare Name<T> is not a value expr.
+                    // `Chan<i64>.init(…)` — type value prefix before `.`.
+                    if (self.tok.kind == .dot) {
+                        e.* = .{ .type_value = .{ .name = name, .args = type_args } };
+                        return e;
+                    }
                     return error.UnexpectedToken;
                 }
                 e.* = .{ .ident = name };

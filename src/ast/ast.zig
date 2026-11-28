@@ -327,8 +327,14 @@ pub const Expr = union(enum) {
     force_unwrap: *Expr,
     /// `go { … }` / `go with (…) { … }` — block launch (JOG-222). `go(fn, arg)` stays a normal call.
     go_block: GoBlock,
+    /// `go f(x)` / `go expr` — launch evaluating expr in the child (JOG-242).
+    go_expr: *Expr,
     /// `scope { … }` — structured-concurrency block (JOG-222). Trailing-lambda `scope()` waits on JOG-221.
     scope_block: ScopeBlock,
+    /// `select { … }` — register cases and wait (JOG-242). Cases are `recv`/`send`/`timeout`/`default` calls.
+    select_block: SelectBlock,
+    /// Type used as a value prefix: `Chan<i64>.init(…)`.
+    type_value: NamedApp,
     /// `(params) [: Ret] -> body` anonymous function (Grammar lambda).
     lambda: Lambda,
 };
@@ -341,6 +347,11 @@ pub const GoBlock = struct {
 
 /// `scope { stmts }` — enter a child Scope, run body, join children, leave.
 pub const ScopeBlock = struct {
+    body: *Block,
+};
+
+/// `select { stmts }` — body holds case calls with trailing lambdas (JOG-242).
+pub const SelectBlock = struct {
     body: *Block,
 };
 

@@ -1,0 +1,21 @@
+// JOG-242: select { recv(ch) { v -> … } }
+// Expected: 7
+
+fn main() {
+    dispatcher_single()
+    scope {
+        val ch = Chan<i64>.init(0)
+        go {
+            ch.send(7)
+        }
+        select {
+            recv(ch) { v ->
+                if v == 7 {
+                    print("7\n")
+                } else {
+                    print("bad\n")
+                }
+            }
+        }
+    }
+}

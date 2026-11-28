@@ -1,0 +1,23 @@
+// JOG-242: for-over-channel until close.
+// Expected: ok
+
+fn main() {
+    dispatcher_single()
+    scope {
+        val ch = Chan<i64>.init(4)
+        go {
+            ch.send(1)
+            ch.send(2)
+            ch.close()
+        }
+        var sum: i64 = 0
+        for v in ch {
+            sum = sum + v
+        }
+        if sum == 3 {
+            print("ok\n")
+        } else {
+            print("bad\n")
+        }
+    }
+}
